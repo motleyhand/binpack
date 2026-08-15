@@ -1,0 +1,71 @@
+# Build and packaging only. Publishing — GHCR, the Homebrew tap, the Helm chart
+# as an OCI artifact — is added with the release pipeline, once there is
+# something worth releasing. CI runs `release --snapshot --skip=publish` on
+# every pull request so a broken config fails there rather than on a tag.
+version: 2
+
+project_name: binpack
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: binpack
+    main: ./cmd/binpack
+    binary: binpack
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+      - -X github.com/motleyhand/binpack/internal/version.version={{ .Version }}
+      - -X github.com/motleyhand/binpack/internal/version.commit={{ .FullCommit }}
+      - -X github.com/motleyhand/binpack/internal/version.date={{ .CommitDate }}
+    goos: [linux, darwin]
+    goarch: [amd64, arm64]
+    mod_timestamp: "{{ .CommitTimestamp }}"
+
+archives:
+  - formats: [tar.gz]
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+
+checksum:
+  name_template: checksums.txt
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-snapshot"
+
+dockers:
+  # Single-arch for now: multi-arch needs QEMU and a manifest, which arrives
+  # with the publishing config rather than cluttering a build-only check.
+  - image_templates:
+      - ghcr.io/motleyhand/binpack:{{ .Version }}
+    dockerfile: Dockerfile
+    use: buildx
+    goos: linux
+    goarch: amd64
+    skip_push: true
+    build_flag_templates:
+      - --platform=linux/amd64
+      - --label=org.opencontainers.image.source=https://github.com/motleyhand/binpack
+      - --label=org.opencontainers.image.version={{ .Version }}
+      - --label=org.opencontainers.image.revision={{ .FullCommit }}
+      - --label=org.opencontainers.image.licenses=Apache-2.0
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^chore:"
+
+release:
+  draft: true

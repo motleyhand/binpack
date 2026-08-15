@@ -5,17 +5,21 @@ easy to trust.
 
 ## Getting started
 
-Requires Go 1.25 or newer. Once the Go scaffold lands:
+Requires Go 1.25 or newer and [golangci-lint](https://golangci-lint.run) v2.
 
 ```bash
+make check      # lint, test, build — what CI runs
 make build      # binary into ./bin
-make test       # go test ./...
-make lint       # golangci-lint
-make fmt        # gofmt
+make test       # go test -race ./...
+make lint       # golangci-lint run
+make fmt        # gofmt -s -w .
+make help       # list every target
 ```
 
-`make lint && make test && make build` is exactly what CI runs. If those pass locally, CI should
-be green.
+`make check` is exactly the sequence CI runs. If it passes locally, CI should be green.
+
+CI additionally verifies that `go.mod` and `go.sum` are tidy, and runs GoReleaser in snapshot
+mode so a broken release config fails on the pull request rather than on a tag.
 
 ## Architecture rules
 
