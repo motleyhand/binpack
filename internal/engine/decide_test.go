@@ -28,6 +28,9 @@ func cluster(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
 		Now:   now,
 		Autoscaler: engine.Autoscaler{
 			Running: true,
+			// Probed just now: a status ConfigMap outlives the autoscaler
+			// that wrote it, so freshness is part of "running".
+			LastProbe: now.Add(-10 * time.Second),
 			Groups: []engine.NodeGroup{
 				{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: len(nodes)},
 			},
@@ -199,6 +202,94 @@ func TestSkipReasons(t *testing.T) {
 				t.Error("a skipped node must not be drained")
 			}
 		})
+	}
+}
+
+func TestStaleAutoscalerStatusIsNotTrusted(t *testing.T) {
+	// The ConfigMap outlives the autoscaler that wrote it and keeps saying
+	// Running. Without a freshness check, the one guard that stops binpack
+	// draining nodes nothing will reap is defeated by a leftover object.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.LastProbe = now.Add(-time.Hour)
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatal("an autoscaler silent for an hour is not running")
+	}
+	if !strings.Contains(d.Reason, "last reported") {
+		t.Errorf("reason should say the status is stale, got: %s", d.Reason)
+	}
+}
+
+func TestProviderTargetGuardsTheFloor(t *testing.T) {
+	// Mid scale-down the autoscaler has already lowered its target to the
+	// minimum while the departing node is still Ready. Trusting Ready would
+	// approve a drain the autoscaler will not honour.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.Groups[0] = engine.NodeGroup{
+		ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10,
+		Ready: 2, Target: 1, HasTarget: true,
+	}
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatalf("the pool is already at its target minimum, got a drain of %s", d.Node.Name)
+	}
+	if a := assessmentFor(d, "a"); a == nil || !strings.Contains(a.SkipReason, "minimum size") {
+		t.Errorf("reason should name the floor, got %+v", a)
+	}
+}
+
+func TestZeroTargetIsARealTarget(t *testing.T) {
+	// A pool with minSize 0 removing its last node reports target 0. Treating
+	// zero as "not reported" would discard exactly the case where the
+	// autoscaler has most clearly finished deciding.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.Groups[0] = engine.NodeGroup{
+		ID: poolID, Name: poolName, MinSize: 0, MaxSize: 10,
+		Ready: 1, Target: 0, HasTarget: true,
+	}
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatalf("the autoscaler is already targeting zero, got a drain of %s", d.Node.Name)
+	}
+}
+
+func TestMissingProbeTimeIsNotTrusted(t *testing.T) {
+	// Absent evidence of life is not evidence of life. A document that says
+	// Running but carries no probe time is one binpack cannot vouch for.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.LastProbe = time.Time{}
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatal("without a probe time binpack cannot tell the autoscaler is alive")
+	}
+	if !strings.Contains(d.Reason, "no probe time") {
+		t.Errorf("reason should say why, got: %s", d.Reason)
+	}
+}
+
+func TestLiveIsTheSameJudgementEverywhere(t *testing.T) {
+	// Decide and explain must not disagree about whether the autoscaler is
+	// running; an earlier version printed "running" above a decision refusing
+	// to act because it was not.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.LastProbe = now.Add(-time.Hour)
+
+	live, why := s.Autoscaler.Live(s.Now)
+	d := engine.Decide(s, config())
+
+	if live {
+		t.Fatal("an autoscaler silent for an hour is not live")
+	}
+	if d.Reason != why {
+		t.Errorf("Decide and Live must give the same reason:\n  Live:   %s\n  Decide: %s", why, d.Reason)
 	}
 }
 

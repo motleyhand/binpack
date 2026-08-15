@@ -73,7 +73,7 @@ func CanFit(pod *corev1.Pod, node *corev1.Node, remaining corev1.ResourceList, r
 	if r := UnsupportedPod(pod); !r.Empty() {
 		return false, r
 	}
-	if r := UnsupportedDestination(node, residents); !r.Empty() {
+	if r := UnsupportedDestination(pod, node, residents); !r.Empty() {
 		return false, r
 	}
 
