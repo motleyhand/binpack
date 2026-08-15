@@ -611,7 +611,13 @@ to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
    actions did not happen. Severity and prose are properties of the *code* rather than of each
    finding, so instances collapse into one explanation with many subjects. See
    [the diagnostics reference](../reference/diagnostics.md).
-10. `binpack run`, dry-run only
+10. `binpack run`, dry-run only. The manager, its caches, leader election, and Events on the
+    node. `collect` reads through controller-runtime's `client.Reader` for both frontends
+    rather than gaining a second path — a direct client for the one-shot commands, the
+    manager's cache for the controller — which is what keeps `explain` a truthful preview of
+    `run` rather than a parallel implementation of it. `--once` evaluates once and exits, for
+    a CronJob. `dryRun: false` is refused while there is no executor, rather than silently
+    reporting decisions nobody acts on.
 11. Executor: cordon, evict, verify, uncordon; cooldown and backoff state.
     **Blocked on** `collect` reading owner templates: until binpack derives the replacement
     pod's spec from its controller rather than from the running pod, a pod resized downward in

@@ -86,6 +86,7 @@ func NewRootCommand(out io.Writer) *cobra.Command {
 		newConfigCommand(opts),
 		newDiagnoseCommand(opts),
 		newExplainCommand(opts),
+		newRunCommand(opts),
 		newVersionCommand(opts),
 	)
 

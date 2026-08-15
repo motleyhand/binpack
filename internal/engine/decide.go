@@ -3,6 +3,7 @@ package engine
 import (
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -536,4 +537,54 @@ func summarise(assessments []NodeAssessment) string {
 	default:
 		return fmt.Sprintf("%d node(s) considered, none whose workload fits elsewhere", considered)
 	}
+}
+
+// CheckPools rejects per-pool overrides naming a pool that is not there.
+//
+// Pools are discovered, never declared, so an override adjusts something that
+// exists. A misspelt name otherwise installs an unreachable map entry and its
+// nodes quietly take the default policy — which is actively dangerous for
+// `enabled: false`, where an operator believes they have switched a pool off
+// and binpack goes on considering it drainable.
+//
+// Checked against the resolved configuration rather than the document, so what
+// is validated is what the engine will actually consult. Every frontend calls
+// it: a configuration `explain` refuses must not be one `run` accepts, and the
+// controller is the one that will eventually act on it.
+func CheckPools(s Snapshot, cfg Config) error {
+	if len(cfg.ByPool) == 0 {
+		return nil
+	}
+
+	known := map[string]bool{}
+	for _, g := range s.Autoscaler.Groups {
+		known[g.ID] = true
+	}
+	for _, node := range s.Nodes {
+		if name := node.Labels[cfg.PoolNameLabel]; name != "" {
+			known[name] = true
+		}
+		if id := node.Labels[cfg.NodeGroupIDLabel]; id != "" {
+			known[id] = true
+		}
+	}
+
+	var unknown []string
+	for name := range cfg.ByPool {
+		if !known[name] {
+			unknown = append(unknown, name)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+
+	// Sorted: the names come from a map, and an error that reorders itself
+	// between runs is one nobody can diff or match against a log.
+	sort.Strings(unknown)
+	return fmt.Errorf(
+		"configuration overrides pools that do not exist in this cluster: %s\n"+
+			"pools are discovered, not declared, so an override must name one that is there;\n"+
+			"check for a typo, or remove the entry if the pool is gone",
+		strings.Join(unknown, ", "))
 }

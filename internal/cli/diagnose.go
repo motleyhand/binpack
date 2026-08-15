@@ -93,7 +93,7 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 			}
 			// Validated even though diagnose reads only the default policy, so
 			// that a typo is not accepted here and rejected by explain.
-			if err := checkPoolsExist(cfg, snapshot); err != nil {
+			if err := engine.CheckPools(snapshot, engineConfig(cfg)); err != nil {
 				return err
 			}
 

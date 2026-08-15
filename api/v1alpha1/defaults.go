@@ -54,6 +54,36 @@ func (c *Config) SetDefaults() {
 //
 // Unknown pool names are a validation error rather than a silent no-op, so a
 // name reaching here has already been checked against discovery.
+// Settings is the resolved top-level configuration: what a document means
+// once defaults have been applied, with nothing left to dereference.
+type Settings struct {
+	Interval time.Duration
+	DryRun   bool
+}
+
+// Settings resolves the top-level fields, the same way [Config.PolicyFor]
+// resolves the per-pool ones.
+//
+// The wire types use pointers so that an omitted field is distinguishable from
+// one explicitly set to its zero value, which round-tripping requires. That is
+// a property of the format, not something every caller should have to handle:
+// a caller that dereferences directly is one nil away from a panic, and gets
+// the wrong answer rather than the default if it guards by testing for nil
+// itself.
+func (c *Config) Settings() Settings {
+	s := Settings{Interval: DefaultInterval, DryRun: DefaultDryRun}
+	if c == nil {
+		return s
+	}
+	if c.Interval != nil {
+		s.Interval = c.Interval.Duration
+	}
+	if c.DryRun != nil {
+		s.DryRun = *c.DryRun
+	}
+	return s
+}
+
 func (c *Config) PolicyFor(names ...string) PoolPolicy {
 	p := PoolPolicy{
 		Enabled:                  DefaultEnabled,
