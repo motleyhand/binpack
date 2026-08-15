@@ -41,8 +41,14 @@ func TestEmptyConfigIsValidAndSafe(t *testing.T) {
 	if p.ExpendablePriorityCutoff != DefaultExpendableCutoff {
 		t.Errorf("cutoff = %d, want %d", p.ExpendablePriorityCutoff, DefaultExpendableCutoff)
 	}
-	if p.VerifyRemovalTimeout != DefaultVerifyRemovalTimeout {
-		t.Errorf("verifyRemovalTimeout = %s", p.VerifyRemovalTimeout)
+	if p.StallTimeout != DefaultStallTimeout {
+		t.Errorf("stallTimeout = %s, want %s", p.StallTimeout, DefaultStallTimeout)
+	}
+	if p.RemovalTimeout != DefaultRemovalTimeout {
+		t.Errorf("removalTimeout = %s, want %s", p.RemovalTimeout, DefaultRemovalTimeout)
+	}
+	if p.BackoffInitial != DefaultBackoffInitial || p.BackoffMax != DefaultBackoffMax {
+		t.Errorf("backoff = %s..%s", p.BackoffInitial, p.BackoffMax)
 	}
 }
 
@@ -165,8 +171,31 @@ func TestValidation(t *testing.T) {
 		},
 		{
 			name:    "zero removal timeout would leave nodes cordoned forever",
-			yaml:    "policy:\n  drain:\n    verifyRemovalTimeout: 0s",
-			wantErr: "must be positive",
+			yaml:    "policy:\n  drain:\n    removalTimeout: 0s",
+			wantErr: "drain.removalTimeout: must be positive",
+		},
+		{
+			name:    "zero stall timeout would let a wedged drain hold a node forever",
+			yaml:    "policy:\n  drain:\n    stallTimeout: 0s",
+			wantErr: "drain.stallTimeout: must be positive",
+		},
+		{
+			name:    "backoff max below initial would shorten the first retry",
+			yaml:    "policy:\n  backoff:\n    initial: 1h\n    max: 10m",
+			wantErr: "shorter than backoff.initial",
+		},
+		{
+			// Legal where written, illegal once the 30m default initial
+			// delay is applied. Only a resolved-policy check catches this.
+			name:    "backoff max below the default initial",
+			yaml:    "policy:\n  backoff:\n    max: 10m",
+			wantErr: "shorter than backoff.initial",
+		},
+		{
+			// Each layer is individually fine; the combination is not.
+			name:    "pool inherits a long initial and overrides only max",
+			yaml:    "policy:\n  backoff:\n    initial: 1h\npools:\n  - name: pool-4g\n    backoff:\n      max: 10m",
+			wantErr: `pools[0] "pool-4g" (resolved)`,
 		},
 		{
 			name:    "duplicate pool names",
@@ -240,7 +269,8 @@ policy:
     reserveForLargestPod: false
   drain:
     maxPodsPerDrain: 5
-    verifyRemovalTimeout: 20m
+    stallTimeout: 20m
+    removalTimeout: 25m
 pools:
   - name: pool-4g
     enabled: true

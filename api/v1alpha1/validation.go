@@ -62,7 +62,37 @@ func (c *Config) Validate() error {
 		errs = append(errs, p.validate(path)...)
 	}
 
+	// Some invariants are properties of the *resolved* policy rather than of
+	// any single layer: a value can be legal where it is written and illegal
+	// once defaults and inheritance are applied. Checking the raw document
+	// alone would accept `backoff.max: 10m` against a 30-minute default
+	// initial delay, which is exactly the state the check exists to reject.
+	errs = append(errs, c.PolicyFor().validate("policy (resolved)")...)
+	for i, pool := range c.Pools {
+		if pool.Name == "" {
+			continue // already reported; PolicyFor would match nothing useful
+		}
+		errs = append(errs, c.PolicyFor(pool.Name).validate(
+			fmt.Sprintf("pools[%d] %q (resolved)", i, pool.Name))...)
+	}
+
 	return errors.Join(errs...)
+}
+
+// validate checks invariants that only exist once defaults and per-pool
+// overrides have been applied.
+func (p PoolPolicy) validate(path string) []error {
+	var errs []error
+
+	if p.BackoffMax < p.BackoffInitial {
+		// Otherwise the cap would shorten the first retry rather than bound
+		// the doubling, which is the opposite of what it reads as.
+		errs = append(errs, fmt.Errorf(
+			"%s.backoff.max: %s is shorter than backoff.initial %s (values may come from defaults or inheritance)",
+			path, p.BackoffMax, p.BackoffInitial))
+	}
+
+	return errs
 }
 
 func (p Policy) validate(path string) []error {
@@ -82,10 +112,26 @@ func (p Policy) validate(path string) []error {
 			path, *n))
 	}
 
-	if t := p.Drain.VerifyRemovalTimeout; t != nil && t.Duration <= 0 {
-		// Without a positive timeout, a node that the autoscaler never
-		// removes would stay cordoned forever.
-		errs = append(errs, fmt.Errorf("%s.drain.verifyRemovalTimeout: must be positive, got %s",
+	if t := p.Drain.StallTimeout; t != nil && t.Duration <= 0 {
+		// Without a positive bound, a drain wedged on an unevictable pod
+		// would hold the node cordoned indefinitely.
+		errs = append(errs, fmt.Errorf("%s.drain.stallTimeout: must be positive, got %s",
+			path, t.Duration))
+	}
+
+	if t := p.Drain.RemovalTimeout; t != nil && t.Duration <= 0 {
+		// Without a positive timeout, a node the autoscaler never removes
+		// would stay cordoned forever.
+		errs = append(errs, fmt.Errorf("%s.drain.removalTimeout: must be positive, got %s",
+			path, t.Duration))
+	}
+
+	if t := p.Backoff.Initial; t != nil && t.Duration <= 0 {
+		errs = append(errs, fmt.Errorf("%s.backoff.initial: must be positive, got %s",
+			path, t.Duration))
+	}
+	if t := p.Backoff.Max; t != nil && t.Duration <= 0 {
+		errs = append(errs, fmt.Errorf("%s.backoff.max: must be positive, got %s",
 			path, t.Duration))
 	}
 

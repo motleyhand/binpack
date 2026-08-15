@@ -83,6 +83,7 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0004](docs/design/adr-0004-provider-agnostic-no-cloud-api.md) | Discovering pool bounds from the autoscaler itself; why binpack holds no cloud credentials |
 | [ADR-0005](docs/design/adr-0005-why-not-a-karpenter-doks-provider.md) | Karpenter compared honestly, and why this project exists anyway |
 | [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md) | Borrowing the scheduler's own logic, and testing against the real one |
+| [ADR-0007](docs/design/adr-0007-drain-progress-not-deadlines.md) | Why drains are bounded by progress rather than deadlines, and why failures back off |
 
 Configuration and metrics references are written as the implementation lands.
 

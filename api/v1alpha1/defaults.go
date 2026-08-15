@@ -15,7 +15,10 @@ const (
 	DefaultExpendableCutoff     = int32(-10)
 	DefaultReserveForLargestPod = true
 	DefaultMaxPodsPerDrain      = 0 // unlimited
-	DefaultVerifyRemovalTimeout = 15 * time.Minute
+	DefaultStallTimeout         = 10 * time.Minute
+	DefaultRemovalTimeout       = 15 * time.Minute
+	DefaultBackoffInitial       = 30 * time.Minute
+	DefaultBackoffMax           = 24 * time.Hour
 	DefaultCooldownAfterScaleUp = 10 * time.Minute
 	DefaultCooldownAfterDrain   = 15 * time.Minute
 )
@@ -57,7 +60,10 @@ func (c *Config) PolicyFor(names ...string) PoolPolicy {
 		ExpendablePriorityCutoff: DefaultExpendableCutoff,
 		ReserveForLargestPod:     DefaultReserveForLargestPod,
 		MaxPodsPerDrain:          DefaultMaxPodsPerDrain,
-		VerifyRemovalTimeout:     DefaultVerifyRemovalTimeout,
+		StallTimeout:             DefaultStallTimeout,
+		RemovalTimeout:           DefaultRemovalTimeout,
+		BackoffInitial:           DefaultBackoffInitial,
+		BackoffMax:               DefaultBackoffMax,
 		CooldownAfterScaleUp:     DefaultCooldownAfterScaleUp,
 		CooldownAfterDrain:       DefaultCooldownAfterDrain,
 	}
@@ -87,8 +93,17 @@ func (p *PoolPolicy) apply(o Policy) {
 	if o.Drain.MaxPodsPerDrain != nil {
 		p.MaxPodsPerDrain = *o.Drain.MaxPodsPerDrain
 	}
-	if o.Drain.VerifyRemovalTimeout != nil {
-		p.VerifyRemovalTimeout = o.Drain.VerifyRemovalTimeout.Duration
+	if o.Drain.StallTimeout != nil {
+		p.StallTimeout = o.Drain.StallTimeout.Duration
+	}
+	if o.Drain.RemovalTimeout != nil {
+		p.RemovalTimeout = o.Drain.RemovalTimeout.Duration
+	}
+	if o.Backoff.Initial != nil {
+		p.BackoffInitial = o.Backoff.Initial.Duration
+	}
+	if o.Backoff.Max != nil {
+		p.BackoffMax = o.Backoff.Max.Duration
 	}
 	if o.Cooldown.AfterScaleUp != nil {
 		p.CooldownAfterScaleUp = o.Cooldown.AfterScaleUp.Duration
