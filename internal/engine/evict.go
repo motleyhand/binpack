@@ -52,6 +52,7 @@ const (
 	BlockedSystemPod      = "system-pod"
 	BlockedMultiplePDBs   = "multiple-pdbs"
 	BlockedPDBInsufficint = "pdb-insufficient"
+	BlockedPDBStale       = "pdb-stale"
 )
 
 // EvictionBlocker is one reason a drain would not complete.
@@ -84,67 +85,17 @@ func CheckEvictable(
 ) []EvictionBlocker {
 	var blockers []EvictionBlocker
 
-	for _, pod := range evicting {
-		if b := checkPod(pod, cfg); b != nil {
-			blockers = append(blockers, *b)
-		}
-	}
-
-	return append(blockers, checkDisruptionBudgets(evicting, pdbs)...)
-}
-
-func checkPod(pod *corev1.Pod, cfg EvictConfig) *EvictionBlocker {
-	// An explicit refusal beats everything, including the exemptions below.
-	if pod.Annotations[safeToEvict] == "false" {
-		return &EvictionBlocker{Pod: pod, Code: BlockedSafeToEvict,
-			Message: fmt.Sprintf("%s is annotated %s=false", podRef(pod), safeToEvict)}
-	}
-
-	// An explicit permission likewise beats the heuristics below: it is how an
-	// operator says a scratch volume is disposable.
-	permitted := pod.Annotations[safeToEvict] == "true"
-
-	if _, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
-		return &EvictionBlocker{Pod: pod, Code: BlockedMirrorPod,
-			Message: fmt.Sprintf("%s is a static pod managed by the kubelet and cannot be evicted", podRef(pod))}
-	}
-
-	// A pod with no controller is not recreated after eviction, so evicting
-	// it destroys it. The autoscaler refuses for the same reason.
-	if len(pod.OwnerReferences) == 0 && !permitted {
-		return &EvictionBlocker{Pod: pod, Code: BlockedBarePod,
-			Message: fmt.Sprintf("%s has no controller, so evicting it would delete it permanently", podRef(pod))}
-	}
-
-	if cfg.SkipNodesWithLocalStorage && !permitted {
-		if volume, ok := firstLocalStorage(pod); ok {
-			return &EvictionBlocker{Pod: pod, Code: BlockedLocalStorage,
-				Message: fmt.Sprintf(
-					"%s uses local storage (%s); annotate it %s=true if the contents are disposable",
-					podRef(pod), volume, safeToEvict)}
-		}
-	}
-
-	if cfg.SkipNodesWithSystemPods && pod.Namespace == metav1.NamespaceSystem && !permitted {
-		return &EvictionBlocker{Pod: pod, Code: BlockedSystemPod,
-			Message: fmt.Sprintf(
-				"%s is a kube-system pod, which the autoscaler will not remove a node for", podRef(pod))}
-	}
-
-	return nil
-}
-
-// checkDisruptionBudgets aggregates demand across the whole drain.
-//
-// A drain is many evictions drawing on the same allowances, so checking each
-// pod alone is insufficient: two pods of one Deployment on the same node, with
-// disruptionsAllowed of 1, pass a per-pod check and then half-drain the node.
-func checkDisruptionBudgets(evicting []*corev1.Pod, pdbs []*policyv1.PodDisruptionBudget) []EvictionBlocker {
-	var blockers []EvictionBlocker
 	demand := make(map[*policyv1.PodDisruptionBudget]int)
 
 	for _, pod := range evicting {
+		// Matched once and reused: a budget both exempts a kube-system pod
+		// from the blanket rule and governs whether it can actually go.
 		matched := matchingPDBs(pod, pdbs)
+
+		if b := checkPod(pod, matched, cfg); b != nil {
+			blockers = append(blockers, *b)
+			continue
+		}
 
 		// The eviction subresource does not arbitrate between budgets. It
 		// returns HTTP 500 — not a retryable 429 — so such a pod cannot be
@@ -166,7 +117,86 @@ func checkDisruptionBudgets(evicting []*corev1.Pod, pdbs []*policyv1.PodDisrupti
 		}
 	}
 
+	return append(blockers, checkAllowances(demand)...)
+}
+
+func checkPod(pod *corev1.Pod, matched []*policyv1.PodDisruptionBudget, cfg EvictConfig) *EvictionBlocker {
+	// An explicit refusal beats everything, including the exemptions below.
+	if pod.Annotations[safeToEvict] == "false" {
+		return &EvictionBlocker{Pod: pod, Code: BlockedSafeToEvict,
+			Message: fmt.Sprintf("%s is annotated %s=false", podRef(pod), safeToEvict)}
+	}
+
+	// An explicit permission likewise beats the heuristics below: it is how an
+	// operator says a scratch volume is disposable.
+	permitted := pod.Annotations[safeToEvict] == "true"
+
+	if _, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
+		return &EvictionBlocker{Pod: pod, Code: BlockedMirrorPod,
+			Message: fmt.Sprintf("%s is a static pod managed by the kubelet and cannot be evicted", podRef(pod))}
+	}
+
+	// A pod with no *controlling* owner is not recreated after eviction, so
+	// evicting it destroys it. The autoscaler refuses for the same reason.
+	//
+	// Counting any owner reference would be wrong: references exist for
+	// garbage collection too, and one with Controller unset means nothing is
+	// responsible for replacing the pod.
+	if metav1.GetControllerOf(pod) == nil && !permitted {
+		return &EvictionBlocker{Pod: pod, Code: BlockedBarePod,
+			Message: fmt.Sprintf("%s has no controller, so evicting it would delete it permanently", podRef(pod))}
+	}
+
+	if cfg.SkipNodesWithLocalStorage && !permitted {
+		if volume, ok := firstLocalStorage(pod); ok {
+			return &EvictionBlocker{Pod: pod, Code: BlockedLocalStorage,
+				Message: fmt.Sprintf(
+					"%s uses local storage (%s); annotate it %s=true if the contents are disposable",
+					podRef(pod), volume, safeToEvict)}
+		}
+	}
+
+	// A kube-system pod blocks node removal only when no budget covers it.
+	// Per the autoscaler's own documentation, configuring a PDB for such a
+	// pod "overrides the default strategy of not touching the node" — the
+	// budget then governs, and its allowance is checked below like any other.
+	if cfg.SkipNodesWithSystemPods && pod.Namespace == metav1.NamespaceSystem &&
+		!permitted && len(matched) == 0 {
+		return &EvictionBlocker{Pod: pod, Code: BlockedSystemPod,
+			Message: fmt.Sprintf(
+				"%s is a kube-system pod with no PodDisruptionBudget, so the autoscaler will not remove its node",
+				podRef(pod))}
+	}
+
+	return nil
+}
+
+// checkAllowances verifies each budget can absorb the drain's demand.
+//
+// Demand is aggregated across the whole drain rather than checked per pod: a
+// drain is many evictions drawing on the same allowances, so two pods of one
+// Deployment on a node with disruptionsAllowed of 1 pass a per-pod check and
+// then half-drain it.
+func checkAllowances(demand map[*policyv1.PodDisruptionBudget]int) []EvictionBlocker {
+	var blockers []EvictionBlocker
+
 	for pdb, wanted := range demand {
+		// A budget whose controller has not caught up with its spec is
+		// refused by the eviction API outright, whatever its recorded
+		// allowance says — see checkAndDecrement in the eviction subresource.
+		// Trusting a stale number is how a drain gets approved and then
+		// rejected mid-flight.
+		if pdb.Status.ObservedGeneration < pdb.Generation {
+			blockers = append(blockers, EvictionBlocker{
+				Code: BlockedPDBStale,
+				PDB:  pdb.Namespace + "/" + pdb.Name,
+				Message: fmt.Sprintf(
+					"%s/%s was edited and its controller has not caught up (generation %d, observed %d), so evictions are refused until it does",
+					pdb.Namespace, pdb.Name, pdb.Generation, pdb.Status.ObservedGeneration),
+			})
+			continue
+		}
+
 		allowed := int(pdb.Status.DisruptionsAllowed)
 		if wanted <= allowed {
 			continue

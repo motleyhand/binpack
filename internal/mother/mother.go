@@ -139,7 +139,8 @@ func Pod(namespace, name string, opts ...PodOption) *corev1.Pod {
 			Namespace: namespace,
 			Name:      name,
 			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name + "-rs"},
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name + "-rs",
+					Controller: ptr(true)},
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -167,7 +168,7 @@ func DaemonSetPod(namespace, name string, opts ...PodOption) *corev1.Pod {
 	return Pod(namespace, name, append([]PodOption{
 		func(p *corev1.Pod) {
 			p.OwnerReferences = []metav1.OwnerReference{
-				{APIVersion: "apps/v1", Kind: "DaemonSet", Name: name},
+				{APIVersion: "apps/v1", Kind: "DaemonSet", Name: name, Controller: ptr(true)},
 			}
 		},
 	}, opts...)...)
@@ -392,6 +393,26 @@ func Bare() PodOption {
 	return func(p *corev1.Pod) { p.OwnerReferences = nil }
 }
 
+// OwnedButNotControlled gives the pod an owner reference with Controller
+// unset — a garbage-collection link rather than a controller that would
+// recreate it. Such a pod is as bare as one with no owner at all.
+func OwnedButNotControlled(kind, name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.OwnerReferences = []metav1.OwnerReference{
+			{APIVersion: "apps/v1", Kind: kind, Name: name},
+		}
+	}
+}
+
+// Stale marks a PDB whose controller has not yet observed the current spec.
+// The eviction API refuses disruptions in that state whatever the recorded
+// allowance says.
+func Stale(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	pdb.Generation = 7
+	pdb.Status.ObservedGeneration = 6
+	return pdb
+}
+
 // WithHostPathVolume attaches a hostPath volume, which the autoscaler treats
 // as local storage.
 func WithHostPathVolume(name, path string) PodOption {
@@ -469,3 +490,5 @@ func Gated(name string) PodOption {
 			corev1.PodSchedulingGate{Name: name})
 	}
 }
+
+func ptr[T any](v T) *T { return &v }

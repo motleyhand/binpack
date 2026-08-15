@@ -59,9 +59,17 @@ func TestCheckEvictablePerPod(t *testing.T) {
 				mother.WithEmptyDir("scratch"), mother.SafeToEvict("true")),
 		},
 		{
-			name: "kube-system pod blocks node removal",
+			name: "kube-system pod with no budget blocks node removal",
 			pod:  mother.Pod("kube-system", "coredns"),
 			want: engine.BlockedSystemPod,
+		},
+		{
+			// An owner reference without Controller set is a
+			// garbage-collection link, not a controller that would recreate
+			// the pod. Counting it would let a pod be deleted permanently.
+			name: "owner reference that does not control is still bare",
+			pod:  mother.Pod("default", "orphan", mother.OwnedButNotControlled("ReplicaSet", "rs")),
+			want: engine.BlockedBarePod,
 		},
 		{
 			name: "kube-system pod explicitly permitted",
@@ -186,6 +194,52 @@ func TestPodMatchedByTwoPDBsIsPermanentlyStuck(t *testing.T) {
 	// Both budgets have ample slack; the block is structural, not arithmetic.
 	if !strings.Contains(got[0].Message, "team-wide") || !strings.Contains(got[0].Message, "api-specific") {
 		t.Errorf("message should name both budgets, got: %s", got[0].Message)
+	}
+}
+
+func TestKubeSystemPodWithABudgetIsAllowed(t *testing.T) {
+	// Per the autoscaler's own FAQ, configuring a PDB for a kube-system pod
+	// "overrides the default strategy of not touching the node". Blocking
+	// unconditionally would falsely reject candidates hosting PDB-protected
+	// CoreDNS, which is a common and correct setup.
+	labelled := map[string]string{"k8s-app": "kube-dns"}
+	pod := mother.Pod("kube-system", "coredns-1", mother.PodLabels(labelled))
+	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("kube-system", "coredns", 1, labelled)}
+
+	if got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig()); len(got) != 0 {
+		t.Errorf("a kube-system pod with an adequate budget is evictable, got %v", codes(got))
+	}
+}
+
+func TestKubeSystemPodWithARestrictiveBudgetIsBlockedByIt(t *testing.T) {
+	// The budget governs once it exists, so the refusal should come from the
+	// allowance rather than the blanket kube-system rule — which is the
+	// difference between "add a PDB" and "your PDB is too tight".
+	labelled := map[string]string{"k8s-app": "kube-dns"}
+	pod := mother.Pod("kube-system", "coredns-1", mother.PodLabels(labelled))
+	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("kube-system", "coredns", 0, labelled)}
+
+	got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig())
+
+	if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
+		t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedPDBInsufficint)
+	}
+}
+
+func TestStalePDBStatusIsNotTrusted(t *testing.T) {
+	// After a restrictive edit the controller may not have reconciled yet.
+	// The eviction API refuses in that state whatever the recorded allowance
+	// says, so trusting it would approve a drain that is then rejected
+	// mid-flight.
+	labelled := map[string]string{"app": "web"}
+	pod := mother.Pod("default", "web-1", mother.PodLabels(labelled))
+	stale := mother.Stale(mother.PDB("default", "web", 5, labelled))
+
+	got := engine.CheckEvictable([]*corev1.Pod{pod}, []*policyv1.PodDisruptionBudget{stale},
+		engine.DefaultEvictConfig())
+
+	if len(got) != 1 || got[0].Code != engine.BlockedPDBStale {
+		t.Fatalf("codes = %v, want [%s] despite an allowance of 5", codes(got), engine.BlockedPDBStale)
 	}
 }
 
