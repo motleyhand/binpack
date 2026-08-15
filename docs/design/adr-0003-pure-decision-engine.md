@@ -27,8 +27,13 @@ func Decide(s Snapshot, cfg Config) Decision
 ```
 
 `Snapshot` is a plain value struct — nodes, pods, PodDisruptionBudgets, cooldown state and the
-current time — with resources already normalised to `int64` millicores, bytes and pod counts.
-It holds no clients, no contexts and no interfaces that reach the network.
+current time. It holds no clients, no contexts and no interfaces that reach the network.
+
+Resource quantities arrive already parsed into an open `map[string]int64` keyed by resource
+name, so the engine never touches `resource.Quantity`. CPU is normalised to millicores and
+everything else to its base unit. The map is deliberately open rather than a struct of CPU,
+memory and pods: the scheduler accounts for `ephemeral-storage`, `hugepages-*` and extended
+resources like `nvidia.com/gpu` on equal terms, and a fixed struct would silently ignore them.
 
 `Decision` carries the verdict **and the arithmetic that produced it**: which node was chosen,
 what would need to relocate, how much room exists elsewhere, and for every rejected candidate,

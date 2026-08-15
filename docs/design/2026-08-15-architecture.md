@@ -122,17 +122,37 @@ The check passes, binpack drains, the pod goes Pending, and the autoscaler adds 
 That is precisely the outcome binpack exists to prevent, and it would be reported as a success.
 
 So feasibility is a real placement simulation: sort relocatable pods largest-first and place
-each onto a specific node with sufficient remaining room, honouring per-node allocatable across
-CPU, memory and pod count, plus node selectors, affinity and taints. First-fit-decreasing is
-sufficient — it is a heuristic, so it can fail to find a packing that exists, but it never
-claims a packing that does not. Erring towards "infeasible" is the correct direction: the cost
-is a missed consolidation, not a scale-up.
+each onto a specific node with sufficient remaining room, honouring node selectors, affinity and
+taints. First-fit-decreasing is sufficient — it is a heuristic, so it can fail to find a packing
+that exists, but it never claims a packing that does not. Erring towards "infeasible" is the
+correct direction: the cost is a missed consolidation, not a scale-up.
 
 This is cheap at cluster scale: tens of nodes, hundreds of pods, run once a minute.
 
-The simulation is an approximation of the kube-scheduler, not a reimplementation of it. Where
-binpack cannot model a constraint — a custom scheduler, an unrecognised plugin — the pod is
-treated as unplaceable and the candidate is skipped.
+#### Every resource the scheduler accounts for, not three of them
+
+Capacity is modelled as an **open map of resource name to quantity**, taken from whatever
+appears in a node's `status.allocatable` and a pod's `resources.requests`. It is deliberately
+not a fixed struct of CPU, memory and pod count.
+
+The scheduler's `NodeResourcesFit` plugin does not privilege those three. It compares requests
+against allocatable for *every* resource name, which includes `ephemeral-storage`, `hugepages-*`
+and extended resources such as `nvidia.com/gpu`. A pod requesting one GPU is unschedulable on a
+node with no GPUs no matter how much CPU and memory are free.
+
+Hardcoding three dimensions would therefore produce exactly the failure this section exists to
+prevent: the simulation places a GPU pod onto a GPU-less node, declares the drain safe, and the
+real scheduler leaves the pod Pending until the autoscaler adds a node. Iterating over the
+resource names actually present is both more correct and less code, and it means binpack
+supports resources that did not exist when it was written.
+
+Pod count needs no special case — `pods` is itself an entry in `status.allocatable`.
+
+#### The simulation approximates the scheduler; it does not reimplement it
+
+Where binpack cannot model a constraint — a custom scheduler name, an unrecognised plugin, a
+topology spread rule it does not evaluate — the pod is treated as unplaceable and the candidate
+is skipped. Every gap in the model must fail towards refusing to drain.
 
 ### Feasibility is computed on requests, not usage
 
@@ -157,10 +177,37 @@ nodes are preferred by construction.
 
 ### Which pods must fit, and which need not
 
-Only pods whose **priority is strictly below the autoscaler's expendable cutoff**
-(`--expendable-pods-priority-cutoff`, default -10) are excluded from the simulation. The
+Every pod on a candidate node falls into exactly one of three classes. Getting this wrong in
+either direction is a correctness bug, so the classification is explicit rather than implied by
+the word "relocatable".
+
+**Node-local — not simulated, not evicted.** These pods do not move to another node when this
+one goes away; they cease to exist with it, and an equivalent already runs elsewhere.
+
+- DaemonSet-owned pods. The CNI agent, `kube-proxy`, log shippers, node exporters. Every
+  remaining node already runs its own copy, so there is nothing to relocate.
+- Mirror pods (static pods managed directly by a kubelet, marked with
+  `kubernetes.io/config.mirror`). They cannot be evicted at all; the kubelet owns them.
+- Pods already terminating.
+
+Both halves of "not simulated, not evicted" matter. Counting DaemonSet pods as workload
+needing a destination inflates the requirement on every single node — every ordinary node runs
+several — which would make otherwise-valid candidates look infeasible and could reject the
+entire cluster. And *evicting* them is worse than pointless: the DaemonSet controller
+immediately recreates the pod on the same node, which still exists, so the drain never
+completes. This is the same reason `kubectl drain` requires `--ignore-daemonsets`.
+
+For the same reason, DaemonSet requests are excluded when ordering candidates by load. Their
+footprint is roughly constant per node, so including it measures node count rather than
+workload.
+
+**Expendable — not simulated, but evicted.** Pods whose **priority is strictly below the
+autoscaler's expendable cutoff** (`--expendable-pods-priority-cutoff`, default -10). The
 autoscaler ignores such pods for both scale-up and scale-down, so it will terminate a node
 running them without ceremony. binpack mirrors that rule exactly and adds nothing to it.
+
+**Relocatable — simulated and evicted.** Everything else. These must be placeable somewhere and
+must pass the evictability check below.
 
 **Overprovisioning pause pods are not expendable, and treating them as such is a trap.** The
 warm-capacity pattern requires those pods to sit at or above the cutoff — below it, the
