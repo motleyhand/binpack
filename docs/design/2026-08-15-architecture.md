@@ -26,7 +26,8 @@ Fixed, and treated as public API from the first release:
 | API group | `binpack.motleyhand.com` |
 | Config `apiVersion` | `binpack.motleyhand.com/v1alpha1` |
 | Node opt-out annotation | `binpack.motleyhand.com/skip: "true"` |
-| Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-deadline` |
+| Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-progress` |
+| Backoff markers on a node | `binpack.motleyhand.com/drain-attempts`, `binpack.motleyhand.com/backoff-until`, `binpack.motleyhand.com/last-failure` |
 | Metric prefix | `binpack_` |
 
 The opt-out annotation key is **not configurable**. A fixed key means one thing to document,
@@ -351,8 +352,14 @@ window is a bonus, never a strategy.
 ## Draining safely
 
 A drain is not one decision followed by a batch of evictions. The cluster keeps moving
-underneath it, so the protocol is deliberately sequential and revalidates at every step.
+underneath it, and a drain can legitimately take far longer than an evaluation interval, so the
+protocol is sequential, revalidates at every step, and is bounded by *progress* rather than by
+elapsed time. The reasoning is in [ADR-0007](adr-0007-drain-progress-not-deadlines.md).
 
+0. **Resume before deciding.** Each evaluation first checks whether any node carries a drain
+   marker. If one does, that drain is advanced and no new decision is made. Without this, a
+   forty-minute drain would have forty evaluations running alongside it, each free to start a
+   second one.
 1. **Mark, then cordon.** Write the drain annotations, then cordon. Cordoning first and deciding
    afterwards is what makes the next step meaningful: until the node is unschedulable, its pod
    set can still grow.
@@ -366,8 +373,8 @@ underneath it, so the protocol is deliberately sequential and revalidates at eve
    somewhere — not merely created, but bound to a node.
 4. **Revalidate and repeat.** Re-snapshot and re-check the remaining pods before each subsequent
    eviction. If the remaining set no longer fits, stop, uncordon, and record a partial drain.
-5. **Verify removal.** Once the node is empty, wait for the autoscaler to delete it. If it still
-   exists at the deadline, uncordon and record the drain as failed.
+5. **Verify removal.** Once the node is empty, wait up to `removalTimeout` for the autoscaler to
+   delete it. If it still exists, uncordon and record the drain as failed.
 
 Every branch of this protocol ends with the node either deleted or uncordoned. That is not
 tidiness, it is the central safety property: a cordoned node the autoscaler never removes is
@@ -375,9 +382,49 @@ lost schedulable capacity, and if the pool is at its maximum, pods can stay Pend
 while a healthy node sits idle. binpack must leave the cluster working without human
 intervention, including — especially — when its own prediction was wrong.
 
-Sequential eviction makes drains slow. That is acceptable: binpack drains one node per run and
-runs on a timer. Trading minutes for the ability to abort at any point is the right side of that
-trade for a tool that deletes capacity.
+Sequential eviction makes drains slow. That is acceptable: binpack drains one node at a time,
+and trading minutes for the ability to abort at any point is the right side of that trade for a
+tool that deletes capacity.
+
+### Slow is not stuck
+
+Steps 3 and 4 have no deadline, because a wall-clock deadline cannot tell a workload that is
+shutting down properly from one that is wedged. A StatefulSet with
+`terminationGracePeriodSeconds: 3600` behaves correctly by taking 45 minutes; a pod held by a
+finalizer never finishes at all. Any single timeout is too short for the first and too long for
+the second.
+
+So `stallTimeout` bounds the **absence of progress**. Any of these keeps a drain alive:
+
+- an eviction request was accepted
+- the count of relocatable pods on the node decreased
+- a pod acquired a `deletionTimestamp`
+- a pod is terminating and still within `deletionTimestamp + terminationGracePeriodSeconds`
+  plus a small fixed slack
+
+The last is a state rather than an event, which is what makes long grace periods work without
+configuration: while a pod is legitimately shutting down, the stall clock does not run.
+
+Being stuck is then **detected**, not inferred. A pod still present past its termination
+deadline plus slack is not slow — the kubelet should have sent SIGKILL — so something is wrong:
+a finalizer, a volume that will not detach, an unhealthy kubelet. binpack names the pod and how
+far past its deadline it is. "Pod monitoring/prometheus-0 is 12 minutes past its termination
+deadline" tells an operator where to look; "the drain timed out" does not.
+
+### A failed drain must not be retried immediately
+
+Abandoning a drain uncordons the node — and a partially drained node has *fewer* pods than
+before. Since candidates are ordered least-loaded-first, it is now **more** attractive than it
+was. Without memory, binpack would preferentially retry its own failures, evicting a few more
+pods each time.
+
+So a failed drain records per-node backoff on the node: an attempt count, a
+`backoff-until` timestamp and the failure reason. Backoff starts at 30 minutes and doubles to a
+24-hour cap, and a node in backoff is not a candidate. Because a successful drain deletes the
+node, the state cleans itself up.
+
+This is distinct from `cooldown.afterDrain`, which is cluster-wide and follows a *successful*
+drain. One prevents thrash after failure; the other lets the cluster settle after success.
 
 ### Why one at a time: binpack does not control placement
 
@@ -415,8 +462,11 @@ So the drain marker is written **on the node itself**, before the cordon:
 
 ```
 binpack.motleyhand.com/drain-started:  2026-08-15T09:15:37Z
-binpack.motleyhand.com/drain-deadline: 2026-08-15T09:30:37Z
+binpack.motleyhand.com/drain-progress: 2026-08-15T09:31:02Z
 ```
+
+`drain-progress` is updated whenever a progress signal is observed, so it records how the drain
+is doing rather than when someone once decided it should be over.
 
 The node is the right home for it. It survives any process failure, it needs no CRD, ConfigMap
 or Lease, it requires no permission binpack does not already hold for cordoning, and it is
@@ -425,9 +475,10 @@ also visible in `kubectl describe node`, so a human debugging a cordoned node fi
 cordoned it and when it was due to be released.
 
 On startup and on acquiring leadership, binpack reconciles before doing anything else: every
-node carrying a drain marker is either resumed, if its deadline is in the future, or uncordoned
-and recorded as failed, if the deadline has passed. Recovery therefore does not depend on the
-process that started the drain still being alive.
+node carrying a drain marker is resumed if its last progress is recent, and uncordoned and
+recorded as failed if progress has gone stale. That is the same judgement the running controller
+makes, so restart behaviour and steady-state behaviour cannot diverge — and recovery does not
+depend on the process that started the drain still being alive.
 
 One case remains unrecoverable by binpack alone: uninstalling it mid-drain leaves a marked,
 cordoned node with nothing running to release it. The marker makes that state self-describing
@@ -457,7 +508,11 @@ policy:                               # applies to every discovered pool
     reserveForLargestPod: true        # not a percentage; see below
   drain:
     maxPodsPerDrain: 0                # 0 = unlimited; a blast-radius guard
-    verifyRemovalTimeout: 15m0s       # uncordon if the node is still here
+    stallTimeout: 10m0s               # abandon if no progress, not if slow
+    removalTimeout: 15m0s             # once empty, how long to await deletion
+  backoff:
+    initial: 30m0s                    # per node, after a failed drain
+    max: 24h0m0s
   cooldown:
     afterScaleUp: 10m0s
     afterDrain: 15m0s

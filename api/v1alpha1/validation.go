@@ -82,11 +82,33 @@ func (p Policy) validate(path string) []error {
 			path, *n))
 	}
 
-	if t := p.Drain.VerifyRemovalTimeout; t != nil && t.Duration <= 0 {
-		// Without a positive timeout, a node that the autoscaler never
-		// removes would stay cordoned forever.
-		errs = append(errs, fmt.Errorf("%s.drain.verifyRemovalTimeout: must be positive, got %s",
+	if t := p.Drain.StallTimeout; t != nil && t.Duration <= 0 {
+		// Without a positive bound, a drain wedged on an unevictable pod
+		// would hold the node cordoned indefinitely.
+		errs = append(errs, fmt.Errorf("%s.drain.stallTimeout: must be positive, got %s",
 			path, t.Duration))
+	}
+
+	if t := p.Drain.RemovalTimeout; t != nil && t.Duration <= 0 {
+		// Without a positive timeout, a node the autoscaler never removes
+		// would stay cordoned forever.
+		errs = append(errs, fmt.Errorf("%s.drain.removalTimeout: must be positive, got %s",
+			path, t.Duration))
+	}
+
+	if t := p.Backoff.Initial; t != nil && t.Duration <= 0 {
+		errs = append(errs, fmt.Errorf("%s.backoff.initial: must be positive, got %s",
+			path, t.Duration))
+	}
+	if t := p.Backoff.Max; t != nil && t.Duration <= 0 {
+		errs = append(errs, fmt.Errorf("%s.backoff.max: must be positive, got %s",
+			path, t.Duration))
+	}
+	if i, m := p.Backoff.Initial, p.Backoff.Max; i != nil && m != nil && m.Duration < i.Duration {
+		// Otherwise the cap would shorten the first retry rather than bound
+		// the doubling, which is the opposite of what it reads as.
+		errs = append(errs, fmt.Errorf("%s.backoff.max: %s is shorter than backoff.initial %s",
+			path, m.Duration, i.Duration))
 	}
 
 	if t := p.Cooldown.AfterScaleUp; t != nil && t.Duration < 0 {

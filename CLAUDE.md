@@ -96,6 +96,18 @@ not a retryable 429.
 lives in node annotations rather than process memory. The failure an in-memory timer guards
 against and the failure that destroys it are the same class of event.
 
+**A partially drained node is *more* attractive to the next evaluation, not less.** It has fewer
+pods, and candidates are ordered least-loaded-first — so without per-node backoff, binpack
+preferentially retries the node that just failed, evicting a few more pods each round. Failed
+drains record exponential backoff on the node itself.
+
+**Slow is not stuck.** A wall-clock drain deadline cannot tell a pod with a one-hour
+`terminationGracePeriodSeconds` from one wedged on a finalizer. Bound the *absence of progress*
+instead, and count "terminating within its grace period" as progress so long shutdowns need no
+configuration. Detect stuck positively — a pod past its termination deadline is a finalizer or a
+volume problem, and saying so is far more useful than "timed out". See
+[ADR-0007](docs/design/adr-0007-drain-progress-not-deadlines.md).
+
 ## Conventions
 
 - **API group `binpack.motleyhand.com`**, metric prefix `binpack_`. Both are public API from the

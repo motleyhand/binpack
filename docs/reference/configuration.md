@@ -51,7 +51,12 @@ policy:
 
   drain:
     maxPodsPerDrain: 0
-    verifyRemovalTimeout: 15m0s
+    stallTimeout: 10m0s
+    removalTimeout: 15m0s
+
+  backoff:
+    initial: 30m0s
+    max: 24h0m0s
 
   cooldown:
     afterScaleUp: 10m0s
@@ -139,20 +144,58 @@ A blast-radius guard, expressed directly rather than as a utilisation threshold 
 one. Because candidates are evaluated least-loaded-first and one node is drained per run,
 low-churn nodes are already preferred.
 
-### `policy.drain.verifyRemovalTimeout`
+### `policy.drain.stallTimeout`
 
-How long to wait for the autoscaler to delete a drained node before **uncordoning it** and
-recording the drain as failed.
+How long a drain may go **without making progress** before it is abandoned.
+
+This is not a limit on how long a drain may take. A pod that is terminating within its
+`terminationGracePeriodSeconds` counts as progress, so a workload that declares an hour-long
+grace period drains happily under the 10-minute default — the stall clock does not run while a
+pod is legitimately shutting down.
+
+Other progress signals: an eviction being accepted, the node's pod count dropping, a pod
+entering `Terminating`.
+
+Being genuinely stuck is detected separately and does not wait for this timeout. A pod still
+present past its termination deadline is reported as such, naming the pod, because that is a
+finalizer or a stuck volume rather than a slow shutdown.
+
+Raise it if your cluster has workloads that pause between shutdown phases for longer than ten
+minutes without any observable change. Must be positive.
+
+### `policy.drain.removalTimeout`
+
+Once the node is **empty**, how long to wait for the autoscaler to delete it before
+**uncordoning** and recording the drain as failed.
+
+A different question from `stallTimeout`, which is why it is a different field: that one is
+about your workload, this one is about the autoscaler. The default of 15 minutes suits a
+cluster-autoscaler that typically reaps within about ten.
 
 This is a correctness bound, not a convenience. A cordoned node that nothing removes is lost
 schedulable capacity, and if the pool is at its maximum, pods can stay Pending while a healthy
 node sits idle. Must be positive.
 
+### `policy.backoff.initial` and `policy.backoff.max`
+
+How long a node is left alone after a **failed** drain, doubling with each consecutive failure
+up to the cap.
+
+Not politeness — correctness. Abandoning a drain uncordons a node that now has fewer pods than
+before, and candidates are evaluated least-loaded-first, so the node that just failed is *more*
+attractive than it was. Without backoff, binpack would preferentially retry its own failures.
+
+A node in backoff is skipped, and `explain` reports why, including the recorded failure reason.
+There is deliberately no permanent give-up: that would need a human to clear an annotation, and
+a node blocked by something transient would stay skipped forever.
+
 ### `policy.cooldown.afterScaleUp` and `policy.cooldown.afterDrain`
 
-Suppress action for a period after the cluster grew, and after binpack itself drained something.
-The first mirrors the autoscaler's own `scale-down-delay-after-add`; the second prevents a
-drain and an immediate re-drain oscillating.
+Suppress action cluster-wide for a period after the cluster grew, and after binpack completed a
+**successful** drain. The first mirrors the autoscaler's own `scale-down-delay-after-add`; the
+second lets the cluster settle before binpack considers removing another node.
+
+Distinct from `backoff`, which is per-node and follows a *failed* drain.
 
 ### `policy.exclusions.namespaces`
 

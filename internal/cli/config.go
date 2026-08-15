@@ -88,7 +88,10 @@ type policyView struct {
 	ExpendablePriorityCutoff int32    `json:"expendablePriorityCutoff"`
 	ReserveForLargestPod     bool     `json:"reserveForLargestPod"`
 	MaxPodsPerDrain          int      `json:"maxPodsPerDrain"`
-	VerifyRemovalTimeout     string   `json:"verifyRemovalTimeout"`
+	StallTimeout             string   `json:"stallTimeout"`
+	RemovalTimeout           string   `json:"removalTimeout"`
+	BackoffInitial           string   `json:"backoffInitial"`
+	BackoffMax               string   `json:"backoffMax"`
 	CooldownAfterScaleUp     string   `json:"cooldownAfterScaleUp"`
 	CooldownAfterDrain       string   `json:"cooldownAfterDrain"`
 	ExcludedNamespaces       []string `json:"excludedNamespaces,omitempty"`
@@ -100,7 +103,10 @@ func viewOf(p v1alpha1.PoolPolicy) policyView {
 		ExpendablePriorityCutoff: p.ExpendablePriorityCutoff,
 		ReserveForLargestPod:     p.ReserveForLargestPod,
 		MaxPodsPerDrain:          p.MaxPodsPerDrain,
-		VerifyRemovalTimeout:     p.VerifyRemovalTimeout.String(),
+		StallTimeout:             p.StallTimeout.String(),
+		RemovalTimeout:           p.RemovalTimeout.String(),
+		BackoffInitial:           p.BackoffInitial.String(),
+		BackoffMax:               p.BackoffMax.String(),
 		CooldownAfterScaleUp:     p.CooldownAfterScaleUp.String(),
 		CooldownAfterDrain:       p.CooldownAfterDrain.String(),
 		ExcludedNamespaces:       p.ExcludedNamespaces,
@@ -178,7 +184,9 @@ func writePolicy(p func(string, ...any), policy v1alpha1.PoolPolicy) {
 	} else {
 		p("  max pods per drain:      %d\n", policy.MaxPodsPerDrain)
 	}
-	p("  verify removal within:   %s\n", policy.VerifyRemovalTimeout)
+	p("  abandon if stalled for:  %s\n", policy.StallTimeout)
+	p("  await removal for:       %s\n", policy.RemovalTimeout)
+	p("  backoff after failure:   %s, doubling to %s\n", policy.BackoffInitial, policy.BackoffMax)
 	p("  cooldown after scale-up: %s\n", policy.CooldownAfterScaleUp)
 	p("  cooldown after drain:    %s\n", policy.CooldownAfterDrain)
 	if len(policy.ExcludedNamespaces) > 0 {

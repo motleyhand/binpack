@@ -70,6 +70,7 @@ type Policy struct {
 
 	Feasibility Feasibility `json:"feasibility,omitempty"`
 	Drain       Drain       `json:"drain,omitempty"`
+	Backoff     Backoff     `json:"backoff,omitempty"`
 	Cooldown    Cooldown    `json:"cooldown,omitempty"`
 	Exclusions  Exclusions  `json:"exclusions,omitempty"`
 }
@@ -115,11 +116,39 @@ type Drain struct {
 	// directly rather than as a utilisation threshold standing in for one.
 	MaxPodsPerDrain *int `json:"maxPodsPerDrain,omitempty"`
 
-	// VerifyRemovalTimeout is how long to wait for the autoscaler to delete
-	// a drained node before uncordoning it and recording a failure. A
+	// StallTimeout abandons a drain that has stopped making progress.
+	//
+	// It bounds the absence of progress, not elapsed time. A pod that is
+	// terminating within its terminationGracePeriodSeconds counts as
+	// progress, so a workload with an hour-long grace period needs no
+	// special configuration — see ADR-0007.
+	StallTimeout *Duration `json:"stallTimeout,omitempty"`
+
+	// RemovalTimeout is how long to wait, once the node is empty, for the
+	// autoscaler to delete it before uncordoning and recording a failure. A
 	// cordoned node nothing removes is lost capacity, so this is a
 	// correctness bound rather than a convenience.
-	VerifyRemovalTimeout *Duration `json:"verifyRemovalTimeout,omitempty"`
+	//
+	// Separate from StallTimeout because it asks a different question: that
+	// one is about the workload, this one is about the autoscaler.
+	RemovalTimeout *Duration `json:"removalTimeout,omitempty"`
+}
+
+// Backoff governs how long a node is left alone after a failed drain.
+//
+// This is not politeness. Abandoning a drain uncordons a node that now has
+// fewer pods than before, and candidates are ordered least-loaded-first — so
+// without backoff, binpack would preferentially retry the node that just
+// failed, evicting a few more pods each time.
+type Backoff struct {
+	// Initial delay after the first failed drain. Doubles with each
+	// consecutive failure.
+	Initial *Duration `json:"initial,omitempty"`
+
+	// Max caps the doubling. Deliberately a long retry rather than a
+	// permanent skip: a permanent skip would need a human to clear it, and
+	// a node blocked by something transient would stay skipped forever.
+	Max *Duration `json:"max,omitempty"`
 }
 
 // Cooldown suppresses action after recent cluster activity.
@@ -127,7 +156,9 @@ type Cooldown struct {
 	// AfterScaleUp mirrors the autoscaler's own scale-down-delay-after-add.
 	AfterScaleUp *Duration `json:"afterScaleUp,omitempty"`
 
-	// AfterDrain prevents a drain and an immediate re-drain oscillating.
+	// AfterDrain pauses cluster-wide after a *successful* drain, so binpack
+	// does not immediately start another while the cluster is still settling.
+	// Distinct from Backoff, which is per-node and follows a failure.
 	AfterDrain *Duration `json:"afterDrain,omitempty"`
 }
 
@@ -158,7 +189,10 @@ type PoolPolicy struct {
 	ExpendablePriorityCutoff int32
 	ReserveForLargestPod     bool
 	MaxPodsPerDrain          int
-	VerifyRemovalTimeout     time.Duration
+	StallTimeout             time.Duration
+	RemovalTimeout           time.Duration
+	BackoffInitial           time.Duration
+	BackoffMax               time.Duration
 	CooldownAfterScaleUp     time.Duration
 	CooldownAfterDrain       time.Duration
 	ExcludedNamespaces       []string
