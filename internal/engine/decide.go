@@ -32,6 +32,12 @@ type Snapshot struct {
 	Pods  []*corev1.Pod
 	PDBs  []*policyv1.PodDisruptionBudget
 
+	// Templates is the pod template of each controller, keyed by the owner
+	// reference its pods carry. The simulation places the pod a controller
+	// *would create*, not the one leaving — see the replacement doc comment —
+	// and this is where that spec comes from.
+	Templates map[OwnerRef]*corev1.PodTemplateSpec
+
 	// Autoscaler is what the cluster-autoscaler reports about itself, read
 	// from its status ConfigMap rather than a cloud API.
 	Autoscaler Autoscaler
@@ -318,7 +324,7 @@ func Decide(s Snapshot, cfg Config) Decision {
 		a := candidates[i]
 		policy := cfg.PolicyFor(a.Group, a.Pool)
 
-		sim := Simulate(s.Nodes, s.Pods, a.Node, policy.Sim)
+		sim := Simulate(s.Nodes, s.Pods, s.Templates, a.Node, policy.Sim)
 		a.Simulation = &sim
 		if !sim.Feasible {
 			assessments = append(assessments, *a)

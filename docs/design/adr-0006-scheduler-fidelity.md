@@ -122,11 +122,15 @@ non-default `schedulerName`; scheduling gates; and dynamic resource allocation c
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
 
-#### Known gap: the running pod is a proxy for the replacement
+#### Closed: the running pod was a proxy for the replacement
 
-`CanFit` is asked whether a *replacement* pod could be placed, and is handed the *running* one.
-Almost always these agree, and where they do not, binpack currently cannot tell. Two cases are
-known, and they differ in how much they matter.
+> **Closed.** binpack reads owner templates and places the pod a controller *would create*.
+> Recorded here as it was found, because the reasoning is what justifies the permissions it
+> costs.
+
+`CanFit` was asked whether a *replacement* pod could be placed, and was handed the *running*
+one. Almost always these agree, and where they did not, binpack could not tell. Two cases were
+known, and they differed in how much they mattered.
 
 **A controller template that pins `spec.nodeName`.** Every pod binpack sees is already bound, so
 its own `nodeName` names the node it is leaving and cannot distinguish a pinned template from an
@@ -144,13 +148,73 @@ exists to prevent. A resize still in flight is refused outright, but a completed
 marker on the pod — `status.resize` and the resize conditions track pending and in-progress
 operations only.
 
-Both close the same way, by reading the owner's template rather than inferring the replacement
-from the running pod. binpack already needs `ReplicaSet`, `StatefulSet` and `DaemonSet` reads
-for ownership classification, so the plumbing is planned rather than new.
+Both closed the same way: `collect` reads `ReplicaSet`, `StatefulSet`, `DaemonSet` and `Job`
+templates, and the engine builds the replacement from the template while keeping the running
+pod's identity for anything it reports. `fit` needed no signature change — it was always asking
+about a pod, and now receives the right one.
 
-**Reading owner templates is a prerequisite for the executor.** `fit` has no production callers
-today, so the gap costs nothing yet; it must be closed before any code path can act on a
-decision, and the roadmap records that as a dependency rather than a nice-to-have.
+The second case became *checkable* rather than merely bounded in the same change. Every running
+pod names a node, so a pinned template was invisible; a replacement's `nodeName` comes from the
+template alone, so `fit` now refuses it outright instead of relying on the drain stalling.
+
+**A pod whose controller kind has no readable template is refused, not guessed at.** An
+operator's own CRD provides no template, and inferring the replacement from the running pod is
+precisely the inference that is unsound. This follows the allowlist rule, and it was settled
+against measurement as this ADR asks: on a real cluster all 145 pods resolved a template through
+the four kinds above, so the refusal cost nothing there. A metric counts it, so if that turns
+out not to be general the evidence will exist before the rule is relaxed.
+
+**The template alone is not the answer either.** Admission mutates a pod on creation — a
+service-mesh sidecar injected by a webhook, requests filled in by a LimitRange, RuntimeClass
+overhead — so the stored template understates the replacement exactly as often as a resize
+overstates it, and in the same unsound direction. Requests are therefore the per-resource
+maximum of template and running pod, and a container present only on the running pod is carried
+over whole: each source understates a different case, neither overstates, so the larger is
+conservative in both.
+
+Labels come from the template alone rather than a union, because selector matching is not
+monotonic. An extra label makes an `In` selector match and makes a `DoesNotExist` selector stop
+matching, so "more labels" is not a safe direction and only the set the replacement will carry
+is right.
+
+A residual gap remains and is worth naming: a label added at admission is on the running pod and
+not the template, so a destination whose pods select on it is not consulted about it. Unlike the
+resource case there is no conservative merge — adding the label is unsafe for `DoesNotExist`
+selectors and omitting it is unsafe for `In` ones — and closing it properly means running the
+admission chain, which is far outside what this project should do. It is bounded: it costs a
+placement the scheduler refuses, which stalls the drain and backs off rather than causing a
+scale-up, because the pod is rejected rather than left unschedulable somewhere new.
+
+#### Open: admission-added placement constraints
+
+Requests are merged safely because the larger of two figures is meaningful. Placement
+constraints are not: a mutating webhook that adds a `nodeSelector`, a required affinity term, a
+toleration, a scheduler name or a volume leaves the template looking *less* constrained than the
+pod the scheduler will receive, and there is no "larger of" for an affinity term.
+
+The obvious remedy — refuse whenever the running pod carries a constraint its template does not
+— was implemented and then withdrawn, because measuring it showed it refuses almost everything.
+On a real cluster with no service mesh it produced **80 refusals across essentially every
+workload**, none of them from a webhook. The API server defaults fields that no template carries:
+the `node.kubernetes.io/not-ready` and `unreachable` tolerations added to every pod, a
+`schedulerName` of `default-scheduler`, the projected service-account token volume. A naive
+comparison measures defaulting, not divergence.
+
+Closing it properly therefore needs a comparison that knows what the API server adds on its own,
+so that it can refuse on a webhook's `nodeSelector` while ignoring a defaulted toleration. That
+is a real piece of work and it is recorded here rather than approximated, because an
+approximation that refuses every pod on every cluster is worse than the gap: binpack would be
+sound and useless, and nobody would run it long enough to benefit.
+
+The gap is bounded in the same way as the others. A replacement the scheduler refuses is a pod
+that never becomes Pending on another node, so the drain stalls and backs off rather than
+provoking a scale-up.
+
+**Verifying the first case mattered more than it looks.** The obvious cheaper fix — compare the
+pod's requests against what its container statuses report as allocated — does not work, and the
+API says so: the kubelet sets `allocatedResources` to the new value *after* a successful resize,
+so a completed one leaves the two in agreement. There is no marker to find, which is why the
+template is the only answer.
 
 The allowlist is applied to **both** the pods being relocated and the pods already resident on
 each prospective destination. Inter-pod affinity is symmetric: the scheduler rejects an incoming

@@ -112,6 +112,14 @@ var (
 		Help: "Nodes ruled out before simulation at the last evaluation, by reason code.",
 	}, []string{"code"})
 
+	unmodelled = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "binpack_nodes_unmodelled",
+		Help: "Nodes refused because binpack could not read a pod's controller template, " +
+			"and so cannot predict what its replacement would request. " +
+			"A gap in what binpack models rather than a fact about the cluster: " +
+			"persistently above zero means the allowlist is too narrow for this cluster.",
+	})
+
 	drainable = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "binpack_drainable_nodes",
 		Help: "Nodes whose entire workload was shown to fit elsewhere. " +
@@ -143,7 +151,7 @@ var (
 // has completed no evaluations reporting zero of them is simply true, and a
 // counter absent from a scrape is harder to reason about than one at zero.
 var state = newGated(
-	lastEvaluation, autoscalerUp, nodes, skipped, drainable,
+	lastEvaluation, autoscalerUp, nodes, skipped, drainable, unmodelled,
 	poolNodes, poolMin, poolMax,
 )
 
@@ -196,7 +204,7 @@ func observeNodes(d engine.Decision) {
 		nodes.WithLabelValues(verdict).Set(0)
 	}
 
-	var canDrain float64
+	var canDrain, cannotModel float64
 	for _, a := range d.Assessments {
 		verdict := a.Verdict()
 		nodes.WithLabelValues(verdict).Inc()
@@ -208,9 +216,18 @@ func observeNodes(d engine.Decision) {
 			}
 		case engine.VerdictDrainable:
 			canDrain++
+		case engine.VerdictInfeasible:
+			// Counted apart from an ordinary shortfall: "the workload does not
+			// fit" is a fact about the cluster and "binpack cannot tell what
+			// the workload is" is a gap in binpack, and they call for
+			// completely different responses.
+			if a.Simulation != nil && a.Simulation.Blocked != nil && a.Simulation.Blocked.NoTemplate {
+				cannotModel++
+			}
 		}
 	}
 	drainable.Set(canDrain)
+	unmodelled.Set(cannotModel)
 }
 
 func observePools(s engine.Snapshot, cfg engine.Config) {

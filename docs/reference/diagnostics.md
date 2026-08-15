@@ -238,6 +238,21 @@ one.
 **Fix.** Give the workload a PodDisruptionBudget. Per the autoscaler's own documentation, a
 budget overrides its refusal to touch the node — and the budget then governs, like any other.
 
+### `unreadable-template` — warning
+
+The pods are created by a controller binpack cannot read a pod template from, so it cannot tell
+what their replacements would request and will not move them.
+
+**Unlike everything else in this reference, this blocks binpack alone.** The cluster-autoscaler
+and `kubectl drain` are unaffected — it is a gap in what binpack models, not a property of your
+cluster. binpack reads templates from ReplicaSets, StatefulSets, DaemonSets and Jobs; a pod owned
+directly by an operator's own custom resource has none, and sizing its move from the running pod
+is the inference that is unsound (see
+[ADR-0006](../design/adr-0006-scheduler-fidelity.md)).
+
+**Fix.** Nothing on your side. Please report the controller, so the list can be widened against
+evidence rather than guesswork. `binpack_nodes_unmodelled` counts the same thing as a metric.
+
 ### `mirror-pod` — blocking
 
 Static pods, created by the kubelet from an on-disk manifest. They cannot be evicted.

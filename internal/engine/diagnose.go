@@ -57,6 +57,7 @@ const (
 	FindingPriorityBelow     = "priority-below-cutoff"
 	FindingAbandonedDrain    = "abandoned-drain"
 	FindingNodeInBackoff     = "node-in-backoff"
+	FindingNoTemplate        = "unreadable-template"
 )
 
 // Diagnosis is one class of finding: how much it matters, what it means and
@@ -210,6 +211,16 @@ var diagnoses = map[string]Diagnosis{
 		Fix: "if this is overprovisioning filler, its warm capacity will never be replenished " +
 			"after the first burst, and nothing will report that. Raise the priority to at or " +
 			"above the cutoff. If these really are throwaway pods, nothing to do.",
+	},
+	FindingNoTemplate: {
+		Severity: Warning,
+		Summary: "these pods are created by a controller binpack cannot read a pod template " +
+			"from, so it cannot tell what their replacements would request and will not move them",
+		Fix: "unlike everything else here this blocks binpack alone — the cluster-autoscaler and " +
+			"kubectl drain are unaffected. binpack reads templates from ReplicaSets, StatefulSets, " +
+			"DaemonSets and Jobs; a pod owned directly by an operator's own resource has none. " +
+			"Nothing to change on your side: please report the controller, so the list can be " +
+			"widened against evidence rather than guesswork.",
 	},
 	FindingAbandonedDrain: {
 		Severity: Warning,
@@ -462,6 +473,18 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 		// unscheduled pod is not.
 		if pod.Spec.NodeName == "" {
 			continue
+		}
+
+		// A pod whose replacement binpack cannot predict is one it will never
+		// move, and nothing else in the cluster reports that: every other tool
+		// is perfectly happy to drain the node.
+		// Guarded on having a controller at all: a bare pod is already its own
+		// finding, and reporting it twice would say the same thing in two
+		// vocabularies.
+		if owner := metav1.GetControllerOf(pod); owner != nil {
+			if _, ok := replacement(pod, s.Templates); !ok {
+				g.add(pod, FindingNoTemplate, "owned by "+owner.Kind+" "+owner.Name)
+			}
 		}
 
 		matched := matchingPDBs(pod, s.PDBs)

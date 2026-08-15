@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/go-logr/logr"
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/fields"
@@ -183,8 +185,42 @@ func cacheOptions() cache.Options {
 			&corev1.Node{}:                  {Transform: dropManagedFields},
 			&corev1.Pod{}:                   {Transform: dropManagedFields},
 			&policyv1.PodDisruptionBudget{}: {Transform: dropManagedFields},
+
+			// Controllers are read for one field: the pod template their
+			// replacements are built from. Everything else is dropped before
+			// caching — status, and on a ReplicaSet the retained revision
+			// history that makes them numerous in the first place.
+			&appsv1.ReplicaSet{}:  {Transform: keepTemplateOnly},
+			&appsv1.StatefulSet{}: {Transform: keepTemplateOnly},
+			&appsv1.DaemonSet{}:   {Transform: keepTemplateOnly},
+			&batchv1.Job{}:        {Transform: keepTemplateOnly},
 		},
 	}
+}
+
+// keepTemplateOnly strips a controller down to what binpack reads: its
+// identity and its pod template.
+//
+// A cluster keeps ten ReplicaSet revisions per Deployment by default, and
+// binpack looks at exactly one field of each. Holding their full status and
+// annotations — which include the last-applied-configuration of the whole
+// workload — would make the cache grow with revision history for no benefit.
+func keepTemplateOnly(in any) (any, error) {
+	switch obj := in.(type) {
+	case *appsv1.ReplicaSet:
+		obj.Status = appsv1.ReplicaSetStatus{}
+		obj.Annotations = nil
+	case *appsv1.StatefulSet:
+		obj.Status = appsv1.StatefulSetStatus{}
+		obj.Annotations = nil
+	case *appsv1.DaemonSet:
+		obj.Status = appsv1.DaemonSetStatus{}
+		obj.Annotations = nil
+	case *batchv1.Job:
+		obj.Status = batchv1.JobStatus{}
+		obj.Annotations = nil
+	}
+	return dropManagedFields(in)
 }
 
 // dropManagedFields strips server-side-apply bookkeeping before an object is

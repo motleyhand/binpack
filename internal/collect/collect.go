@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -59,11 +61,72 @@ func Snapshot(ctx context.Context, reader Reader, now time.Time) (engine.Snapsho
 	}
 
 	var err error
+	if s.Templates, err = templates(ctx, reader); err != nil {
+		return s, err
+	}
+
 	if s.Autoscaler, err = autoscaler(ctx, reader); err != nil {
 		return s, err
 	}
 
 	return s, nil
+}
+
+// templates reads the pod template of every controller that owns pods.
+//
+// binpack asks whether a *replacement* pod would fit and, without these, was
+// answering about the pod that is leaving. The two diverge exactly where it
+// matters most: a pod resized downward in place carries smaller requests than
+// its replacement will, and nothing on the pod records that this happened. See
+// ADR-0006.
+//
+// Kinds binpack cannot read a template for — pods created directly by an
+// operator's own controller — are simply absent, and the engine refuses to
+// move a pod it cannot predict rather than guessing from the running one.
+func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.PodTemplateSpec, error) {
+	out := map[engine.OwnerRef]*corev1.PodTemplateSpec{}
+
+	var replicaSets appsv1.ReplicaSetList
+	if err := reader.List(ctx, &replicaSets); err != nil {
+		return nil, fmt.Errorf("listing replicasets: %w", err)
+	}
+	for i := range replicaSets.Items {
+		rs := &replicaSets.Items[i]
+		out[engine.OwnerRef{Namespace: rs.Namespace, APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID}] = &rs.Spec.Template
+	}
+
+	var statefulSets appsv1.StatefulSetList
+	if err := reader.List(ctx, &statefulSets); err != nil {
+		return nil, fmt.Errorf("listing statefulsets: %w", err)
+	}
+	for i := range statefulSets.Items {
+		sts := &statefulSets.Items[i]
+		out[engine.OwnerRef{Namespace: sts.Namespace, APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID}] = &sts.Spec.Template
+	}
+
+	// DaemonSet pods are node-local and never relocated, so their templates are
+	// never consulted for placement. They are read anyway because a DaemonSet
+	// is one of the kinds a pod can name as its controller, and an absent entry
+	// is indistinguishable from a kind binpack cannot read.
+	var daemonSets appsv1.DaemonSetList
+	if err := reader.List(ctx, &daemonSets); err != nil {
+		return nil, fmt.Errorf("listing daemonsets: %w", err)
+	}
+	for i := range daemonSets.Items {
+		ds := &daemonSets.Items[i]
+		out[engine.OwnerRef{Namespace: ds.Namespace, APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID}] = &ds.Spec.Template
+	}
+
+	var jobs batchv1.JobList
+	if err := reader.List(ctx, &jobs); err != nil {
+		return nil, fmt.Errorf("listing jobs: %w", err)
+	}
+	for i := range jobs.Items {
+		job := &jobs.Items[i]
+		out[engine.OwnerRef{Namespace: job.Namespace, APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID}] = &job.Spec.Template
+	}
+
+	return out, nil
 }
 
 // autoscaler reads the cluster-autoscaler's published status.

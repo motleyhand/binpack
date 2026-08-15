@@ -706,3 +706,26 @@ func TestDiagnoseDoesNotExcuseAFindingBecauseItsOtherPodsAreOnAStaticPool(t *tes
 		t.Error("marked dormant despite an unscheduled pod that nothing will place")
 	}
 }
+
+func TestDiagnoseReportsAPodWhoseTemplateCannotBeRead(t *testing.T) {
+	// A pod binpack will never move, which nothing else in the cluster reports:
+	// the autoscaler and kubectl drain are perfectly happy with it. Without
+	// this the node simply never becomes a candidate and nobody can find out
+	// why without reading binpack's source.
+	exotic := mother.Pod("default", "shard-0", mother.OnNode("a"),
+		mother.OwnedBy("KafkaCluster", "events"))
+
+	findings := diagnose(nil, []*corev1.Pod{exotic})
+
+	f := only(t, findings, engine.FindingNoTemplate)
+	if f.Severity != engine.Warning {
+		t.Errorf("severity = %s: it blocks binpack, not the cluster", f.Severity)
+	}
+	if !strings.Contains(f.Detail, "KafkaCluster events") {
+		t.Errorf("detail does not name the controller to report: %q", f.Detail)
+	}
+	// A bare pod is already its own finding; saying it twice helps nobody.
+	none(t, diagnose(nil, []*corev1.Pod{
+		mother.Pod("default", "orphan", mother.OnNode("a"), mother.Bare()),
+	}), engine.FindingNoTemplate)
+}

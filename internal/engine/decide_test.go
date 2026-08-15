@@ -26,7 +26,10 @@ func cluster(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
 	return engine.Snapshot{
 		Nodes: nodes,
 		Pods:  pods,
-		Now:   now,
+		// A template matching each pod: the ordinary case, where what is
+		// running is what the controller would create again.
+		Templates: mother.Templates(pods...),
+		Now:       now,
 		Autoscaler: engine.Autoscaler{
 			Running: true,
 			// Probed just now: a status ConfigMap outlives the autoscaler

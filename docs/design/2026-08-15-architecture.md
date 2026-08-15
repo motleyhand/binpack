@@ -626,11 +626,9 @@ alongside its prose: see [the metrics reference](../reference/metrics.md).
     `run` rather than a parallel implementation of it. `--once` evaluates once and exits, for
     a CronJob. `dryRun: false` is refused while there is no executor, rather than silently
     reporting decisions nobody acts on.
-11. Executor: cordon, evict, verify, uncordon; cooldown and backoff state.
-    **Blocked on** `collect` reading owner templates: until binpack derives the replacement
-    pod's spec from its controller rather than from the running pod, a pod resized downward in
-    place can be approved for a node its replacement does not fit. Harmless while nothing acts
-    on a decision; not harmless once something does. See
+11. Executor: cordon, evict, verify, uncordon; cooldown and backoff state. **Unblocked**:
+    `collect` reads owner templates and the engine places the pod a controller would create,
+    so the replacement-versus-running gap that made acting unsound is closed. See
     [ADR-0006](adr-0006-scheduler-fidelity.md).
 12. Helm chart and RBAC
 13. Release pipeline. **Includes migrating `.goreleaser.yaml` from `dockers` to `dockers_v2`**,

@@ -399,3 +399,29 @@ func TestPoolNodesReportsReadyNodesNotTheTarget(t *testing.T) {
 		t.Errorf("pool_nodes does not report the 3 nodes that exist:\n%s", gather(t))
 	}
 }
+
+func TestUnmodelledNodesAreCountedApartFromOrdinaryShortfalls(t *testing.T) {
+	// "The workload does not fit" is a fact about the cluster; "binpack cannot
+	// tell what the workload is" is a gap in binpack. Folding them together
+	// would hide the second behind the first, which is the one that is
+	// permanent until somebody changes the allowlist.
+	tooSmall := assess(engine.VerdictInfeasible, "")
+	tooSmall.Simulation.Blocked = &engine.Blocked{Summary: "nowhere to go"}
+
+	unreadable := assess(engine.VerdictInfeasible, "")
+	unreadable.Simulation.Blocked = &engine.Blocked{
+		Summary: "no readable controller template", NoTemplate: true,
+	}
+
+	Observe(snapshot(), engine.Decision{
+		Code:        engine.CodeNoneFeasible,
+		Assessments: []engine.NodeAssessment{tooSmall, unreadable},
+	}, config(), 0.01)
+
+	if got := testutil.ToFloat64(nodes.WithLabelValues(engine.VerdictInfeasible)); got != 2 {
+		t.Errorf("infeasible = %v, want both nodes counted", got)
+	}
+	if got := testutil.ToFloat64(unmodelled); got != 1 {
+		t.Errorf("binpack_nodes_unmodelled = %v, want only the unreadable one", got)
+	}
+}
