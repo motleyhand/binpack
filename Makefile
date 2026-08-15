@@ -35,8 +35,12 @@ vet: ## Run go vet
 tidy: ## Tidy go.mod and go.sum
 	go mod tidy
 
+.PHONY: smoke
+smoke: build ## Run the built binary once
+	./bin/$(BINARY) version
+
 .PHONY: check
-check: lint test build ## Everything CI runs
+check: lint test build smoke ## Everything CI runs
 
 .PHONY: clean
 clean: ## Remove build output

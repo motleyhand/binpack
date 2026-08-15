@@ -53,7 +53,10 @@ func NewRootCommand(out io.Writer) *cobra.Command {
 	cmd.PersistentFlags().StringVar((*string)(&opts.output), "output", string(outputText),
 		"output format: text or json")
 
-	cmd.AddCommand(newVersionCommand(opts))
+	cmd.AddCommand(
+		newConfigCommand(opts),
+		newVersionCommand(opts),
+	)
 
 	return cmd
 }

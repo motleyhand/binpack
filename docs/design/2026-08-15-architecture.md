@@ -435,35 +435,44 @@ rather than mysterious, and `diagnose` reports it.
 
 ## Configuration
 
-Mounted from a ConfigMap, parsed into `api/v1alpha1` types. Sketch, not final — the field-level
-reference is written with the implementation.
+Mounted from a ConfigMap, parsed into `api/v1alpha1` types. Every field is optional: pools and
+their bounds are discovered, so an empty document is a working, safe configuration. Field-level
+detail is in the [configuration reference](../reference/configuration.md).
 
 ```yaml
 apiVersion: binpack.motleyhand.com/v1alpha1
 kind: BinpackConfig
 
-interval: 60s
+interval: 1m0s
 dryRun: true                          # safe by default; acting is opt-in
 
 discovery:
   nodeGroupIDLabel: doks.digitalocean.com/node-pool-id
-  pools: []                           # only needed when discovery is unavailable
+  poolNameLabel: doks.digitalocean.com/node-pool
 
-feasibility:
-  headroomPercent: 10                 # do not plan to fill the cluster exactly
-  expendablePriorityCutoff: -10       # mirrors the autoscaler's own flag
+policy:                               # applies to every discovered pool
+  enabled: true
+  feasibility:
+    expendablePriorityCutoff: -10     # mirrors the autoscaler's own flag
+    reserveForLargestPod: true        # not a percentage; see below
+  drain:
+    maxPodsPerDrain: 0                # 0 = unlimited; a blast-radius guard
+    verifyRemovalTimeout: 15m0s       # uncordon if the node is still here
+  cooldown:
+    afterScaleUp: 10m0s
+    afterDrain: 15m0s
+  exclusions:
+    namespaces: []
 
-drain:
-  maxPodsPerDrain: 0                  # 0 = unlimited; a blast-radius guard
-  verifyRemovalTimeout: 15m           # uncordon if the node is still here
-
-cooldown:
-  afterScaleUp: 10m
-  afterDrain: 15m
-
-exclusions:
-  namespaces: []
+pools: []                             # per-pool overrides of the above
 ```
+
+**Headroom is not a percentage.** An earlier draft had `headroomPercent: 10`, which is exactly
+the reasoning this design rejects elsewhere: on a 4GB node it reserves around 136MB, and on an
+8GB node twice that, for no principled reason. `reserveForLargestPod` states the actual
+requirement instead — after a drain, some node must still hold a pod the size of the largest
+relocatable one — because the risk is not "the cluster is full" but "the next pod that restarts
+cannot be placed", and that is a question about bytes.
 
 ## Command surface
 
