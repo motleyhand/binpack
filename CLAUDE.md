@@ -17,7 +17,7 @@ made.
 ## Commands
 
 ```bash
-make check                       # lint, test, build — exactly what CI runs
+make check                       # lint, test, build, smoke test — exactly what CI runs
 make test                        # go test -race ./...
 make lint                        # golangci-lint run
 make help                        # every target
