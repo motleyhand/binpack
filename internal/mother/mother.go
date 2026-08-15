@@ -369,6 +369,16 @@ func Tolerating(key string, effect corev1.TaintEffect) PodOption {
 	}
 }
 
+// Resizing marks an in-place vertical scale as in progress.
+func Resizing() PodOption {
+	return func(p *corev1.Pod) {
+		p.Status.Conditions = append(p.Status.Conditions, corev1.PodCondition{
+			Type:   corev1.PodResizeInProgress,
+			Status: corev1.ConditionTrue,
+		})
+	}
+}
+
 // Priority sets the pod's resolved priority value.
 func Priority(v int32) PodOption {
 	return func(p *corev1.Pod) { p.Spec.Priority = &v }

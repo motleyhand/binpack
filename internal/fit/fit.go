@@ -177,6 +177,14 @@ func firstShortfall(need, have corev1.ResourceList) (string, bool) {
 // in the running total, and adds RuntimeClass overhead — arithmetic that is
 // fiddly enough to be worth delegating to the same library the scheduler uses.
 //
+// It describes the pod as it exists now, which is a proxy for the pod that
+// would replace it — and the two can differ. An in-place vertical scale
+// applies to a running pod without touching its controller's template, so a
+// pod resized *downward* reports less here than its replacement will request.
+// Detecting that needs the owner's template, which binpack does not yet read;
+// a resize still in flight is refused outright by UnsupportedPod, but a
+// completed one leaves no marker on the pod. See ADR-0006.
+//
 // It also carries a synthetic pods:1 entry. `pods` appears in a node's
 // allocatable but never in a pod's requests, so without it a uniform
 // subtract-request-from-remaining loop would never consume a slot and the

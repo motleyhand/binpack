@@ -74,7 +74,38 @@ func UnsupportedPod(pod *corev1.Pod) Reason {
 		return unsupportedPod(pod, "uses dynamic resource allocation claims")
 	}
 
+	// An in-flight in-place resize means the pod's requests are changing
+	// underneath us, so any answer computed from them is about to be stale.
+	//
+	// This does not cover a resize that has already completed — see the
+	// replacement-versus-running gap documented on EffectiveRequests — but a
+	// resize we can see is one we should not reason through.
+	if r := resizeInFlight(pod); r != "" {
+		return unsupportedPod(pod, "has an in-place resize "+r)
+	}
+
 	return Reason{}
+}
+
+// resizeInFlight reports an in-progress in-place vertical scaling operation,
+// via the conditions that replaced the deprecated status.resize field, or that
+// field itself for older API servers.
+func resizeInFlight(pod *corev1.Pod) string {
+	for _, c := range pod.Status.Conditions {
+		if c.Status != corev1.ConditionTrue {
+			continue
+		}
+		switch c.Type {
+		case corev1.PodResizePending:
+			return "pending"
+		case corev1.PodResizeInProgress:
+			return "in progress"
+		}
+	}
+	if pod.Status.Resize != "" {
+		return string(pod.Status.Resize)
+	}
+	return ""
 }
 
 // UnsupportedDestination reports why node cannot be considered as a

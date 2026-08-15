@@ -69,6 +69,13 @@ func TestUnsupportedPod(t *testing.T) {
 			pod:  mother.Pod("default", "waiting", mother.Gated("example.com/hold")),
 			want: "scheduling gates",
 		},
+		{
+			// A resize in flight means the requests are changing underneath
+			// us, so anything computed from them is about to be stale.
+			name: "in-place resize in progress",
+			pod:  mother.Pod("default", "web", mother.Resizing()),
+			want: "in-place resize in progress",
+		},
 	}
 
 	for _, tc := range tests {
