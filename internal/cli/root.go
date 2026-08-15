@@ -5,11 +5,40 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"io"
 
 	"github.com/spf13/cobra"
 )
+
+// ExitFindings is the status `binpack diagnose` exits with when a report
+// crosses its --fail-on threshold.
+//
+// Deliberately not 1. A CI job needs to tell "diagnose ran and your cluster has
+// blockers" from "diagnose could not reach the cluster", and 1 already means
+// the latter for every other command.
+const ExitFindings = 2
+
+// ExitError is a command reporting a result through its exit status rather
+// than failing. It is not an error in the usual sense: the command did what it
+// was asked, and the status is the answer.
+type ExitError struct {
+	Code    int
+	Message string
+}
+
+func (e *ExitError) Error() string { return e.Message }
+
+// ExitCodeFor is the status a failed Execute should exit with. Anything that
+// is not an [ExitError] is an ordinary failure, and stays 1.
+func ExitCodeFor(err error) int {
+	var exit *ExitError
+	if errors.As(err, &exit) {
+		return exit.Code
+	}
+	return 1
+}
 
 // outputFormat selects how a command renders its result.
 type outputFormat string

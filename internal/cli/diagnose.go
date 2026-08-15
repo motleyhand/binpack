@@ -12,11 +12,47 @@ import (
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
+// failThreshold is the severity at which `diagnose` starts reporting failure
+// through its exit status.
+//
+// A threshold rather than a set: asking to fail on warnings and pass on
+// blockers is not a thing anyone means.
+type failThreshold string
+
+const (
+	failNever    failThreshold = "never"
+	failBlocking failThreshold = "blocking"
+	failWarning  failThreshold = "warning"
+)
+
+// severity resolves the threshold, and reports whether it fails at all.
+//
+// There is deliberately no "info" level. Info findings are the cluster working
+// as intended — a pool at its minimum, an autoscaler reporting NoCandidates —
+// so a job configured that way would be red on a perfectly healthy cluster,
+// and a check that is always red is a check nobody reads.
+func (f failThreshold) severity() (engine.Severity, bool) {
+	switch f {
+	case failBlocking:
+		return engine.Blocking, true
+	case failWarning:
+		return engine.Warning, true
+	default:
+		return engine.Info, false
+	}
+}
+
+func (f failThreshold) valid() bool {
+	return f == failNever || f == failBlocking || f == failWarning
+}
+
 func newDiagnoseCommand(opts *options) *cobra.Command {
 	var (
 		path        string
 		kubeconfig  string
 		kubecontext string
+		failOn      string
+		failStatic  bool
 	)
 
 	cmd := &cobra.Command{
@@ -28,8 +64,20 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 			"object — a disruption budget permitting zero disruptions looks perfectly healthy.\n\n" +
 			"Read-only. diagnose suggests changes and never makes them, both because a cost tool\n" +
 			"should not quietly rewrite availability policy and because Flux or Argo would\n" +
-			"reconcile the change away within minutes.",
+			"reconcile the change away within minutes.\n\n" +
+			"Exits 0 by default whatever it finds. Pass --fail-on to use it as a CI gate:\n" +
+			"a report at or above the threshold exits 2, while 1 stays reserved for diagnose\n" +
+			"failing to run at all — a job needs to tell those apart.",
 		Args: cobra.NoArgs,
+		PreRunE: func(_ *cobra.Command, _ []string) error {
+			// Checked before the cluster is contacted, so a typo fails in
+			// milliseconds rather than after a full read.
+			if !failThreshold(failOn).valid() {
+				return fmt.Errorf("invalid --fail-on %q: want %q, %q or %q",
+					failOn, failNever, failBlocking, failWarning)
+			}
+			return nil
+		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, err := loadConfigOrDefaults(path, cmd.InOrStdin())
 			if err != nil {
@@ -49,15 +97,60 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 				return err
 			}
 
-			return renderDiagnose(opts, engine.Diagnose(snapshot, engineConfig(cfg)))
+			findings := engine.Diagnose(snapshot, engineConfig(cfg))
+			if err := renderDiagnose(opts, findings); err != nil {
+				return err
+			}
+			return exitFor(findings, failThreshold(failOn), failStatic)
 		},
 	}
 
 	cmd.Flags().StringVarP(&path, "file", "f", "", "configuration file (defaults apply when absent)")
 	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "path to a kubeconfig (defaults to the usual rules)")
 	cmd.Flags().StringVar(&kubecontext, "context", "", "kubeconfig context to use")
+	cmd.Flags().StringVar(&failOn, "fail-on", string(failNever),
+		"exit non-zero when findings reach this severity: never, blocking or warning")
+	cmd.Flags().BoolVar(&failStatic, "fail-on-static-pools", false,
+		"also count findings on pools the cluster-autoscaler does not manage, "+
+			"which cannot free a node today and are excluded from --fail-on by default")
 
 	return cmd
+}
+
+// exitFor decides whether a report should fail the command.
+//
+// Findings on pools nothing will ever remove are excluded by default. They are
+// real, and they go live the moment that pool autoscales — but a gate that
+// fails today over a node that was never going away is one a team turns off.
+func exitFor(findings []engine.Finding, threshold failThreshold, countStatic bool) error {
+	minimum, fails := threshold.severity()
+	if !fails {
+		return nil
+	}
+
+	var counted, excluded int
+	for _, f := range findings {
+		if f.Severity < minimum {
+			continue
+		}
+		if f.FreesNothing && !countStatic {
+			excluded++
+			continue
+		}
+		counted++
+	}
+	if counted == 0 {
+		return nil
+	}
+
+	message := fmt.Sprintf("%d finding(s) at or above %s", counted, minimum)
+	if excluded > 0 {
+		// Stated, so a count that disagrees with the report above it is
+		// explained rather than merely puzzling.
+		message += fmt.Sprintf(" (%d more on pools that are not autoscaled were not counted; "+
+			"pass --fail-on-static-pools to include them)", excluded)
+	}
+	return &ExitError{Code: ExitFindings, Message: message}
 }
 
 // findingView is the machine-readable rendering. Codes are the stable part of

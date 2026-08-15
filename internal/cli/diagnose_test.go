@@ -3,6 +3,8 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -195,5 +197,125 @@ func TestDiagnoseTextMarksTheStaticOnesInAMixedGroup(t *testing.T) {
 	}
 	if n := strings.Count(out, "frees nothing today"); n != 1 {
 		t.Errorf("marked %d lines, want only the static one:\n%s", n, out)
+	}
+}
+
+func exitCodeFor(t *testing.T, findings []engine.Finding, threshold failThreshold, static bool) int {
+	t.Helper()
+	err := exitFor(findings, threshold, static)
+	if err == nil {
+		return 0
+	}
+	return ExitCodeFor(err)
+}
+
+func TestDiagnoseExitsZeroByDefaultWhateverItFinds(t *testing.T) {
+	// Reporting is the job; failing a build is an opt-in. A diagnostic that
+	// broke pipelines the day it was installed would be uninstalled the same
+	// day.
+	if code := exitCodeFor(t, sample, failNever, false); code != 0 {
+		t.Errorf("exit = %d with --fail-on never, want 0", code)
+	}
+}
+
+func TestDiagnoseFailOnIsAThreshold(t *testing.T) {
+	tests := []struct {
+		threshold failThreshold
+		findings  []engine.Finding
+		want      int
+	}{
+		{failBlocking, sample, ExitFindings},
+		{failWarning, sample, ExitFindings},
+		// Blocking findings only. A threshold fails at the lower setting too;
+		// an exact-match check would let these through.
+		{failBlocking, sample[:2], ExitFindings},
+		{failWarning, sample[:2], ExitFindings},
+		// Warnings and info only: blocking passes, warning fails.
+		{failBlocking, sample[2:], 0},
+		{failWarning, sample[2:], ExitFindings},
+		// Info only: neither threshold fires, since info is the cluster
+		// working as intended.
+		{failBlocking, sample[3:], 0},
+		{failWarning, sample[3:], 0},
+		{failWarning, nil, 0},
+	}
+
+	for _, tc := range tests {
+		got := exitCodeFor(t, tc.findings, tc.threshold, false)
+		if got != tc.want {
+			t.Errorf("--fail-on %s over %d finding(s): exit = %d, want %d",
+				tc.threshold, len(tc.findings), got, tc.want)
+		}
+	}
+}
+
+func TestDiagnoseDoesNotFailForFindingsThatFreeNothing(t *testing.T) {
+	// A gate that fails today over a node that was never going away is one a
+	// team turns off, and then it catches nothing at all.
+	onStatic := []engine.Finding{{
+		Diagnosis:    engine.Diagnosis{Severity: engine.Blocking, Code: engine.BlockedBarePod},
+		Subject:      "a/orphan",
+		FreesNothing: true,
+	}}
+
+	if code := exitCodeFor(t, onStatic, failBlocking, false); code != 0 {
+		t.Errorf("exit = %d, want 0: nothing will remove that node anyway", code)
+	}
+	if code := exitCodeFor(t, onStatic, failBlocking, true); code != ExitFindings {
+		t.Errorf("exit = %d with --fail-on-static-pools, want %d", code, ExitFindings)
+	}
+}
+
+func TestDiagnoseSaysWhatItDidNotCount(t *testing.T) {
+	mixed := []engine.Finding{
+		{Diagnosis: engine.Diagnosis{Severity: engine.Blocking, Code: engine.BlockedBarePod},
+			Subject: "a/live"},
+		{Diagnosis: engine.Diagnosis{Severity: engine.Blocking, Code: engine.BlockedBarePod},
+			Subject: "a/static", FreesNothing: true},
+	}
+
+	err := exitFor(mixed, failBlocking, false)
+	if err == nil {
+		t.Fatal("no failure for a live blocking finding")
+	}
+	// Otherwise a count that disagrees with the report printed above it is
+	// merely puzzling.
+	if !strings.Contains(err.Error(), "1 finding(s) at or above blocking") {
+		t.Errorf("message does not give the counted total: %q", err)
+	}
+	if !strings.Contains(err.Error(), "--fail-on-static-pools") {
+		t.Errorf("message does not say how to include the rest: %q", err)
+	}
+}
+
+func TestExitCodeForKeepsOrdinaryFailuresAtOne(t *testing.T) {
+	// A CI job has to tell "your cluster has blockers" from "diagnose could
+	// not reach the cluster", and every other command already exits 1.
+	if code := ExitCodeFor(errors.New("connection refused")); code != 1 {
+		t.Errorf("exit = %d for an ordinary error, want 1", code)
+	}
+	if ExitFindings == 1 {
+		t.Error("the findings status is indistinguishable from a runtime failure")
+	}
+}
+
+func TestDiagnoseRejectsAnUnknownFailOnBeforeReadingTheCluster(t *testing.T) {
+	var buf bytes.Buffer
+	cmd := NewRootCommand(&buf)
+	// An unusable kubeconfig, so this both stays hermetic and proves the order:
+	// were the flag checked after the cluster read, the failure below would be
+	// about the kubeconfig instead.
+	cmd.SetArgs([]string{"diagnose", "--fail-on", "everything",
+		"--kubeconfig", filepath.Join(t.TempDir(), "no-such-kubeconfig")})
+
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("accepted an unknown --fail-on value")
+	}
+	if !strings.Contains(err.Error(), "invalid --fail-on") {
+		t.Errorf("error does not name the flag: %v", err)
+	}
+	if code := ExitCodeFor(err); code != 1 {
+		t.Errorf("exit = %d for a bad flag, want 1: it is a usage error, not a verdict", code)
 	}
 }

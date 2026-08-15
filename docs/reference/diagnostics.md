@@ -5,6 +5,7 @@ Every code `binpack diagnose` can report, what it means, and what to do about it
 ```bash
 binpack diagnose
 binpack diagnose --output json
+binpack diagnose --fail-on blocking     # for CI
 ```
 
 `diagnose` is read-only and **never remediates**. It tells you what to change and leaves the
@@ -43,6 +44,48 @@ A finding on a node whose pool the autoscaler does not manage is real but curren
 nothing: that node was never going to be removed. Such findings are marked rather than hidden —
 they go live the moment autoscaling is enabled on the pool — but they are not worth acting on
 first. In JSON this is `"freesNothing": true`.
+
+## Exit codes
+
+`diagnose` exits **0 whatever it finds**, by default. Reporting is the job; failing a build is
+opt-in, because a diagnostic that broke pipelines the day it was installed would be uninstalled
+the same day.
+
+`--fail-on` turns it into a gate:
+
+| Value | Fails on |
+|---|---|
+| `never` (default) | nothing; always exits 0 |
+| `blocking` | `blocking` findings |
+| `warning` | `warning` **and** `blocking` findings |
+
+It is a threshold, not a filter: `--fail-on warning` fails on blockers too. There is
+deliberately no `info` level — those findings are the cluster working as intended, so a job
+configured that way would be red on a perfectly healthy cluster, and a check that is always red
+is a check nobody reads.
+
+| Exit | Meaning |
+|---|---|
+| `0` | Ran, and nothing reached the threshold |
+| `1` | Could not run: unreachable cluster, bad flag, invalid configuration |
+| `2` | Ran, and findings reached the threshold |
+
+Findings and failures are separate codes on purpose. A job needs to distinguish "your cluster
+has blockers" from "diagnose could not reach the cluster", and every other binpack command
+already exits 1 for the latter.
+
+**Findings marked `freesNothing` are not counted** towards `--fail-on`. A gate that fails today
+over a node that was never going away is one a team turns off, and then it catches nothing at
+all. Pass `--fail-on-static-pools` to count them anyway — worth doing if you intend to enable
+autoscaling on those pools. When any are excluded, the message says how many, so a count that
+disagrees with the report above it is explained rather than merely puzzling:
+
+```
+binpack: 15 finding(s) at or above warning (6 more on pools that are not autoscaled
+were not counted; pass --fail-on-static-pools to include them)
+```
+
+The count goes to stderr, so `--output json` on stdout stays machine-readable.
 
 ---
 

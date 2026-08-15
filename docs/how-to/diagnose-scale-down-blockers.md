@@ -5,7 +5,8 @@ modifies anything, so it is safe to run against production.
 
 > **`binpack diagnose` does all of this in one command**, including the checks that are hard to
 > do by hand — a budget matching no pods, a pod matched by two. It needs no configuration and no
-> installation. See the [diagnostics reference](../reference/diagnostics.md).
+> installation, and `--fail-on blocking` makes it a CI gate. See the
+> [diagnostics reference](../reference/diagnostics.md).
 >
 > The manual sequence below is still worth knowing: it is what the tool is doing, it works when
 > you have no binary to hand, and it shows you the raw objects rather than binpack's reading of

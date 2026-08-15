@@ -12,6 +12,9 @@ import (
 func main() {
 	if err := cli.NewRootCommand(os.Stdout).Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, "binpack:", err)
-		os.Exit(1)
+		// Not every non-nil error is a failure: `diagnose --fail-on` reports
+		// its verdict through the exit status, and a CI job has to be able to
+		// tell that from a command that could not run at all.
+		os.Exit(cli.ExitCodeFor(err))
 	}
 }
