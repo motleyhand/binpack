@@ -58,7 +58,7 @@ jobs:
 
       # Builds every target and the container image without publishing
       # anything, so a broken release config fails here rather than on a tag.
-      - uses: goreleaser/goreleaser-action@v6
+      - uses: goreleaser/goreleaser-action@v7
         with:
           version: "~> v2"
           args: release --snapshot --clean --skip=publish
