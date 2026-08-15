@@ -25,6 +25,7 @@ import (
 
 	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
+	"github.com/motleyhand/binpack/internal/metrics"
 )
 
 // LeaderElectionID is the Lease binpack coordinates on. Fixed, like the node
@@ -280,8 +281,11 @@ func (e *evaluator) Start(ctx context.Context) error {
 
 // evaluate reads the cluster once and reports what binpack would do.
 func (e *evaluator) evaluate(ctx context.Context) error {
-	snapshot, err := collect.Snapshot(ctx, e.reader, time.Now())
+	started := time.Now()
+
+	snapshot, err := collect.Snapshot(ctx, e.reader, started)
 	if err != nil {
+		metrics.Failed()
 		// Returned rather than logged and swallowed. A read that fails every
 		// tick is a broken deployment — bad RBAC, most likely — and a
 		// controller that hides it behind a log line looks healthy while doing
@@ -295,10 +299,12 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 	// it, so silently applying the default policy to a pool an operator
 	// believes they switched off is the failure that costs something.
 	if err := engine.CheckPools(snapshot, e.opts.Engine); err != nil {
+		metrics.Failed()
 		return err
 	}
 
 	decision := engine.Decide(snapshot, e.opts.Engine)
+	metrics.Observe(snapshot, decision, e.opts.Engine, time.Since(started).Seconds())
 
 	if err := e.report(ctx, snapshot, decision); err != nil {
 		if e.opts.Once {

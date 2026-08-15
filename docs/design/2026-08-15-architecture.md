@@ -587,10 +587,18 @@ The controller emits a Kubernetes Event on the Node for every decision, so `kube
 node` explains why a node was or was not drained without access to binpack's logs. This
 deliberately mirrors how the autoscaler's own decisions surface on a managed control plane.
 
-Prometheus metrics (prefix `binpack_`) cover decisions by action and reason, drains attempted
-and succeeded, drains that failed to produce a node removal, evictions failed, per-group node
-counts against discovered bounds, and the size of the feasibility shortfall. The last is the one
-to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
+Prometheus metrics (prefix `binpack_`) cover decisions by outcome code, nodes by verdict and by
+skip code, per-pool node counts against discovered bounds, autoscaler liveness, and evaluation
+health. Drains attempted, drains that failed to produce a node removal, and failed evictions
+arrive with the executor, which is what will have anything to say about them.
+
+`binpack_drainable_nodes` is the one to alert on: persistently zero means the cluster genuinely
+needs the nodes it has, and no amount of consolidation will change that.
+
+Labels are drawn only from bounded sets. The engine's prose reasons name individual nodes and
+pods, so they are reported in logs, Events and `explain`, and never as a label — an unbounded
+label value is how a monitoring system falls over. That is why the engine carries bounded codes
+alongside its prose: see [the metrics reference](../reference/metrics.md).
 
 ## Roadmap
 
