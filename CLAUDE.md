@@ -108,6 +108,11 @@ configuration. Detect stuck positively — a pod past its termination deadline i
 volume problem, and saying so is far more useful than "timed out". See
 [ADR-0007](docs/design/adr-0007-drain-progress-not-deadlines.md).
 
+**Recovery reads live pod state, not the age of the progress annotation.** The annotation
+records when binpack last looked, not whether the cluster is progressing — and the two come
+apart exactly when the controller has been down. A restart after a twenty-minute outage during a
+legitimate forty-minute shutdown must not kill a healthy drain because a timestamp looks old.
+
 ## Conventions
 
 - **API group `binpack.motleyhand.com`**, metric prefix `binpack_`. Both are public API from the

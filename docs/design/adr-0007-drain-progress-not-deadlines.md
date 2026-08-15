@@ -96,14 +96,31 @@ harmless and fast enough to recover on its own.
 The durable markers become:
 
 ```
-binpack.motleyhand.com/drain-started:  "2026-08-15T09:15:37Z"
-binpack.motleyhand.com/drain-progress: "2026-08-15T09:31:02Z"
+binpack.motleyhand.com/drain-started:        "2026-08-15T09:15:37Z"
+binpack.motleyhand.com/drain-progress:       "2026-08-15T09:31:02Z"
+binpack.motleyhand.com/drain-pods-remaining: "4"
 ```
 
-`drain-progress` is updated whenever a progress signal is observed. On startup or on acquiring
-leadership, a node carrying a marker is resumed if progress is recent and abandoned if it is
-stale — which is the same judgement the running controller makes, so restart behaviour and
-steady-state behaviour cannot diverge.
+`drain-progress` and `drain-pods-remaining` are updated whenever a progress signal is observed.
+
+**Recovery reads live pod state first, and the annotation only as a fallback.** The annotation
+records when *binpack* last looked, not whether the cluster is making progress — and those come
+apart precisely when the controller has been unavailable. A controller down for twenty minutes
+during a legitimate forty-minute graceful shutdown returns to find a stale timestamp and a
+perfectly healthy drain. Abandoning it on annotation age alone would reintroduce elapsed-time
+abandonment through the back door, in the one situation the design is meant to handle.
+
+So on startup or on acquiring leadership, for each node carrying a drain marker:
+
+1. If a pod on it is terminating and still within its grace period plus slack, **resume** —
+   the drain is demonstrably alive.
+2. If fewer pods remain than `drain-pods-remaining` records, progress happened while binpack was
+   away, so **resume** and refresh the markers.
+3. Only if neither holds, and the recorded progress is older than `stallTimeout`, **abandon**.
+
+That is the same judgement the running controller makes, evaluated against the same signals, so
+restart behaviour and steady-state behaviour cannot diverge. The annotation age is a fallback
+for the case where no live signal is observable, not the primary test.
 
 This replaces a `drain-deadline` annotation, which encoded a decision that is no longer
 time-based.

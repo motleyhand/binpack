@@ -26,7 +26,7 @@ Fixed, and treated as public API from the first release:
 | API group | `binpack.motleyhand.com` |
 | Config `apiVersion` | `binpack.motleyhand.com/v1alpha1` |
 | Node opt-out annotation | `binpack.motleyhand.com/skip: "true"` |
-| Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-progress` |
+| Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-progress`, `binpack.motleyhand.com/drain-pods-remaining` |
 | Backoff markers on a node | `binpack.motleyhand.com/drain-attempts`, `binpack.motleyhand.com/backoff-until`, `binpack.motleyhand.com/last-failure` |
 | Metric prefix | `binpack_` |
 
@@ -461,12 +461,12 @@ exact outcome the safeguard exists to prevent, reached by a different route.
 So the drain marker is written **on the node itself**, before the cordon:
 
 ```
-binpack.motleyhand.com/drain-started:  2026-08-15T09:15:37Z
-binpack.motleyhand.com/drain-progress: 2026-08-15T09:31:02Z
+binpack.motleyhand.com/drain-started:        2026-08-15T09:15:37Z
+binpack.motleyhand.com/drain-progress:       2026-08-15T09:31:02Z
+binpack.motleyhand.com/drain-pods-remaining: 4
 ```
 
-`drain-progress` is updated whenever a progress signal is observed, so it records how the drain
-is doing rather than when someone once decided it should be over.
+These record how the drain is doing rather than when someone once decided it should be over.
 
 The node is the right home for it. It survives any process failure, it needs no CRD, ConfigMap
 or Lease, it requires no permission binpack does not already hold for cordoning, and it is
@@ -474,11 +474,18 @@ self-cleaning: when the drain succeeds the node is deleted and the marker goes w
 also visible in `kubectl describe node`, so a human debugging a cordoned node finds out who
 cordoned it and when it was due to be released.
 
-On startup and on acquiring leadership, binpack reconciles before doing anything else: every
-node carrying a drain marker is resumed if its last progress is recent, and uncordoned and
-recorded as failed if progress has gone stale. That is the same judgement the running controller
-makes, so restart behaviour and steady-state behaviour cannot diverge — and recovery does not
-depend on the process that started the drain still being alive.
+On startup and on acquiring leadership, binpack reconciles before doing anything else. For each
+node carrying a drain marker it checks **live pod state first**: a pod still terminating within
+its grace period means the drain is alive, and fewer pods remaining than the marker records means
+progress happened while binpack was away. Either resumes the drain. Only when neither holds, and
+the recorded progress has gone stale, is the node uncordoned and the drain recorded as failed.
+
+Reading the annotation age alone would be wrong in the case that matters most: a controller
+unavailable for twenty minutes during a legitimate forty-minute shutdown returns to a stale
+timestamp and a perfectly healthy drain, and would kill it. The annotation is a fallback for
+when no live signal is observable, not the primary test — which keeps recovery and steady-state
+behaviour identical, and means recovery does not depend on the process that started the drain
+still being alive.
 
 One case remains unrecoverable by binpack alone: uninstalling it mid-drain leaves a marked,
 cordoned node with nothing running to release it. The marker makes that state self-describing

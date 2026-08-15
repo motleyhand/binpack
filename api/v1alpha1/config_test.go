@@ -185,6 +185,19 @@ func TestValidation(t *testing.T) {
 			wantErr: "shorter than backoff.initial",
 		},
 		{
+			// Legal where written, illegal once the 30m default initial
+			// delay is applied. Only a resolved-policy check catches this.
+			name:    "backoff max below the default initial",
+			yaml:    "policy:\n  backoff:\n    max: 10m",
+			wantErr: "shorter than backoff.initial",
+		},
+		{
+			// Each layer is individually fine; the combination is not.
+			name:    "pool inherits a long initial and overrides only max",
+			yaml:    "policy:\n  backoff:\n    initial: 1h\npools:\n  - name: pool-4g\n    backoff:\n      max: 10m",
+			wantErr: `pools[0] "pool-4g" (resolved)`,
+		},
+		{
 			name:    "duplicate pool names",
 			yaml:    "pools:\n  - name: a\n  - name: a",
 			wantErr: "already configured",
