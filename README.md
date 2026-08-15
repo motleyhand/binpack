@@ -21,8 +21,8 @@ would.
 
 **Yes, if** you run Kubernetes on a managed service that constrains the cluster-autoscaler —
 DigitalOcean DOKS, Linode LKE, Vultr, Scaleway, Civo, OVH — and your node count drifts upward
-after load spikes and stays there. On these platforms binpack is the only option short of a
-commercial product.
+after load spikes and stays there. On these platforms the alternatives are thin: the descheduler
+helps only in narrow cases, and everything else is commercial.
 
 **Also worth considering if** you run EKS, GKE or AKS. [Karpenter][karpenter] is the more
 complete answer on those platforms: it provisions right-sized nodes and treats consolidation as
@@ -41,7 +41,7 @@ consolidation is a superset of it.
 capacity than binpack can, because they remove *permanent* blocks rather than optimising around
 them — a `PodDisruptionBudget` with `minAvailable: 1` on a single-replica Deployment permits
 *zero* voluntary disruptions, forever, and will pin a node in place no matter what tooling you
-add. If those fixes solve it, you don't need this.
+add. If those fixes solve it, you might not need this.
 
 ## Documentation
 

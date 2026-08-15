@@ -5,8 +5,8 @@ more capacity than binpack can, because they remove *permanent* blocks rather th
 around them. All of them make the cluster-autoscaler you already run work the way you assumed
 it did.
 
-If you do all of these and your node count still doesn't drop, that is when binpack has
-something to add. Start here.
+If you work through all of these and your node count still doesn't drop, that is where binpack
+may have something to add. Start here.
 
 ## 1. Fix PDBs that permit zero disruptions
 
@@ -121,9 +121,10 @@ it is how you *see* the gap between requested and used, which is what makes fix 
 ## After all that
 
 Re-run the [diagnosis](diagnose-scale-down-blockers.md) and give the cluster a few hours. If the
-autoscaler now reaps the extra nodes, you're done and you don't need this tool.
+autoscaler now reaps the extra nodes, you might not need this tool — at least not yet.
 
 If it still reports `NoCandidates` while sitting at 50-something percent utilisation across
-every node, you have hit the actual gap: the cluster would fit on fewer nodes, but only if the
-workload were rearranged, and the autoscaler will never attempt that. That is what binpack is
-for.
+every node, you may have reached the gap this project was built for: the cluster might fit on
+fewer nodes, but only if the workload were rearranged, and the autoscaler will never attempt
+that. Whether it actually would fit is a question `binpack explain` can answer read-only,
+before you install anything.

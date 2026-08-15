@@ -31,8 +31,11 @@ which means nothing will ever remove its nodes no matter how empty they get. Com
 against your actual pools catches a surprising number of "why won't this shrink" questions
 outright.
 
-If the ConfigMap does not exist, no cluster-autoscaler is running, and nothing in this document
-will help — that is the answer.
+If the ConfigMap does not exist, the likeliest explanation by far is that no cluster-autoscaler
+is running — in which case nothing else in this document will help, because nothing is going to
+remove a node however empty it gets. It can also mean the autoscaler is running with status
+reporting disabled, which is unusual on managed platforms but worth ruling out before concluding
+anything.
 
 ## 2. Check for PDBs allowing zero disruptions
 
@@ -114,9 +117,10 @@ namespace. `binpack diagnose` will report it directly.
 
 ## What to do with the answer
 
-If step 1 said `NoCandidates` and steps 2–8 found nothing, your cluster genuinely needs its
-nodes at their current placement — which is precisely the case binpack exists for: the workload
-may still fit on fewer nodes if it were rearranged, and the autoscaler will never try that.
+If step 1 said `NoCandidates` and steps 2–8 found nothing, then at the current placement the
+cluster does need its nodes — which is the case binpack was written for. The workload may still
+fit on fewer nodes if it were rearranged, and the autoscaler will never try that. Whether it
+would fit on yours is an arithmetic question, and `binpack explain` answers it read-only.
 
 If steps 2–8 found something, fix that first. It is cheaper than any tool, and several of those
 blocks would defeat a consolidation tool as thoroughly as they defeat the autoscaler. The
