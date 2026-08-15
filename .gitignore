@@ -1,0 +1,19 @@
+# Build output
+/bin/
+/dist/
+
+# Go
+*.test
+*.out
+coverage.*
+
+# Private working notes — never published. See CONTRIBUTING.md.
+/notes/
+
+# Editors
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
