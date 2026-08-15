@@ -18,25 +18,29 @@ linters:
   settings:
     depguard:
       rules:
-        # ADR-0003: the decision engine is a pure function over plain values.
-        # If it can import a Kubernetes client it will eventually hold one, and
-        # then the logic can no longer be tested without a cluster — and the
-        # CLI and controller can drift apart. Conversion belongs in
-        # internal/collect; fit predicates belong in internal/fit.
+        # ADR-0008: the decision engine is a pure function over data. It may
+        # name Kubernetes API types — those are inert structs, constructible in
+        # a test literal — but it must never hold anything that talks to a
+        # cluster. A client is what forces a cluster into a test and what makes
+        # behaviour depend on the environment; a type is not.
+        #
+        # Allowed: k8s.io/api, k8s.io/apimachinery, k8s.io/component-helpers.
         engine-purity:
           files:
             - "**/internal/engine/**"
           deny:
-            - pkg: k8s.io
+            - pkg: k8s.io/client-go
               desc: >-
-                internal/engine must stay free of Kubernetes libraries (ADR-0003).
-                Add the field you need to the engine's own snapshot types and
-                populate it in internal/collect.
-            - pkg: sigs.k8s.io
+                internal/engine must hold no cluster clients (ADR-0008). Take the
+                objects as arguments; listing them is internal/collect's job.
+            - pkg: sigs.k8s.io/controller-runtime
               desc: >-
-                internal/engine must stay free of Kubernetes libraries (ADR-0003).
-                Add the field you need to the engine's own snapshot types and
-                populate it in internal/collect.
+                internal/engine must hold no cluster clients (ADR-0008). The
+                manager, caches and clients belong in internal/controller.
+            - pkg: k8s.io/kubectl
+              desc: >-
+                internal/engine must hold no cluster clients (ADR-0008).
+                Eviction and drain helpers belong in internal/executor.
 
     revive:
       rules:

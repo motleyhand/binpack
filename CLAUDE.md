@@ -34,19 +34,33 @@ CI additionally verifies `go.mod`/`go.sum` are tidy and runs `goreleaser release
 These two are load-bearing. Breaking either silently destroys the property the project is sold
 on.
 
-**`internal/engine` imports no Kubernetes libraries.** It is a pure function,
-`Decide(Snapshot, Config) → Decision`, over plain values. Enforced by a `depguard` rule in
-`.golangci.yml`, so a violating import fails CI. If the engine seems to need a Kubernetes type,
-add the field to its own snapshot types and populate it in `internal/collect`. Rationale:
-[ADR-0003](docs/design/adr-0003-pure-decision-engine.md). This is what guarantees `binpack
-explain` and the controller cannot disagree, and it is why engine tests need no cluster.
+**`internal/engine` holds no cluster clients.** It is a pure function,
+`Decide(Snapshot, Config) → Decision`, taking Kubernetes API objects as data. Naming
+`corev1.Pod` is fine — it is an inert struct you can write in a test literal. Holding a client
+is not: that is what forces a cluster into a test and makes behaviour depend on the environment.
+Enforced by a `depguard` rule denying `k8s.io/client-go`, `sigs.k8s.io/controller-runtime` and
+`k8s.io/kubectl`, so a violating import fails CI. Rationale:
+[ADR-0008](docs/design/adr-0008-engine-uses-api-types.md), which supersedes the stricter
+no-Kubernetes-imports rule of [ADR-0003](docs/design/adr-0003-pure-decision-engine.md) — that
+rule was a proxy, and the mirror types it required caused most of the defects found in review.
 
-**`internal/collect` and `internal/fit` are the high-risk packages**, not the boring adapter
-layers. Every defect found in design review was a translation error at that boundary — a
-resource type unaccounted for, a pod class unrecognised, a request computed differently from how
-the scheduler computes it. A wrong number there produces a *confidently wrong* decision that no
-engine unit test can catch. Prefer upstream Kubernetes libraries over hand-rolled equivalents
-even when the hand-rolled version looks obviously correct, and test against real API fixtures.
+**Objects handed to the engine are strictly read-only.** The controller path passes pointers
+into a shared informer cache; writing to a Node or Pod corrupts it for every other consumer in
+the process. Copy before modifying, always. This cannot be linted — it is a review rule.
+
+**`internal/fit` is the high-risk package**, not a boring adapter. Every defect found in design
+review was the same shape: a resource type unaccounted for, a pod class unrecognised, a request
+computed differently from how the scheduler computes it. A wrong answer there produces a
+*confidently wrong* decision that no amount of engine testing can catch. Prefer upstream
+Kubernetes libraries over hand-rolled equivalents even when the hand-rolled version looks
+obviously correct.
+
+**Test fixtures use object mothers plus builders.** Mothers name archetypes —
+`mother.SmallNode()`, `mother.DaemonSetPod()` — so a test says what it needs in three words and
+"ordinary" is defined in one place. Builders customise from there —
+`mother.SmallNode().WithTaint(...)` — so a test states only the thing it is about. Mothers
+return builders so the two compose. This matters more here than usual: the test table *is* the
+specification of the decision procedure, so it has to stay readable.
 
 ## Domain traps
 

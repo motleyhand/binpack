@@ -64,22 +64,21 @@ The consequence must be stated honestly in user-facing documentation rather than
 
 ## Decision
 
-### Depend on an interface, not an implementation
+### Keep fit in one package, called directly
 
-The engine takes a `FitChecker`:
+Fit lives in `internal/fit` and is called directly by the engine:
 
 ```go
-type FitChecker interface {
-    CanFit(pod Pod, node Node) (bool, Reason)
-}
+func CanFit(pod *corev1.Pod, node *corev1.Node) (bool, Reason)
 ```
 
-The engine stays pure and its tests use a trivial fake, so
-[ADR-0003](adr-0003-pure-decision-engine.md) is refined rather than contradicted: the *decision
-logic* remains free of Kubernetes libraries, while the fit predicate becomes a pluggable
-dependency living in `internal/fit`, which may import them.
+An earlier draft of this ADR wrapped it in an interface so the engine could avoid naming
+Kubernetes types. [ADR-0008](adr-0008-engine-uses-api-types.md) removed that constraint, and
+with it the interface, the lookup back to the original objects, and the choice between them.
+The engine imports `internal/fit` like any other package.
 
-This is what makes the staging below possible without a rewrite.
+Staging remains possible without a rewrite: the implementation behind `CanFit` can change
+completely as long as its answer stays sound in the direction described above.
 
 ### Stage 1: the light path, plus honest refusal
 
@@ -141,7 +140,7 @@ measurement rather than intuition, and it can only grow as constraints are genui
 ### Stage 2: escalate only if measurement justifies it
 
 If the refusal reason above fires often on real clusters, adopt the full scheduler framework
-from `k8s.io/kubernetes/pkg/scheduler/framework/plugins` behind the same `FitChecker` interface.
+from `k8s.io/kubernetes/pkg/scheduler/framework/plugins`, behind the same `CanFit` signature.
 
 That is deliberately deferred rather than rejected. It buys exact fidelity, and it costs a
 dependency on the main Kubernetes repository: replace directives across every staging module, a
