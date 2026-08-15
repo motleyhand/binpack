@@ -614,7 +614,11 @@ to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
     on a decision; not harmless once something does. See
     [ADR-0006](adr-0006-scheduler-fidelity.md).
 12. Helm chart and RBAC
-13. Release pipeline
+13. Release pipeline. **Includes migrating `.goreleaser.yaml` from `dockers` to `dockers_v2`**,
+    which GoReleaser now warns is being phased out. Deliberately deferred to here rather than
+    done piecemeal: the publishing configuration is written in this step anyway, and the new
+    schema is not yet in GoReleaser's published `schema.json`, so it should be verified against
+    the version CI actually runs rather than guessed at.
 
 Each of steps 4 onward gets its own specification before implementation.
 
