@@ -31,11 +31,13 @@ which means nothing will ever remove its nodes no matter how empty they get. Com
 against your actual pools catches a surprising number of "why won't this shrink" questions
 outright.
 
-If the ConfigMap does not exist, the likeliest explanation by far is that no cluster-autoscaler
-is running — in which case nothing else in this document will help, because nothing is going to
-remove a node however empty it gets. It can also mean the autoscaler is running with status
-reporting disabled, which is unusual on managed platforms but worth ruling out before concluding
-anything.
+If the ConfigMap does not exist, the likeliest explanation is that no cluster-autoscaler is
+running — in which case nothing else here will help, because nothing is going to remove a node
+however empty it gets. But treat that as a hypothesis, not a finding. The autoscaler can be
+running with status reporting turned off, and an RBAC or reconciliation failure can prevent the
+object being written while scaling continues perfectly well. Confirm with step 3: if you see
+recent `TriggeredScaleUp` events, an autoscaler is clearly at work regardless of what this step
+suggested, and the rest of the checks apply.
 
 ## 2. Check for PDBs allowing zero disruptions
 
@@ -88,15 +90,43 @@ satisfies.
 
 ## 6. Find the biggest requests in the cluster
 
+One oversized request can be the reason a node cannot be emptied — there may be nowhere else in
+the cluster with a single contiguous block that large. Aggregate free capacity is irrelevant
+here: a 3GB pod does not fit in three nodes with 1GB free each.
+
+What you want is the **effective pod request**, which is not the same as reading
+`resources.requests` off each container. The scheduler reserves the larger of the sum across
+regular containers and the peak across init containers, keeps native sidecars in the running
+total, and adds `spec.overhead` from the RuntimeClass. A pod with three 1GiB containers, or a
+light main container behind a 4GiB init container, is far bigger than a per-container listing
+suggests.
+
 ```bash
 kubectl get pods -A -o json | jq -r '
-  .items[] | "\(.metadata.namespace)/\(.metadata.name) \(.spec.containers[].resources.requests.memory // "none")"
-' | sort -k2 -h | tail -20
+  def to_bytes:
+    if . == null then 0
+    elif type == "number" then .
+    elif test("Ki$") then (rtrimstr("Ki")|tonumber)*1024
+    elif test("Mi$") then (rtrimstr("Mi")|tonumber)*1048576
+    elif test("Gi$") then (rtrimstr("Gi")|tonumber)*1073741824
+    elif test("Ti$") then (rtrimstr("Ti")|tonumber)*1099511627776
+    else (tonumber? // 0) end;
+  .items[] | . as $p
+  | [ $p.spec.containers[]?.resources.requests.memory | to_bytes ] as $reg
+  | [ $p.spec.initContainers[]? | select(.restartPolicy == "Always")
+      | .resources.requests.memory | to_bytes ] as $side
+  | [ $p.spec.initContainers[]? | select(.restartPolicy != "Always")
+      | .resources.requests.memory | to_bytes ] as $init
+  | (($reg|add) // 0) as $r | (($side|add) // 0) as $s | (($init|max) // 0) as $i
+  | (($p.spec.overhead.memory // 0) | to_bytes) as $o
+  | ((([$r + $s, $i + $s] | max) + $o) / 1048576 | floor) as $mib
+  | "\($mib)Mi \($p.metadata.namespace)/\($p.metadata.name)"
+' | sort -rn | head -20
 ```
 
-One oversized request can be the reason a node cannot be emptied — there may be nowhere else in
-the cluster with a single contiguous block that large. Aggregate free capacity across the
-cluster is irrelevant here: a 3GB pod does not fit in three nodes with 1GB free each.
+This is a close approximation rather than the exact upstream calculation, and it is deliberately
+biased towards overstating rather than understating. `binpack explain` computes the real figure
+using the same library the scheduler does.
 
 ## 7. Count pods per node
 

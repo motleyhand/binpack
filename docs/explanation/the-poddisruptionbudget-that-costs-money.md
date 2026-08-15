@@ -58,8 +58,14 @@ replica, it is anchored permanently rather than momentarily.
 In rough order of cleanliness.
 
 **Delete the PDB in non-production namespaces.** With `strategy: RollingUpdate`, `maxSurge: 1`,
-`maxUnavailable: 0`, your rollouts are already zero-downtime without it. The PDB governs only
-*involuntary* disruption — which, in a test environment, is exactly what you want to permit.
+`maxUnavailable: 0`, your rollouts are already zero-downtime without it — the Deployment
+controller, not the PDB, is what protects a rollout.
+
+What deleting the PDB gives up is protection against *voluntary* disruption: evictions, drains,
+node upgrades. In a staging or review environment, permitting those is exactly what you want,
+and it costs a few seconds of downtime when one happens. Nothing changes for involuntary
+disruption — node failure, OOM kills, hardware faults — because a PDB never protected against
+those in the first place.
 
 **Or invert the condition:** replace `minAvailable: 1` with `maxUnavailable: 1`. Same shape of
 protection, opposite phrasing, and it permits eviction at the cost of roughly thirty seconds of

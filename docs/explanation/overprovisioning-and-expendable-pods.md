@@ -77,11 +77,21 @@ Two requirements, and any configuration satisfying both is fine:
 The canonical upstream example uses `-1` for overprovisioning with the default class at `0`.
 A default class at `1` with overprovisioning at `0` works equally well.
 
-One piece of housekeeping worth knowing: a `default` PriorityClass with `globalDefault: true` and
-value `1` behaves identically to having no default class at all, since pods without a class
-default to `0` anyway. Some teams set the default to something like `100` specifically to leave
-numeric headroom for higher-priority classes above it. Either document the intent or move the
-value, so the next person doesn't have to work out whether it was deliberate.
+One trap worth spelling out, because the class involved looks redundant and is not.
+
+If you run a `default` PriorityClass with `globalDefault: true` and value `1`, alongside
+overprovisioning at `0`, that default class is **load-bearing**. It is what puts ordinary pods
+at priority 1, one step above the pause pods, which is what makes preemption work.
+
+Delete it as tidy-up — it looks like it does nothing, since Kubernetes assigns `0` to unclassed
+pods anyway — and every ordinary pod drops to `0`, level with the pause pods. Preemption stops:
+the scheduler has no reason to prefer evicting the buffer, and the warm-capacity pattern quietly
+becomes a pile of pods occupying space for no benefit.
+
+If you want numeric headroom for higher-priority classes, raise the default's value (some teams
+use `100`) rather than removing it. And whatever the values, leave a comment saying which class
+is meant to be preempted first, because the relationship between the numbers is the entire
+configuration and nothing in the manifests explains it.
 
 ## Checking yours
 

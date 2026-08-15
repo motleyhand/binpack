@@ -46,10 +46,26 @@ autoscaler looks at each in turn, finds each one moderately busy, and does nothi
 This is the equilibrium that costs money: stable, symmetric, and completely invisible unless you
 go looking. Every node at 40–70 percent. None clearly removable. All billed.
 
-You can often demonstrate it in one move. Delete a single pod from one of the nodes. The
-replacement lands elsewhere, the symmetry breaks, the node crosses the threshold from
-"moderately busy" to "clearly unneeded" — and the autoscaler reaps it within minutes. The
-capacity was never necessary. The autoscaler just could not find the opening on its own.
+You can often demonstrate it by hand, in two steps:
+
+```bash
+kubectl cordon <node>                     # stop new pods landing here
+kubectl delete pod -n <ns> <pod>          # let its replacement be scheduled elsewhere
+```
+
+The cordon is not optional, and the reason is the whole problem in miniature. Delete the pod
+without it and the node you just freed space on becomes the *emptiest* node in the cluster — so
+`LeastAllocated` is quite likely to schedule the replacement straight back onto it. You get a
+pod restart and no progress. Cordon first and the replacement has to go elsewhere; the symmetry
+breaks; the node crosses from "moderately busy" to "clearly unneeded"; and the autoscaler
+usually reaps it within minutes.
+
+When that works, the capacity was never necessary. The autoscaler simply had no way to find the
+opening, because finding it required moving something first.
+
+Those two commands are, in essence, what binpack automates — with the arithmetic to establish
+beforehand that the displaced pods have somewhere to go, and the bookkeeping to uncordon the
+node if they turn out not to.
 
 ## The three conditions, all of which must hold
 
@@ -112,9 +128,16 @@ logs aren't yours to read either.
 That is a real frustration, but it is worth being clear that the knobs are not the fundamental
 problem.
 
-**Even a perfectly tuned autoscaler never rebalances.** Lowering the utilisation threshold makes
-it readier to remove a node that is *already* nearly empty. It does not make the cluster arrive
-at a state where such a node exists. If every dial were exposed to you tomorrow, the symmetric
+Note the direction of `scale-down-utilization-threshold`, because it is easy to get backwards. A
+node qualifies for removal when its utilisation is **below** the threshold. *Raising* it from
+0.5 to 0.7 therefore widens the net and makes the autoscaler consider more nodes; lowering it to
+0.3 narrows the net and excludes everything between 30 and 50 percent. If you are hoping for
+more scale-down, the dial goes up.
+
+But — and this is the point — **even a perfectly tuned autoscaler never rebalances.** Widening
+the net makes it readier to remove a node that is *already* nearly empty. It does not make the
+cluster arrive at a state where such a node exists, and it does nothing about condition 3, which
+is what actually pins most nodes. If every dial were exposed to you tomorrow, the symmetric
 equilibrium would still form, and the extra node would still sit there.
 
 That gap is architectural rather than configurational, which is the reason this project exists.

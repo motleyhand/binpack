@@ -42,8 +42,12 @@ spec:
     updateMode: "Off"
 ```
 
-Then read its recommendations against your current requests. Note that VPA does not use the
-Metrics API, so this works even if `kubectl top` is broken.
+Then read its recommendations against your current requests.
+
+**Check `kubectl top nodes` works first.** The VPA recommender reads usage samples from the
+resource Metrics API, so a broken `metrics.k8s.io` leaves it with nothing to recommend from —
+and it fails quietly, producing no recommendations rather than an error. If `kubectl top` is
+empty, do [fix 7](#7-fix-your-metrics-api-if-kubectl-top-is-broken) before this one.
 
 This is the highest-leverage *structural* fix available, and it improves scheduling density,
 scale-down behaviour and cost simultaneously.

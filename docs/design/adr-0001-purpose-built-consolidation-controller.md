@@ -52,9 +52,10 @@ is worth setting if you run multiple pools, but it improves which pool a scale-*
 and does nothing for scale-down.
 
 More fundamentally, this would not be sufficient even if the knobs were available. The
-autoscaler has no rebalancing code path at any configuration. Lowering
-`scale-down-utilization-threshold` makes it more willing to remove a node that is *already*
-nearly empty; it does not make the cluster arrive at a state where such a node exists.
+autoscaler has no rebalancing code path at any configuration. Raising
+`scale-down-utilization-threshold` widens the set of nodes it will consider removing — a node
+qualifies when its utilisation is *below* the threshold — but a wider net only helps if the
+cluster ever produces a nearly-empty node. Tuning does not make it arrive at that state.
 
 ### Right-size resource requests
 

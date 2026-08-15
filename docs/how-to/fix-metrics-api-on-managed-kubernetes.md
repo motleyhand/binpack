@@ -31,16 +31,18 @@ Worth knowing, because the blast radius is larger than a missing `kubectl top`:
 
 - **HPA scaling on `cpu` or `memory`** silently never triggers. The HPA reports unknown metrics
   and does nothing.
+- **The Vertical Pod Autoscaler recommender**, which reads usage samples from this same API. It
+  produces no recommendations rather than an error, so it looks installed and idle rather than
+  broken.
 - Anything else reading `metrics.k8s.io`.
 
 Not affected, which narrows the search:
 
 - **KEDA scalers using external triggers** — AMQP, cron, Prometheus queries. These bypass the
   Metrics API entirely. Only KEDA's `cpu` and `memory` trigger types are affected.
-- **VPA**, which reads from its own source.
 
 So a cluster can appear to be autoscaling correctly on KEDA while every CPU-based HPA in it is
-inert.
+inert and VPA has been silently recommending nothing for months.
 
 ## The cause: a label mismatch
 
@@ -87,7 +89,9 @@ binpack's feasibility arithmetic runs on **requests**, not usage, because reques
 scheduler honours — a pod using 200MB but requesting 1GB needs 1GB of room wherever it lands. So
 a broken Metrics API does not affect any decision binpack makes.
 
-Where it helps is human judgement. The gap between requested and used is what tells you your
-requests are inflated, and right-sizing them is
+Where it matters is everything you would do *before* reaching for binpack. The gap between
+requested and used is what tells you your requests are inflated, and right-sizing them is
 [the highest-leverage fix](quick-wins-before-installing-binpack.md) available. You need
-`kubectl top` working to see that gap.
+`kubectl top` working to see that gap by hand — and the VPA recommender, which is the tool that
+does it properly, cannot work at all without this API. So while a broken Metrics API changes
+none of binpack's decisions, it blocks the fix that usually matters more.
