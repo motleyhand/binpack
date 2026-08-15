@@ -497,3 +497,100 @@ func TestTheReserveDoesNotRefuseAClusterWithObviousRoom(t *testing.T) {
 		t.Errorf("refused a drain with 7.75Gi free and a 256Mi largest pod: %s", sim.Blocked.Summary)
 	}
 }
+
+func TestAdmissionInjectedContainersAreCarriedOntoTheReplacement(t *testing.T) {
+	// The template understates whenever admission mutates a pod on creation —
+	// a service-mesh sidecar from a webhook, requests filled in by a
+	// LimitRange. Sizing on the template alone approves a node the real
+	// replacement does not fit: the same failure as an in-place resize, from
+	// the opposite cause. Requests are the maximum of both for that reason.
+	candidate := sized("candidate", "4Gi")
+	destination := sized("destination", "1Gi")
+
+	// Running with an injected sidecar its template knows nothing about.
+	injected := mother.Pod("default", "web", mother.OnNode("candidate"), mother.Requests("100m", "256Mi"))
+	injected.Spec.Containers = append(injected.Spec.Containers, corev1.Container{
+		Name: "istio-proxy",
+		Resources: corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{corev1.ResourceMemory: resource.MustParse("900Mi")},
+		},
+	})
+	pods := []*corev1.Pod{injected}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, injected, mother.Requests("100m", "256Mi"))
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Error("sized the move on the raw template: the injected sidecar needs 900Mi more than it accounts for")
+	}
+}
+
+func TestTheReplacementTakesTheLargerRequestOfEitherSpec(t *testing.T) {
+	// Each source understates a different case and neither overstates.
+	running := mother.Pod("default", "web", mother.OnNode("a"), mother.Requests("500m", "128Mi"))
+	pods := []*corev1.Pod{running}
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, running, mother.Requests("100m", "2Gi"))
+
+	candidate := sized("a", "8Gi")
+	// Room for 2Gi but only 400m of CPU: the template wins on memory, the
+	// running pod on CPU, and both must be respected at once.
+	destination := mother.Node("b", mother.Allocatable(corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("400m"),
+		corev1.ResourceMemory: resource.MustParse("8Gi"),
+		corev1.ResourcePods:   resource.MustParse("110"),
+	}))
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Error("took only the template's requests: the running pod asks for 500m and the destination has 400m")
+	}
+}
+
+func TestHeadroomRefusesWhenATemplateCannotBeRead(t *testing.T) {
+	// The reserve is a lower bound on space that must remain. An unreadable
+	// pod may be the largest replacement in the cluster, so under-estimating
+	// it approves a drain that should have been refused — a wrong answer, not
+	// a missed one.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	exotic := mother.Pod("default", "shard-0", mother.OnNode("destination"),
+		mother.OwnedBy("KafkaCluster", "events"))
+	pods := []*corev1.Pod{exotic}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if sim.Feasible {
+		t.Fatal("reserved headroom while unable to size the cluster's largest pod")
+	}
+	if !sim.Blocked.NoTemplate {
+		t.Errorf("refusal is not marked as a gap in what binpack models: %+v", sim.Blocked)
+	}
+}
+
+func TestRuntimeClassOverheadSurvivesOnTheReplacement(t *testing.T) {
+	// Overhead is added at admission from the RuntimeClass, so it is on the
+	// running pod and absent from the template — and the scheduler reserves
+	// it. Losing it understates every gVisor or Kata pod by its sandbox cost.
+	candidate := sized("candidate", "4Gi")
+	destination := sized("destination", "1Gi")
+	heavy := mother.Pod("default", "sandboxed", mother.OnNode("candidate"),
+		mother.Requests("100m", "512Mi"), mother.WithOverhead("100m", "700Mi"))
+	pods := []*corev1.Pod{heavy}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, heavy, mother.Requests("100m", "512Mi"))
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Error("dropped the sandbox overhead: 512Mi + 700Mi does not fit 1Gi")
+	}
+}

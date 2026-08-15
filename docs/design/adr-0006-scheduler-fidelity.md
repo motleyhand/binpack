@@ -164,6 +164,27 @@ against measurement as this ADR asks: on a real cluster all 145 pods resolved a 
 the four kinds above, so the refusal cost nothing there. A metric counts it, so if that turns
 out not to be general the evidence will exist before the rule is relaxed.
 
+**The template alone is not the answer either.** Admission mutates a pod on creation — a
+service-mesh sidecar injected by a webhook, requests filled in by a LimitRange, RuntimeClass
+overhead — so the stored template understates the replacement exactly as often as a resize
+overstates it, and in the same unsound direction. Requests are therefore the per-resource
+maximum of template and running pod, and a container present only on the running pod is carried
+over whole: each source understates a different case, neither overstates, so the larger is
+conservative in both.
+
+Labels come from the template alone rather than a union, because selector matching is not
+monotonic. An extra label makes an `In` selector match and makes a `DoesNotExist` selector stop
+matching, so "more labels" is not a safe direction and only the set the replacement will carry
+is right.
+
+A residual gap remains and is worth naming: a label added at admission is on the running pod and
+not the template, so a destination whose pods select on it is not consulted about it. Unlike the
+resource case there is no conservative merge — adding the label is unsafe for `DoesNotExist`
+selectors and omitting it is unsafe for `In` ones — and closing it properly means running the
+admission chain, which is far outside what this project should do. It is bounded: it costs a
+placement the scheduler refuses, which stalls the drain and backs off rather than causing a
+scale-up, because the pod is rejected rather than left unschedulable somewhere new.
+
 **Verifying the first case mattered more than it looks.** The obvious cheaper fix — compare the
 pod's requests against what its container statuses report as allocated — does not work, and the
 API says so: the kubelet sets `allocatedResources` to the new value *after* a successful resize,

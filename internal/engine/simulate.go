@@ -2,6 +2,7 @@ package engine
 
 import (
 	"fmt"
+	"maps"
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
@@ -222,11 +223,11 @@ func checkHeadroom(
 	// resized downward in place would otherwise understate the margin by
 	// exactly the amount that matters.
 	//
-	// Pods whose template cannot be read are skipped rather than refused.
-	// Nothing is relocating them — one on the candidate node has already
-	// blocked the simulation — and they only inform how large a pod this
-	// cluster tends to want. Skipping makes the margin an under-estimate,
-	// which costs a missed consolidation rather than a wrong one.
+	// A pod whose template cannot be read blocks the proof rather than being
+	// skipped. It may be the largest replacement in the cluster, and the
+	// reserve is a lower bound on space that must remain: under-estimating it
+	// approves a drain that should have been refused, which is a wrong answer
+	// and not a missed one. Skipping had that backwards.
 	var largest, largestRunning *corev1.Pod
 	for _, pod := range pods {
 		if !occupies(pod) || Classify(pod, cfg.ExpendablePriorityCutoff) != Relocatable {
@@ -234,7 +235,13 @@ func checkHeadroom(
 		}
 		next, ok := replacement(pod, templates)
 		if !ok {
-			continue
+			return &Blocked{
+				Pod: pod,
+				Summary: fmt.Sprintf(
+					"%s/%s has no readable controller template, so binpack cannot tell how much "+
+						"room to reserve for a pod of its size", pod.Namespace, pod.Name),
+				NoTemplate: true,
+			}
 		}
 		if largest == nil || memoryOf(next) > memoryOf(largest) {
 			largest, largestRunning = next, pod
@@ -321,9 +328,24 @@ func ControllerOf(pod *corev1.Pod) (OwnerRef, bool) {
 //     scheduler entirely. Every running pod has a nodeName, so the running pod
 //     cannot show this; the template can.
 //
-// Identity comes from the running pod so that anything reported names an object
-// an operator can actually go and look at. Labels are the union of both: they
-// drive anti-affinity matching, and matching more is the refusing direction.
+// Neither spec alone is safe, so the replacement is built from both.
+//
+// The template understates in the other direction whenever admission mutates a
+// pod on creation: a service-mesh sidecar injected by a webhook, or requests
+// filled in by a LimitRange, are on the running pod and absent from the stored
+// template. Sizing on the template alone would then approve a node the real
+// replacement does not fit — the identical failure, from the opposite cause.
+//
+// So requests are the per-resource maximum of the two. Each source understates
+// a different case and neither overstates, which makes the larger of them
+// conservative in both.
+//
+// Labels come from the template, not the running pod and not a union of the
+// two. Selector matching is not monotonic — an extra label makes an `In`
+// selector match and a `DoesNotExist` selector stop matching — so "more labels"
+// is not a safe direction and only the set the replacement will actually carry
+// is right. Identity stays the running pod's, so anything reported names an
+// object an operator can go and look at.
 func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec) (*corev1.Pod, bool) {
 	ref, owned := ControllerOf(pod)
 	if !owned {
@@ -338,14 +360,51 @@ func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec
 		ObjectMeta: *pod.ObjectMeta.DeepCopy(),
 		Spec:       *template.Spec.DeepCopy(),
 	}
-	for k, v := range template.Labels {
-		if out.Labels == nil {
-			out.Labels = map[string]string{}
-		}
-		out.Labels[k] = v
-	}
+	out.Labels = maps.Clone(template.Labels)
+	raiseRequests(out, pod)
 	// NodeName comes from the template and nowhere else, which is what makes a
 	// pinned template visible: every running pod names a node, so inheriting
 	// it would hide exactly the case worth catching.
 	return out, true
+}
+
+// raiseRequests lifts each of the replacement's container requests to the
+// running pod's where the running pod asks for more.
+//
+// Container-by-container and resource-by-resource, matched by name: a sidecar
+// present only on the running pod is carried over wholesale, since admission
+// will inject it again and the node must have room for it.
+func raiseRequests(replacement, running *corev1.Pod) {
+	raise := func(target *[]corev1.Container, source []corev1.Container) {
+		byName := map[string]int{}
+		for i := range *target {
+			byName[(*target)[i].Name] = i
+		}
+		for _, from := range source {
+			i, known := byName[from.Name]
+			if !known {
+				// Injected at admission, so it will be injected again.
+				(*target) = append(*target, *from.DeepCopy())
+				continue
+			}
+			into := &(*target)[i]
+			if into.Resources.Requests == nil && len(from.Resources.Requests) > 0 {
+				into.Resources.Requests = corev1.ResourceList{}
+			}
+			for name, quantity := range from.Resources.Requests {
+				if have, ok := into.Resources.Requests[name]; !ok || quantity.Cmp(have) > 0 {
+					into.Resources.Requests[name] = quantity.DeepCopy()
+				}
+			}
+		}
+	}
+
+	raise(&replacement.Spec.Containers, running.Spec.Containers)
+	raise(&replacement.Spec.InitContainers, running.Spec.InitContainers)
+
+	// RuntimeClass overhead is added by admission from the class, so the
+	// running pod carries it and the template does not.
+	if replacement.Spec.Overhead == nil {
+		replacement.Spec.Overhead = running.Spec.Overhead.DeepCopy()
+	}
 }
