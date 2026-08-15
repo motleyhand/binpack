@@ -35,6 +35,16 @@ everything else to its base unit. The map is deliberately open rather than a str
 memory and pods: the scheduler accounts for `ephemeral-storage`, `hugepages-*` and extended
 resources like `nvidia.com/gpu` on equal terms, and a fixed struct would silently ignore them.
 
+The numbers in that map are **scheduler-effective**, not raw. Computing them means taking the
+maximum of init-container peaks and regular-container sums, folding in native sidecars, adding
+RuntimeClass `spec.overhead`, and synthesising the `pods: 1` entry that no pod spec carries but
+every node's `allocatable` limits. All of that happens in `internal/collect`, using
+`k8s.io/component-helpers/resource` rather than hand-rolled arithmetic.
+
+This is the boundary earning its keep. The engine subtracts maps from maps and needs no
+knowledge of init containers, sandbox overhead, or which keys are special — while the fiddly,
+version-sensitive part lives in one place, delegated to upstream code that is already correct.
+
 `Decision` carries the verdict **and the arithmetic that produced it**: which node was chosen,
 what would need to relocate, how much room exists elsewhere, and for every rejected candidate,
 the specific reason it was rejected.

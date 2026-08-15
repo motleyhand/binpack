@@ -146,7 +146,37 @@ real scheduler leaves the pod Pending until the autoscaler adds a node. Iteratin
 resource names actually present is both more correct and less code, and it means binpack
 supports resources that did not exist when it was written.
 
-Pod count needs no special case — `pods` is itself an entry in `status.allocatable`.
+#### What counts as a pod's request
+
+The map a pod contributes is **not** a copy of `resources.requests`. Building it naively
+under-reserves the destination in three separate ways, each of which lets the simulation approve
+a node that cannot host the pod.
+
+**Init containers and sidecars.** The scheduler reserves the *effective* pod request, which for
+each resource is the larger of the sum across regular containers and the peak across init
+containers — because init containers run sequentially before the regular ones, but the regular
+ones run concurrently. Native sidecars (init containers with `restartPolicy: Always`) stay
+running, so they add to the running total rather than participating in the maximum. A pod with a
+lightweight main container and a 2GB init container needs 2GB at admission time.
+
+**Pod overhead.** `spec.overhead`, populated from the RuntimeClass, is added on top. It is the
+resource cost of the sandbox itself, and clusters using gVisor or Kata have a non-trivial amount
+of it.
+
+This arithmetic is fiddly and upstream already gets it right, so `internal/collect` uses
+`k8s.io/component-helpers/resource` rather than hand-rolling it. That is precisely the kind of
+work the collect boundary exists for: the engine receives a finished number and stays free of
+Kubernetes libraries.
+
+**Pod slots.** `pods` appears in `status.allocatable` but never in a pod's requests, so a
+uniform "subtract request from remaining" loop would never consume a slot, and the simulation
+would happily pack an unlimited number of pods onto a node capped at 110. Every pod's request
+map therefore carries a synthetic `pods: 1`, added during collection. The kubelet's pod limit is
+a real scheduling constraint and a genuine ceiling that clusters hit while showing plenty of
+free CPU and memory.
+
+Synthesising the entry at the collect boundary keeps the engine's arithmetic uniform: it
+subtracts maps from maps and knows nothing about which keys are special.
 
 #### The simulation approximates the scheduler; it does not reimplement it
 
@@ -231,8 +261,22 @@ A drain that will hit a PodDisruptionBudget wall should be predicted and skipped
 and failed. binpack checks PDB slack, the `cluster-autoscaler.kubernetes.io/safe-to-evict`
 annotation, controller ownership, local storage, and node selectors and affinity.
 
-**PDB slack is evaluated conservatively from current status.** A PDB reporting zero allowed
-disruptions blocks the candidate, full stop.
+**PDB demand is aggregated across the whole drain, not checked per pod.** Draining a node is not
+one eviction, it is many, and they all draw on the same allowances. So for every PDB, binpack
+counts how many of the candidate's pods match it and requires that total to be within the PDB's
+current `disruptionsAllowed`.
+
+Checking only for zero would be insufficient in a common case: two pods of the same Deployment
+landing on one node, with `disruptionsAllowed: 1`. The zero test passes, the first eviction
+consumes the sole allowance, the second is refused, and the node is left cordoned and half
+drained until the uncordon safeguard fires. Requiring `matching pods ≤ disruptionsAllowed` per
+PDB rejects that candidate before anything is touched.
+
+This is conservative in a knowable way. An allowance does replenish once an evicted pod's
+replacement becomes ready elsewhere, so a patient sequential drain might eventually succeed
+where this check refuses. binpack does not attempt that: it would mean holding a node cordoned
+for an unbounded time while betting on rescheduling that has not happened yet. Refusing costs a
+missed consolidation the next run may find; proceeding costs a half-drained node.
 
 It is worth being explicit about a common misconception, because it explains otherwise baffling
 cluster behaviour. A Deployment with one replica and a PDB of `minAvailable: 1` allows zero
