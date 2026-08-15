@@ -1,0 +1,365 @@
+package engine_test
+
+import (
+	"strings"
+	"testing"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+
+	"github.com/motleyhand/binpack/internal/engine"
+	"github.com/motleyhand/binpack/internal/mother"
+)
+
+const (
+	poolID   = "da8977ba-244f"
+	poolName = "pool-4g"
+)
+
+var now = time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+
+// cluster is a working three-node autoscaling pool above its minimum, which
+// every test then perturbs in exactly one way.
+func cluster(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
+	return engine.Snapshot{
+		Nodes: nodes,
+		Pods:  pods,
+		Now:   now,
+		Autoscaler: engine.Autoscaler{
+			Running: true,
+			Groups: []engine.NodeGroup{
+				{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: len(nodes)},
+			},
+		},
+	}
+}
+
+func inPool(name string, opts ...mother.NodeOption) *corev1.Node {
+	return sized(name, "4Gi", append([]mother.NodeOption{mother.InPool(poolName, poolID)}, opts...)...)
+}
+
+func config() engine.Config {
+	return engine.Config{
+		NodeGroupIDLabel: "doks.digitalocean.com/node-pool-id",
+		PoolNameLabel:    "doks.digitalocean.com/node-pool",
+		Default: engine.Policy{
+			Enabled: true,
+			Sim:     engine.SimConfig{ExpendablePriorityCutoff: cutoff},
+			Evict:   engine.DefaultEvictConfig(),
+		},
+	}
+}
+
+func assessmentFor(d engine.Decision, node string) *engine.NodeAssessment {
+	for i := range d.Assessments {
+		if d.Assessments[i].Node.Name == node {
+			return &d.Assessments[i]
+		}
+	}
+	return nil
+}
+
+func TestDrainsTheEmptiestFeasibleNode(t *testing.T) {
+	nodes := []*corev1.Node{inPool("a"), inPool("b"), inPool("c")}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "heavy", mother.OnNode("a"), mother.Requests("100m", "1Gi")),
+		mother.Pod("default", "light", mother.OnNode("b"), mother.Requests("100m", "128Mi")),
+	}
+
+	d := engine.Decide(cluster(nodes, pods), config())
+
+	if d.Action != engine.Drain {
+		t.Fatalf("expected a drain, got none: %s", d.Reason)
+	}
+	// c is empty, so it is the cheapest to remove.
+	if d.Node.Name != "c" {
+		t.Errorf("drained %s, want the emptiest node c", d.Node.Name)
+	}
+}
+
+func TestRefusesWithoutAnAutoscaler(t *testing.T) {
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.Running = false
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatal("binpack must not drain when nothing would remove the node")
+	}
+	if !strings.Contains(d.Reason, "no cluster-autoscaler") {
+		t.Errorf("reason should say why, got: %s", d.Reason)
+	}
+}
+
+func TestWaitsAfterAScaleUp(t *testing.T) {
+	// Draining straight after the cluster grew is how oscillation starts —
+	// and the autoscaler pauses its own scale-down then anyway.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.LastScaleUp = now.Add(-2 * time.Minute)
+
+	cfg := config()
+	cfg.Default.CooldownAfterScaleUp = 10 * time.Minute
+
+	d := engine.Decide(s, cfg)
+
+	if d.Action != engine.None {
+		t.Fatal("expected to wait")
+	}
+	if !strings.Contains(d.Reason, "scaled up") {
+		t.Errorf("reason should mention the scale-up, got: %s", d.Reason)
+	}
+}
+
+func TestActsOnceTheCooldownHasPassed(t *testing.T) {
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.LastScaleUp = now.Add(-30 * time.Minute)
+
+	cfg := config()
+	cfg.Default.CooldownAfterScaleUp = 10 * time.Minute
+
+	if d := engine.Decide(s, cfg); d.Action != engine.Drain {
+		t.Fatalf("the cooldown has passed, expected a drain: %s", d.Reason)
+	}
+}
+
+func TestSkipReasons(t *testing.T) {
+	tests := []struct {
+		name  string
+		node  *corev1.Node
+		want  string
+		setup func(*engine.Snapshot, *engine.Config)
+	}{
+		{
+			name: "not in an autoscaling pool",
+			node: sized("static", "4Gi"), // no pool labels
+			want: "not part of an autoscaling pool",
+		},
+		{
+			name: "explicitly annotated",
+			node: inPool("skipped", mother.NodeAnnotations(map[string]string{
+				engine.AnnotationSkip: "true",
+			})),
+			want: "annotated",
+		},
+		{
+			name: "a drain is already running",
+			node: inPool("draining", mother.NodeAnnotations(map[string]string{
+				engine.AnnotationDrainStarted: now.Add(-time.Minute).Format(time.RFC3339),
+			})),
+			want: "drain is already in progress",
+		},
+		{
+			name: "in backoff after a failure",
+			node: inPool("failed", mother.NodeAnnotations(map[string]string{
+				engine.AnnotationBackoffUntil: now.Add(time.Hour).Format(time.RFC3339),
+				engine.AnnotationLastFailure:  "pod stuck terminating",
+			})),
+			want: "in backoff",
+		},
+		{
+			name: "already cordoned by someone else",
+			node: inPool("cordoned", mother.Cordoned()),
+			want: "already cordoned",
+		},
+		{
+			name: "pool disabled",
+			node: inPool("disabled"),
+			want: "disabled for this pool",
+			setup: func(_ *engine.Snapshot, c *engine.Config) {
+				c.ByPool = map[string]engine.Policy{poolID: {Enabled: false}}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			// Two healthy nodes alongside, so the pool is above its minimum
+			// and the subject node is the only interesting one.
+			nodes := []*corev1.Node{tc.node, inPool("healthy-1"), inPool("healthy-2")}
+			s := cluster(nodes, nil)
+			cfg := config()
+			if tc.setup != nil {
+				tc.setup(&s, &cfg)
+			}
+
+			d := engine.Decide(s, cfg)
+
+			a := assessmentFor(d, tc.node.Name)
+			if a == nil {
+				t.Fatalf("every node must be accounted for; %s was not", tc.node.Name)
+			}
+			if !a.Skipped {
+				t.Fatalf("%s should have been skipped", tc.node.Name)
+			}
+			if !strings.Contains(a.SkipReason, tc.want) {
+				t.Errorf("skip reason = %q, want it to mention %q", a.SkipReason, tc.want)
+			}
+			if d.Action == engine.Drain && d.Node.Name == tc.node.Name {
+				t.Error("a skipped node must not be drained")
+			}
+		})
+	}
+}
+
+func TestPoolAtMinimumIsLeftAlone(t *testing.T) {
+	// At the minimum the autoscaler simply replaces whatever is drained, so
+	// the drain is pure churn.
+	nodes := []*corev1.Node{inPool("a"), inPool("b")}
+	s := cluster(nodes, nil)
+	s.Autoscaler.Groups[0].MinSize = 2
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatal("a pool at its minimum must not be drained")
+	}
+	if a := assessmentFor(d, "a"); a == nil || !strings.Contains(a.SkipReason, "minimum size") {
+		t.Errorf("reason should name the floor, got %+v", a)
+	}
+}
+
+func TestInfeasibleNodeIsReportedNotDrained(t *testing.T) {
+	// Everything is full, so nothing can move.
+	nodes := []*corev1.Node{inPool("a"), inPool("b")}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "big-a", mother.OnNode("a"), mother.Requests("100m", "3Gi")),
+		mother.Pod("default", "big-b", mother.OnNode("b"), mother.Requests("100m", "3Gi")),
+	}
+
+	d := engine.Decide(cluster(nodes, pods), config())
+
+	if d.Action != engine.None {
+		t.Fatal("neither node's workload fits on the other")
+	}
+	a := assessmentFor(d, "a")
+	if a == nil || a.Simulation == nil || a.Simulation.Feasible {
+		t.Fatalf("the simulation should be recorded and infeasible, got %+v", a)
+	}
+	if a.Simulation.Blocked == nil || a.Simulation.Blocked.Pod == nil {
+		t.Error("an infeasible simulation should name the pod with nowhere to go")
+	}
+	if !strings.Contains(d.Reason, "fits elsewhere") {
+		t.Errorf("summary should say what went wrong, got: %s", d.Reason)
+	}
+}
+
+func TestEvictionBlockersPreventADrain(t *testing.T) {
+	// The workload fits, but a disruption budget will not let it move.
+	labelled := map[string]string{"app": "web"}
+	// b is annotated skip so it is a destination but not a candidate,
+	// leaving a as the only node under consideration. A skipped node is
+	// still somewhere pods can go — it is only excluded from being drained.
+	nodes := []*corev1.Node{
+		inPool("a"),
+		inPool("b", mother.NodeAnnotations(map[string]string{engine.AnnotationSkip: "true"})),
+	}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web-1", mother.OnNode("a"),
+			mother.PodLabels(labelled), mother.Requests("100m", "128Mi")),
+	}
+	s := cluster(nodes, pods)
+	s.PDBs = []*policyv1.PodDisruptionBudget{mother.PDB("default", "web", 0, labelled)}
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatal("a pod that cannot be evicted must stop the drain")
+	}
+	a := assessmentFor(d, "a")
+	if a == nil || len(a.Blockers) == 0 {
+		t.Fatalf("the blocker should be recorded against the node, got %+v", a)
+	}
+	if a.Simulation == nil || !a.Simulation.Feasible {
+		t.Error("the simulation succeeded; it is eviction that failed, and explain must show both")
+	}
+}
+
+func TestTriesEveryEligibleNode(t *testing.T) {
+	// The emptiest node is blocked by a budget, so binpack should move on
+	// rather than give up — ordering is a preference, not a filter.
+	labelled := map[string]string{"app": "stuck"}
+	nodes := []*corev1.Node{inPool("blocked"), inPool("free"), inPool("spare")}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "stuck-1", mother.OnNode("blocked"),
+			mother.PodLabels(labelled), mother.Requests("100m", "128Mi")),
+		mother.Pod("default", "movable", mother.OnNode("free"), mother.Requests("100m", "256Mi")),
+	}
+	s := cluster(nodes, pods)
+	s.PDBs = []*policyv1.PodDisruptionBudget{mother.PDB("default", "stuck", 0, labelled)}
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.Drain {
+		t.Fatalf("another node was drainable: %s", d.Reason)
+	}
+	if d.Node.Name == "blocked" {
+		t.Fatal("drained the node whose pod cannot be evicted")
+	}
+}
+
+func TestMaxPodsPerDrainCapsBlastRadius(t *testing.T) {
+	// roomy is a destination but not a candidate, so busy is the only node
+	// the cap can apply to.
+	nodes := []*corev1.Node{
+		inPool("busy"),
+		inPool("roomy", mother.NodeAnnotations(map[string]string{engine.AnnotationSkip: "true"})),
+	}
+	var pods []*corev1.Pod
+	for _, name := range []string{"p1", "p2", "p3"} {
+		pods = append(pods, mother.Pod("default", name,
+			mother.OnNode("busy"), mother.Requests("50m", "64Mi")))
+	}
+
+	cfg := config()
+	cfg.Default.MaxPodsPerDrain = 2
+
+	d := engine.Decide(cluster(nodes, pods), cfg)
+
+	if d.Action != engine.None {
+		t.Fatalf("three pods exceeds the cap of two, got a drain of %s", d.Node.Name)
+	}
+	if a := assessmentFor(d, "busy"); a == nil || !strings.Contains(a.SkipReason, "above the limit") {
+		t.Errorf("reason should name the cap, got %+v", a)
+	}
+}
+
+func TestExcludedNamespaceProtectsItsNode(t *testing.T) {
+	// The pods are protected, not ignored: removing them from the arithmetic
+	// while leaving them on the node would be unsound.
+	nodes := []*corev1.Node{inPool("a"), inPool("b")}
+	pods := []*corev1.Pod{
+		mother.Pod("payments", "ledger", mother.OnNode("a"), mother.Requests("100m", "128Mi")),
+	}
+
+	cfg := config()
+	cfg.Default.ExcludedNamespaces = []string{"payments"}
+
+	d := engine.Decide(cluster(nodes, pods), cfg)
+
+	if d.Action == engine.Drain && d.Node.Name == "a" {
+		t.Fatal("a node hosting an excluded namespace must not be drained")
+	}
+	if a := assessmentFor(d, "a"); a == nil || !strings.Contains(a.SkipReason, "payments") {
+		t.Errorf("reason should name the namespace, got %+v", a)
+	}
+}
+
+func TestEveryNodeIsAccountedFor(t *testing.T) {
+	// explain has to describe the whole cluster, not only the interesting
+	// part. A node missing from the assessments is a node an operator cannot
+	// ask about.
+	nodes := []*corev1.Node{
+		inPool("a"), inPool("b"),
+		sized("static", "4Gi"),
+		inPool("skipped", mother.NodeAnnotations(map[string]string{engine.AnnotationSkip: "true"})),
+	}
+
+	d := engine.Decide(cluster(nodes, nil), config())
+
+	for _, node := range nodes {
+		if assessmentFor(d, node.Name) == nil {
+			t.Errorf("%s is missing from the assessments", node.Name)
+		}
+	}
+}
