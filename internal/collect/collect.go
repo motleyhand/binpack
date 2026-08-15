@@ -92,7 +92,7 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 	}
 	for i := range replicaSets.Items {
 		rs := &replicaSets.Items[i]
-		out[engine.OwnerRef{Namespace: rs.Namespace, Kind: "ReplicaSet", Name: rs.Name}] = &rs.Spec.Template
+		out[engine.OwnerRef{Namespace: rs.Namespace, APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID}] = &rs.Spec.Template
 	}
 
 	var statefulSets appsv1.StatefulSetList
@@ -101,7 +101,7 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 	}
 	for i := range statefulSets.Items {
 		sts := &statefulSets.Items[i]
-		out[engine.OwnerRef{Namespace: sts.Namespace, Kind: "StatefulSet", Name: sts.Name}] = &sts.Spec.Template
+		out[engine.OwnerRef{Namespace: sts.Namespace, APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID}] = &sts.Spec.Template
 	}
 
 	// DaemonSet pods are node-local and never relocated, so their templates are
@@ -114,7 +114,7 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 	}
 	for i := range daemonSets.Items {
 		ds := &daemonSets.Items[i]
-		out[engine.OwnerRef{Namespace: ds.Namespace, Kind: "DaemonSet", Name: ds.Name}] = &ds.Spec.Template
+		out[engine.OwnerRef{Namespace: ds.Namespace, APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID}] = &ds.Spec.Template
 	}
 
 	var jobs batchv1.JobList
@@ -123,7 +123,7 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 	}
 	for i := range jobs.Items {
 		job := &jobs.Items[i]
-		out[engine.OwnerRef{Namespace: job.Namespace, Kind: "Job", Name: job.Name}] = &job.Spec.Template
+		out[engine.OwnerRef{Namespace: job.Namespace, APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID}] = &job.Spec.Template
 	}
 
 	return out, nil

@@ -185,6 +185,31 @@ admission chain, which is far outside what this project should do. It is bounded
 placement the scheduler refuses, which stalls the drain and backs off rather than causing a
 scale-up, because the pod is rejected rather than left unschedulable somewhere new.
 
+#### Open: admission-added placement constraints
+
+Requests are merged safely because the larger of two figures is meaningful. Placement
+constraints are not: a mutating webhook that adds a `nodeSelector`, a required affinity term, a
+toleration, a scheduler name or a volume leaves the template looking *less* constrained than the
+pod the scheduler will receive, and there is no "larger of" for an affinity term.
+
+The obvious remedy — refuse whenever the running pod carries a constraint its template does not
+— was implemented and then withdrawn, because measuring it showed it refuses almost everything.
+On a real cluster with no service mesh it produced **80 refusals across essentially every
+workload**, none of them from a webhook. The API server defaults fields that no template carries:
+the `node.kubernetes.io/not-ready` and `unreachable` tolerations added to every pod, a
+`schedulerName` of `default-scheduler`, the projected service-account token volume. A naive
+comparison measures defaulting, not divergence.
+
+Closing it properly therefore needs a comparison that knows what the API server adds on its own,
+so that it can refuse on a webhook's `nodeSelector` while ignoring a defaulted toleration. That
+is a real piece of work and it is recorded here rather than approximated, because an
+approximation that refuses every pod on every cluster is worse than the gap: binpack would be
+sound and useless, and nobody would run it long enough to benefit.
+
+The gap is bounded in the same way as the others. A replacement the scheduler refuses is a pod
+that never becomes Pending on another node, so the drain stalls and backs off rather than
+provoking a scale-up.
+
 **Verifying the first case mattered more than it looks.** The obvious cheaper fix — compare the
 pod's requests against what its container statuses report as allocated — does not work, and the
 API says so: the kubelet sets `allocatedResources` to the new value *after* a successful resize,

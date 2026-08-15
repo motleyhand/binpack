@@ -184,7 +184,7 @@ func TestSnapshotReadsATemplateForEveryOwningKind(t *testing.T) {
 	// four are owners a pod can name.
 	r := reader(
 		&appsv1.ReplicaSet{
-			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web-rs"},
+			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web-rs", UID: "rs-uid"},
 			Spec:       appsv1.ReplicaSetSpec{Template: template("web")},
 		},
 		&appsv1.StatefulSet{
@@ -211,10 +211,10 @@ func TestSnapshotReadsATemplateForEveryOwningKind(t *testing.T) {
 		ref   engine.OwnerRef
 		image string
 	}{
-		{engine.OwnerRef{Namespace: "default", Kind: "ReplicaSet", Name: "web-rs"}, "web"},
-		{engine.OwnerRef{Namespace: "default", Kind: "StatefulSet", Name: "db"}, "db"},
-		{engine.OwnerRef{Namespace: "kube-system", Kind: "DaemonSet", Name: "cilium"}, "cilium"},
-		{engine.OwnerRef{Namespace: "default", Kind: "Job", Name: "backfill"}, "backfill"},
+		{engine.OwnerRef{Namespace: "default", APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-rs", UID: "rs-uid"}, "web"},
+		{engine.OwnerRef{Namespace: "default", APIVersion: "apps/v1", Kind: "StatefulSet", Name: "db"}, "db"},
+		{engine.OwnerRef{Namespace: "kube-system", APIVersion: "apps/v1", Kind: "DaemonSet", Name: "cilium"}, "cilium"},
+		{engine.OwnerRef{Namespace: "default", APIVersion: "batch/v1", Kind: "Job", Name: "backfill"}, "backfill"},
 	} {
 		got, ok := s.Templates[want.ref]
 		if !ok {
@@ -235,6 +235,8 @@ func TestTemplatesAreKeyedByNamespaceSoNamesCanRepeat(t *testing.T) {
 	// "web-rs" in two namespaces is two different workloads. Keying on name
 	// alone would hand one namespace's pods the other's template — a silent
 	// wrong answer of exactly the kind reading templates exists to prevent.
+	// The key carries apiVersion and UID for the same reason: a custom
+	// resource sharing a kind and name, or a controller recreated under one.
 	r := reader(
 		&appsv1.ReplicaSet{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "staging", Name: "web-rs"},
@@ -253,7 +255,7 @@ func TestTemplatesAreKeyedByNamespaceSoNamesCanRepeat(t *testing.T) {
 	}
 
 	for _, ns := range []string{"staging", "production"} {
-		ref := engine.OwnerRef{Namespace: ns, Kind: "ReplicaSet", Name: "web-rs"}
+		ref := engine.OwnerRef{Namespace: ns, APIVersion: "apps/v1", Kind: "ReplicaSet", Name: "web-rs"}
 		got, ok := s.Templates[ref]
 		if !ok {
 			t.Fatalf("no template for %s/web-rs", ns)

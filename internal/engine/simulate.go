@@ -7,6 +7,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/motleyhand/binpack/internal/fit"
 )
@@ -299,8 +300,15 @@ func freeMemory(remaining corev1.ResourceList) int64 {
 // will be built from.
 type OwnerRef struct {
 	Namespace string
-	Kind      string
-	Name      string
+	// APIVersion and UID are part of the key, not decoration. Kind and name
+	// alone alias a custom resource onto a built-in one that happens to share
+	// them, and alias a controller onto its own deleted predecessor — either
+	// of which would hand a pod an unrelated workload's template and size the
+	// move for the wrong shape.
+	APIVersion string
+	Kind       string
+	Name       string
+	UID        types.UID
 }
 
 // ControllerOf returns the reference to a pod's controlling owner.
@@ -309,7 +317,13 @@ func ControllerOf(pod *corev1.Pod) (OwnerRef, bool) {
 	if owner == nil {
 		return OwnerRef{}, false
 	}
-	return OwnerRef{Namespace: pod.Namespace, Kind: owner.Kind, Name: owner.Name}, true
+	return OwnerRef{
+		Namespace:  pod.Namespace,
+		APIVersion: owner.APIVersion,
+		Kind:       owner.Kind,
+		Name:       owner.Name,
+		UID:        owner.UID,
+	}, true
 }
 
 // replacement is the pod that will exist after this one is evicted.
@@ -359,6 +373,11 @@ func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec
 	out := &corev1.Pod{
 		ObjectMeta: *pod.ObjectMeta.DeepCopy(),
 		Spec:       *template.Spec.DeepCopy(),
+		// Carried over so the status-based checks still apply to the
+		// replacement. Without it fit sees an empty Status, and an in-flight
+		// resize — whose requests are changing underneath the snapshot — stops
+		// being refused at exactly the moment it matters most.
+		Status: *pod.Status.DeepCopy(),
 	}
 	out.Labels = maps.Clone(template.Labels)
 	raiseRequests(out, pod)

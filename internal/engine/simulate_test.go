@@ -594,3 +594,21 @@ func TestRuntimeClassOverheadSurvivesOnTheReplacement(t *testing.T) {
 		t.Error("dropped the sandbox overhead: 512Mi + 700Mi does not fit 1Gi")
 	}
 }
+
+func TestAnInFlightResizeIsStillRefusedOnTheReplacement(t *testing.T) {
+	// The replacement is synthesised, so an empty Status would silently drop
+	// every status-based refusal — including the one for requests that are
+	// changing underneath the snapshot, which is where reasoning through them
+	// is least defensible.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	resizing := mother.Pod("default", "web", mother.OnNode("candidate"), mother.Resizing())
+	pods := []*corev1.Pod{resizing}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Error("reasoned through a pod whose requests are changing underneath the snapshot")
+	}
+}
