@@ -18,11 +18,18 @@ spec:
         {{- with .Values.podAnnotations }}
         {{- toYaml . | nindent 8 }}
         {{- end }}
-      labels:
-        {{- include "binpack.selectorLabels" . | nindent 8 }}
-        {{- with .Values.podLabels }}
-        {{- toYaml . | nindent 8 }}
-        {{- end }}
+      # Merged rather than concatenated, with the selector labels taking
+      # precedence. Appending podLabels would let one set
+      # app.kubernetes.io/name to something else, producing either a duplicate
+      # YAML key or a Deployment whose selector no longer matches its own pod
+      # template — which the API server rejects.
+      # merge fills the first argument from the second without overwriting it,
+      # so the selector labels must be the first — piping podLabels in would
+      # make them the source and let a user's value win, which is the whole
+      # thing this guards against.
+      labels: {{- merge (include "binpack.selectorLabels" . | fromYaml)
+                        (deepCopy (.Values.podLabels | default dict))
+                  | toYaml | nindent 8 }}
     spec:
       serviceAccountName: {{ include "binpack.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
