@@ -605,7 +605,12 @@ to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
 8. `internal/collect`, preflight, and `binpack explain`. Integration-tested against real API
    fixtures — init containers, RuntimeClass overhead, extended resources — since a wrong number
    here produces a confidently wrong decision no engine unit test can catch
-9. `binpack diagnose`
+9. `binpack diagnose`. Reports what blocks scale-down and never remediates: patching a
+   disruption budget from a cost tool is both a policy decision that is not binpack's to make
+   and one Flux or Argo would reconcile away within minutes, leaving a tool whose reported
+   actions did not happen. Severity and prose are properties of the *code* rather than of each
+   finding, so instances collapse into one explanation with many subjects. See
+   [the diagnostics reference](../reference/diagnostics.md).
 10. `binpack run`, dry-run only
 11. Executor: cordon, evict, verify, uncordon; cooldown and backoff state.
     **Blocked on** `collect` reading owner templates: until binpack derives the replacement
@@ -614,7 +619,11 @@ to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
     on a decision; not harmless once something does. See
     [ADR-0006](adr-0006-scheduler-fidelity.md).
 12. Helm chart and RBAC
-13. Release pipeline
+13. Release pipeline. **Includes migrating `.goreleaser.yaml` from `dockers` to `dockers_v2`**,
+    which GoReleaser now warns is being phased out. Deliberately deferred to here rather than
+    done piecemeal: the publishing configuration is written in this step anyway, and the new
+    schema is not yet in GoReleaser's published `schema.json`, so it should be verified against
+    the version CI actually runs rather than guessed at.
 
 Each of steps 4 onward gets its own specification before implementation.
 

@@ -16,6 +16,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/intstr"
 )
 
 // NodeOption customises a node archetype.
@@ -399,14 +400,50 @@ func Tolerating(key string, effect corev1.TaintEffect) PodOption {
 // disruptionsAllowed is status rather than spec: it is what the controller
 // computed from current replica health, and it is what the eviction API
 // actually consults.
+//
+// The rest of the status is filled in to match — a two-replica workload, both
+// healthy, requiring however many the allowance implies. A budget carrying
+// only an allowance is not a budget any cluster produces, and one with
+// expectedPods left at zero is indistinguishable from a budget whose selector
+// matches nothing, which is a real and separately diagnosable condition.
 func PDB(namespace, name string, disruptionsAllowed int32, selector map[string]string) *policyv1.PodDisruptionBudget {
+	const replicas = 2
+	desired := int32(replicas) - disruptionsAllowed
+	minAvailable := intstr.FromInt32(desired)
+
 	return &policyv1.PodDisruptionBudget{
 		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
 		Spec: policyv1.PodDisruptionBudgetSpec{
-			Selector: &metav1.LabelSelector{MatchLabels: selector},
+			Selector:     &metav1.LabelSelector{MatchLabels: selector},
+			MinAvailable: &minAvailable,
 		},
-		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: disruptionsAllowed},
+		Status: policyv1.PodDisruptionBudgetStatus{
+			DisruptionsAllowed: disruptionsAllowed,
+			ExpectedPods:       replicas,
+			CurrentHealthy:     replicas,
+			DesiredHealthy:     desired,
+		},
 	}
+}
+
+// Replicas sets how many pods a budget selects, independently of how many are
+// healthy. The gap between the two is what separates a budget temporarily out
+// of slack from one that can never have any.
+func Replicas(pdb *policyv1.PodDisruptionBudget, expected int32) *policyv1.PodDisruptionBudget {
+	pdb.Status.ExpectedPods = expected
+	return pdb
+}
+
+// SelectsNothing empties a budget's status the way the disruption controller
+// does when its selector matches no pods — as a chart whose pod labels changed
+// leaves behind. Such a budget blocks nothing and protects nothing, and looks
+// identical to a healthy one until you read expectedPods.
+func SelectsNothing(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	pdb.Status.ExpectedPods = 0
+	pdb.Status.CurrentHealthy = 0
+	pdb.Status.DesiredHealthy = 0
+	pdb.Status.DisruptionsAllowed = 0
+	return pdb
 }
 
 // Bare removes the controller reference, making the pod one nothing would
@@ -451,6 +488,21 @@ func SafeToEvict(value string) PodOption {
 	return Annotated("cluster-autoscaler.kubernetes.io/safe-to-evict", value)
 }
 
+// Pending is a pod the scheduler has not placed. It holds no node open — and
+// for a pod below the autoscaler's expendable cutoff, being unplaced is itself
+// the failure, since the autoscaler will not scale up to accommodate one.
+func Pending() PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.NodeName = ""
+		p.Status.Phase = corev1.PodPending
+		p.Status.Conditions = []corev1.PodCondition{{
+			Type:   corev1.PodScheduled,
+			Status: corev1.ConditionFalse,
+			Reason: corev1.PodReasonUnschedulable,
+		}}
+	}
+}
+
 // Unready flips the pod's Ready condition, as a CrashLoopBackOff replica has.
 func Unready() PodOption {
 	return func(p *corev1.Pod) {
@@ -462,11 +514,15 @@ func Unready() PodOption {
 	}
 }
 
-// Healthy sets a budget's health counters, which decide whether an unready
-// pod can be evicted without consuming the allowance.
+// Healthy sets a budget's health counters, which decide whether an unready pod
+// can be evicted without consuming the allowance. expectedPods is widened to
+// match, since a budget cannot desire more replicas than it selects.
 func Healthy(pdb *policyv1.PodDisruptionBudget, current, desired int32) *policyv1.PodDisruptionBudget {
 	pdb.Status.CurrentHealthy = current
 	pdb.Status.DesiredHealthy = desired
+	if pdb.Status.ExpectedPods < desired {
+		pdb.Status.ExpectedPods = desired
+	}
 	return pdb
 }
 

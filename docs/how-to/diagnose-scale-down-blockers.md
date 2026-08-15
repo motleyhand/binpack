@@ -3,6 +3,15 @@
 A sequence of read-only commands for working out why a node is still there. Nothing here
 modifies anything, so it is safe to run against production.
 
+> **`binpack diagnose` does all of this in one command**, including the checks that are hard to
+> do by hand — a budget matching no pods, a pod matched by two. It needs no configuration and no
+> installation, and `--fail-on blocking` makes it a CI gate. See the
+> [diagnostics reference](../reference/diagnostics.md).
+>
+> The manual sequence below is still worth knowing: it is what the tool is doing, it works when
+> you have no binary to hand, and it shows you the raw objects rather than binpack's reading of
+> them.
+
 This works on managed Kubernetes where the autoscaler's own logs are unreachable. For the
 background on *why* each of these matters, see
 [why your cluster doesn't shrink](../explanation/why-clusters-dont-shrink.md).

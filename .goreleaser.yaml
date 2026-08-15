@@ -41,6 +41,10 @@ checksum:
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
 
+# GoReleaser warns that `dockers` is being phased out in favour of
+# `dockers_v2`. Migrating with the publishing configuration in the release
+# pipeline step, rather than guessing at a schema that is not yet in the
+# published schema.json. See the architecture spec's roadmap.
 dockers:
   # Single-arch for now: multi-arch needs QEMU and a manifest, which arrives
   # with the publishing config rather than cluttering a build-only check.
