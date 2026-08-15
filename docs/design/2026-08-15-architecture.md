@@ -26,6 +26,7 @@ Fixed, and treated as public API from the first release:
 | API group | `binpack.motleyhand.com` |
 | Config `apiVersion` | `binpack.motleyhand.com/v1alpha1` |
 | Node opt-out annotation | `binpack.motleyhand.com/skip: "true"` |
+| Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-deadline` |
 | Metric prefix | `binpack_` |
 
 The opt-out annotation key is **not configurable**. A fixed key means one thing to document,
@@ -186,10 +187,16 @@ Deciding whether a pod can go on a node is delegated to a `FitChecker`, implemen
 requests, `nodeaffinity` for selectors and affinity, `corev1` for taints. Hand-rolling this is
 how the defects above arose in the first place.
 
-Two hard constraints are not modelled — required inter-pod (anti-)affinity, and topology spread
-with `whenUnsatisfiable: DoNotSchedule`. Their *presence* is detected, and any candidate holding
-such a pod is refused with that stated as the reason. Their soft counterparts are ignored
-outright, because they affect only the scheduler's scoring, never its filtering.
+What binpack understands is a **closed allowlist**, never a list of known exceptions. Stage 1
+models `NodeUnschedulable`, `NodeName`, `NodeAffinity` and `nodeSelector`, `NodeResourcesFit`
+and `TaintToleration`. A relocatable pod using anything outside that set — a `hostPort`, a
+persistent volume claim, required inter-pod affinity, hard topology spread, a custom scheduler —
+makes its node an invalid candidate, with the specific feature named as the reason.
+
+The direction matters: a denylist of constraints we remembered can never be complete, and every
+Kubernetes release lengthens it. An unrecognised feature must refuse by default. Soft
+constraints are the exception, ignored rather than refused, because they affect only scoring and
+can never cause a placement to fail.
 
 Every gap in the model must fail towards refusing to drain, and `internal/fit` is tested
 against a real `kube-scheduler` with a one-directional property: if binpack says a pod fits, the
@@ -289,6 +296,22 @@ where this check refuses. binpack does not attempt that: it would mean holding a
 for an unbounded time while betting on rescheduling that has not happened yet. Refusing costs a
 missed consolidation the next run may find; proceeding costs a half-drained node.
 
+**A pod matched by more than one PDB can never be evicted at all.** This is not a matter of
+allowances. The eviction subresource refuses outright:
+
+> This pod has more than one PodDisruptionBudget, which the eviction subresource does not
+> support.
+
+— returned as an HTTP **500**, which is neither retryable nor time-limited. Any candidate
+holding such a pod is refused.
+
+This is worth surfacing rather than merely handling, because it is close to invisible. Two PDBs
+with overlapping label selectors are easy to create by accident — a team-wide budget and a
+service-specific one — and neither object shows anything wrong. Both report healthy status and
+sensible allowed disruptions. The only symptom is that the pod is permanently unevictable, so
+its node can never be drained by anything, including `kubectl drain` and the cluster-autoscaler
+itself. `diagnose` reports it.
+
 It is worth being explicit about a common misconception, because it explains otherwise baffling
 cluster behaviour. A Deployment with one replica and a PDB of `minAvailable: 1` allows zero
 voluntary disruptions **permanently** at steady state. Rolling-update `maxSurge` does not
@@ -323,6 +346,36 @@ This is not optional bookkeeping. A cordoned node that the autoscaler never remo
 schedulable capacity: if the pool is at its maximum, later pods can stay Pending indefinitely
 while a healthy node sits idle. binpack must leave the cluster in a working state without
 human intervention, including when its own prediction was wrong.
+
+### The recovery state must outlive the process
+
+An in-memory timer is not good enough, because the failure it guards against and the failure
+that destroys it are the same kind of event. If binpack is OOM-killed, rescheduled, upgraded, or
+simply loses leader election between cordoning a node and observing its removal, an in-process
+watch dies with it. The node stays cordoned with nobody left who intends to uncordon it — the
+exact outcome the safeguard exists to prevent, reached by a different route.
+
+So the drain marker is written **on the node itself**, before the cordon:
+
+```
+binpack.motleyhand.com/drain-started:  2026-08-15T09:15:37Z
+binpack.motleyhand.com/drain-deadline: 2026-08-15T09:30:37Z
+```
+
+The node is the right home for it. It survives any process failure, it needs no CRD, ConfigMap
+or Lease, it requires no permission binpack does not already hold for cordoning, and it is
+self-cleaning: when the drain succeeds the node is deleted and the marker goes with it. It is
+also visible in `kubectl describe node`, so a human debugging a cordoned node finds out who
+cordoned it and when it was due to be released.
+
+On startup and on acquiring leadership, binpack reconciles before doing anything else: every
+node carrying a drain marker is either resumed, if its deadline is in the future, or uncordoned
+and recorded as failed, if the deadline has passed. Recovery therefore does not depend on the
+process that started the drain still being alive.
+
+One case remains unrecoverable by binpack alone: uninstalling it mid-drain leaves a marked,
+cordoned node with nothing running to release it. The marker makes that state self-describing
+rather than mysterious, and `diagnose` reports it.
 
 ## Configuration
 
@@ -370,9 +423,14 @@ only read access, and the means by which someone decides whether to trust the to
 
 ### diagnose reports; it never remediates
 
-`diagnose` will identify PodDisruptionBudgets that permit zero disruptions, pause pods below the
-expendable cutoff, unevictable pods, and nodes pinned by affinity. It will suggest the fix. It
-will not apply it.
+`diagnose` will identify PodDisruptionBudgets that permit zero disruptions, pods matched by more
+than one PDB and therefore permanently unevictable, pause pods below the expendable cutoff,
+other unevictable pods, nodes pinned by affinity, and nodes left cordoned with a stale binpack
+drain marker. It will suggest the fix. It will not apply it.
+
+Several of these are worth reporting even to someone who never installs binpack, because they
+block the cluster-autoscaler and `kubectl drain` just as thoroughly, and none of them announce
+themselves.
 
 Beyond the obvious risk of a cost tool mutating availability policy, there is a decisive
 practical reason: in any GitOps-managed cluster — Flux, Argo CD — a patched PDB is reconciled

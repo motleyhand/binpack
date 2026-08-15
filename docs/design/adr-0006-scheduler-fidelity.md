@@ -79,10 +79,39 @@ this use case.
 Resource fit against `status.allocatable` is implemented directly, since the rules are now
 understood and the inputs come from upstream.
 
-Two hard constraints are **not** modelled: required inter-pod affinity and anti-affinity, and
-topology spread with `whenUnsatisfiable: DoNotSchedule`. Their presence on any relocatable pod
-causes the candidate to be refused, with that stated as the reason in `explain` and recorded as
-a metric.
+#### What is modelled is a closed allowlist, not an open denylist
+
+An earlier draft named two constraints as unmodelled and implied the rest were covered. That
+structure is unsound, and demonstrably so: the list omitted `hostPort` conflicts, persistent
+volume node affinity and zone constraints, and CSI attachment limits, each of which can make
+every destination invalid while resource, affinity and taint checks all pass.
+
+A denylist of things we forgot can never be complete, and every future Kubernetes release adds
+to it. So the model is inverted. `internal/fit` maintains an **allowlist of pod features it
+knows how to reason about**, and any relocatable pod using a feature outside that list makes its
+node an invalid candidate, with the specific feature named as the reason.
+
+Stage 1 models the constraints corresponding to these scheduler Filter plugins:
+`NodeUnschedulable`, `NodeName`, `NodeAffinity` (including `nodeSelector`), `NodeResourcesFit`
+and `TaintToleration`.
+
+Everything else triggers a refusal. That includes, non-exhaustively: `hostPort` (`NodePorts`);
+any persistent volume claim, since deciding whether a volume can follow the pod means modelling
+`VolumeBinding`, `VolumeZone`, `VolumeRestrictions` and per-node CSI attachment limits; required
+inter-pod affinity or anti-affinity; topology spread with `whenUnsatisfiable: DoNotSchedule`; a
+non-default `schedulerName`; scheduling gates; and dynamic resource allocation claims.
+
+The point of the allowlist is that this paragraph does not have to be exhaustive for the design
+to be sound. An unrecognised feature refuses by default.
+
+The soft counterparts of these constraints — `preferredDuringSchedulingIgnoredDuringExecution`,
+`whenUnsatisfiable: ScheduleAnyway` — are ignored rather than refused, because they affect only
+scoring and can never cause a placement to fail.
+
+This is deliberately conservative, and it may turn out to be *too* conservative: refusing every
+pod with a PVC would exclude most stateful workloads. That is exactly what the metric is for.
+The initial allowlist membership is settled in the `internal/fit` specification, against
+measurement rather than intuition, and it can only grow as constraints are genuinely modelled.
 
 ### Stage 2: escalate only if measurement justifies it
 
