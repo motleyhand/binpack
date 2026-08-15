@@ -97,9 +97,10 @@ func (p *PoolPolicy) apply(o Policy) {
 		p.CooldownAfterDrain = o.Cooldown.AfterDrain.Duration
 	}
 	// An override replaces the namespace list rather than appending to it,
-	// so a pool can narrow the global set as well as widen it.
+	// so a pool can narrow the global set as well as widen it. A non-nil
+	// pointer to an empty list clears it entirely.
 	if o.Exclusions.Namespaces != nil {
-		p.ExcludedNamespaces = append([]string(nil), o.Exclusions.Namespaces...)
+		p.ExcludedNamespaces = append([]string(nil), *o.Exclusions.Namespaces...)
 	}
 }
 

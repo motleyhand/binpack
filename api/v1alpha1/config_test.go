@@ -271,6 +271,60 @@ pools:
 	}
 }
 
+func TestExplicitEmptyNamespaceOverrideSurvivesRoundTrip(t *testing.T) {
+	// `namespaces: []` on a pool means "clear the global exclusions for this
+	// pool", which is different from omitting the field. A plain slice cannot
+	// carry that across Marshal: omitempty drops an empty slice, and the
+	// reloaded document silently inherits the global list again — changing the
+	// pool's resolved policy without anyone touching it.
+	cfg := mustLoad(t, `
+policy:
+  exclusions:
+    namespaces: [kube-system, monitoring]
+pools:
+  - name: pool-4g
+    exclusions:
+      namespaces: []
+`)
+
+	if got := cfg.PolicyFor("pool-4g").ExcludedNamespaces; len(got) != 0 {
+		t.Fatalf("explicit empty list should clear exclusions, got %v", got)
+	}
+
+	out, err := Marshal(cfg)
+	if err != nil {
+		t.Fatalf("Marshal: %v", err)
+	}
+	if !strings.Contains(string(out), "namespaces: []") {
+		t.Errorf("marshalled document must keep the explicit empty list:\n%s", out)
+	}
+
+	reloaded, err := Load(out)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if got := reloaded.PolicyFor("pool-4g").ExcludedNamespaces; len(got) != 0 {
+		t.Errorf("round trip restored the global exclusions: %v", got)
+	}
+}
+
+func TestOmittedNamespacesStillInherit(t *testing.T) {
+	// The other half of the distinction: omitting the field entirely must
+	// still inherit, or the pointer change would have broken inheritance.
+	cfg := mustLoad(t, `
+policy:
+  exclusions:
+    namespaces: [kube-system]
+pools:
+  - name: pool-4g
+    drain:
+      maxPodsPerDrain: 3
+`)
+	if got := cfg.PolicyFor("pool-4g").ExcludedNamespaces; len(got) != 1 || got[0] != "kube-system" {
+		t.Errorf("omitted namespaces should inherit, got %v", got)
+	}
+}
+
 func TestDurationMarshalsAsString(t *testing.T) {
 	cfg := mustLoad(t, "interval: 90s")
 	out, err := Marshal(cfg)

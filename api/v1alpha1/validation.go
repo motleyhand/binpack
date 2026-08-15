@@ -98,10 +98,12 @@ func (p Policy) validate(path string) []error {
 			path, t.Duration))
 	}
 
-	for i, ns := range p.Exclusions.Namespaces {
-		if !namespaceRE.MatchString(ns) {
-			errs = append(errs, fmt.Errorf("%s.exclusions.namespaces[%d]: %q is not a valid namespace name",
-				path, i, ns))
+	if p.Exclusions.Namespaces != nil {
+		for i, ns := range *p.Exclusions.Namespaces {
+			if !namespaceRE.MatchString(ns) {
+				errs = append(errs, fmt.Errorf("%s.exclusions.namespaces[%d]: %q is not a valid namespace name",
+					path, i, ns))
+			}
 		}
 	}
 

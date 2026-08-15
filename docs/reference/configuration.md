@@ -189,6 +189,16 @@ Two things to know:
 
 - **Lists replace, they do not merge.** `pool-4g` above excludes only `kube-system`, not
   `kube-system` plus `monitoring`. This lets a pool narrow the global set as well as widen it.
+  An explicitly empty list clears it outright:
+
+  ```yaml
+  pools:
+    - name: pool-4g
+      exclusions:
+        namespaces: []     # no exclusions on this pool, despite the global list
+  ```
+
+  Omitting the field means "inherit"; `[]` means "none". They are different.
 - **Pools are discovered, never declared.** An entry here adjusts a pool that discovery found;
   it does not create one. Naming a pool that does not exist is a configuration error.
 

@@ -138,8 +138,15 @@ type Exclusions struct {
 	// Ignoring them would remove them from the feasibility arithmetic while
 	// leaving them on the node, which is unsound.
 	//
-	// A pool override replaces this list rather than adding to it.
-	Namespaces []string `json:"namespaces,omitempty"`
+	// A pool override replaces this list rather than adding to it, so a pool
+	// can narrow the global set as well as widen it.
+	//
+	// A pointer, like every other optional field here, because an explicitly
+	// empty list means something different from an absent one: `namespaces:
+	// []` on a pool clears the global exclusions for that pool. A plain slice
+	// cannot express that across a round trip, since `omitempty` drops an
+	// empty slice and the reloaded document would silently inherit again.
+	Namespaces *[]string `json:"namespaces,omitempty"`
 }
 
 // PoolPolicy is a fully resolved policy for one pool. Every field has a
