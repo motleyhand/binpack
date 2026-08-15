@@ -281,7 +281,8 @@ shrinking a buffer someone sized on purpose. If the buffer is too large, that is
 configuration decision for its owner.
 
 The corollary is a useful `diagnose` check: pause pods sitting *below* the cutoff mean the
-overprovisioning pattern is already broken. Nothing surfaces this today.
+overprovisioning pattern is already broken. Nothing surfaces this today. Background:
+[overprovisioning and expendable pods](../explanation/overprovisioning-and-expendable-pods.md).
 
 ### Evictability is predicted, not discovered
 

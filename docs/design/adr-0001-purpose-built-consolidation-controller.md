@@ -52,9 +52,10 @@ is worth setting if you run multiple pools, but it improves which pool a scale-*
 and does nothing for scale-down.
 
 More fundamentally, this would not be sufficient even if the knobs were available. The
-autoscaler has no rebalancing code path at any configuration. Lowering
-`scale-down-utilization-threshold` makes it more willing to remove a node that is *already*
-nearly empty; it does not make the cluster arrive at a state where such a node exists.
+autoscaler has no rebalancing code path at any configuration. Raising
+`scale-down-utilization-threshold` widens the set of nodes it will consider removing — a node
+qualifies when its utilisation is *below* the threshold — but a wider net only helps if the
+cluster ever produces a nearly-empty node. Tuning does not make it arrive at that state.
 
 ### Right-size resource requests
 
@@ -62,8 +63,9 @@ Adopted, but not as a substitute. The autoscaler scores nodes on requests, not u
 requests inflated three to five times above real consumption make every node look busy. VPA in
 recommendation-only mode (`updateMode: "Off"`) surfaces the gap without changing anything.
 
-This is the highest-leverage structural fix and should be done regardless. It does not solve the
-problem, because right-sized requests still leave every node at 60 percent with no clear
+This is the highest-leverage structural fix and should be done regardless — see
+[quick wins](../how-to/quick-wins-before-installing-binpack.md). It does not solve the problem,
+because right-sized requests still leave every node at 60 percent with no clear
 consolidation candidate.
 
 ### The Kubernetes descheduler
@@ -72,7 +74,8 @@ Rejected after being deployed and observed in production. The `HighNodeUtilizati
 the right idea and has three structural gaps that no configuration closes: it classifies nodes
 by percentage and is therefore blind to absolute capacity on mixed node sizes; it cannot
 consolidate across node pools; and it will thrash on a node that is genuinely needed. The full
-analysis, including what it does well, is recorded separately under `docs/explanation/`.
+analysis, including what it does well, is in
+[why the descheduler can't solve this](../explanation/why-not-descheduler.md).
 
 ### Karpenter
 

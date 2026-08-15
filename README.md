@@ -21,8 +21,8 @@ would.
 
 **Yes, if** you run Kubernetes on a managed service that constrains the cluster-autoscaler —
 DigitalOcean DOKS, Linode LKE, Vultr, Scaleway, Civo, OVH — and your node count drifts upward
-after load spikes and stays there. On these platforms binpack is the only option short of a
-commercial product.
+after load spikes and stays there. On these platforms the alternatives are thin: the descheduler
+helps only in narrow cases, and everything else is commercial.
 
 **Also worth considering if** you run EKS, GKE or AKS. [Karpenter][karpenter] is the more
 complete answer on those platforms: it provisions right-sized nodes and treats consolidation as
@@ -36,12 +36,39 @@ deliberately, on any platform. [ADR-0005](docs/design/adr-0005-why-not-a-karpent
 sets out the comparison honestly, including why binpack exists at all given that Karpenter's
 consolidation is a superset of it.
 
-**Before installing anything**, there are cheaper fixes that are often sufficient on their own.
-A `PodDisruptionBudget` with `minAvailable: 1` on a single-replica Deployment permits *zero*
-voluntary disruptions, permanently, and will pin a node in place forever. That is a one-line fix
-worth more than any tool. A how-to covering these is coming in the next documentation pass.
+**Before installing anything**, work through the
+[quick wins](docs/how-to/quick-wins-before-installing-binpack.md). Several of them recover more
+capacity than binpack can, because they remove *permanent* blocks rather than optimising around
+them — a `PodDisruptionBudget` with `minAvailable: 1` on a single-replica Deployment permits
+*zero* voluntary disruptions, forever, and will pin a node in place no matter what tooling you
+add. If those fixes solve it, you might not need this.
 
-## Design
+## Documentation
+
+### Start here
+
+| Document | What it covers |
+|---|---|
+| [Why your cluster doesn't shrink](docs/explanation/why-clusters-dont-shrink.md) | What the autoscaler actually does, why the scheduler works against you, and the three conditions a node must meet before removal |
+| [Quick wins before installing binpack](docs/how-to/quick-wins-before-installing-binpack.md) | Seven fixes worth doing regardless. Do these first |
+| [Diagnose scale-down blockers](docs/how-to/diagnose-scale-down-blockers.md) | Read-only commands for working out why a node is still there |
+
+### Background
+
+| Document | What it covers |
+|---|---|
+| [The PodDisruptionBudget that costs you money](docs/explanation/the-poddisruptionbudget-that-costs-money.md) | The single-replica PDB trap, why `maxSurge` doesn't save you, and the two-PDB case that blocks eviction permanently |
+| [Overprovisioning and expendable pods](docs/explanation/overprovisioning-and-expendable-pods.md) | Warm capacity, the -10 priority cutoff, and the silent failure either side of it |
+| [Why the descheduler can't solve this](docs/explanation/why-not-descheduler.md) | What it does well, and the three structural gaps no configuration closes |
+
+### Reference
+
+| Document | What it covers |
+|---|---|
+| [RBAC](docs/reference/rbac.md) | Every permission binpack needs, and what it is deliberately never granted |
+| [Fix a silently broken Metrics API](docs/how-to/fix-metrics-api-on-managed-kubernetes.md) | When `kubectl top` returns nothing and your HPAs are quietly inert |
+
+### Design
 
 The tool is a single Go binary with two frontends over one decision engine: a read-only CLI you
 run against your own kubeconfig, and an in-cluster controller.
@@ -56,8 +83,7 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0005](docs/design/adr-0005-why-not-a-karpenter-doks-provider.md) | Karpenter compared honestly, and why this project exists anyway |
 | [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md) | Borrowing the scheduler's own logic, and testing against the real one |
 
-Reference documentation, how-to guides and background explanation are being written as the
-implementation lands; this table will grow to cover them.
+Configuration and metrics references are written as the implementation lands.
 
 ## Design principles
 
