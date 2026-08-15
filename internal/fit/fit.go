@@ -109,6 +109,22 @@ func CanFit(pod *corev1.Pod, node *corev1.Node, remaining corev1.ResourceList, r
 			podRef(pod) + " requires node labels that " + node.Name + " does not have"}
 	}
 
+	// pod.Spec.NodeName is deliberately not compared against node.Name.
+	//
+	// Every pod binpack sees is already bound, so its NodeName always names
+	// the node it is being relocated *from*. Refusing when they differ would
+	// refuse every relocation there is.
+	//
+	// The gap this leaves: a controller whose pod *template* pins NodeName
+	// recreates its pod on the same node regardless of what binpack decides,
+	// and such a pod ignores cordon because setting NodeName bypasses the
+	// scheduler entirely. Detecting that needs the owner's template, which
+	// binpack does not read. The consequence is bounded — the pod reappears on
+	// the node being drained, no pod goes Pending, so no scale-up follows, and
+	// the drain stalls and backs off exactly as ADR-0007 provides for an
+	// undetected blocker. It costs a wasted drain, not the failure this
+	// project exists to prevent.
+
 	if short, ok := firstShortfall(EffectiveRequests(pod), remaining); !ok {
 		return false, Reason{ReasonInsufficient,
 			"node " + node.Name + " has insufficient " + short}

@@ -32,8 +32,8 @@ func UnsupportedPod(pod *corev1.Pod) Reason {
 	// Whether a volume can follow a pod depends on the PV's node affinity, its
 	// zone, and how many volumes the destination already has attached — none
 	// of which binpack models.
-	if name, ok := firstPersistentVolume(pod); ok {
-		return unsupportedPod(pod, "uses persistent volume claim "+name)
+	if name, ok := firstConstrainingVolume(pod); ok {
+		return unsupportedPod(pod, "uses volume "+name+", which may constrain placement")
 	}
 
 	// InterPodAffinity. Required terms constrain placement relative to other
@@ -121,15 +121,33 @@ func firstHostPort(pod *corev1.Pod) (int32, bool) {
 	return 0, false
 }
 
-func firstPersistentVolume(pod *corev1.Pod) (string, bool) {
+// firstConstrainingVolume returns the first volume binpack cannot prove is
+// placement-neutral.
+//
+// An allowlist, for the same reason everything else here is one. Enumerating
+// the volume types that *do* constrain placement means listing persistent
+// volume claims, generic ephemeral volumes, inline CSI sources, and every
+// in-tree cloud disk — and then adding to that list whenever Kubernetes gains
+// another. Naming the handful that are demonstrably node-independent is a
+// finite job, and a volume type nobody has considered refuses by default.
+//
+// The allowed kinds are projections of API objects or node-local scratch: they
+// exist on any node, need no attachment, and impose no scheduling constraint.
+// Note that hostPath does affect *evictability* — the autoscaler will not
+// evict a pod using one without an explicit safe-to-evict annotation — but
+// that is a separate question from where a replacement could be placed.
+func firstConstrainingVolume(pod *corev1.Pod) (string, bool) {
 	for _, v := range pod.Spec.Volumes {
-		if v.PersistentVolumeClaim != nil {
-			return v.PersistentVolumeClaim.ClaimName, true
-		}
-		// Generic ephemeral volumes are PVCs created on the pod's behalf, and
-		// carry the same placement constraints.
-		if v.Ephemeral != nil {
-			return v.Name + " (generic ephemeral)", true
+		switch {
+		case v.EmptyDir != nil,
+			v.ConfigMap != nil,
+			v.Secret != nil,
+			v.DownwardAPI != nil,
+			v.Projected != nil,
+			v.HostPath != nil:
+			continue
+		default:
+			return v.Name, true
 		}
 	}
 	return "", false

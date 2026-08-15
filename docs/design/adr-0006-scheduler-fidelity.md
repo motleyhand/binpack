@@ -122,6 +122,15 @@ non-default `schedulerName`; scheduling gates; and dynamic resource allocation c
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
 
+One gap is known and deliberately left open, because closing it needs data binpack does not
+read: a controller whose pod *template* pins `spec.nodeName`. Every pod binpack sees is already
+bound, so its own `nodeName` names the node it is leaving and cannot distinguish a pinned
+template from an ordinary scheduling decision. The consequence is bounded rather than dangerous
+— such a pod reappears on the node being drained and never goes Pending, so no scale-up follows,
+and the drain stalls and backs off as [ADR-0007](adr-0007-drain-progress-not-deadlines.md)
+provides for any undetected blocker. It costs a wasted drain. Closing it would mean reading
+owner templates, which is worth doing if it ever shows up in practice.
+
 The allowlist is applied to **both** the pods being relocated and the pods already resident on
 each prospective destination. Inter-pod affinity is symmetric: the scheduler rejects an incoming
 pod if a pod already on that node declares required anti-affinity matching it. A relocating pod

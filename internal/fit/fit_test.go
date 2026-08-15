@@ -143,6 +143,24 @@ func TestCanFit(t *testing.T) {
 	}
 }
 
+func TestBoundPodCanBePlacedElsewhere(t *testing.T) {
+	// Every pod binpack sees is already bound, so spec.NodeName always names
+	// the node it is being relocated FROM. Comparing it against the candidate
+	// destination would refuse every relocation there is.
+	//
+	// This test exists to stop that "fix" being applied: the gap it appears to
+	// leave — a controller template that pins NodeName — is documented in
+	// CanFit and bounded by the stall-and-backoff machinery, because such a
+	// pod returns to its own node rather than going Pending.
+	pod := mother.Pod("default", "web", mother.OnNode("node-a"))
+	destination := mother.SmallNode("node-b")
+
+	ok, reason := fit.CanFit(pod, destination, free(destination), nil)
+	if !ok {
+		t.Fatalf("a bound pod must be placeable on another node, got refusal: %s", reason.Message)
+	}
+}
+
 func TestPodCountIsAResource(t *testing.T) {
 	// `pods` is in a node's allocatable but never in a pod's requests, so a
 	// naive subtract-request-from-remaining loop never consumes a slot and

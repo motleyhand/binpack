@@ -281,6 +281,41 @@ func WithPVC(claim string) PodOption {
 	}
 }
 
+// WithEmptyDir attaches scratch space, which constrains placement not at all.
+func WithEmptyDir(name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+			Name:         name,
+			VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}},
+		})
+	}
+}
+
+// WithConfigMapVolume projects a ConfigMap, which exists on every node.
+func WithConfigMapVolume(name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				ConfigMap: &corev1.ConfigMapVolumeSource{
+					LocalObjectReference: corev1.LocalObjectReference{Name: name},
+				},
+			},
+		})
+	}
+}
+
+// WithInlineCSIVolume attaches a CSI volume without a PVC. Its driver may
+// still count against the destination's attachment limit.
+func WithInlineCSIVolume(name, driver string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+			Name:         name,
+			VolumeSource: corev1.VolumeSource{CSI: &corev1.CSIVolumeSource{Driver: driver}},
+		})
+	}
+}
+
 // WithRequiredAntiAffinity declares required pod anti-affinity, which is
 // symmetric: it can reject an incoming pod as well as constrain this one.
 func WithRequiredAntiAffinity(labelKey, labelValue string) PodOption {

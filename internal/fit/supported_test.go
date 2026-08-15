@@ -38,7 +38,16 @@ func TestUnsupportedPod(t *testing.T) {
 		{
 			name: "persistent volume claim",
 			pod:  mother.Pod("default", "db", mother.WithPVC("data")),
-			want: "persistent volume claim data",
+			want: "uses volume data",
+		},
+		{
+			// An inline CSI source has no PVC, but its driver can still count
+			// against the destination's attachment limit. Enumerating volume
+			// types that constrain placement would have missed this; naming
+			// the ones that do not cannot.
+			name: "inline CSI volume without a PVC",
+			pod:  mother.Pod("default", "db", mother.WithInlineCSIVolume("vol", "ebs.csi.aws.com")),
+			want: "uses volume vol",
 		},
 		{
 			name: "required pod anti-affinity",
@@ -82,6 +91,18 @@ func TestUnsupportedPod(t *testing.T) {
 				t.Errorf("message should name the feature %q, got: %s", tc.want, got.Message)
 			}
 		})
+	}
+}
+
+func TestPlacementNeutralVolumesAreSupported(t *testing.T) {
+	// Projections of API objects and node-local scratch exist on any node and
+	// need no attachment. Refusing them would refuse most pods in a cluster.
+	pod := mother.Pod("default", "web",
+		mother.WithEmptyDir("cache"),
+		mother.WithConfigMapVolume("settings"),
+	)
+	if r := fit.UnsupportedPod(pod); !r.Empty() {
+		t.Errorf("placement-neutral volumes must not cause a refusal, got: %s", r.Message)
 	}
 }
 
