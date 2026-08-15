@@ -34,6 +34,11 @@ const (
 type status struct {
 	AutoscalerStatus string `json:"autoscalerStatus"`
 
+	// Time is the document's own publication time, written in Go's default
+	// time format rather than RFC3339. A fallback for freshness when the
+	// health probe time is absent.
+	Time string `json:"time"`
+
 	ClusterWide struct {
 		Health    transition `json:"health"`
 		ScaleUp   transition `json:"scaleUp"`
@@ -43,9 +48,12 @@ type status struct {
 	NodeGroups []struct {
 		Name   string `json:"name"`
 		Health struct {
-			MinSize             int `json:"minSize"`
-			MaxSize             int `json:"maxSize"`
-			CloudProviderTarget int `json:"cloudProviderTarget"`
+			MinSize int `json:"minSize"`
+			MaxSize int `json:"maxSize"`
+			// A pointer so a reported zero is distinguishable from an absent
+			// field: zero is a legitimate target for a pool removing its last
+			// node.
+			CloudProviderTarget *int `json:"cloudProviderTarget"`
 			NodeCounts          struct {
 				Registered struct {
 					Ready int `json:"ready"`
@@ -87,6 +95,12 @@ func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
 	// Compared against the clock in the engine, not here: parsing stays pure.
 	if t := s.ClusterWide.Health.LastProbeTime; t != nil {
 		out.LastProbe = *t
+	} else if published, ok := parseStatusTime(s.Time); ok {
+		// Older autoscalers may not publish a health probe time. Falling back
+		// to the document's own timestamp keeps binpack usable there, rather
+		// than refusing to work at all on a cluster whose autoscaler is
+		// demonstrably fine.
+		out.LastProbe = published
 	}
 
 	// The autoscaler records when it last changed scale-up state. Using it
@@ -102,16 +116,35 @@ func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
 	}
 
 	for _, g := range s.NodeGroups {
-		out.Groups = append(out.Groups, engine.NodeGroup{
+		group := engine.NodeGroup{
 			ID:      g.Name,
 			MinSize: g.Health.MinSize,
 			MaxSize: g.Health.MaxSize,
 			Ready:   g.Health.NodeCounts.Registered.Ready,
-			// What the autoscaler has asked the provider for, which is its
-			// intent rather than the cluster's lagging reality.
-			Target: g.Health.CloudProviderTarget,
-		})
+		}
+		// What the autoscaler has asked the provider for: its intent, rather
+		// than the cluster's lagging reality.
+		if g.Health.CloudProviderTarget != nil {
+			group.Target, group.HasTarget = *g.Health.CloudProviderTarget, true
+		}
+		out.Groups = append(out.Groups, group)
 	}
 
 	return out, nil
+}
+
+// statusTimeLayout is Go's default time rendering, which is what the
+// autoscaler writes for the document's top-level time field — not RFC3339,
+// unlike every other timestamp in the same document.
+const statusTimeLayout = "2006-01-02 15:04:05.999999999 -0700 MST"
+
+func parseStatusTime(value string) (time.Time, bool) {
+	if value == "" {
+		return time.Time{}, false
+	}
+	t, err := time.Parse(statusTimeLayout, value)
+	if err != nil {
+		return time.Time{}, false
+	}
+	return t, true
 }

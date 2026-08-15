@@ -73,6 +73,35 @@ type Autoscaler struct {
 	Groups []NodeGroup
 }
 
+// Live reports whether there is an autoscaler that would actually remove a
+// drained node, and why not when there is not.
+//
+// One function so that what binpack decides and what explain prints cannot
+// disagree — an earlier version had the renderer read Running directly and
+// announce a healthy autoscaler above a decision refusing to act because it
+// was not.
+func (a Autoscaler) Live(now time.Time) (bool, string) {
+	if !a.Running {
+		return false, "no cluster-autoscaler is running, so a drained node would never be removed"
+	}
+
+	// A status ConfigMap outlives the autoscaler that wrote it and keeps
+	// saying Running indefinitely, so freshness is what separates a live
+	// autoscaler from a leftover object claiming to be one. Absent evidence
+	// of life counts as absent life: a document with no probe time at all is
+	// one binpack cannot vouch for.
+	if a.LastProbe.IsZero() {
+		return false, "the cluster-autoscaler status carries no probe time, so binpack cannot tell whether it is alive"
+	}
+	if since := now.Sub(a.LastProbe); since > MaxStatusAge {
+		return false, fmt.Sprintf(
+			"the cluster-autoscaler last reported %s ago, so it is not running; a drained node would never be removed",
+			since.Round(time.Second))
+	}
+
+	return true, ""
+}
+
 // NodeGroup is one autoscaling pool, as the autoscaler reports it. Pools it
 // does not manage are absent, which is how binpack knows not to touch them.
 type NodeGroup struct {
@@ -86,7 +115,13 @@ type NodeGroup struct {
 	// Target is what the autoscaler has asked the provider for. It can differ
 	// from Ready mid-transition: after a scale-down lowers the target to the
 	// minimum but before the node disappears, Ready still exceeds MinSize.
-	Target int
+	//
+	// HasTarget distinguishes a reported zero from an absent value. Zero is a
+	// legitimate target — a pool with minSize 0 removing its last node — so
+	// treating it as "not reported" would discard exactly the case where the
+	// autoscaler has most clearly finished deciding.
+	Target    int
+	HasTarget bool
 }
 
 // Size is the group size to compare against its floor.
@@ -96,7 +131,7 @@ type NodeGroup struct {
 // costs a missed consolidation the next run may find; preferring the larger
 // costs a pointless drain.
 func (g NodeGroup) Size() int {
-	if g.Target > 0 && g.Target < g.Ready {
+	if g.HasTarget && g.Target < g.Ready {
 		return g.Target
 	}
 	return g.Ready
@@ -195,19 +230,8 @@ type NodeAssessment struct {
 // planning a multi-node consolidation against a cluster that is changing
 // underneath the plan.
 func Decide(s Snapshot, cfg Config) Decision {
-	if !s.Autoscaler.Running {
-		return Decision{Reason: "no cluster-autoscaler is running, so a drained node would never be removed"}
-	}
-
-	// A status ConfigMap outlives the autoscaler that wrote it, and it will
-	// keep saying Running indefinitely. Freshness is what separates a live
-	// autoscaler from a leftover object claiming to be one.
-	if !s.Autoscaler.LastProbe.IsZero() {
-		if since := s.Now.Sub(s.Autoscaler.LastProbe); since > MaxStatusAge {
-			return Decision{Reason: fmt.Sprintf(
-				"the cluster-autoscaler last reported %s ago, so it is not running; a drained node would never be removed",
-				since.Round(time.Second))}
-		}
+	if live, why := s.Autoscaler.Live(s.Now); !live {
+		return Decision{Reason: why}
 	}
 
 	candidates, assessments := eligible(s, cfg)

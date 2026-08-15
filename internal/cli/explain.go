@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -44,6 +45,10 @@ func newExplainCommand(opts *options) *cobra.Command {
 
 			snapshot, err := collect.Snapshot(cmd.Context(), client, time.Now())
 			if err != nil {
+				return err
+			}
+
+			if err := checkPoolsExist(cfg, snapshot); err != nil {
 				return err
 			}
 
@@ -169,7 +174,8 @@ func renderExplain(opts *options, s engine.Snapshot, d engine.Decision) error {
 
 func buildView(s engine.Snapshot, d engine.Decision) explainView {
 	var v explainView
-	v.Autoscaler.Running = s.Autoscaler.Running
+	live, _ := s.Autoscaler.Live(s.Now)
+	v.Autoscaler.Running = live
 	v.Autoscaler.ScaleDownStatus = s.Autoscaler.ScaleDownStatus
 	for _, g := range s.Autoscaler.Groups {
 		v.Autoscaler.Pools = append(v.Autoscaler.Pools, struct {
@@ -231,10 +237,14 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 		}
 	}
 
+	// The same liveness check Decide uses, so this line cannot contradict the
+	// decision printed below it.
+	live, why := s.Autoscaler.Live(s.Now)
+
 	p("cluster-autoscaler: ")
-	if !s.Autoscaler.Running {
-		p("not found\n\n")
-		p("binpack will not act: a drained node would never be removed.\n")
+	if !live {
+		p("unavailable\n\n")
+		p("binpack will not act: %s\n", why)
 		return errors.Join(errs...)
 	}
 	p("running")
@@ -289,4 +299,47 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// checkPoolsExist rejects overrides naming a pool discovery did not find.
+//
+// Pools are discovered, never declared, so an entry here adjusts something
+// that exists. A misspelt name would otherwise install an unreachable map
+// entry and the node would quietly take the default policy — which is
+// actively dangerous for `enabled: false`, where the operator believes they
+// have switched a pool off and binpack reports it as drainable.
+func checkPoolsExist(cfg *v1alpha1.Config, s engine.Snapshot) error {
+	if len(cfg.Pools) == 0 {
+		return nil
+	}
+
+	known := map[string]bool{}
+	for _, g := range s.Autoscaler.Groups {
+		known[g.ID] = true
+	}
+	for _, node := range s.Nodes {
+		if name := node.Labels[cfg.Discovery.PoolNameLabel]; name != "" {
+			known[name] = true
+		}
+		if id := node.Labels[cfg.Discovery.NodeGroupIDLabel]; id != "" {
+			known[id] = true
+		}
+	}
+
+	var unknown []string
+	for _, pool := range cfg.Pools {
+		if !known[pool.Name] {
+			unknown = append(unknown, pool.Name)
+		}
+	}
+	if len(unknown) == 0 {
+		return nil
+	}
+
+	sort.Strings(unknown)
+	return fmt.Errorf(
+		"configuration overrides pools that do not exist in this cluster: %s\n"+
+			"pools are discovered, not declared, so an override must name one that is there;\n"+
+			"check for a typo, or remove the entry if the pool is gone",
+		strings.Join(unknown, ", "))
 }

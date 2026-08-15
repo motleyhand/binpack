@@ -104,6 +104,35 @@ func TestOnlyAutoscalingPoolsAppear(t *testing.T) {
 	}
 }
 
+func TestFallsBackToTheDocumentTimestamp(t *testing.T) {
+	// Older autoscalers may not publish a health probe time. Falling back to
+	// the document's own timestamp keeps binpack usable there rather than
+	// refusing to work on a cluster whose autoscaler is demonstrably fine.
+	//
+	// Note the format: Go's default rendering, not RFC3339 like every other
+	// timestamp in the same document.
+	got, err := collect.ParseAutoscalerStatus(
+		"autoscalerStatus: Running\ntime: 2026-08-15 09:15:37.012080408 +0000 UTC\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := time.Date(2026, 8, 15, 9, 15, 37, 12080408, time.UTC)
+	if !got.LastProbe.Equal(want) {
+		t.Errorf("lastProbe = %s, want %s", got.LastProbe, want)
+	}
+}
+
+func TestAbsentTargetIsDistinguishableFromZero(t *testing.T) {
+	got, err := collect.ParseAutoscalerStatus(
+		"autoscalerStatus: Running\nnodeGroups:\n- name: g\n  health:\n    minSize: 0\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Groups[0].HasTarget {
+		t.Error("a missing cloudProviderTarget must not read as a target of zero")
+	}
+}
+
 func TestNonRunningAutoscalerIsNotRunning(t *testing.T) {
 	got, err := collect.ParseAutoscalerStatus("autoscalerStatus: Unhealthy\n")
 	if err != nil {
