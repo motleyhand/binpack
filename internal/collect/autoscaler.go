@@ -35,6 +35,7 @@ type status struct {
 	AutoscalerStatus string `json:"autoscalerStatus"`
 
 	ClusterWide struct {
+		Health    transition `json:"health"`
 		ScaleUp   transition `json:"scaleUp"`
 		ScaleDown transition `json:"scaleDown"`
 	} `json:"clusterWide"`
@@ -42,9 +43,10 @@ type status struct {
 	NodeGroups []struct {
 		Name   string `json:"name"`
 		Health struct {
-			MinSize    int `json:"minSize"`
-			MaxSize    int `json:"maxSize"`
-			NodeCounts struct {
+			MinSize             int `json:"minSize"`
+			MaxSize             int `json:"maxSize"`
+			CloudProviderTarget int `json:"cloudProviderTarget"`
+			NodeCounts          struct {
 				Registered struct {
 					Ready int `json:"ready"`
 				} `json:"registered"`
@@ -55,6 +57,7 @@ type status struct {
 
 type transition struct {
 	Status             string     `json:"status"`
+	LastProbeTime      *time.Time `json:"lastProbeTime"`
 	LastTransitionTime *time.Time `json:"lastTransitionTime"`
 }
 
@@ -76,6 +79,16 @@ func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
 		ScaleDownStatus: s.ClusterWide.ScaleDown.Status,
 	}
 
+	// The autoscaler updates lastProbeTime on every scan. Without it a
+	// ConfigMap left behind by a dead autoscaler would report Running
+	// forever, and binpack would cheerfully drain nodes nothing will reap —
+	// defeating the one check that exists to prevent exactly that.
+	//
+	// Compared against the clock in the engine, not here: parsing stays pure.
+	if t := s.ClusterWide.Health.LastProbeTime; t != nil {
+		out.LastProbe = *t
+	}
+
 	// The autoscaler records when it last changed scale-up state. Using it
 	// rather than inferring from node creation timestamps means the cooldown
 	// needs no persistence and cannot disagree with the autoscaler's own view.
@@ -94,6 +107,9 @@ func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
 			MinSize: g.Health.MinSize,
 			MaxSize: g.Health.MaxSize,
 			Ready:   g.Health.NodeCounts.Registered.Ready,
+			// What the autoscaler has asked the provider for, which is its
+			// intent rather than the cluster's lagging reality.
+			Target: g.Health.CloudProviderTarget,
 		})
 	}
 

@@ -19,6 +19,11 @@ const (
 	AnnotationLastFailure  = "binpack.motleyhand.com/last-failure"
 )
 
+// MaxStatusAge is how stale the autoscaler's status may be before binpack
+// treats it as abandoned. The autoscaler scans every ten seconds by default,
+// so minutes of silence means it is gone rather than busy.
+const MaxStatusAge = 5 * time.Minute
+
 // Snapshot is the cluster as binpack sees it. Plain data: no clients, nothing
 // that performs I/O, and every object read-only.
 type Snapshot struct {
@@ -54,6 +59,12 @@ type Autoscaler struct {
 	// clearest possible signal not to be removing nodes.
 	ScaleUpInProgress bool
 
+	// LastProbe is when the autoscaler last completed a scan. A status
+	// ConfigMap outlives the autoscaler that wrote it, so freshness is what
+	// distinguishes a running autoscaler from a leftover object claiming to
+	// be one.
+	LastProbe time.Time
+
 	// ScaleDownStatus is what the autoscaler reports about its own
 	// scale-down search — "NoCandidates" being the state binpack exists to
 	// resolve. Informational: it is reported, never acted on.
@@ -71,6 +82,24 @@ type NodeGroup struct {
 	MinSize int
 	MaxSize int
 	Ready   int
+
+	// Target is what the autoscaler has asked the provider for. It can differ
+	// from Ready mid-transition: after a scale-down lowers the target to the
+	// minimum but before the node disappears, Ready still exceeds MinSize.
+	Target int
+}
+
+// Size is the group size to compare against its floor.
+//
+// The smaller of intent and reality, because either being at the minimum
+// means a drained node will simply be replaced. Preferring the smaller value
+// costs a missed consolidation the next run may find; preferring the larger
+// costs a pointless drain.
+func (g NodeGroup) Size() int {
+	if g.Target > 0 && g.Target < g.Ready {
+		return g.Target
+	}
+	return g.Ready
 }
 
 // Policy is a fully resolved policy for one pool.
@@ -168,6 +197,17 @@ type NodeAssessment struct {
 func Decide(s Snapshot, cfg Config) Decision {
 	if !s.Autoscaler.Running {
 		return Decision{Reason: "no cluster-autoscaler is running, so a drained node would never be removed"}
+	}
+
+	// A status ConfigMap outlives the autoscaler that wrote it, and it will
+	// keep saying Running indefinitely. Freshness is what separates a live
+	// autoscaler from a leftover object claiming to be one.
+	if !s.Autoscaler.LastProbe.IsZero() {
+		if since := s.Now.Sub(s.Autoscaler.LastProbe); since > MaxStatusAge {
+			return Decision{Reason: fmt.Sprintf(
+				"the cluster-autoscaler last reported %s ago, so it is not running; a drained node would never be removed",
+				since.Round(time.Second))}
+		}
 	}
 
 	candidates, assessments := eligible(s, cfg)
@@ -300,7 +340,7 @@ func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []
 		case cooling:
 			a.Skipped, a.SkipReason = true, cooldown
 
-		case group.Ready <= group.MinSize:
+		case group.Size() <= group.MinSize:
 			a.Skipped, a.SkipReason = true, fmt.Sprintf(
 				"pool %s is at its minimum size (%d)", displayPool(a), group.MinSize)
 

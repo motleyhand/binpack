@@ -28,6 +28,9 @@ func cluster(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
 		Now:   now,
 		Autoscaler: engine.Autoscaler{
 			Running: true,
+			// Probed just now: a status ConfigMap outlives the autoscaler
+			// that wrote it, so freshness is part of "running".
+			LastProbe: now.Add(-10 * time.Second),
 			Groups: []engine.NodeGroup{
 				{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: len(nodes)},
 			},
@@ -199,6 +202,43 @@ func TestSkipReasons(t *testing.T) {
 				t.Error("a skipped node must not be drained")
 			}
 		})
+	}
+}
+
+func TestStaleAutoscalerStatusIsNotTrusted(t *testing.T) {
+	// The ConfigMap outlives the autoscaler that wrote it and keeps saying
+	// Running. Without a freshness check, the one guard that stops binpack
+	// draining nodes nothing will reap is defeated by a leftover object.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.LastProbe = now.Add(-time.Hour)
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatal("an autoscaler silent for an hour is not running")
+	}
+	if !strings.Contains(d.Reason, "last reported") {
+		t.Errorf("reason should say the status is stale, got: %s", d.Reason)
+	}
+}
+
+func TestProviderTargetGuardsTheFloor(t *testing.T) {
+	// Mid scale-down the autoscaler has already lowered its target to the
+	// minimum while the departing node is still Ready. Trusting Ready would
+	// approve a drain the autoscaler will not honour.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.Groups[0] = engine.NodeGroup{
+		ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10,
+		Ready: 2, Target: 1,
+	}
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatalf("the pool is already at its target minimum, got a drain of %s", d.Node.Name)
+	}
+	if a := assessmentFor(d, "a"); a == nil || !strings.Contains(a.SkipReason, "minimum size") {
+		t.Errorf("reason should name the floor, got %+v", a)
 	}
 }
 
