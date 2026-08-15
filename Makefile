@@ -39,8 +39,12 @@ tidy: ## Tidy go.mod and go.sum
 smoke: build ## Run the built binary once
 	./bin/$(BINARY) version
 
+.PHONY: test-differential
+test-differential: ## Check the fit predicate against the real scheduler
+	cd test/differential && go test ./...
+
 .PHONY: check
-check: lint test build smoke ## Everything CI runs
+check: lint test build smoke ## Everything CI runs (except test-differential)
 
 .PHONY: clean
 clean: ## Remove build output

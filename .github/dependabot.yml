@@ -14,6 +14,19 @@ updates:
           - "k8s.io/*"
           - "sigs.k8s.io/*"
 
+  # The differential harness is its own module so that k8s.io/kubernetes and
+  # its replace block stay out of what binpack ships.
+  - package-ecosystem: gomod
+    directory: /test/differential
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    groups:
+      kubernetes:
+        patterns:
+          - "k8s.io/*"
+          - "sigs.k8s.io/*"
+
   - package-ecosystem: github-actions
     directory: /
     schedule:

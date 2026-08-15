@@ -24,7 +24,13 @@ make help                        # every target
 
 go test ./internal/version/ -run TestResolve -v      # one test
 go test ./internal/cli/ -run 'TestVersion.*'         # one package, matching tests
+
+make test-differential                               # fit vs the real scheduler
 ```
+
+`test/differential` is a **separate Go module**. It depends on `k8s.io/kubernetes`, which
+requires ~29 replace directives from every consumer, and keeping it out of the main module is
+the whole point — do not add that dependency to the module binpack ships.
 
 CI additionally verifies `go.mod`/`go.sum` are tidy and runs `goreleaser release --snapshot
 --skip=publish`, so release-config breakage surfaces on the PR rather than on a tag.
@@ -54,6 +60,12 @@ computed differently from how the scheduler computes it. A wrong answer there pr
 *confidently wrong* decision that no amount of engine testing can catch. Prefer upstream
 Kubernetes libraries over hand-rolled equivalents even when the hand-rolled version looks
 obviously correct.
+
+**The differential harness's feature gates come from `NewSchedulerFeaturesFromGates`, never a
+hand-written list.** Its first run reported 171 unsound placements, all one message: sidecar
+containers disabled. That was the oracle modelling a cluster that has not existed since 1.33,
+not a defect in `fit`. A hand-maintained gate list is a set of guesses about someone else's
+defaults, and a wrong guess produces confident, wrong disagreement reports rather than an error.
 
 **Test fixtures use object mothers plus builders.** Mothers name archetypes —
 `mother.SmallNode()`, `mother.DaemonSetPod()` — so a test says what it needs in three words and

@@ -43,6 +43,29 @@ jobs:
       - name: Smoke test the binary
         run: ./bin/binpack version
 
+  differential:
+    name: differential (vs real scheduler)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: test/differential/go.sum
+
+      # A separate module, so k8s.io/kubernetes and the replace block it
+      # requires stay out of the module binpack ships. See ADR-0006.
+      - name: Verify the harness module is tidy
+        working-directory: test/differential
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum
+
+      - name: Compare fit against the scheduler's own Filter plugins
+        working-directory: test/differential
+        run: go test -v ./...
+
   release-config:
     name: validate release config
     runs-on: ubuntu-latest
