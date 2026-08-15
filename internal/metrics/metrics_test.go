@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/expfmt"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -312,4 +313,89 @@ func gather(t *testing.T) string {
 		}
 	}
 	return b.String()
+}
+
+func TestAReplicaThatHasNotEvaluatedPublishesNothingAboutTheCluster(t *testing.T) {
+	// Only the leader evaluates, but every replica serves its own metrics
+	// endpoint — and during a rolling update there are always two. A standby
+	// publishing a full set of zeroes is indistinguishable from a cluster in
+	// serious trouble, and the documented alerts would fire depending on which
+	// pod answered the scrape.
+	registry := prometheus.NewRegistry()
+	quiet := newGated(
+		prometheus.NewGauge(prometheus.GaugeOpts{Name: "binpack_test_drainable"}),
+		prometheus.NewGauge(prometheus.GaugeOpts{Name: "binpack_test_autoscaler_up"}),
+	)
+	registry.MustRegister(quiet)
+
+	families, err := registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering: %v", err)
+	}
+	if len(families) != 0 {
+		var names []string
+		for _, f := range families {
+			names = append(names, f.GetName())
+		}
+		t.Errorf("a process that has not evaluated published %v", names)
+	}
+
+	quiet.publish(func() {})
+
+	families, err = registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering after an evaluation: %v", err)
+	}
+	if len(families) != 2 {
+		t.Errorf("got %d families after an evaluation, want both", len(families))
+	}
+}
+
+func TestTheGateStaysShutWhileTheValuesAreWritten(t *testing.T) {
+	// A scrape landing between the gate opening and the values being written
+	// sees a half-written set — and on the first evaluation that is a full set
+	// of zeroes, the exact reading the gate exists to prevent. Asserted from
+	// inside the write, since no sequential test can observe that window from
+	// outside it.
+	g := newGated()
+
+	var openDuringWrite bool
+	g.publish(func() { openDuringWrite = g.evaluated.Load() })
+
+	if openDuringWrite {
+		t.Error("the gate was open while the values were still being written")
+	}
+	if !g.evaluated.Load() {
+		t.Error("the gate never opened, so nothing would ever be published")
+	}
+}
+
+func TestObservePublishesThroughTheGate(t *testing.T) {
+	Observe(snapshot(), engine.Decision{
+		Code:        engine.CodeNoneFeasible,
+		Assessments: []engine.NodeAssessment{assess(engine.VerdictDrainable, "")},
+	}, config(), 0.01)
+
+	if !strings.Contains(gather(t), "binpack_drainable_nodes 1") {
+		t.Errorf("a completed evaluation published nothing:\n%s", gather(t))
+	}
+}
+
+func TestPoolNodesReportsReadyNodesNotTheTarget(t *testing.T) {
+	// They differ exactly while a scale-down is in progress: the target has
+	// dropped and the nodes are still there and still billed. A series called
+	// "nodes" that quietly means "intent" is one nobody can trust.
+	scalingDown := engine.NodeGroup{
+		ID: "da8977ba-244f", MinSize: 1, MaxSize: 10, Ready: 3,
+		Target: 1, HasTarget: true,
+	}
+	if scalingDown.Size() != 1 {
+		t.Fatalf("setup: Size() = %d, want the lower target", scalingDown.Size())
+	}
+
+	Observe(snapshot(scalingDown), engine.Decision{Code: engine.CodeNoneFeasible}, config(), 0.01)
+
+	if !strings.Contains(gather(t), `binpack_pool_nodes{pool="pool-4g"} 3`) {
+		t.Errorf("pool_nodes does not report the 3 nodes that exist:\n%s", gather(t))
+	}
 }

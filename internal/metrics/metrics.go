@@ -11,11 +11,62 @@
 package metrics
 
 import (
+	"sync/atomic"
+
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/motleyhand/binpack/internal/engine"
 )
+
+// gated wraps the collectors that describe a cluster and reports nothing until
+// an evaluation has actually produced them.
+//
+// Every replica serves its own metrics endpoint, but only the leader
+// evaluates — and during a rolling update there are always two. Without this,
+// a standby publishes a complete set of zeroes: no drainable nodes, no
+// autoscaler, an evaluation timestamp at the epoch. Scraped, that is
+// indistinguishable from a cluster in serious trouble, and the alerts in the
+// reference would fire or flap depending on which pod answered.
+//
+// An absent series is the honest answer for a process that has not looked. It
+// covers the startup window too, where even the leader has not yet decided
+// anything.
+type gated struct {
+	evaluated atomic.Bool
+	inner     []prometheus.Collector
+}
+
+func newGated(collectors ...prometheus.Collector) *gated {
+	return &gated{inner: collectors}
+}
+
+func (g *gated) Describe(ch chan<- *prometheus.Desc) {
+	for _, c := range g.inner {
+		c.Describe(ch)
+	}
+}
+
+func (g *gated) Collect(ch chan<- prometheus.Metric) {
+	if !g.evaluated.Load() {
+		return
+	}
+	for _, c := range g.inner {
+		c.Collect(ch)
+	}
+}
+
+// publish runs write and only then starts serving.
+//
+// The order is the point, which is why it is a function taking the writes
+// rather than an open() anyone can call wherever they like: a scrape landing
+// between the gate opening and the values being written would see a
+// half-written set, and on the first evaluation that means a full set of
+// zeroes — the exact reading this type exists to prevent.
+func (g *gated) publish(write func()) {
+	write()
+	g.evaluated.Store(true)
+}
 
 // Collectors, registered with controller-runtime's registry so they are served
 // on the manager's existing metrics endpoint.
@@ -70,13 +121,13 @@ var (
 
 	poolNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "binpack_pool_nodes",
-		Help: "Ready nodes in each autoscaling pool, as the cluster-autoscaler reports them.",
+		Help: "Nodes registered and ready in each autoscaling pool, as the " +
+			"cluster-autoscaler reports them.",
 	}, []string{"pool"})
 
 	poolMin = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "binpack_pool_min_nodes",
-		Help: "The configured minimum size of each autoscaling pool. " +
-			"binpack_pool_nodes sitting on this is why a pool is not shrinking.",
+		Help: "The configured minimum size of each autoscaling pool.",
 	}, []string{"pool"})
 
 	poolMax = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -85,12 +136,19 @@ var (
 	}, []string{"pool"})
 )
 
+// state is everything that describes a cluster, and so everything a process
+// that has not evaluated one must keep quiet about.
+//
+// The counters and the histogram are deliberately outside it: a replica that
+// has completed no evaluations reporting zero of them is simply true, and a
+// counter absent from a scrape is harder to reason about than one at zero.
+var state = newGated(
+	lastEvaluation, autoscalerUp, nodes, skipped, drainable,
+	poolNodes, poolMin, poolMax,
+)
+
 func init() {
-	metrics.Registry.MustRegister(
-		evaluations, evaluationErrors, evaluationDuration, lastEvaluation,
-		autoscalerUp, nodes, skipped, drainable,
-		poolNodes, poolMin, poolMax,
-	)
+	metrics.Registry.MustRegister(evaluations, evaluationErrors, evaluationDuration, state)
 }
 
 // Failed records an evaluation that could not be completed.
@@ -115,8 +173,10 @@ func Observe(s engine.Snapshot, d engine.Decision, cfg engine.Config, took float
 	live, _ := s.Autoscaler.Live(s.Now)
 	autoscalerUp.Set(boolAsFloat(live))
 
-	observeNodes(d)
-	observePools(s, cfg)
+	state.publish(func() {
+		observeNodes(d)
+		observePools(s, cfg)
+	})
 }
 
 func observeNodes(d engine.Decision) {
@@ -170,7 +230,13 @@ func observePools(s engine.Snapshot, cfg engine.Config) {
 		if label == "" {
 			label = g.ID
 		}
-		poolNodes.WithLabelValues(label).Set(float64(g.Size()))
+		// Ready, not Size(). They differ while a scale-down is in progress —
+		// Size() is the lower of ready and the autoscaler's target, which is
+		// the number binpack compares against the floor — and a series called
+		// "nodes" that quietly means "intent" is one nobody can trust.
+		// Whether a pool is at its floor is reported directly, as the
+		// pool-at-minimum skip code.
+		poolNodes.WithLabelValues(label).Set(float64(g.Ready))
 		poolMin.WithLabelValues(label).Set(float64(g.MinSize))
 		poolMax.WithLabelValues(label).Set(float64(g.MaxSize))
 	}
