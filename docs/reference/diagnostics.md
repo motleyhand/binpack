@@ -148,10 +148,17 @@ the entire time.
 
 ### `pdb-workload-unhealthy` — warning
 
-The budget permits no disruption because its workload is currently short of replicas.
+The budget permits no disruption because a replica it selects is missing or unhealthy.
 
 A different problem with a different owner, and reported separately so you do not go and edit a
 budget that is behaving exactly as intended.
+
+Health is judged against `status.expectedPods`, not `status.desiredHealthy`. A budget that has
+temporarily lost exactly its slack — three replicas, `maxUnavailable: 1`, one of them down —
+reports `currentHealthy` *equal* to `desiredHealthy` and zero disruptions allowed, and is fine
+again the moment the third recovers. The converse also matters: `minAvailable` set above the
+replica count leaves `currentHealthy` below `desiredHealthy` while every selected pod is
+healthy, and that block is permanent — reported as `pdb-zero-disruptions`.
 
 **Fix.** Nothing in the budget. Find out why the replicas are unhealthy; it will permit
 disruptions again once they recover.
@@ -196,6 +203,9 @@ Workload findings are collapsed by controller, so a twenty-replica Deployment mo
 controller to group by and stay separate, because each is individually something you have to
 deal with. The detail names the node, so you can weigh the finding against the cost of the node
 it is holding open.
+
+Every check here except `priority-below-cutoff` considers only pods that are **on a node**: an
+unscheduled pod holds nothing open, so it cannot be why a node is still there.
 
 ### `bare-pod` — blocking
 
@@ -250,6 +260,10 @@ This is the silent failure in most overprovisioning setups. If these are pause p
 warm capacity, that capacity is consumed by the first burst and never replenished, because the
 autoscaler will not scale up for a pod below its cutoff. Nothing anywhere reports this. See
 [overprovisioning and expendable pods](../explanation/overprovisioning-and-expendable-pods.md).
+
+This is the one check that also examines **unscheduled** pods, and the detail counts them
+(`3 pending`). A stuck Pending pod below the cutoff is not a symptom of the problem — it *is*
+the problem, and a finding covering one is never treated as freeing nothing.
 
 **Fix.** Raise the priority to at or above the cutoff. If these really are throwaway pods,
 nothing to do.

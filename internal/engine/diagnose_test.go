@@ -579,3 +579,130 @@ func TestDiagnoseMarksNothingWithoutAnAutoscaler(t *testing.T) {
 		}
 	}
 }
+
+func TestDiagnoseFindsFillerThatCannotBeScheduled(t *testing.T) {
+	// The failure this diagnosis exists for. A pause pod below the cutoff is
+	// evicted by a burst and then stays Pending forever, because the
+	// autoscaler will not scale up for a pod it considers expendable — and
+	// nothing else in the cluster reports it. A check that required the pod to
+	// be on a node was silent in exactly this case.
+	pods := []*corev1.Pod{
+		mother.PausePod("default", "filler-a", mother.Priority(cutoff-1), mother.Pending()),
+		mother.PausePod("default", "filler-b", mother.Priority(cutoff-1), mother.Pending()),
+	}
+	for _, p := range pods {
+		p.OwnerReferences[0].Name = "filler-rs"
+	}
+
+	f := only(t, diagnose(nil, pods), engine.FindingPriorityBelow)
+
+	if !strings.Contains(f.Detail, "2 pending") {
+		t.Errorf("detail does not report the unscheduled pods: %q", f.Detail)
+	}
+	// Nothing will place them, so this is a live problem, not a dormant one.
+	if f.FreesNothing {
+		t.Error("an unscheduled pod was treated as sitting on a node nothing will remove")
+	}
+}
+
+func TestDiagnoseReportsPendingAndScheduledPodsTogether(t *testing.T) {
+	pods := []*corev1.Pod{
+		mother.PausePod("default", "filler-a", mother.Priority(cutoff-1), mother.OnNode("a")),
+		mother.PausePod("default", "filler-b", mother.Priority(cutoff-1), mother.Pending()),
+	}
+	for _, p := range pods {
+		p.OwnerReferences[0].Name = "filler-rs"
+	}
+
+	f := only(t, diagnose(nil, pods), engine.FindingPriorityBelow)
+
+	if !strings.Contains(f.Detail, "a") || !strings.Contains(f.Detail, "1 pending") {
+		t.Errorf("detail loses either the node or the pending pod: %q", f.Detail)
+	}
+}
+
+func TestDiagnoseIgnoresUnscheduledPodsForEverythingElse(t *testing.T) {
+	// A Pending pod holds no node open, so it cannot be why one is still
+	// there. Only the priority check has anything to say about it.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "orphan", mother.Bare(), mother.Pending()),
+		mother.Pod("default", "cache", mother.WithEmptyDir("scratch"), mother.Pending()),
+		mother.Pod("kube-system", "coredns", mother.Pending()),
+	}
+
+	if findings := diagnose(nil, pods); len(findings) != 0 {
+		t.Errorf("unscheduled pods produced findings: %s", render(findings))
+	}
+}
+
+func TestDiagnoseTreatsABudgetTemporarilyOutOfSlackAsTransient(t *testing.T) {
+	// Three replicas, maxUnavailable: 1, so desiredHealthy is 2. One replica
+	// is down: currentHealthy equals desiredHealthy exactly, the disruption
+	// controller reports zero allowed, and the budget is fine again the moment
+	// the third recovers. Nothing about it needs editing.
+	pdb := mother.Replicas(
+		mother.Healthy(mother.PDB("default", "web", 0, map[string]string{"app": "web"}), 2, 2), 3)
+
+	findings := diagnose(nil, nil, pdb)
+
+	f := only(t, findings, engine.FindingPDBUnhealthy)
+	if !strings.Contains(f.Detail, "2 of 3 pods healthy") {
+		t.Errorf("detail does not show the missing replica: %q", f.Detail)
+	}
+	none(t, findings, engine.FindingPDBZero)
+}
+
+func TestDiagnoseStillReportsABudgetThatCanNeverAllowADisruption(t *testing.T) {
+	tests := []struct {
+		name string
+		pdb  *policyv1.PodDisruptionBudget
+	}{
+		{
+			// The classic trap: one replica, minAvailable 1. Every pod it
+			// selects is healthy and it can still never permit a disruption.
+			"single replica at minAvailable 1",
+			mother.Replicas(
+				mother.Healthy(mother.PDB("default", "solo", 0, map[string]string{"app": "solo"}), 1, 1), 1),
+		},
+		{
+			// minAvailable above the replica count. currentHealthy is below
+			// desiredHealthy, which looks transient — but every selected pod
+			// is already healthy, so nothing is coming to fix it.
+			"minAvailable above the replica count",
+			mother.Replicas(
+				mother.Healthy(mother.PDB("default", "over", 0, map[string]string{"app": "over"}), 2, 5), 2),
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			findings := diagnose(nil, nil, tc.pdb)
+			only(t, findings, engine.FindingPDBZero)
+			none(t, findings, engine.FindingPDBUnhealthy)
+		})
+	}
+}
+
+func TestDiagnoseDoesNotExcuseAFindingBecauseItsOtherPodsAreOnAStaticPool(t *testing.T) {
+	// One filler pod on a pool nothing will remove, one Pending. Judging the
+	// workload only by the nodes it occupies would call the whole finding
+	// dormant — and the Pending pod is the live half, so the gate would let a
+	// real broken buffer through.
+	nodes := []*corev1.Node{
+		inPool("auto-1"), inPool("auto-2"), inPool("auto-3"),
+		sized("static-1", "8Gi", mother.InPool("pool-8g", "static-id")),
+	}
+	pods := []*corev1.Pod{
+		mother.PausePod("default", "filler-a", mother.Priority(cutoff-1), mother.OnNode("static-1")),
+		mother.PausePod("default", "filler-b", mother.Priority(cutoff-1), mother.Pending()),
+	}
+	for _, p := range pods {
+		p.OwnerReferences[0].Name = "filler-rs"
+	}
+
+	f := only(t, diagnose(nodes, pods), engine.FindingPriorityBelow)
+
+	if f.FreesNothing {
+		t.Error("marked dormant despite an unscheduled pod that nothing will place")
+	}
+}

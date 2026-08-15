@@ -371,9 +371,21 @@ func diagnoseBudgets(s Snapshot) []Finding {
 			findings = append(findings, finding(FindingPDBSelectsNothing, ref,
 				"selector matches no pods: "+selectorSummary(pdb)))
 
-		case pdb.Status.CurrentHealthy < pdb.Status.DesiredHealthy:
-			// Zero because the workload is broken rather than because the
-			// budget is wrong. A different problem, with a different owner.
+		case pdb.Status.CurrentHealthy < pdb.Status.ExpectedPods:
+			// Zero because a replica is missing rather than because the budget
+			// is wrong. A different problem, with a different owner.
+			//
+			// Compared against ExpectedPods, not DesiredHealthy. A budget that
+			// has temporarily lost exactly its slack — three replicas,
+			// maxUnavailable 1, one of them down — reports currentHealthy
+			// equal to desiredHealthy and zero disruptions allowed, and is
+			// fine again the moment the third recovers. Testing only against
+			// desiredHealthy called that a permanent misconfiguration and sent
+			// the reader off to edit a correct budget.
+			//
+			// It also gets the converse right: minAvailable set above the
+			// replica count leaves currentHealthy below desiredHealthy but
+			// equal to expectedPods, and that block really is permanent.
 			findings = append(findings, finding(FindingPDBUnhealthy, ref,
 				fmt.Sprintf("%d of %d pods healthy, %d required",
 					pdb.Status.CurrentHealthy, pdb.Status.ExpectedPods, pdb.Status.DesiredHealthy)))
@@ -434,15 +446,28 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 	g := newGrouped(staticNodes(s, cfg))
 
 	for _, pod := range s.Pods {
-		if pod.Spec.NodeName == "" || !occupies(pod) || isNodeLocal(pod) {
+		if !occupies(pod) || isNodeLocal(pod) {
 			continue
 		}
 
+		// Checked before the pod is required to be on a node, because a pod
+		// below the cutoff that is *Pending* is the failure this diagnosis
+		// exists for: the autoscaler ignores such pods when deciding to scale
+		// up, so overprovisioning filler evicted by a burst never comes back
+		// and no other signal reports it. Requiring an assignment first made
+		// the check silent in exactly the case it documents.
+		//
 		// Narrow by construction: the cutoff defaults to -10 and an unclassed
 		// pod sits at 0, so only a deliberate negative priority lands here.
 		if pod.Spec.PriorityClassName != "" && podPriority(pod) < policy.Sim.ExpendablePriorityCutoff {
 			g.add(pod, FindingPriorityBelow, fmt.Sprintf("priority %d (%s), cutoff %d",
 				podPriority(pod), pod.Spec.PriorityClassName, policy.Sim.ExpendablePriorityCutoff))
+		}
+
+		// Everything below is about a pod holding a node open, which an
+		// unscheduled pod is not.
+		if pod.Spec.NodeName == "" {
+			continue
 		}
 
 		matched := matchingPDBs(pod, s.PDBs)
@@ -529,6 +554,31 @@ type groupedFinding struct {
 	// one they cannot weigh against the cost of the node it is holding open.
 	nodes []string
 	seen  map[string]bool
+	// pending counts pods the scheduler has not placed. They pin no node, and
+	// for an expendable pod being unplaced is itself the finding.
+	pending int
+}
+
+// where says how many pods are involved and on which nodes, which is what
+// turns a finding into something an operator can locate and cost.
+func (f *groupedFinding) where() string {
+	var parts []string
+
+	if scheduled := f.pods - f.pending; scheduled > 0 {
+		location := f.nodes[0]
+		if len(f.nodes) > 1 {
+			location = fmt.Sprintf("%d nodes", len(f.nodes))
+		}
+		if scheduled > 1 {
+			location = fmt.Sprintf("%d pods on %s", scheduled, location)
+		}
+		parts = append(parts, location)
+	}
+	if f.pending > 0 {
+		parts = append(parts, fmt.Sprintf("%d pending", f.pending))
+	}
+
+	return strings.Join(parts, ", ")
 }
 
 func newGrouped(static map[string]bool) *grouped {
@@ -552,21 +602,30 @@ func (g *grouped) add(pod *corev1.Pod, code, detail string) {
 		g.order = append(g.order, key)
 	}
 	entry.pods++
-	if node := pod.Spec.NodeName; !entry.seen[node] {
+	node := pod.Spec.NodeName
+	if node == "" {
+		entry.pending++
+		return
+	}
+	if !entry.seen[node] {
 		entry.seen[node] = true
 		entry.nodes = append(entry.nodes, node)
 	}
 }
 
-// allStatic reports whether every node a finding sits on is one nothing will
-// ever remove.
-func (g *grouped) allStatic(nodes []string) bool {
-	for _, node := range nodes {
+// allStatic reports whether a finding sits entirely on nodes nothing will ever
+// remove. An unscheduled pod is never static: it is on no node at all, and for
+// expendable filler that is the live problem rather than a dormant one.
+func (g *grouped) allStatic(f *groupedFinding) bool {
+	if f.pending > 0 || len(f.nodes) == 0 {
+		return false
+	}
+	for _, node := range f.nodes {
 		if !g.static[node] {
 			return false
 		}
 	}
-	return len(nodes) > 0
+	return true
 }
 
 func (g *grouped) findings() []Finding {
@@ -575,20 +634,12 @@ func (g *grouped) findings() []Finding {
 		entry := g.byKey[key]
 		f := entry.finding
 
-		where := entry.nodes[0]
-		if len(entry.nodes) > 1 {
-			where = fmt.Sprintf("%d nodes", len(entry.nodes))
-		}
-		if entry.pods > 1 {
-			where = fmt.Sprintf("%d pods on %s", entry.pods, where)
-		}
-
-		if f.Detail == "" {
+		if where := entry.where(); f.Detail == "" {
 			f.Detail = where
 		} else {
 			f.Detail += ", " + where
 		}
-		f.FreesNothing = g.allStatic(entry.nodes)
+		f.FreesNothing = g.allStatic(entry)
 		out = append(out, f)
 	}
 	return out

@@ -426,6 +426,14 @@ func PDB(namespace, name string, disruptionsAllowed int32, selector map[string]s
 	}
 }
 
+// Replicas sets how many pods a budget selects, independently of how many are
+// healthy. The gap between the two is what separates a budget temporarily out
+// of slack from one that can never have any.
+func Replicas(pdb *policyv1.PodDisruptionBudget, expected int32) *policyv1.PodDisruptionBudget {
+	pdb.Status.ExpectedPods = expected
+	return pdb
+}
+
 // SelectsNothing empties a budget's status the way the disruption controller
 // does when its selector matches no pods — as a chart whose pod labels changed
 // leaves behind. Such a budget blocks nothing and protects nothing, and looks
@@ -478,6 +486,21 @@ func WithHostPathVolume(name, path string) PodOption {
 // SafeToEvict sets the cluster-autoscaler annotation.
 func SafeToEvict(value string) PodOption {
 	return Annotated("cluster-autoscaler.kubernetes.io/safe-to-evict", value)
+}
+
+// Pending is a pod the scheduler has not placed. It holds no node open — and
+// for a pod below the autoscaler's expendable cutoff, being unplaced is itself
+// the failure, since the autoscaler will not scale up to accommodate one.
+func Pending() PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.NodeName = ""
+		p.Status.Phase = corev1.PodPending
+		p.Status.Conditions = []corev1.PodCondition{{
+			Type:   corev1.PodScheduled,
+			Status: corev1.ConditionFalse,
+			Reason: corev1.PodReasonUnschedulable,
+		}}
+	}
 }
 
 // Unready flips the pod's Ready condition, as a CrashLoopBackOff replica has.
