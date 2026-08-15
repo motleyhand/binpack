@@ -107,8 +107,12 @@ func (a Autoscaler) Live(now time.Time) (bool, string) {
 // does not manage are absent, which is how binpack knows not to touch them.
 type NodeGroup struct {
 	// ID matches the value of Config.NodeGroupIDLabel on a node.
+	//
+	// There is deliberately no Name here. The autoscaler's status carries no
+	// human-readable pool name — that lives on the nodes, as a label — and a
+	// field only tests could fill in is one every consumer silently falls back
+	// from. Use [PoolNames] instead.
 	ID      string
-	Name    string
 	MinSize int
 	MaxSize int
 	Ready   int
@@ -189,12 +193,54 @@ func (a Action) String() string {
 	return "none"
 }
 
+// Verdicts: what binpack concluded about one node, as a bounded value.
+//
+// The prose says why in a sentence an operator can act on; these name the
+// outcome so it can be counted, alerted on and matched against without anyone
+// parsing English. Stable, like the diagnostic codes and the metric names.
+const (
+	VerdictSkipped    = "skipped"
+	VerdictInfeasible = "infeasible"
+	VerdictBlocked    = "blocked"
+	VerdictDrainable  = "drainable"
+)
+
+// Skip codes: why a node was ruled out. One per branch of the eligibility
+// check, set beside the prose so the two cannot drift apart.
+const (
+	SkipNotAutoscaled        = "not-autoscaled"
+	SkipPoolDisabled         = "pool-disabled"
+	SkipScaleUpInProgress    = "scale-up-in-progress"
+	SkipCooldownAfterScaleUp = "cooldown-after-scale-up"
+	SkipCooldownAfterDrain   = "cooldown-after-drain"
+	SkipPoolAtMinimum        = "pool-at-minimum"
+	SkipAnnotated            = "annotated-skip"
+	SkipDrainInProgress      = "drain-in-progress"
+	SkipBackoff              = "backoff"
+	SkipCordoned             = "cordoned"
+	SkipProtectedPod         = "protected-pod"
+	SkipTooManyPods          = "too-many-pods"
+)
+
+// Decision codes: the outcome of a whole evaluation.
+const (
+	CodeDrain        = "drain"
+	CodeNoAutoscaler = "no-autoscaler"
+	// CodeNoCandidates: every node was ruled out before any simulation ran.
+	CodeNoCandidates = "no-candidates"
+	// CodeNoneFeasible: nodes were simulated and none could be emptied.
+	CodeNoneFeasible = "none-feasible"
+)
+
 // Decision is the engine's answer, carrying the arithmetic that produced it.
 //
 // Every field exists so `binpack explain` can show its working. A decision
 // that cannot be explained is one nobody should act on.
 type Decision struct {
 	Action Action
+	// Code names the outcome, from the bounded set above. Reason explains it;
+	// this is what a metric or an alert can key on.
+	Code string
 	// Node is set when Action is Drain.
 	Node *corev1.Node
 	// Reason explains a None, in a sentence an operator can act on.
@@ -211,9 +257,10 @@ type NodeAssessment struct {
 	Pool  string
 
 	// Skipped is set when the node was ruled out before simulation, with
-	// SkipReason saying why.
+	// SkipReason saying why in prose and SkipCode naming it.
 	Skipped    bool
 	SkipReason string
+	SkipCode   string
 
 	// Simulation and Blockers are populated only for nodes that reached
 	// those stages.
@@ -224,6 +271,23 @@ type NodeAssessment struct {
 	Chosen bool
 }
 
+// Verdict names what binpack concluded about this node.
+//
+// Derived rather than stored: it is a reading of the other fields, and a
+// stored copy is a copy that can disagree with them.
+func (a NodeAssessment) Verdict() string {
+	switch {
+	case a.Skipped:
+		return VerdictSkipped
+	case len(a.Blockers) > 0:
+		return VerdictBlocked
+	case a.Simulation != nil && !a.Simulation.Feasible:
+		return VerdictInfeasible
+	default:
+		return VerdictDrainable
+	}
+}
+
 // Decide runs the whole procedure and returns one action.
 //
 // Deliberately one node per run. Iterative beats clever: the next run observes
@@ -232,7 +296,7 @@ type NodeAssessment struct {
 // underneath the plan.
 func Decide(s Snapshot, cfg Config) Decision {
 	if live, why := s.Autoscaler.Live(s.Now); !live {
-		return Decision{Reason: why}
+		return Decision{Code: CodeNoAutoscaler, Reason: why}
 	}
 
 	candidates, assessments := eligible(s, cfg)
@@ -263,6 +327,7 @@ func Decide(s Snapshot, cfg Config) Decision {
 
 		if policy.MaxPodsPerDrain > 0 && len(sim.Relocated) > policy.MaxPodsPerDrain {
 			a.Skipped = true
+			a.SkipCode = SkipTooManyPods
 			a.SkipReason = fmt.Sprintf("would relocate %d pods, above the limit of %d",
 				len(sim.Relocated), policy.MaxPodsPerDrain)
 			assessments = append(assessments, *a)
@@ -286,15 +351,30 @@ func Decide(s Snapshot, cfg Config) Decision {
 		assessments[chosen].Chosen = true
 		return Decision{
 			Action:      Drain,
+			Code:        CodeDrain,
 			Node:        assessments[chosen].Node,
 			Assessments: assessments,
 		}
 	}
 
 	return Decision{
+		Code:        outcomeCode(assessments),
 		Reason:      summarise(assessments),
 		Assessments: assessments,
 	}
+}
+
+// outcomeCode distinguishes a cluster where nothing was even eligible from one
+// where candidates were simulated and none worked. They call for entirely
+// different responses — the first is configuration, the second is capacity —
+// and the prose already draws the line, so the code must too.
+func outcomeCode(assessments []NodeAssessment) string {
+	for _, a := range assessments {
+		if !a.Skipped {
+			return CodeNoneFeasible
+		}
+	}
+	return CodeNoCandidates
 }
 
 // cooling reports whether recent activity means this node should be left
@@ -305,30 +385,36 @@ func Decide(s Snapshot, cfg Config) Decision {
 // hold up a pool that wants none. The underlying autoscaler behaviour is
 // cluster-wide, so this can only ever be more conservative than reality —
 // which is the safe direction.
-func cooling(s Snapshot, policy Policy) (string, bool) {
+// cooling reports whether recent activity means a node should be left alone,
+// with a code naming which of the three reasons applies. They are worth
+// telling apart: scaling up right now is the cluster disagreeing with binpack,
+// while a cooldown is binpack disagreeing with itself a few minutes ago.
+func cooling(s Snapshot, policy Policy) (code, reason string, cooling bool) {
 	// Growing right now is the clearest possible signal not to be removing
 	// nodes, and it does not depend on any configured duration.
 	if s.Autoscaler.ScaleUpInProgress {
-		return "the cluster is scaling up right now", true
+		return SkipScaleUpInProgress, "the cluster is scaling up right now", true
 	}
 
 	// Draining straight after the cluster grew is how oscillation starts, and
 	// the autoscaler pauses its own scale-down then anyway.
 	if d := policy.CooldownAfterScaleUp; d > 0 && !s.Autoscaler.LastScaleUp.IsZero() {
 		if since := s.Now.Sub(s.Autoscaler.LastScaleUp); since < d {
-			return fmt.Sprintf("the cluster scaled up %s ago; waiting %s before considering a drain",
+			return SkipCooldownAfterScaleUp, fmt.Sprintf(
+				"the cluster scaled up %s ago; waiting %s before considering a drain",
 				since.Round(time.Second), d), true
 		}
 	}
 
 	if d := policy.CooldownAfterDrain; d > 0 && !s.LastDrain.IsZero() {
 		if since := s.Now.Sub(s.LastDrain); since < d {
-			return fmt.Sprintf("a drain completed %s ago; letting the cluster settle for %s",
+			return SkipCooldownAfterDrain, fmt.Sprintf(
+				"a drain completed %s ago; letting the cluster settle for %s",
 				since.Round(time.Second), d), true
 		}
 	}
 
-	return "", false
+	return "", "", false
 }
 
 // eligible splits nodes into those worth simulating and those ruled out, with
@@ -351,40 +437,41 @@ func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []
 
 		policy := cfg.PolicyFor(a.Group, a.Pool)
 		group, managed := groups[a.Group]
-		cooldown, cooling := cooling(s, policy)
+		coolCode, cooldown, cooling := cooling(s, policy)
 
 		switch {
 		case !managed:
 			// Absent from the autoscaler's status means it does not manage
 			// this pool, so nothing would ever remove the node.
-			a.Skipped, a.SkipReason = true, "not part of an autoscaling pool"
+			a.Skipped, a.SkipCode, a.SkipReason = true, SkipNotAutoscaled, "not part of an autoscaling pool"
 
 		case !policy.Enabled:
-			a.Skipped, a.SkipReason = true, "binpack is disabled for this pool"
+			a.Skipped, a.SkipCode, a.SkipReason = true, SkipPoolDisabled, "binpack is disabled for this pool"
 
 		case cooling:
-			a.Skipped, a.SkipReason = true, cooldown
+			a.Skipped, a.SkipCode, a.SkipReason = true, coolCode, cooldown
 
 		case group.Size() <= group.MinSize:
-			a.Skipped, a.SkipReason = true, fmt.Sprintf(
+			a.Skipped, a.SkipCode = true, SkipPoolAtMinimum
+			a.SkipReason = fmt.Sprintf(
 				"pool %s is at its minimum size (%d)", displayPool(a), group.MinSize)
 
 		case node.Annotations[AnnotationSkip] == "true":
-			a.Skipped, a.SkipReason = true, "annotated "+AnnotationSkip
+			a.Skipped, a.SkipCode, a.SkipReason = true, SkipAnnotated, "annotated "+AnnotationSkip
 
 		case node.Annotations[AnnotationDrainStarted] != "":
-			a.Skipped, a.SkipReason = true, "a drain is already in progress on this node"
+			a.Skipped, a.SkipCode, a.SkipReason = true, SkipDrainInProgress, "a drain is already in progress on this node"
 
 		case backoffActive(node, s.Now):
-			a.Skipped, a.SkipReason = true, backoffReason(node)
+			a.Skipped, a.SkipCode, a.SkipReason = true, SkipBackoff, backoffReason(node)
 
 		case node.Spec.Unschedulable:
 			// Already cordoned by someone else. Draining it would not be
 			// binpack's to finish, and it is not accepting work anyway.
-			a.Skipped, a.SkipReason = true, "already cordoned"
+			a.Skipped, a.SkipCode, a.SkipReason = true, SkipCordoned, "already cordoned"
 
 		case protected[node.Name] != "":
-			a.Skipped, a.SkipReason = true, protected[node.Name]
+			a.Skipped, a.SkipCode, a.SkipReason = true, SkipProtectedPod, protected[node.Name]
 		}
 
 		if a.Skipped {
@@ -537,6 +624,29 @@ func summarise(assessments []NodeAssessment) string {
 	default:
 		return fmt.Sprintf("%d node(s) considered, none whose workload fits elsewhere", considered)
 	}
+}
+
+// PoolNames maps each autoscaling group's identifier to the human-readable
+// pool name its nodes carry.
+//
+// The two names come from different places: the identifier from the
+// cluster-autoscaler's status, the readable name from a node label. Anything
+// shown to a person wants the second — nobody recognises a provider UUID on a
+// dashboard or in an alert — and anything matching against the autoscaler
+// wants the first.
+//
+// A pool with no nodes has nothing to take a name from and is absent here, so
+// callers fall back to the identifier.
+func PoolNames(s Snapshot, cfg Config) map[string]string {
+	names := map[string]string{}
+	for _, node := range s.Nodes {
+		id := node.Labels[cfg.NodeGroupIDLabel]
+		name := node.Labels[cfg.PoolNameLabel]
+		if id != "" && name != "" {
+			names[id] = name
+		}
+	}
+	return names
 }
 
 // CheckPools rejects per-pool overrides naming a pool that is not there.

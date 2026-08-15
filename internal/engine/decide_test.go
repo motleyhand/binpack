@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -32,7 +33,7 @@ func cluster(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
 			// that wrote it, so freshness is part of "running".
 			LastProbe: now.Add(-10 * time.Second),
 			Groups: []engine.NodeGroup{
-				{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: len(nodes)},
+				{ID: poolID, MinSize: 1, MaxSize: 10, Ready: len(nodes)},
 			},
 		},
 	}
@@ -228,7 +229,7 @@ func TestProviderTargetGuardsTheFloor(t *testing.T) {
 	// approve a drain the autoscaler will not honour.
 	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
 	s.Autoscaler.Groups[0] = engine.NodeGroup{
-		ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10,
+		ID: poolID, MinSize: 1, MaxSize: 10,
 		Ready: 2, Target: 1, HasTarget: true,
 	}
 
@@ -248,7 +249,7 @@ func TestZeroTargetIsARealTarget(t *testing.T) {
 	// autoscaler has most clearly finished deciding.
 	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
 	s.Autoscaler.Groups[0] = engine.NodeGroup{
-		ID: poolID, Name: poolName, MinSize: 0, MaxSize: 10,
+		ID: poolID, MinSize: 0, MaxSize: 10,
 		Ready: 1, Target: 0, HasTarget: true,
 	}
 
@@ -446,8 +447,8 @@ func inOtherPool(name string, opts ...mother.NodeOption) *corev1.Node {
 func twoPools(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
 	s := cluster(nodes, pods)
 	s.Autoscaler.Groups = []engine.NodeGroup{
-		{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: 2},
-		{ID: otherPoolID, Name: "pool-8g", MinSize: 1, MaxSize: 10, Ready: 2},
+		{ID: poolID, MinSize: 1, MaxSize: 10, Ready: 2},
+		{ID: otherPoolID, MinSize: 1, MaxSize: 10, Ready: 2},
 	}
 	return s
 }
@@ -603,12 +604,165 @@ func TestCheckPoolsAcceptsAPoolKnownOnlyToTheAutoscaler(t *testing.T) {
 	// binpack down over a pool that is merely empty.
 	s := cluster(nil, nil)
 	s.Autoscaler.Groups = []engine.NodeGroup{
-		{ID: poolID, Name: poolName, MinSize: 0, MaxSize: 10, Ready: 0},
+		{ID: poolID, MinSize: 0, MaxSize: 10, Ready: 0},
 	}
 	cfg := config()
 	cfg.ByPool = map[string]engine.Policy{poolID: {Enabled: false}}
 
 	if err := engine.CheckPools(s, cfg); err != nil {
 		t.Errorf("an empty but autoscaled pool was rejected: %v", err)
+	}
+}
+
+func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
+	// The prose says why in a sentence; the code is what a metric and an alert
+	// key on. Two branches sharing a code is invisible in the prose and makes
+	// the metric lie — "12 nodes in backoff" when none are.
+	// The cooldowns only apply when configured, and the shared config leaves
+	// them off so that other tests are not silently governed by a clock.
+	withCooldowns := func() engine.Config {
+		c := config()
+		c.Default.CooldownAfterScaleUp = 10 * time.Minute
+		c.Default.CooldownAfterDrain = 10 * time.Minute
+		return c
+	}
+
+	tests := []struct {
+		name  string
+		build func() engine.Snapshot
+		cfg   engine.Config
+		want  string
+	}{
+		{"not autoscaled", func() engine.Snapshot {
+			s := cluster([]*corev1.Node{sized("loner", "4Gi")}, nil)
+			return s
+		}, config(), engine.SkipNotAutoscaled},
+
+		{"scaling up right now", func() engine.Snapshot {
+			s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+			s.Autoscaler.ScaleUpInProgress = true
+			return s
+		}, config(), engine.SkipScaleUpInProgress},
+
+		{"cooldown after scale-up", func() engine.Snapshot {
+			s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+			s.Autoscaler.LastScaleUp = now.Add(-time.Minute)
+			return s
+		}, withCooldowns(), engine.SkipCooldownAfterScaleUp},
+
+		{"cooldown after drain", func() engine.Snapshot {
+			s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+			s.LastDrain = now.Add(-time.Minute)
+			return s
+		}, withCooldowns(), engine.SkipCooldownAfterDrain},
+
+		{"pool at its minimum", func() engine.Snapshot {
+			s := cluster([]*corev1.Node{inPool("a")}, nil)
+			s.Autoscaler.Groups = []engine.NodeGroup{
+				{ID: poolID, MinSize: 3, MaxSize: 10, Ready: 3},
+			}
+			return s
+		}, config(), engine.SkipPoolAtMinimum},
+
+		{"annotated skip", func() engine.Snapshot {
+			return cluster([]*corev1.Node{
+				inPool("a", mother.NodeAnnotations(map[string]string{engine.AnnotationSkip: "true"})),
+				inPool("b"),
+			}, nil)
+		}, config(), engine.SkipAnnotated},
+
+		{"drain in progress", func() engine.Snapshot {
+			return cluster([]*corev1.Node{
+				inPool("a", mother.NodeAnnotations(map[string]string{
+					engine.AnnotationDrainStarted: now.Format(time.RFC3339)})),
+				inPool("b"),
+			}, nil)
+		}, config(), engine.SkipDrainInProgress},
+
+		{"backoff", func() engine.Snapshot {
+			return cluster([]*corev1.Node{
+				inPool("a", mother.NodeAnnotations(map[string]string{
+					engine.AnnotationBackoffUntil: now.Add(time.Hour).Format(time.RFC3339),
+					engine.AnnotationLastFailure:  "eviction refused",
+				})),
+				inPool("b"),
+			}, nil)
+		}, config(), engine.SkipBackoff},
+
+		{"cordoned", func() engine.Snapshot {
+			return cluster([]*corev1.Node{inPool("a", mother.Cordoned()), inPool("b")}, nil)
+		}, config(), engine.SkipCordoned},
+	}
+
+	seen := map[string]bool{}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			d := engine.Decide(tc.build(), tc.cfg)
+
+			var codes []string
+			for _, a := range d.Assessments {
+				if a.Skipped {
+					codes = append(codes, a.SkipCode)
+					if a.SkipReason == "" {
+						t.Errorf("%s: a skip code with no prose to explain it", a.SkipCode)
+					}
+				}
+			}
+			if !slices.Contains(codes, tc.want) {
+				t.Errorf("skip codes = %v, want one of them to be %q", codes, tc.want)
+			}
+			seen[tc.want] = true
+		})
+	}
+
+	// Every code the engine can emit must be reachable, or it is documentation
+	// for a state that cannot happen.
+	for _, code := range []string{
+		engine.SkipNotAutoscaled, engine.SkipScaleUpInProgress,
+		engine.SkipCooldownAfterScaleUp, engine.SkipCooldownAfterDrain,
+		engine.SkipPoolAtMinimum, engine.SkipAnnotated, engine.SkipDrainInProgress,
+		engine.SkipBackoff, engine.SkipCordoned,
+	} {
+		if !seen[code] {
+			t.Errorf("no case reaches %q", code)
+		}
+	}
+}
+
+func TestEveryDecisionCarriesACode(t *testing.T) {
+	// Decide has several returns and the code is set at each. A new one that
+	// forgets leaves a metric labelled with the empty string.
+	noAutoscaler := cluster([]*corev1.Node{inPool("a")}, nil)
+	noAutoscaler.Autoscaler = engine.Autoscaler{}
+
+	allSkipped := cluster([]*corev1.Node{inPool("a", mother.Cordoned())}, nil)
+
+	feasible := cluster([]*corev1.Node{inPool("a"), inPool("b"), inPool("c")},
+		[]*corev1.Pod{mother.Pod("default", "web", mother.OnNode("a"))})
+
+	// Two nodes, each too full to take the other's workload — so every
+	// candidate is simulated and every one fails, which is the state
+	// none-feasible names and no-candidates does not.
+	tooBig := cluster([]*corev1.Node{inPool("a"), inPool("b")}, []*corev1.Pod{
+		mother.Pod("default", "big-a", mother.OnNode("a"), mother.Requests("100m", "3Gi")),
+		mother.Pod("default", "big-b", mother.OnNode("b"), mother.Requests("100m", "3Gi")),
+	})
+
+	for _, tc := range []struct {
+		name string
+		s    engine.Snapshot
+		want string
+	}{
+		{"no autoscaler", noAutoscaler, engine.CodeNoAutoscaler},
+		{"nothing eligible", allSkipped, engine.CodeNoCandidates},
+		{"nothing fits", tooBig, engine.CodeNoneFeasible},
+		{"a drain", feasible, engine.CodeDrain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := engine.Decide(tc.s, config())
+			if d.Code != tc.want {
+				t.Errorf("code = %q, want %q (reason: %s)", d.Code, tc.want, d.Reason)
+			}
+		})
 	}
 }

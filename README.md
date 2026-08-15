@@ -68,6 +68,7 @@ add. If those fixes solve it, you might not need this.
 |---|---|
 | [Configuration](docs/reference/configuration.md) | Every field, what it does, and why headroom is not a percentage |
 | [Diagnostics](docs/reference/diagnostics.md) | Every `binpack diagnose` code, its severity, and the fix |
+| [Metrics](docs/reference/metrics.md) | Every `binpack_` series, what to alert on, and why prose is never a label |
 | [RBAC](docs/reference/rbac.md) | Every permission binpack needs, and what it is deliberately never granted |
 | [Fix a silently broken Metrics API](docs/how-to/fix-metrics-api-on-managed-kubernetes.md) | When `kubectl top` returns nothing and your HPAs are quietly inert |
 
