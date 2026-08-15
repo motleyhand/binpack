@@ -161,15 +161,16 @@ func TestCanFit(t *testing.T) {
 }
 
 func TestBoundPodCanBePlacedElsewhere(t *testing.T) {
-	// Every pod binpack sees is already bound, so spec.NodeName always names
-	// the node it is being relocated FROM. Comparing it against the candidate
-	// destination would refuse every relocation there is.
+	// CanFit is handed the pod a controller *would create*, never the running
+	// one, so an unset NodeName is the normal case and a set one means the
+	// template pins it. That was not always true: while CanFit received the
+	// running pod, spec.NodeName always named the node being drained, and
+	// refusing on it would have refused every relocation there is.
 	//
-	// This test exists to stop that "fix" being applied: the gap it appears to
-	// leave — a controller template that pins NodeName — is documented in
-	// CanFit and bounded by the stall-and-backoff machinery, because such a
-	// pod returns to its own node rather than going Pending.
-	pod := mother.Pod("default", "web", mother.OnNode("node-a"))
+	// This test stays as the tripwire for that older mistake — a replacement
+	// with no NodeName must be placeable anywhere — and its counterpart below
+	// covers what the change made checkable.
+	pod := mother.Pod("default", "web")
 	destination := mother.SmallNode("node-b")
 
 	ok, reason := fit.CanFit(pod, destination, free(destination), nil)

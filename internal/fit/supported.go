@@ -80,11 +80,21 @@ func UnsupportedPod(pod *corev1.Pod) Reason {
 	// An in-flight in-place resize means the pod's requests are changing
 	// underneath us, so any answer computed from them is about to be stale.
 	//
-	// This does not cover a resize that has already completed — see the
-	// replacement-versus-running gap documented on EffectiveRequests — but a
-	// resize we can see is one we should not reason through.
+	// A resize that has already *completed* is handled elsewhere and better:
+	// the engine asks about the pod a controller would create, built from its
+	// template, so the running pod's shrunken requests never enter the
+	// arithmetic. See the replacement doc comment in internal/engine.
 	if r := resizeInFlight(pod); r != "" {
 		return unsupportedPod(pod, "has an in-place resize "+r)
+	}
+
+	// A template that pins spec.nodeName produces pods that bypass the
+	// scheduler entirely: they land on the named node whatever binpack decides,
+	// so a placement computed for them is fiction. Reachable only because the
+	// caller passes the replacement — every *running* pod names a node, which
+	// is why this could not be checked before.
+	if pod.Spec.NodeName != "" {
+		return unsupportedPod(pod, "is pinned to node "+pod.Spec.NodeName+" by its controller template")
 	}
 
 	return Reason{}

@@ -17,6 +17,8 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/intstr"
+
+	"github.com/motleyhand/binpack/internal/engine"
 )
 
 // NodeOption customises a node archetype.
@@ -452,6 +454,16 @@ func Bare() PodOption {
 	return func(p *corev1.Pod) { p.OwnerReferences = nil }
 }
 
+// OwnedBy names a controller of an arbitrary kind, as an operator's own
+// controller does. binpack can read no template for such a pod.
+func OwnedBy(kind, name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.OwnerReferences = []metav1.OwnerReference{
+			{APIVersion: "example.com/v1", Kind: kind, Name: name, Controller: ptr(true)},
+		}
+	}
+}
+
 // OwnedButNotControlled gives the pod an owner reference with Controller
 // unset — a garbage-collection link rather than a controller that would
 // recreate it. Such a pod is as bare as one with no owner at all.
@@ -597,3 +609,58 @@ func Gated(name string) PodOption {
 }
 
 func ptr[T any](v T) *T { return &v }
+
+// Templates derives a controller template for each pod, matching the pod's own
+// spec and labels.
+//
+// That is the ordinary case and what nearly every test means: a running pod
+// looks like what its controller would create again. Tests about the gap
+// between the two — a pod resized downward in place, a template pinning
+// nodeName — build a divergent template deliberately, which is exactly the
+// distinction that makes those tests worth reading.
+func Templates(pods ...*corev1.Pod) map[engine.OwnerRef]*corev1.PodTemplateSpec {
+	// Only the kinds collect can actually read a template for. A pod owned by
+	// an operator's own CRD gets no entry, which is the whole distinction the
+	// no-template refusal turns on — building one for every kind would make
+	// that case untestable and the fixture a lie.
+	readable := map[string]bool{
+		"ReplicaSet": true, "StatefulSet": true, "DaemonSet": true, "Job": true,
+	}
+
+	out := map[engine.OwnerRef]*corev1.PodTemplateSpec{}
+	for _, pod := range pods {
+		ref, owned := engine.ControllerOf(pod)
+		if !owned || !readable[ref.Kind] {
+			continue
+		}
+		spec := *pod.Spec.DeepCopy()
+		// A template names no node: its pods are scheduled, not placed.
+		spec.NodeName = ""
+		out[ref] = &corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: pod.Labels},
+			Spec:       spec,
+		}
+	}
+	return out
+}
+
+// TemplateFor overrides one pod's template, for the cases where the
+// replacement genuinely differs from what is running.
+func TemplateFor(
+	templates map[engine.OwnerRef]*corev1.PodTemplateSpec,
+	pod *corev1.Pod,
+	opts ...PodOption,
+) {
+	ref, owned := engine.ControllerOf(pod)
+	if !owned {
+		return
+	}
+	// NodeName is *not* stripped here, unlike in [Templates]: an override says
+	// exactly what the template contains, and a template that pins its pods to
+	// a node is one of the things worth writing a test about.
+	shape := Pod(pod.Namespace, pod.Name, opts...)
+	templates[ref] = &corev1.PodTemplateSpec{
+		ObjectMeta: metav1.ObjectMeta{Labels: pod.Labels},
+		Spec:       *shape.Spec.DeepCopy(),
+	}
+}

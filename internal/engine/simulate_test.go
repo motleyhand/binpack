@@ -1,6 +1,7 @@
 package engine_test
 
 import (
+	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -92,7 +93,7 @@ func TestSimulateStraightforwardMove(t *testing.T) {
 		mother.Pod("default", "web", mother.OnNode("candidate"), mother.Requests("100m", "1Gi")),
 	}
 
-	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, candidate, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if !sim.Feasible {
 		t.Fatalf("expected feasible, blocked: %s", sim.Blocked.Summary)
@@ -117,7 +118,7 @@ func TestAggregateCapacityIsNotEnough(t *testing.T) {
 		mother.Pod("default", "chunky", mother.OnNode("candidate"), mother.Requests("100m", "3Gi")),
 	}
 
-	sim := engine.Simulate(nodes, pods, candidate, defaultCfg())
+	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if sim.Feasible {
 		t.Fatal("3Gi does not fit in three separate 1Gi holes; summing free capacity is not schedulability")
@@ -143,7 +144,7 @@ func TestMixedNodeSizes(t *testing.T) {
 		mother.Pod("default", "big", mother.OnNode("large"), mother.Requests("100m", "4100Mi")),
 	}
 
-	sim := engine.Simulate([]*corev1.Node{small, large}, pods, small, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{small, large}, pods, mother.Templates(pods...), small, defaultCfg())
 
 	if !sim.Feasible {
 		t.Fatalf("1100Mi fits in 2700Mi of free space; blocked: %s", sim.Blocked.Summary)
@@ -161,7 +162,7 @@ func TestNodeLocalPodsNeedNoDestination(t *testing.T) {
 		mother.DaemonSetPod("kube-system", "logs", mother.OnNode("candidate"), mother.Requests("100m", "300Mi")),
 	}
 
-	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, candidate, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if !sim.Feasible {
 		t.Fatalf("a node of only DaemonSets should drain, blocked: %s", sim.Blocked.Summary)
@@ -182,7 +183,7 @@ func TestExpendablePodsAreEvictedNotPlaced(t *testing.T) {
 			mother.Priority(-100), mother.Requests("100m", "2Gi")),
 	}
 
-	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, candidate, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if !sim.Feasible {
 		t.Fatalf("an expendable pod needs no destination, blocked: %s", sim.Blocked.Summary)
@@ -205,7 +206,7 @@ func TestPausePodsMustFitSomewhere(t *testing.T) {
 		mother.PausePod("default", "buffer", mother.OnNode("candidate"), mother.Requests("100m", "2Gi")),
 	}
 
-	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, candidate, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if sim.Feasible {
 		t.Fatal("pause pods are real workload for consolidation; 2Gi does not fit in 256Mi")
@@ -220,7 +221,7 @@ func TestResidentsConsumeDestinationCapacity(t *testing.T) {
 		mother.Pod("default", "sitting", mother.OnNode("destination"), mother.Requests("100m", "1Gi")),
 	}
 
-	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, candidate, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if sim.Feasible {
 		t.Fatal("the destination already holds 1Gi of a 2Gi node; 1500Mi does not fit alongside it")
@@ -237,7 +238,7 @@ func TestPacksLargestFirst(t *testing.T) {
 		mother.Pod("default", "large", mother.OnNode("candidate"), mother.Requests("100m", "3Gi")),
 	}
 
-	sim := engine.Simulate(nodes, pods, candidate, defaultCfg())
+	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if !sim.Feasible {
 		t.Fatalf("both pods fit if the larger is placed first, blocked: %s", sim.Blocked.Summary)
@@ -257,14 +258,14 @@ func TestReserveForLargestPod(t *testing.T) {
 	}
 	nodes := []*corev1.Node{candidate, destination}
 
-	tight := engine.Simulate(nodes, pods, candidate, defaultCfg())
+	tight := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
 	if !tight.Feasible {
 		t.Fatalf("without the reservation an exact fit is allowed, blocked: %s", tight.Blocked.Summary)
 	}
 
 	cfg := defaultCfg()
 	cfg.ReserveForLargestPod = true
-	reserved := engine.Simulate(nodes, pods, candidate, cfg)
+	reserved := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, cfg)
 
 	if reserved.Feasible {
 		t.Fatal("packing the cluster to the last byte leaves nowhere for the next pod that restarts")
@@ -288,7 +289,7 @@ func TestFinishedPodsDoNotOccupy(t *testing.T) {
 		done,
 	}
 
-	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, candidate, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if !sim.Feasible {
 		t.Fatalf("a Succeeded pod holds nothing, blocked: %s", sim.Blocked.Summary)
@@ -304,9 +305,109 @@ func TestUnschedulableDestinationIsRefused(t *testing.T) {
 		mother.Pod("default", "web", mother.OnNode("candidate"), mother.Requests("100m", "1Gi")),
 	}
 
-	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, candidate, defaultCfg())
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if sim.Feasible {
 		t.Fatal("a cordoned node must not be used as a destination")
+	}
+}
+
+func TestAPodResizedDownwardIsPlacedAtItsTemplateSize(t *testing.T) {
+	// The unbounded gap ADR-0006 recorded, and the reason this PR exists.
+	//
+	// In-place vertical scaling rewrites a running pod's requests without
+	// touching its controller's template, and the kubelet updates
+	// allocatedResources to match — so a *completed* downward resize leaves
+	// nothing on the pod to notice. Sizing the move on what is running would
+	// approve a node the replacement does not fit, leaving it Pending and
+	// provoking exactly the scale-up binpack exists to prevent.
+	candidate := sized("candidate", "4Gi")
+	destination := sized("destination", "1Gi")
+
+	// Running at 512Mi after a resize; its template still says 3Gi.
+	shrunk := mother.Pod("default", "web", mother.OnNode("candidate"), mother.Requests("100m", "512Mi"))
+	pods := []*corev1.Pod{shrunk}
+
+	asRunning := mother.Templates(pods...)
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, asRunning, candidate, defaultCfg())
+	if !sim.Feasible {
+		t.Fatalf("setup: the shrunken pod should fit 1Gi, got %s", sim.Blocked.Summary)
+	}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, shrunk, mother.Requests("100m", "3Gi"))
+
+	sim = engine.Simulate([]*corev1.Node{candidate, destination}, pods, templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Error("approved a drain the replacement does not fit: it asks for 3Gi, the destination has 1Gi")
+	}
+}
+
+func TestAPodWithNoReadableTemplateIsRefused(t *testing.T) {
+	// A pod created by an operator's own controller. binpack cannot tell what
+	// its replacement would request, and guessing from the running pod is the
+	// guess that is unsound. Counted, so ADR-0006's "settle it against
+	// measurement" can settle it.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	exotic := mother.Pod("default", "shard-0", mother.OnNode("candidate"),
+		mother.OwnedBy("KafkaCluster", "events"))
+	pods := []*corev1.Pod{exotic}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("moved a pod whose replacement binpack cannot predict")
+	}
+	if !sim.Blocked.NoTemplate {
+		t.Errorf("refusal is not marked as a gap in what binpack models: %+v", sim.Blocked)
+	}
+	if !strings.Contains(sim.Blocked.Summary, "no readable controller template") {
+		t.Errorf("summary does not say why: %s", sim.Blocked.Summary)
+	}
+}
+
+func TestATemplateThatPinsANodeIsRefused(t *testing.T) {
+	// The second gap. Such a pod ignores cordon entirely — setting nodeName
+	// bypasses the scheduler — and reappears on the node being drained. Every
+	// running pod names a node, so this was invisible until binpack read the
+	// template.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	pinned := mother.Pod("default", "agent", mother.OnNode("candidate"))
+	pods := []*corev1.Pod{pinned}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, pinned, mother.OnNode("candidate"))
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("planned to relocate a pod its own template pins to the node being drained")
+	}
+}
+
+func TestReportsNameTheRunningPodNotTheReplacement(t *testing.T) {
+	// The replacement is a spec binpack synthesised; it has no existence an
+	// operator can go and look at. Everything reported must name what is
+	// actually running.
+	candidate := sized("candidate", "4Gi")
+	destination := sized("destination", "256Mi")
+	pod := mother.Pod("default", "web", mother.OnNode("candidate"), mother.Requests("100m", "2Gi"))
+	pods := []*corev1.Pod{pod}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("setup: 2Gi should not fit in 256Mi")
+	}
+	if sim.Blocked.Pod != pod {
+		t.Errorf("blocked names %v, want the running pod", sim.Blocked.Pod)
+	}
+	if !strings.Contains(sim.Blocked.Summary, "default/web") {
+		t.Errorf("summary does not name a real object: %s", sim.Blocked.Summary)
 	}
 }
