@@ -55,13 +55,32 @@ leaderElection:
 metrics:
   enabled: true
   port: 8080
-  service:
-    enabled: true
-  serviceMonitor:
-    # Requires the Prometheus operator's CRDs.
+
+  # Prometheus operator discovery. Set one of these; both need the operator's
+  # CRDs, and both need `labels` to match your Prometheus's selector — check it
+  # with:
+  #
+  #   kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
+  #
+  # A PodMonitor is the better fit and is why the Service is off by default.
+  # Prometheus does not scrape through a Service's ClusterIP — the operator
+  # resolves its Endpoints and scrapes each pod directly — so a Service exists
+  # only to give a ServiceMonitor something to select, and binpack serves
+  # nothing to anyone. Use the ServiceMonitor path if your Prometheus is
+  # configured to discover only those.
+  podMonitor:
     enabled: false
     interval: 60s
     labels: {}
+
+  serviceMonitor:
+    enabled: false
+    interval: 60s
+    labels: {}
+
+  service:
+    # Only useful alongside serviceMonitor.enabled, or to scrape by hand.
+    enabled: false
 
 probes:
   port: 8081
