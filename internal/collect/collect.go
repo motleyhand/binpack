@@ -6,56 +6,60 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/client-go/kubernetes"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
-// Reader is the subset of a Kubernetes client binpack uses to read a cluster.
+// Reader is how binpack reads a cluster: controller-runtime's read interface,
+// which is Get and List and nothing else. There is no verb here that changes
+// anything, so the read path cannot mutate a cluster even by mistake. Writes
+// live in the executor.
 //
-// Deliberately narrow. Everything here is a list or a get; there is no verb in
-// this interface that changes anything, so the read path cannot mutate a
-// cluster even by mistake. Writes live in the executor.
-type Reader interface {
-	kubernetes.Interface
-}
+// One interface for both frontends, and that is the point. `binpack explain`
+// satisfies it with a direct client built from a kubeconfig; the controller
+// satisfies it with the manager's watch-backed cache. Neither `collect` nor
+// the engine can tell which it has, which is what guarantees that what
+// `explain` prints is what `run` will do — a property that would otherwise
+// rest on two code paths being kept in step by hand.
+type Reader = client.Reader
 
 // Snapshot reads the cluster into the value the engine decides on.
 //
 // Nothing is transformed on the way through: the engine works on API types, so
 // this lists objects and hands them over. The only interpretation is the
 // autoscaler's status document, which is YAML inside a ConfigMap.
-func Snapshot(ctx context.Context, client Reader, now time.Time) (engine.Snapshot, error) {
+func Snapshot(ctx context.Context, reader Reader, now time.Time) (engine.Snapshot, error) {
 	s := engine.Snapshot{Now: now}
 
-	nodes, err := client.CoreV1().Nodes().List(ctx, metav1.ListOptions{})
-	if err != nil {
+	var nodes corev1.NodeList
+	if err := reader.List(ctx, &nodes); err != nil {
 		return s, fmt.Errorf("listing nodes: %w", err)
 	}
 	for i := range nodes.Items {
 		s.Nodes = append(s.Nodes, &nodes.Items[i])
 	}
 
-	pods, err := client.CoreV1().Pods(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-	if err != nil {
+	var pods corev1.PodList
+	if err := reader.List(ctx, &pods); err != nil {
 		return s, fmt.Errorf("listing pods: %w", err)
 	}
 	for i := range pods.Items {
 		s.Pods = append(s.Pods, &pods.Items[i])
 	}
 
-	pdbs, err := client.PolicyV1().PodDisruptionBudgets(metav1.NamespaceAll).List(ctx, metav1.ListOptions{})
-	if err != nil {
+	var pdbs policyv1.PodDisruptionBudgetList
+	if err := reader.List(ctx, &pdbs); err != nil {
 		return s, fmt.Errorf("listing pod disruption budgets: %w", err)
 	}
 	for i := range pdbs.Items {
 		s.PDBs = append(s.PDBs, &pdbs.Items[i])
 	}
 
-	s.Autoscaler, err = autoscaler(ctx, client)
-	if err != nil {
+	var err error
+	if s.Autoscaler, err = autoscaler(ctx, reader); err != nil {
 		return s, err
 	}
 
@@ -67,10 +71,12 @@ func Snapshot(ctx context.Context, client Reader, now time.Time) (engine.Snapsho
 // A missing ConfigMap yields a not-running autoscaler rather than an error.
 // That is a diagnosis, not a failure: binpack should report "nothing here will
 // remove a drained node" clearly rather than exiting with a stack trace.
-func autoscaler(ctx context.Context, client Reader) (engine.Autoscaler, error) {
-	cm, err := client.CoreV1().
-		ConfigMaps(StatusConfigMapNamespace).
-		Get(ctx, StatusConfigMapName, metav1.GetOptions{})
+func autoscaler(ctx context.Context, reader Reader) (engine.Autoscaler, error) {
+	var cm corev1.ConfigMap
+	err := reader.Get(ctx, client.ObjectKey{
+		Namespace: StatusConfigMapNamespace,
+		Name:      StatusConfigMapName,
+	}, &cm)
 
 	switch {
 	case apierrors.IsNotFound(err):

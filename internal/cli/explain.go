@@ -9,8 +9,9 @@ import (
 	"time"
 
 	"github.com/spf13/cobra"
-	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/motleyhand/binpack/api/v1alpha1"
 	"github.com/motleyhand/binpack/internal/collect"
@@ -64,9 +65,9 @@ func newExplainCommand(opts *options) *cobra.Command {
 	return cmd
 }
 
-// clientFor builds a read-only client from the usual kubeconfig rules, so
-// `binpack explain` works wherever kubectl does.
-func clientFor(kubeconfig, kubecontext string) (kubernetes.Interface, error) {
+// restConfigFor resolves a connection from the usual kubeconfig rules, so the
+// read-only commands work wherever kubectl does.
+func restConfigFor(kubeconfig, kubecontext string) (*rest.Config, error) {
 	rules := clientcmd.NewDefaultClientConfigLoadingRules()
 	if kubeconfig != "" {
 		rules.ExplicitPath = kubeconfig
@@ -81,8 +82,21 @@ func clientFor(kubeconfig, kubecontext string) (kubernetes.Interface, error) {
 	if err != nil {
 		return nil, fmt.Errorf("building a Kubernetes client: %w", err)
 	}
+	return restCfg, nil
+}
 
-	return kubernetes.NewForConfig(restCfg)
+// clientFor builds a direct, uncached reader.
+//
+// Direct on purpose: a one-shot command wants one List per resource and no
+// watches, where the controller wants the opposite. Both satisfy
+// [collect.Reader], so the read path is shared regardless.
+func clientFor(kubeconfig, kubecontext string) (collect.Reader, error) {
+	restCfg, err := restConfigFor(kubeconfig, kubecontext)
+	if err != nil {
+		return nil, err
+	}
+	// The default scheme already carries every built-in type binpack reads.
+	return client.New(restCfg, client.Options{})
 }
 
 func loadConfigOrDefaults(path string, stdin interface{ Read([]byte) (int, error) }) (*v1alpha1.Config, error) {
