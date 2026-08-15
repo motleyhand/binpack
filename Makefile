@@ -32,8 +32,13 @@ vet: ## Run go vet
 	go vet ./...
 
 .PHONY: tidy
-tidy: ## Tidy go.mod and go.sum
+tidy: ## Tidy go.mod and go.sum in both modules
 	go mod tidy
+	# test/differential consumes the main module via a replace directive, so a
+	# dependency change here leaves it stale and fails its CI job on an
+	# otherwise unrelated PR. Tidying both together is the only reliable way
+	# to not rediscover that from a red check.
+	cd test/differential && go mod tidy
 
 .PHONY: smoke
 smoke: build ## Run the built binary once
