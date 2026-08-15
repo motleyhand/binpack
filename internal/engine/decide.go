@@ -50,6 +50,15 @@ type Autoscaler struct {
 	// autoscaler publishes it.
 	LastScaleUp time.Time
 
+	// ScaleUpInProgress means the cluster is growing right now, which is the
+	// clearest possible signal not to be removing nodes.
+	ScaleUpInProgress bool
+
+	// ScaleDownStatus is what the autoscaler reports about its own
+	// scale-down search — "NoCandidates" being the state binpack exists to
+	// resolve. Informational: it is reported, never acted on.
+	ScaleDownStatus string
+
 	Groups []NodeGroup
 }
 
@@ -232,6 +241,12 @@ func Decide(s Snapshot, cfg Config) Decision {
 // cluster-wide, so this can only ever be more conservative than reality —
 // which is the safe direction.
 func cooling(s Snapshot, policy Policy) (string, bool) {
+	// Growing right now is the clearest possible signal not to be removing
+	// nodes, and it does not depend on any configured duration.
+	if s.Autoscaler.ScaleUpInProgress {
+		return "the cluster is scaling up right now", true
+	}
+
 	// Draining straight after the cluster grew is how oscillation starts, and
 	// the autoscaler pauses its own scale-down then anyway.
 	if d := policy.CooldownAfterScaleUp; d > 0 && !s.Autoscaler.LastScaleUp.IsZero() {

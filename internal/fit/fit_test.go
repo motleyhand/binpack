@@ -94,13 +94,30 @@ func TestCanFit(t *testing.T) {
 			wantFit: true,
 		},
 		{
-			name: "resident with required anti-affinity disqualifies the node",
-			pod:  mother.Pod("default", "web"),
+			// The resident's term selects app=sharded, and so does the
+			// incoming pod's label — so it could genuinely be rejected.
+			name: "resident anti-affinity that could match disqualifies the node",
+			pod:  mother.Pod("default", "web", mother.PodLabels(map[string]string{"app": "sharded"})),
 			node: mother.SmallNode("node-a"),
 			residents: []*corev1.Pod{
 				mother.Pod("default", "sharded", mother.WithRequiredAntiAffinity("app", "sharded")),
 			},
 			wantCode: fit.ReasonUnsupportedNode,
+		},
+		{
+			// The CNI case. Cilium's agent has anti-affinity to itself so it
+			// lands once per node, and it runs on every node — so treating
+			// its presence as disqualifying would rule out every destination
+			// on every cluster running it, which on DOKS is all of them.
+			name: "resident anti-affinity that cannot match does not disqualify",
+			pod:  mother.Pod("default", "web"),
+			node: mother.SmallNode("node-a"),
+			residents: []*corev1.Pod{
+				mother.DaemonSetPod("kube-system", "cilium",
+					mother.PodLabels(map[string]string{"k8s-app": "cilium"}),
+					mother.WithRequiredAntiAffinity("k8s-app", "cilium")),
+			},
+			wantFit: true,
 		},
 		{
 			// Only anti-affinity is symmetric. A resident's *affinity* is not

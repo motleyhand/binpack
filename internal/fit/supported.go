@@ -2,8 +2,11 @@ package fit
 
 import (
 	"fmt"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 )
 
 // defaultSchedulerName is the only scheduler whose behaviour binpack models.
@@ -124,19 +127,63 @@ func resizeInFlight(pod *corev1.Pod) string {
 //
 // Checking only the incoming pod would let the first case through and leave
 // the replacement Pending.
-func UnsupportedDestination(node *corev1.Node, residents []*corev1.Pod) Reason {
+func UnsupportedDestination(pod *corev1.Pod, node *corev1.Node, residents []*corev1.Pod) Reason {
 	for _, resident := range residents {
-		affinity := resident.Spec.Affinity
-		if affinity == nil || affinity.PodAntiAffinity == nil {
-			continue
-		}
-		if len(affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+		if antiAffinityCouldReject(resident, pod) {
 			return Reason{ReasonUnsupportedNode,
 				"node " + node.Name + " hosts " + podRef(resident) +
-					", which declares required pod anti-affinity that binpack does not model"}
+					", whose required pod anti-affinity could reject " + podRef(pod)}
 		}
 	}
 	return Reason{}
+}
+
+// antiAffinityCouldReject reports whether a resident's required anti-affinity
+// might apply to the incoming pod.
+//
+// The selector has to be evaluated, not merely detected. Almost every cluster
+// runs a CNI DaemonSet with anti-affinity to *itself* — Cilium's agent selects
+// k8s-app=cilium, so that it lands once per node — and that term is on every
+// node in the cluster. Treating its presence as disqualifying would rule out
+// every destination on every such cluster, which is to say most of them.
+//
+// So a term matters only when its selector matches the incoming pod's labels
+// and its namespace scope covers that pod. Anything binpack cannot evaluate —
+// an unparseable selector, a namespace selector needing Namespace objects it
+// does not read — counts as a possible match, because refusing is the safe
+// direction.
+func antiAffinityCouldReject(resident, incoming *corev1.Pod) bool {
+	affinity := resident.Spec.Affinity
+	if affinity == nil || affinity.PodAntiAffinity == nil {
+		return false
+	}
+
+	for _, term := range affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+		// A namespace selector would need the Namespace objects to evaluate,
+		// which this package does not have.
+		if term.NamespaceSelector != nil {
+			return true
+		}
+
+		// An empty Namespaces list means the resident's own namespace.
+		scope := term.Namespaces
+		if len(scope) == 0 {
+			scope = []string{resident.Namespace}
+		}
+		if !slices.Contains(scope, incoming.Namespace) {
+			continue
+		}
+
+		selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+		if err != nil {
+			return true
+		}
+		if selector.Matches(labels.Set(incoming.Labels)) {
+			return true
+		}
+	}
+
+	return false
 }
 
 func firstHostPort(pod *corev1.Pod) (int32, bool) {

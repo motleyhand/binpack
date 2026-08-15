@@ -153,23 +153,37 @@ func TestUnsupportedDestination(t *testing.T) {
 	node := mother.SmallNode("node-a")
 
 	t.Run("no residents", func(t *testing.T) {
-		if r := fit.UnsupportedDestination(node, nil); !r.Empty() {
+		if r := fit.UnsupportedDestination(mother.Pod("default", "incoming"), node, nil); !r.Empty() {
 			t.Errorf("expected support, got: %s", r.Message)
 		}
 	})
 
-	t.Run("resident anti-affinity names the offending pod", func(t *testing.T) {
+	t.Run("a term that could match names the offending resident", func(t *testing.T) {
+		// Same namespace and a matching label, so the term genuinely applies.
+		incoming := mother.Pod("shard", "incoming", mother.PodLabels(map[string]string{"app": "member"}))
 		residents := []*corev1.Pod{
-			mother.Pod("default", "ordinary"),
+			mother.Pod("shard", "ordinary"),
 			mother.Pod("shard", "member", mother.WithRequiredAntiAffinity("app", "member")),
 		}
-		r := fit.UnsupportedDestination(node, residents)
+		r := fit.UnsupportedDestination(incoming, node, residents)
 
 		if r.Empty() {
-			t.Fatal("a resident with required anti-affinity must disqualify the node")
+			t.Fatal("an anti-affinity term that could match must disqualify the node")
 		}
 		if !strings.Contains(r.Message, "shard/member") {
 			t.Errorf("message should name the offending resident, got: %s", r.Message)
+		}
+	})
+
+	t.Run("a term in another namespace does not apply", func(t *testing.T) {
+		// With no explicit namespaces the term covers only the resident's own,
+		// so a pod elsewhere cannot be the one it is guarding against.
+		incoming := mother.Pod("default", "incoming", mother.PodLabels(map[string]string{"app": "member"}))
+		residents := []*corev1.Pod{
+			mother.Pod("shard", "member", mother.WithRequiredAntiAffinity("app", "member")),
+		}
+		if r := fit.UnsupportedDestination(incoming, node, residents); !r.Empty() {
+			t.Errorf("a term scoped to another namespace must not disqualify, got: %s", r.Message)
 		}
 	})
 
@@ -181,7 +195,7 @@ func TestUnsupportedDestination(t *testing.T) {
 			mother.Pod("default", "ingress", mother.WithHostPort(80)),
 			mother.Pod("default", "db", mother.WithPVC("data")),
 		}
-		if r := fit.UnsupportedDestination(node, residents); !r.Empty() {
+		if r := fit.UnsupportedDestination(mother.Pod("default", "incoming", mother.PodLabels(map[string]string{"app": "member"})), node, residents); !r.Empty() {
 			t.Errorf("asymmetric features on residents must not disqualify a node, got: %s", r.Message)
 		}
 	})
