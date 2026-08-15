@@ -161,10 +161,6 @@ func Decide(s Snapshot, cfg Config) Decision {
 		return Decision{Reason: "no cluster-autoscaler is running, so a drained node would never be removed"}
 	}
 
-	if wait, ok := cooling(s, cfg); ok {
-		return Decision{Reason: wait}
-	}
-
 	candidates, assessments := eligible(s, cfg)
 
 	// Least loaded first. Not a filter — every eligible node is tried in
@@ -227,19 +223,25 @@ func Decide(s Snapshot, cfg Config) Decision {
 	}
 }
 
-// cooling reports whether recent activity means binpack should wait.
-func cooling(s Snapshot, cfg Config) (string, bool) {
-	// The autoscaler pauses all scale-down after any scale-up, so acting
-	// inside that window achieves nothing anyway — and draining straight
-	// after the cluster grew is how oscillation starts.
-	if d := cfg.Default.CooldownAfterScaleUp; d > 0 && !s.Autoscaler.LastScaleUp.IsZero() {
+// cooling reports whether recent activity means this node should be left
+// alone, according to its own pool's policy.
+//
+// Per node rather than cluster-wide, because the cooldowns are per-pool
+// configuration: a pool that wants an hour of quiet after a scale-up must not
+// hold up a pool that wants none. The underlying autoscaler behaviour is
+// cluster-wide, so this can only ever be more conservative than reality —
+// which is the safe direction.
+func cooling(s Snapshot, policy Policy) (string, bool) {
+	// Draining straight after the cluster grew is how oscillation starts, and
+	// the autoscaler pauses its own scale-down then anyway.
+	if d := policy.CooldownAfterScaleUp; d > 0 && !s.Autoscaler.LastScaleUp.IsZero() {
 		if since := s.Now.Sub(s.Autoscaler.LastScaleUp); since < d {
 			return fmt.Sprintf("the cluster scaled up %s ago; waiting %s before considering a drain",
 				since.Round(time.Second), d), true
 		}
 	}
 
-	if d := cfg.Default.CooldownAfterDrain; d > 0 && !s.LastDrain.IsZero() {
+	if d := policy.CooldownAfterDrain; d > 0 && !s.LastDrain.IsZero() {
 		if since := s.Now.Sub(s.LastDrain); since < d {
 			return fmt.Sprintf("a drain completed %s ago; letting the cluster settle for %s",
 				since.Round(time.Second), d), true
@@ -267,15 +269,21 @@ func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []
 			Pool:  node.Labels[cfg.PoolNameLabel],
 		}
 
+		policy := cfg.PolicyFor(a.Group, a.Pool)
 		group, managed := groups[a.Group]
+		cooldown, cooling := cooling(s, policy)
+
 		switch {
 		case !managed:
 			// Absent from the autoscaler's status means it does not manage
 			// this pool, so nothing would ever remove the node.
 			a.Skipped, a.SkipReason = true, "not part of an autoscaling pool"
 
-		case !cfg.PolicyFor(a.Group, a.Pool).Enabled:
+		case !policy.Enabled:
 			a.Skipped, a.SkipReason = true, "binpack is disabled for this pool"
+
+		case cooling:
+			a.Skipped, a.SkipReason = true, cooldown
 
 		case group.Ready <= group.MinSize:
 			a.Skipped, a.SkipReason = true, fmt.Sprintf(
@@ -313,13 +321,26 @@ func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []
 //
 // The pods are protected, not ignored: removing them from the arithmetic
 // while leaving them on the node would be unsound.
+//
+// The exclusion list is resolved from the pod's own node's pool, not from the
+// global default. A pool may widen the list or clear it, and reading the
+// default would make both overrides silently ineffective.
 func protectedNamespaces(s Snapshot, cfg Config) map[string]string {
+	byName := make(map[string]*corev1.Node, len(s.Nodes))
+	for _, node := range s.Nodes {
+		byName[node.Name] = node
+	}
+
 	out := make(map[string]string)
 	for _, pod := range s.Pods {
 		if pod.Spec.NodeName == "" || !occupies(pod) {
 			continue
 		}
-		policy := cfg.Default
+		node, known := byName[pod.Spec.NodeName]
+		if !known {
+			continue
+		}
+		policy := cfg.PolicyFor(node.Labels[cfg.NodeGroupIDLabel], node.Labels[cfg.PoolNameLabel])
 		for _, ns := range policy.ExcludedNamespaces {
 			if pod.Namespace != ns {
 				continue
@@ -381,6 +402,25 @@ func displayPool(a NodeAssessment) string {
 	return a.Group
 }
 
+// commonestSkip returns the most frequent skip reason, so a cluster where
+// nothing was eligible still explains itself rather than shrugging.
+func commonestSkip(assessments []NodeAssessment) (string, int) {
+	counts := make(map[string]int)
+	for _, a := range assessments {
+		if a.Skipped {
+			counts[a.SkipReason]++
+		}
+	}
+	var best string
+	var bestN int
+	for reason, n := range counts {
+		if n > bestN || (n == bestN && reason < best) {
+			best, bestN = reason, n
+		}
+	}
+	return best, bestN
+}
+
 // summarise turns a set of rejections into one sentence. "Nothing to do" is
 // not an answer; an operator wants to know which wall was hit.
 func summarise(assessments []NodeAssessment) string {
@@ -398,9 +438,17 @@ func summarise(assessments []NodeAssessment) string {
 		}
 	}
 
-	switch {
-	case considered == 0:
+	if considered == 0 {
+		if reason, n := commonestSkip(assessments); reason != "" {
+			if n == len(assessments) {
+				return fmt.Sprintf("no node was eligible: %s", reason)
+			}
+			return fmt.Sprintf("no node was eligible; most commonly: %s", reason)
+		}
 		return "no node was eligible to consider"
+	}
+
+	switch {
 	case blocked > 0 && infeasible > 0:
 		return fmt.Sprintf("%d node(s) considered: %d could not be emptied, %d had pods that cannot be evicted",
 			considered, infeasible, blocked)

@@ -345,6 +345,117 @@ func TestExcludedNamespaceProtectsItsNode(t *testing.T) {
 	}
 }
 
+const otherPoolID = "758e416b-b3f9"
+
+func inOtherPool(name string, opts ...mother.NodeOption) *corev1.Node {
+	return sized(name, "4Gi", append([]mother.NodeOption{mother.InPool("pool-8g", otherPoolID)}, opts...)...)
+}
+
+// twoPools is a snapshot with both pools autoscaling and above their minimums.
+func twoPools(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
+	s := cluster(nodes, pods)
+	s.Autoscaler.Groups = []engine.NodeGroup{
+		{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: 2},
+		{ID: otherPoolID, Name: "pool-8g", MinSize: 1, MaxSize: 10, Ready: 2},
+	}
+	return s
+}
+
+func TestCooldownIsResolvedPerPool(t *testing.T) {
+	// A pool that wants an hour of quiet after a scale-up must not hold up a
+	// pool that wants none. Reading only the global default would make both
+	// directions of override silently ineffective.
+	nodes := []*corev1.Node{
+		inPool("cautious-1"), inPool("cautious-2"),
+		inOtherPool("eager-1"), inOtherPool("eager-2"),
+	}
+	s := twoPools(nodes, nil)
+	s.Autoscaler.LastScaleUp = now.Add(-5 * time.Minute)
+
+	cfg := config()
+	cfg.ByPool = map[string]engine.Policy{
+		poolID: {Enabled: true, CooldownAfterScaleUp: time.Hour,
+			Sim: cfg.Default.Sim, Evict: cfg.Default.Evict},
+	}
+
+	d := engine.Decide(s, cfg)
+
+	if d.Action != engine.Drain {
+		t.Fatalf("the pool without a cooldown should still be drainable: %s", d.Reason)
+	}
+	if !strings.HasPrefix(d.Node.Name, "eager") {
+		t.Errorf("drained %s, want a node from the pool with no cooldown", d.Node.Name)
+	}
+
+	a := assessmentFor(d, "cautious-1")
+	if a == nil || !a.Skipped || !strings.Contains(a.SkipReason, "scaled up") {
+		t.Errorf("the cautious pool should be waiting, got %+v", a)
+	}
+}
+
+func TestExcludedNamespacesAreResolvedPerPool(t *testing.T) {
+	nodes := []*corev1.Node{
+		inPool("a-1"), inPool("a-2"),
+		inOtherPool("b-1"), inOtherPool("b-2"),
+	}
+	pods := []*corev1.Pod{
+		mother.Pod("payments", "ledger", mother.OnNode("a-1"), mother.Requests("100m", "128Mi")),
+		mother.Pod("payments", "billing", mother.OnNode("b-1"), mother.Requests("100m", "128Mi")),
+	}
+
+	t.Run("a pool override can add an exclusion the default lacks", func(t *testing.T) {
+		cfg := config()
+		cfg.ByPool = map[string]engine.Policy{
+			poolID: {Enabled: true, ExcludedNamespaces: []string{"payments"},
+				Sim: cfg.Default.Sim, Evict: cfg.Default.Evict},
+		}
+
+		d := engine.Decide(twoPools(nodes, pods), cfg)
+
+		if a := assessmentFor(d, "a-1"); a == nil || !strings.Contains(a.SkipReason, "payments") {
+			t.Errorf("the override should protect a-1, got %+v", a)
+		}
+		// The other pool has no such exclusion, so its node is untouched by it.
+		if a := assessmentFor(d, "b-1"); a != nil && strings.Contains(a.SkipReason, "payments") {
+			t.Errorf("b-1 is in a pool with no exclusion and must not be protected, got %+v", a)
+		}
+	})
+
+	t.Run("a pool override can clear a global exclusion", func(t *testing.T) {
+		cfg := config()
+		cfg.Default.ExcludedNamespaces = []string{"payments"}
+		cfg.ByPool = map[string]engine.Policy{
+			otherPoolID: {Enabled: true, ExcludedNamespaces: nil,
+				Sim: cfg.Default.Sim, Evict: cfg.Default.Evict},
+		}
+
+		d := engine.Decide(twoPools(nodes, pods), cfg)
+
+		if a := assessmentFor(d, "a-1"); a == nil || !strings.Contains(a.SkipReason, "payments") {
+			t.Errorf("the global exclusion should still protect a-1, got %+v", a)
+		}
+		if a := assessmentFor(d, "b-1"); a == nil {
+			t.Fatal("b-1 missing from the assessments")
+		} else if strings.Contains(a.SkipReason, "payments") {
+			t.Errorf("the override cleared the exclusion for this pool, got %+v", a)
+		}
+	})
+}
+
+func TestNothingEligibleStillExplainsItself(t *testing.T) {
+	// "No node was eligible" on its own tells an operator nothing. The
+	// commonest reason is what they need.
+	nodes := []*corev1.Node{inPool("a"), inPool("b")}
+	s := cluster(nodes, nil)
+	s.Autoscaler.Groups[0].MinSize = 2
+
+	d := engine.Decide(s, config())
+
+	if !strings.Contains(d.Reason, "minimum size") {
+		t.Errorf("reason should name the commonest obstacle, got: %s", d.Reason)
+	}
+}
+
 func TestEveryNodeIsAccountedFor(t *testing.T) {
 	// explain has to describe the whole cluster, not only the interesting
 	// part. A node missing from the assessments is a node an operator cannot
