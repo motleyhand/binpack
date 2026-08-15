@@ -20,7 +20,7 @@ import (
 // which the next run may find. It is never allowed to accept one the scheduler
 // would refuse, because that is a drain, a Pending pod, and the scale-up this
 // project exists to prevent.
-func check(t *testing.T, o *differential.Oracle, name string, pod *corev1.Pod, node *corev1.Node, residents []*corev1.Pod) {
+func check(t *testing.T, o *differential.Oracle, name string, pod *corev1.Pod, node *corev1.Node, residents []*corev1.Pod) differential.Verdict {
 	t.Helper()
 
 	remaining := fit.Allocatable(node)
@@ -46,6 +46,8 @@ func check(t *testing.T, o *differential.Oracle, name string, pod *corev1.Pod, n
 	if !binpackFits && verdict.Accepted {
 		t.Logf("%s: conservative — binpack refused (%s) where the scheduler accepts", name, reason.Code)
 	}
+
+	return verdict
 }
 
 func newOracle(t *testing.T) *differential.Oracle {
@@ -69,96 +71,117 @@ func TestMirrorsUnitCases(t *testing.T) {
 		pod       *corev1.Pod
 		node      *corev1.Node
 		residents []*corev1.Pod
+		// schedulerAccepts is what the real scheduler must say, asserted
+		// independently of fit. Without it this suite is one-directional too,
+		// and an oracle that accepted everything would pass every case here
+		// AND make the generated suite vacuous — binpack's refusals would all
+		// log as "conservative" and the unsound direction would be
+		// unreachable. These are the answers the harness is calibrated on.
+		schedulerAccepts bool
 	}{
-		{"ordinary pod on ordinary node", mother.Pod("default", "web"), mother.SmallNode("n"), nil},
-		{"cordoned node", mother.Pod("default", "web"), mother.SmallNode("n", mother.Cordoned()), nil},
+		{"ordinary pod on ordinary node", mother.Pod("default", "web"), mother.SmallNode("n"), nil, true},
+		{"cordoned node", mother.Pod("default", "web"), mother.SmallNode("n", mother.Cordoned()), nil, false},
 		{
 			"untolerated NoSchedule taint",
 			mother.Pod("default", "web"),
 			mother.SmallNode("n", mother.Tainted("dedicated", "db", corev1.TaintEffectNoSchedule)),
-			nil,
+			nil, false,
 		},
 		{
 			"tolerated taint",
 			mother.Pod("default", "web", mother.Tolerating("dedicated", corev1.TaintEffectNoSchedule)),
 			mother.SmallNode("n", mother.Tainted("dedicated", "db", corev1.TaintEffectNoSchedule)),
-			nil,
+			nil, true,
 		},
 		{
 			"PreferNoSchedule does not block",
 			mother.Pod("default", "web"),
 			mother.SmallNode("n", mother.Tainted("spot", "true", corev1.TaintEffectPreferNoSchedule)),
-			nil,
+			nil, true,
 		},
 		{
 			"unsatisfied node selector",
 			mother.Pod("default", "web", mother.WithNodeSelector("disk", "ssd")),
 			mother.SmallNode("n"),
-			nil,
+			nil, false,
 		},
 		{
 			"satisfied node selector",
 			mother.Pod("default", "web", mother.WithNodeSelector("disk", "ssd")),
 			mother.SmallNode("n", mother.NodeLabels(map[string]string{"disk": "ssd"})),
-			nil,
+			nil, true,
 		},
 		{
 			"memory exhausted",
 			mother.Pod("default", "hungry", mother.Requests("100m", "8Gi")),
 			mother.SmallNode("n"),
-			nil,
+			nil, false,
 		},
 		{
 			"extended resource absent",
 			mother.Pod("default", "trainer", mother.Requesting("nvidia.com/gpu", "1")),
 			mother.LargeNode("n"),
-			nil,
+			nil, false,
 		},
 		{
 			"extended resource present",
 			mother.Pod("default", "trainer", mother.Requesting("nvidia.com/gpu", "1")),
 			mother.GPUNode("n", 2),
-			nil,
+			nil, true,
 		},
 		{
 			// The arithmetic that produced several defects: the scheduler
 			// reserves the init container's peak, not the container sum.
+			// 1200Mi peak fits a 1360Mi node; 128Mi+1200Mi would not.
 			"init container peak",
 			mother.Pod("default", "web",
 				mother.Requests("100m", "128Mi"),
 				mother.WithInitContainer("migrate", "100m", "1200Mi")),
 			mother.SmallNode("n"),
-			nil,
+			nil, true,
 		},
 		{
+			// A native sidecar keeps running, so 1000Mi+500Mi exceeds 1360Mi.
+			// If sidecars were treated as ordinary init containers this would
+			// be accepted — which is what the first oracle misconfiguration
+			// would have hidden.
 			"native sidecar adds rather than maxes",
 			mother.Pod("default", "web",
 				mother.Requests("100m", "1000Mi"),
 				mother.WithSidecar("proxy", "100m", "500Mi")),
 			mother.SmallNode("n"),
-			nil,
+			nil, false,
 		},
 		{
+			// 1200Mi + 256Mi overhead exceeds 1360Mi.
 			"RuntimeClass overhead counts",
 			mother.Pod("default", "web",
 				mother.Requests("100m", "1200Mi"),
 				mother.WithOverhead("50m", "256Mi")),
 			mother.SmallNode("n"),
-			nil,
+			nil, false,
 		},
 		{
+			// 1360Mi node, 1000Mi resident, 600Mi candidate.
 			"residents consume capacity",
 			mother.Pod("default", "web", mother.Requests("100m", "600Mi")),
 			mother.SmallNode("n"),
 			[]*corev1.Pod{
 				mother.Pod("default", "sitting", mother.Requests("100m", "1000Mi"), mother.OnNode("n")),
 			},
+			false,
 		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			check(t, o, tc.name, tc.pod, tc.node, tc.residents)
+			verdict := check(t, o, tc.name, tc.pod, tc.node, tc.residents)
+
+			if verdict.Accepted != tc.schedulerAccepts {
+				t.Errorf("ORACLE MISCALIBRATED — scheduler accepted=%t, expected %t (%s).\n"+
+					"Fix the harness before trusting anything the generated suite reports.",
+					verdict.Accepted, tc.schedulerAccepts, verdict)
+			}
 		})
 	}
 }
@@ -172,7 +195,7 @@ func TestGeneratedStates(t *testing.T) {
 	const cases = 3000
 	rng := rand.New(rand.NewSource(20260815))
 
-	accepted, refused := 0, 0
+	accepted, refused, oracleRefused := 0, 0, 0
 	for i := range cases {
 		node, pod, residents := randomScenario(rng, i)
 
@@ -186,15 +209,29 @@ func TestGeneratedStates(t *testing.T) {
 			refused++
 		}
 
-		check(t, o, fmt.Sprintf("generated/%d", i), pod, node, residents)
+		if v := check(t, o, fmt.Sprintf("generated/%d", i), pod, node, residents); !v.Accepted {
+			oracleRefused++
+		}
 	}
 
-	// A corpus that binpack refuses outright proves nothing: the unsound
-	// direction is only reachable through acceptances.
+	// Two ways this suite could pass while proving nothing, both worth
+	// failing on rather than discovering later.
+
+	// If binpack accepts none of the corpus, the unsound direction is never
+	// exercised: it is only reachable through an acceptance.
 	if accepted == 0 {
 		t.Fatalf("generated %d scenarios and binpack accepted none — the corpus cannot test the property", cases)
 	}
-	t.Logf("%d scenarios: binpack accepted %d, refused %d", cases, accepted, refused)
+
+	// If the oracle refuses none, it may simply be accepting everything, in
+	// which case no acceptance by binpack could ever be caught. That is the
+	// failure mode a one-directional check cannot see from the inside.
+	if oracleRefused == 0 {
+		t.Fatalf("the scheduler refused none of %d scenarios — the oracle is not discriminating, so this suite proves nothing", cases)
+	}
+
+	t.Logf("%d scenarios: binpack accepted %d, refused %d; scheduler refused %d",
+		cases, accepted, refused, oracleRefused)
 }
 
 func randomScenario(rng *rand.Rand, i int) (*corev1.Node, *corev1.Pod, []*corev1.Pod) {

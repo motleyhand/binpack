@@ -61,6 +61,14 @@ computed differently from how the scheduler computes it. A wrong answer there pr
 Kubernetes libraries over hand-rolled equivalents even when the hand-rolled version looks
 obviously correct.
 
+**A test oracle needs its own assertions, or it cannot fail.** The differential harness checks a
+one-directional property — binpack must never accept what the scheduler refuses — and an oracle
+that accepted everything would satisfy it vacuously: every binpack refusal logs as
+"conservative", and the unsound direction becomes unreachable. So mirror cases assert the
+expected scheduler verdict *independently of binpack*, and the generated suite fails if the
+oracle refused nothing. Verified by sabotage: an always-accepting oracle must make the suite
+fail, and it does.
+
 **The differential harness's feature gates come from `NewSchedulerFeaturesFromGates`, never a
 hand-written list.** Its first run reported 171 unsound placements, all one message: sidecar
 containers disabled. That was the oracle modelling a cluster that has not existed since 1.33,
