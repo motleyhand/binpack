@@ -51,7 +51,8 @@ add. If those fixes solve it, you might not need this.
 |---|---|
 | [Why your cluster doesn't shrink](docs/explanation/why-clusters-dont-shrink.md) | What the autoscaler actually does, why the scheduler works against you, and the three conditions a node must meet before removal |
 | [Quick wins before installing binpack](docs/how-to/quick-wins-before-installing-binpack.md) | Seven fixes worth doing regardless. Do these first |
-| [Diagnose scale-down blockers](docs/how-to/diagnose-scale-down-blockers.md) | Read-only commands for working out why a node is still there |
+| [Diagnose scale-down blockers](docs/how-to/diagnose-scale-down-blockers.md) | Read-only commands for working out why a node is still there, by hand |
+| [Diagnostics reference](docs/reference/diagnostics.md) | Every code `binpack diagnose` reports, what it means, and what to change |
 
 ### Background
 
@@ -66,6 +67,7 @@ add. If those fixes solve it, you might not need this.
 | Document | What it covers |
 |---|---|
 | [Configuration](docs/reference/configuration.md) | Every field, what it does, and why headroom is not a percentage |
+| [Diagnostics](docs/reference/diagnostics.md) | Every `binpack diagnose` code, its severity, and the fix |
 | [RBAC](docs/reference/rbac.md) | Every permission binpack needs, and what it is deliberately never granted |
 | [Fix a silently broken Metrics API](docs/how-to/fix-metrics-api-on-managed-kubernetes.md) | When `kubectl top` returns nothing and your HPAs are quietly inert |
 
