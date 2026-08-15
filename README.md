@@ -65,6 +65,10 @@ implementation lands; this table will grow to cover them.
   so binpack simulates placing every pod onto a specific remaining node before it cordons
   anything. Aggregate free capacity is not proof: three nodes with 1GB free each do not hold a
   3GB pod.
+- **One pod at a time, and check again.** binpack does not place pods and cannot steer the
+  scheduler, so a valid packing existing is not the same as the scheduler choosing it. Evictions
+  are sequential and the cluster is re-examined between each one. This makes a scale-up unlikely
+  and immediately detectable — not impossible, and the docs say so.
 - **Show your working.** Every decision returns the arithmetic that produced it. `binpack
   explain` is not a separate code path from the controller; it is the same function, printed.
 - **Borrow the scheduler's logic; never guess it.** Fit uses upstream Kubernetes code, and is

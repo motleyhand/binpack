@@ -43,6 +43,25 @@ affect scoring.
 detected and causes a refusal. "We do not model hard topology spread" is acceptable. "We
 silently ignore hard topology spread" is not.
 
+### What the guarantee does not cover
+
+The one-directional property is about the **fit predicate**: if binpack says a pod fits a node,
+the scheduler agrees. It says nothing about which of several valid nodes the scheduler will
+actually pick, and that gap is real.
+
+A feasible packing is an *existence* proof. If pod A fits N1 or N2 while pod B fits only N2, the
+simulation may assign A to N1 and B to N2 and be entirely correct that a valid assignment
+exists — and the scheduler may still place A on N2, fill it, and leave B Pending. Every filter
+check was sound and the outcome was still wrong.
+
+binpack cannot close this, because it does not place pods and has no supported way to steer the
+scheduler. It closes it operationally instead, by never having more than one pod in flight:
+evictions are sequential and the state is revalidated between each, so the only open question at
+any moment is where a single pod lands, and that is observed before anything else moves.
+
+The consequence must be stated honestly in user-facing documentation rather than implied away:
+**binpack makes a scale-up unlikely and immediately detectable; it cannot make it impossible.**
+
 ## Decision
 
 ### Depend on an interface, not an implementation
@@ -103,6 +122,12 @@ non-default `schedulerName`; scheduling gates; and dynamic resource allocation c
 
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
+
+The allowlist is applied to **both** the pods being relocated and the pods already resident on
+each prospective destination. Inter-pod affinity is symmetric: the scheduler rejects an incoming
+pod if a pod already on that node declares required anti-affinity matching it. A relocating pod
+using nothing but allowlisted features can therefore still be refused by a destination, and
+checking only the relocating side would let exactly that case through.
 
 The soft counterparts of these constraints — `preferredDuringSchedulingIgnoredDuringExecution`,
 `whenUnsatisfiable: ScheduleAnyway` — are ignored rather than refused, because they affect only

@@ -189,14 +189,24 @@ how the defects above arose in the first place.
 
 What binpack understands is a **closed allowlist**, never a list of known exceptions. Stage 1
 models `NodeUnschedulable`, `NodeName`, `NodeAffinity` and `nodeSelector`, `NodeResourcesFit`
-and `TaintToleration`. A relocatable pod using anything outside that set — a `hostPort`, a
-persistent volume claim, required inter-pod affinity, hard topology spread, a custom scheduler —
-makes its node an invalid candidate, with the specific feature named as the reason.
+and `TaintToleration`. Anything outside that set — a `hostPort`, a persistent volume claim,
+required inter-pod affinity, hard topology spread, a custom scheduler — makes the node an
+invalid candidate, with the specific feature named as the reason.
 
 The direction matters: a denylist of constraints we remembered can never be complete, and every
 Kubernetes release lengthens it. An unrecognised feature must refuse by default. Soft
 constraints are the exception, ignored rather than refused, because they affect only scoring and
 can never cause a placement to fail.
+
+**The allowlist applies in both directions.** It is not enough to inspect the pods being
+relocated; the pods already resident on each prospective destination must be inspected too.
+Inter-pod affinity is symmetric — the scheduler's filter rejects an incoming pod if an existing
+pod on that node declares required anti-affinity matching it. A relocating pod using nothing but
+allowlisted features can still be refused by a destination it knows nothing about.
+
+So a destination is disqualified if any pod on it uses a feature outside the allowlist, exactly
+as a relocating pod is. Checking only one side would let precisely this case through and leave
+the replacement Pending.
 
 Every gap in the model must fail towards refusing to drain, and `internal/fit` is tested
 against a real `kube-scheduler` with a one-directional property: if binpack says a pod fits, the
@@ -339,15 +349,60 @@ window is a bonus, never a strategy.
 
 ## Draining safely
 
-Cordon, evict in order, then **verify**. If the node still exists after a configured timeout,
-binpack uncordons it and records the drain as failed.
+A drain is not one decision followed by a batch of evictions. The cluster keeps moving
+underneath it, so the protocol is deliberately sequential and revalidates at every step.
 
-This is not optional bookkeeping. A cordoned node that the autoscaler never removes is lost
-schedulable capacity: if the pool is at its maximum, later pods can stay Pending indefinitely
-while a healthy node sits idle. binpack must leave the cluster in a working state without
-human intervention, including when its own prediction was wrong.
+1. **Mark, then cordon.** Write the drain annotations, then cordon. Cordoning first and deciding
+   afterwards is what makes the next step meaningful: until the node is unschedulable, its pod
+   set can still grow.
+2. **Re-snapshot and re-decide.** The decision that selected this candidate was made against a
+   snapshot that is now stale. Between it and the cordon, the scheduler may have bound new pods
+   to this very node — pods whose fit, evictability and PDB demand were never assessed. So
+   feasibility and evictability are recomputed against the actual post-cordon pod set. If the
+   answer is now no, uncordon, unmark, and record the drain as aborted. Nothing has been evicted
+   at this point, so aborting is free.
+3. **Evict one pod, then wait.** Evict a single pod and wait for its replacement to be scheduled
+   somewhere — not merely created, but bound to a node.
+4. **Revalidate and repeat.** Re-snapshot and re-check the remaining pods before each subsequent
+   eviction. If the remaining set no longer fits, stop, uncordon, and record a partial drain.
+5. **Verify removal.** Once the node is empty, wait for the autoscaler to delete it. If it still
+   exists at the deadline, uncordon and record the drain as failed.
 
-### The recovery state must outlive the process
+Every branch of this protocol ends with the node either deleted or uncordoned. That is not
+tidiness, it is the central safety property: a cordoned node the autoscaler never removes is
+lost schedulable capacity, and if the pool is at its maximum, pods can stay Pending indefinitely
+while a healthy node sits idle. binpack must leave the cluster working without human
+intervention, including — especially — when its own prediction was wrong.
+
+Sequential eviction makes drains slow. That is acceptable: binpack drains one node per run and
+runs on a timer. Trading minutes for the ability to abort at any point is the right side of that
+trade for a tool that deletes capacity.
+
+### Why one at a time: binpack does not control placement
+
+There is a limit to what feasibility can promise, and it is worth stating plainly rather than
+hiding behind the simulation.
+
+The placement simulation proves that a valid assignment **exists**. It does not oblige the
+scheduler to choose that one. Suppose pod A fits either N1 or N2, while pod B fits only N2. The
+simulation may pack A onto N1 and B onto N2 and correctly report the drain feasible — and then
+the scheduler, following its own scoring, places A on N2, fills it, and leaves B Pending. Every
+filter check was sound; the assignment was still wrong.
+
+binpack cannot prevent this, because it does not place pods and cannot steer the scheduler. What
+it can do is never have more than one pod in flight. Evicting singly and revalidating means the
+only uncertainty at any moment is where one pod lands, and the answer is observed before
+anything else is touched. A wrong guess costs one Pending pod and an aborted drain, not a
+half-emptied node with several.
+
+The honest statement, which the documentation should make rather than bury: **binpack makes a
+scale-up unlikely and immediately detectable; it cannot make it impossible.** A pod that goes
+Pending may trigger the autoscaler before binpack aborts. The guarantee in
+[ADR-0006](adr-0006-scheduler-fidelity.md) is about the *fit predicate* — if binpack says a pod
+fits a node, the scheduler agrees — and does not extend to the scheduler's choice among valid
+destinations.
+
+### Recovery state must outlive the process
 
 An in-memory timer is not good enough, because the failure it guards against and the failure
 that destroys it are the same kind of event. If binpack is OOM-killed, rescheduled, upgraded, or
