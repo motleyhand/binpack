@@ -13,6 +13,7 @@ package mother
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -367,6 +368,44 @@ func Tolerating(key string, effect corev1.TaintEffect) PodOption {
 			Effect:   effect,
 		})
 	}
+}
+
+// PDB builds a PodDisruptionBudget selecting pods by label, with the given
+// number of disruptions currently allowed.
+//
+// disruptionsAllowed is status rather than spec: it is what the controller
+// computed from current replica health, and it is what the eviction API
+// actually consults.
+func PDB(namespace, name string, disruptionsAllowed int32, selector map[string]string) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: disruptionsAllowed},
+	}
+}
+
+// Bare removes the controller reference, making the pod one nothing would
+// recreate after eviction.
+func Bare() PodOption {
+	return func(p *corev1.Pod) { p.OwnerReferences = nil }
+}
+
+// WithHostPathVolume attaches a hostPath volume, which the autoscaler treats
+// as local storage.
+func WithHostPathVolume(name, path string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+			Name:         name,
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: path}},
+		})
+	}
+}
+
+// SafeToEvict sets the cluster-autoscaler annotation.
+func SafeToEvict(value string) PodOption {
+	return Annotated("cluster-autoscaler.kubernetes.io/safe-to-evict", value)
 }
 
 // Resizing marks an in-place vertical scale as in progress.
