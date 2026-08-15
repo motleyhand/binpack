@@ -13,6 +13,7 @@ package mother
 
 import (
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
@@ -138,7 +139,8 @@ func Pod(namespace, name string, opts ...PodOption) *corev1.Pod {
 			Namespace: namespace,
 			Name:      name,
 			OwnerReferences: []metav1.OwnerReference{
-				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name + "-rs"},
+				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name + "-rs",
+					Controller: ptr(true)},
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -151,6 +153,16 @@ func Pod(namespace, name string, opts ...PodOption) *corev1.Pod {
 					},
 				},
 			}},
+		},
+		// Running and Ready by default. Readiness is load-bearing for
+		// eviction: an unready pod may be evictable without drawing on its
+		// disruption budget, so an archetype that silently defaulted to
+		// unready would make tests agree with the code for the wrong reason.
+		Status: corev1.PodStatus{
+			Phase: corev1.PodRunning,
+			Conditions: []corev1.PodCondition{
+				{Type: corev1.PodReady, Status: corev1.ConditionTrue},
+			},
 		},
 	}
 	for _, o := range opts {
@@ -166,7 +178,7 @@ func DaemonSetPod(namespace, name string, opts ...PodOption) *corev1.Pod {
 	return Pod(namespace, name, append([]PodOption{
 		func(p *corev1.Pod) {
 			p.OwnerReferences = []metav1.OwnerReference{
-				{APIVersion: "apps/v1", Kind: "DaemonSet", Name: name},
+				{APIVersion: "apps/v1", Kind: "DaemonSet", Name: name, Controller: ptr(true)},
 			}
 		},
 	}, opts...)...)
@@ -369,6 +381,91 @@ func Tolerating(key string, effect corev1.TaintEffect) PodOption {
 	}
 }
 
+// PDB builds a PodDisruptionBudget selecting pods by label, with the given
+// number of disruptions currently allowed.
+//
+// disruptionsAllowed is status rather than spec: it is what the controller
+// computed from current replica health, and it is what the eviction API
+// actually consults.
+func PDB(namespace, name string, disruptionsAllowed int32, selector map[string]string) *policyv1.PodDisruptionBudget {
+	return &policyv1.PodDisruptionBudget{
+		ObjectMeta: metav1.ObjectMeta{Namespace: namespace, Name: name},
+		Spec: policyv1.PodDisruptionBudgetSpec{
+			Selector: &metav1.LabelSelector{MatchLabels: selector},
+		},
+		Status: policyv1.PodDisruptionBudgetStatus{DisruptionsAllowed: disruptionsAllowed},
+	}
+}
+
+// Bare removes the controller reference, making the pod one nothing would
+// recreate after eviction.
+func Bare() PodOption {
+	return func(p *corev1.Pod) { p.OwnerReferences = nil }
+}
+
+// OwnedButNotControlled gives the pod an owner reference with Controller
+// unset — a garbage-collection link rather than a controller that would
+// recreate it. Such a pod is as bare as one with no owner at all.
+func OwnedButNotControlled(kind, name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.OwnerReferences = []metav1.OwnerReference{
+			{APIVersion: "apps/v1", Kind: kind, Name: name},
+		}
+	}
+}
+
+// Stale marks a PDB whose controller has not yet observed the current spec.
+// The eviction API refuses disruptions in that state whatever the recorded
+// allowance says.
+func Stale(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	pdb.Generation = 7
+	pdb.Status.ObservedGeneration = 6
+	return pdb
+}
+
+// WithHostPathVolume attaches a hostPath volume, which the autoscaler treats
+// as local storage.
+func WithHostPathVolume(name, path string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+			Name:         name,
+			VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: path}},
+		})
+	}
+}
+
+// SafeToEvict sets the cluster-autoscaler annotation.
+func SafeToEvict(value string) PodOption {
+	return Annotated("cluster-autoscaler.kubernetes.io/safe-to-evict", value)
+}
+
+// Unready flips the pod's Ready condition, as a CrashLoopBackOff replica has.
+func Unready() PodOption {
+	return func(p *corev1.Pod) {
+		for i := range p.Status.Conditions {
+			if p.Status.Conditions[i].Type == corev1.PodReady {
+				p.Status.Conditions[i].Status = corev1.ConditionFalse
+			}
+		}
+	}
+}
+
+// Healthy sets a budget's health counters, which decide whether an unready
+// pod can be evicted without consuming the allowance.
+func Healthy(pdb *policyv1.PodDisruptionBudget, current, desired int32) *policyv1.PodDisruptionBudget {
+	pdb.Status.CurrentHealthy = current
+	pdb.Status.DesiredHealthy = desired
+	return pdb
+}
+
+// AlwaysAllowUnhealthy sets unhealthyPodEvictionPolicy: AlwaysAllow, under
+// which an unready pod is evictable regardless of the budget.
+func AlwaysAllowUnhealthy(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	policy := policyv1.AlwaysAllow
+	pdb.Spec.UnhealthyPodEvictionPolicy = &policy
+	return pdb
+}
+
 // Resizing marks an in-place vertical scale as in progress.
 func Resizing() PodOption {
 	return func(p *corev1.Pod) {
@@ -430,3 +527,5 @@ func Gated(name string) PodOption {
 			corev1.PodSchedulingGate{Name: name})
 	}
 }
+
+func ptr[T any](v T) *T { return &v }
