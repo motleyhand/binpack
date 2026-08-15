@@ -30,6 +30,17 @@ That one lives in its own Go module under `test/differential`, because it depend
 Keeping it separate is what stops any of that reaching the module binpack ships. It runs as its
 own CI job and is not part of `make check`.
 
+**It consumes the main module through a `replace` directive, so changing the main module's
+dependencies leaves it stale.** After any dependency bump, run:
+
+```bash
+cd test/differential && go mod tidy
+```
+
+CI checks this, so a forgotten tidy fails the differential job rather than going unnoticed —
+but it fails on a PR that has nothing to do with dependencies, which is confusing if you do not
+know why.
+
 ## Architecture rules
 
 Two rules matter more than style, because the project's credibility rests on them.
