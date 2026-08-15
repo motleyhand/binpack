@@ -123,6 +123,18 @@ func NodeLabels(labels map[string]string) NodeOption {
 	}
 }
 
+// NodeAnnotations merges annotations onto a node.
+func NodeAnnotations(annotations map[string]string) NodeOption {
+	return func(n *corev1.Node) {
+		if n.Annotations == nil {
+			n.Annotations = map[string]string{}
+		}
+		for k, v := range annotations {
+			n.Annotations[k] = v
+		}
+	}
+}
+
 // InPool labels a node with the DOKS pool labels binpack discovers pools by.
 func InPool(name, id string) NodeOption {
 	return NodeLabels(map[string]string{
