@@ -32,6 +32,10 @@ make test-differential                               # fit vs the real scheduler
 requires ~29 replace directives from every consumer, and keeping it out of the main module is
 the whole point — do not add that dependency to the module binpack ships.
 
+It consumes the main module via `replace`, so **a main-module dependency bump leaves it stale**
+and fails the differential CI job on an unrelated PR. Run `cd test/differential && go mod tidy`
+after any dependency change.
+
 CI additionally verifies `go.mod`/`go.sum` are tidy and runs `goreleaser release --snapshot
 --skip=publish`, so release-config breakage surfaces on the PR rather than on a tag.
 
