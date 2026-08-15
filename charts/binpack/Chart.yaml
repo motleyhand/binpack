@@ -1,0 +1,14 @@
+apiVersion: v2
+name: binpack
+description: Consolidate nodes a managed cluster-autoscaler will not remove on its own
+type: application
+# Chart and app track together until there is a reason for them not to.
+version: 0.1.0
+appVersion: "0.1.0"
+home: https://github.com/motleyhand/binpack
+sources:
+  - https://github.com/motleyhand/binpack
+keywords: [autoscaling, cost, consolidation, bin-packing, cluster-autoscaler]
+maintainers:
+  - name: MotleyHand
+    url: https://github.com/motleyhand

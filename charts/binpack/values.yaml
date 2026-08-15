@@ -1,0 +1,100 @@
+# binpack decides whether draining one node would leave every one of its pods
+# schedulable elsewhere, and drains it only when the answer is yes.
+
+image:
+  repository: ghcr.io/motleyhand/binpack
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# binpack's own configuration, rendered into a ConfigMap. Every field is
+# optional: pools and their bounds are discovered from the cluster-autoscaler,
+# so an empty document is a working configuration.
+#
+# See docs/reference/configuration.md. Check a document before applying it with
+# `binpack config validate -f values-fragment.yaml`.
+config:
+  # Decide everything, change nothing. Acting is opt-in, deliberately: a tool
+  # that drains nodes should be one you switched on, not one you inherited.
+  #
+  # Leave this true until `binpack explain` has told you something you agree
+  # with. Note that this build cannot act at all — it refuses to start with
+  # dryRun: false rather than pretending — so changing it now only produces a
+  # crash loop.
+  dryRun: true
+  interval: 1m0s
+
+rbac:
+  # The ClusterRole, the kube-system Role for the autoscaler's status, and the
+  # bindings. Turn off only if you manage RBAC separately.
+  create: true
+  # Grant the verbs the executor will need. Nothing in this build uses them,
+  # and granting a permission before the code that needs it is how a role
+  # outlives its justification.
+  allowDraining: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# One replica is the right number: only the leader acts, so a second is a
+# warm spare rather than more throughput.
+replicaCount: 1
+
+leaderElection:
+  # On by default. A single replica still runs two pods during a rolling
+  # update, and two binpacks draining at once is precisely what the lease
+  # prevents.
+  enabled: true
+
+metrics:
+  enabled: true
+  port: 8080
+  service:
+    enabled: true
+  serviceMonitor:
+    # Requires the Prometheus operator's CRDs.
+    enabled: false
+    interval: 60s
+    labels: {}
+
+probes:
+  port: 8081
+
+# Modest, and honest: binpack holds an informer cache of every node, pod and
+# disruption budget, so memory scales with the cluster rather than with load.
+# Raise the limit rather than the request on a large cluster.
+resources:
+  requests:
+    cpu: 20m
+    memory: 128Mi
+  limits:
+    memory: 512Mi
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# binpack is relocatable like any other workload and is not special-cased: a
+# drain that moves it simply resumes on the new node, and the lease means the
+# replacement does not act until the old one has stopped.
+priorityClassName: ""
