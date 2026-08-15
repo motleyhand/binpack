@@ -82,6 +82,7 @@ is a capacity one.
 | `binpack_nodes` | gauge | `verdict` | Nodes by verdict at the last evaluation |
 | `binpack_nodes_skipped` | gauge | `code` | Nodes ruled out before simulation, by reason |
 | `binpack_drainable_nodes` | gauge | — | Nodes whose whole workload was shown to fit elsewhere |
+| `binpack_nodes_unmodelled` | gauge | — | Nodes refused because a pod's controller template could not be read |
 
 `verdict` is one of `skipped`, `infeasible`, `blocked`, `drainable`. All four are always
 published, reporting zero rather than disappearing — "no drainable nodes" and "binpack is not
@@ -147,6 +148,21 @@ The engine's prose reasons are deliberately **not** exposed as labels. They name
 nodes and pods — "draining would leave nowhere for a pod the size of
 `monitoring/prometheus-…`" — and a label whose values are unbounded is how a monitoring system
 falls over. The prose is in the logs, in the Events on the node, and in `binpack explain`.
+
+### When `binpack_nodes_unmodelled` is above zero
+
+binpack asks whether a pod's *replacement* would fit, which it reads from the pod's controller.
+For a pod created by an operator's own CRD there is no template to read, and binpack refuses to
+move it rather than sizing it from the running pod — the inference that is unsound, since a pod
+resized downward in place would be sized too small.
+
+Zero on every cluster measured so far. Persistently above zero means the four readable kinds
+(ReplicaSet, StatefulSet, DaemonSet, Job) do not cover your workloads, and it is worth saying
+so — [ADR-0006](../design/adr-0006-scheduler-fidelity.md) settles the allowlist against
+measurement, and this is the measurement.
+
+It is deliberately separate from the ordinary infeasible count: "the workload does not fit" is a
+fact about your cluster, and "binpack cannot tell what the workload is" is a gap in binpack.
 
 ## Replicas that have not evaluated
 

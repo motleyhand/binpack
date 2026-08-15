@@ -31,7 +31,33 @@ rules:
   - apiGroups: ["policy"]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch]
+
+  # Pod templates: what a controller would create to replace an evicted pod.
+  - apiGroups: ["apps"]
+    resources: [replicasets, statefulsets, daemonsets]
+    verbs: [get, list, watch]
+
+  - apiGroups: ["batch"]
+    resources: [jobs]
+    verbs: [get, list, watch]
 ```
+
+### Why the controllers are read
+
+binpack asks whether a pod's *replacement* would fit elsewhere, and the running pod is not
+always a reliable stand-in for it. A pod resized downward in place carries smaller requests than
+its replacement will ask for, and nothing on the pod records that this happened — so sizing the
+move on what is running can approve a node the replacement does not fit. The controller's
+template is the only source of truth for that, and reading it is what makes the decision sound
+rather than usually-right. See
+[ADR-0006](../design/adr-0006-scheduler-fidelity.md).
+
+Only the pod template is read. The cache drops status and annotations before storing, which
+matters because a cluster keeps ten ReplicaSet revisions per Deployment by default and binpack
+looks at one field of each.
+
+Pods owned by a controller binpack cannot read a template for — an operator's own CRD — are not
+moved at all, rather than being sized from the running pod.
 
 The cluster-autoscaler's status ConfigMap is granted separately, as a **Role in `kube-system`**:
 
@@ -134,8 +160,6 @@ interval and reports on nodes, and still changes nothing.
 - ConfigMaps outside `kube-system`
 - Secrets, of any kind
 
-`apps` resources — DaemonSets, ReplicaSets, StatefulSets — are also not granted. Pod ownership
-is read from each pod's own `ownerReferences`, so the controllers themselves never need to be
-fetched. That changes if binpack starts reading owner templates to predict a replacement pod's
-spec, which [ADR-0006](../design/adr-0006-scheduler-fidelity.md) records as a known gap; the
-permission will be added in the same change, not before.
+Note that `apps` and `batch` are granted **read-only**, and only for the four kinds that own
+pods. binpack never writes to a workload: scaling a Deployment down would be a far blunter
+instrument than moving its pods, and not a decision a consolidation tool should be making.

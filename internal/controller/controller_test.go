@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
+	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -567,5 +568,41 @@ func TestRunReportsAOneShotFailureTheManagerCannotCarry(t *testing.T) {
 	}
 	if !strings.Contains(got.Error(), "running") {
 		t.Errorf("the manager's failure is unlabelled: %v", got)
+	}
+}
+
+func TestControllersAreTrimmedBeforeCaching(t *testing.T) {
+	// A cluster keeps ten ReplicaSet revisions per Deployment by default and
+	// binpack reads one field of each. Their status and annotations — which
+	// include the last-applied-configuration of the whole workload — are pure
+	// memory cost in a tool whose purpose is to reduce what a cluster costs.
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace:   "default",
+			Name:        "web-rs",
+			Annotations: map[string]string{"kubectl.kubernetes.io/last-applied-configuration": "{...}"},
+		},
+		Spec: appsv1.ReplicaSetSpec{
+			Template: corev1.PodTemplateSpec{
+				Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+			},
+		},
+		Status: appsv1.ReplicaSetStatus{Replicas: 3, ReadyReplicas: 3},
+	}
+
+	out, err := keepTemplateOnly(rs)
+	if err != nil {
+		t.Fatalf("keepTemplateOnly: %v", err)
+	}
+	trimmed := out.(*appsv1.ReplicaSet)
+
+	if len(trimmed.Spec.Template.Spec.Containers) != 1 {
+		t.Error("the template was dropped, which is the one thing binpack reads")
+	}
+	if trimmed.Status.Replicas != 0 {
+		t.Error("status is still cached")
+	}
+	if trimmed.Annotations != nil {
+		t.Error("annotations are still cached, including last-applied-configuration")
 	}
 }

@@ -122,11 +122,15 @@ non-default `schedulerName`; scheduling gates; and dynamic resource allocation c
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
 
-#### Known gap: the running pod is a proxy for the replacement
+#### Closed: the running pod was a proxy for the replacement
 
-`CanFit` is asked whether a *replacement* pod could be placed, and is handed the *running* one.
-Almost always these agree, and where they do not, binpack currently cannot tell. Two cases are
-known, and they differ in how much they matter.
+> **Closed.** binpack reads owner templates and places the pod a controller *would create*.
+> Recorded here as it was found, because the reasoning is what justifies the permissions it
+> costs.
+
+`CanFit` was asked whether a *replacement* pod could be placed, and was handed the *running*
+one. Almost always these agree, and where they did not, binpack could not tell. Two cases were
+known, and they differed in how much they mattered.
 
 **A controller template that pins `spec.nodeName`.** Every pod binpack sees is already bound, so
 its own `nodeName` names the node it is leaving and cannot distinguish a pinned template from an
@@ -144,13 +148,27 @@ exists to prevent. A resize still in flight is refused outright, but a completed
 marker on the pod — `status.resize` and the resize conditions track pending and in-progress
 operations only.
 
-Both close the same way, by reading the owner's template rather than inferring the replacement
-from the running pod. binpack already needs `ReplicaSet`, `StatefulSet` and `DaemonSet` reads
-for ownership classification, so the plumbing is planned rather than new.
+Both closed the same way: `collect` reads `ReplicaSet`, `StatefulSet`, `DaemonSet` and `Job`
+templates, and the engine builds the replacement from the template while keeping the running
+pod's identity for anything it reports. `fit` needed no signature change — it was always asking
+about a pod, and now receives the right one.
 
-**Reading owner templates is a prerequisite for the executor.** `fit` has no production callers
-today, so the gap costs nothing yet; it must be closed before any code path can act on a
-decision, and the roadmap records that as a dependency rather than a nice-to-have.
+The second case became *checkable* rather than merely bounded in the same change. Every running
+pod names a node, so a pinned template was invisible; a replacement's `nodeName` comes from the
+template alone, so `fit` now refuses it outright instead of relying on the drain stalling.
+
+**A pod whose controller kind has no readable template is refused, not guessed at.** An
+operator's own CRD provides no template, and inferring the replacement from the running pod is
+precisely the inference that is unsound. This follows the allowlist rule, and it was settled
+against measurement as this ADR asks: on a real cluster all 145 pods resolved a template through
+the four kinds above, so the refusal cost nothing there. A metric counts it, so if that turns
+out not to be general the evidence will exist before the rule is relaxed.
+
+**Verifying the first case mattered more than it looks.** The obvious cheaper fix — compare the
+pod's requests against what its container statuses report as allocated — does not work, and the
+API says so: the kubelet sets `allocatedResources` to the new value *after* a successful resize,
+so a completed one leaves the two in agreement. There is no marker to find, which is why the
+template is the only answer.
 
 The allowlist is applied to **both** the pods being relocated and the pods already resident on
 each prospective destination. Inter-pod affinity is symmetric: the scheduler rejects an incoming

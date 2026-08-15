@@ -411,3 +411,89 @@ func TestReportsNameTheRunningPodNotTheReplacement(t *testing.T) {
 		t.Errorf("summary does not name a real object: %s", sim.Blocked.Summary)
 	}
 }
+
+func TestTheReplacementCarriesItsTemplateLabels(t *testing.T) {
+	// Labels decide anti-affinity, and anti-affinity is symmetric: a pod
+	// already on a destination can refuse an incoming one whose labels match
+	// its selector. The replacement will carry the template's labels, so those
+	// are what a destination must be asked about.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+
+	// The resident refuses anything labelled app=web.
+	resident := mother.Pod("default", "resident", mother.OnNode("destination"),
+		mother.WithRequiredAntiAffinity("app", "web"))
+	// The moving pod is unlabelled today; its template says app=web.
+	moving := mother.Pod("default", "moving", mother.OnNode("candidate"))
+	pods := []*corev1.Pod{resident, moving}
+
+	templates := mother.Templates(pods...)
+	ref, _ := engine.ControllerOf(moving)
+	templates[ref].Labels = map[string]string{"app": "web"}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Error("placed a pod the destination's anti-affinity will refuse once it carries its template's labels")
+	}
+}
+
+func TestHeadroomIsSizedOnReplacementsToo(t *testing.T) {
+	// The reserve asks whether a pod of the largest shape could still be
+	// *created* after the drain. Sizing it on what is running understates the
+	// margin by exactly the amount an in-place downward resize removed — and
+	// the reserve exists to stop the next scale-up, which is provoked by the
+	// replacement, not by the pod that shrank.
+	candidate := sized("candidate", "4Gi")
+	destination := sized("destination", "4Gi")
+
+	// Nothing on the candidate, so the drain is trivially feasible; the
+	// question is entirely whether the reserve is big enough.
+	shrunk := mother.Pod("default", "big", mother.OnNode("destination"),
+		mother.Requests("100m", "512Mi"))
+	pods := []*corev1.Pod{shrunk}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	asRunning := mother.Templates(pods...)
+	if sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		asRunning, candidate, cfg); !sim.Feasible {
+		t.Fatalf("setup: 4Gi has room to spare for another 512Mi, got %s", sim.Blocked.Summary)
+	}
+
+	// Its template says 3.6Gi. The destination holds it at its shrunken 512Mi,
+	// leaving 3584Mi — enough for another shrunken copy, not for a real one.
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, shrunk, mother.Requests("100m", "3600Mi"))
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods, templates, candidate, cfg)
+
+	if sim.Feasible {
+		t.Error("reserved headroom for the shrunken pod rather than for the replacement it would be recreated as")
+	}
+}
+
+func TestTheReserveDoesNotRefuseAClusterWithObviousRoom(t *testing.T) {
+	// The reserve is checked by asking whether a pod of the largest shape
+	// could be placed. It must be asked about a *replacement*: a running pod
+	// carries a nodeName, and fit refuses those outright now that an unset one
+	// is the normal case. Handing it the running pod would refuse every
+	// cluster there is — while printing the message a genuine shortfall
+	// prints, which is what makes this worth its own test.
+	candidate := sized("candidate", "4Gi")
+	destination := sized("destination", "8Gi")
+	pods := []*corev1.Pod{
+		mother.Pod("default", "small", mother.OnNode("destination"), mother.Requests("100m", "256Mi")),
+	}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if !sim.Feasible {
+		t.Errorf("refused a drain with 7.75Gi free and a 256Mi largest pod: %s", sim.Blocked.Summary)
+	}
+}
