@@ -243,6 +243,85 @@ func TestStalePDBStatusIsNotTrusted(t *testing.T) {
 	}
 }
 
+func TestUnreadyPodsMayNotConsumeTheBudget(t *testing.T) {
+	// The eviction API skips the budget entirely for a pod that is not Ready,
+	// in two cases. Counting such a pod would refuse a drain Kubernetes would
+	// have permitted — and a CrashLoopBackOff replica under a tight budget is
+	// exactly the sort of thing that pins a node in the first place.
+	labelled := map[string]string{"app": "web"}
+	broken := mother.Pod("default", "web-1", mother.PodLabels(labelled), mother.Unready())
+	healthy := mother.Pod("default", "web-2", mother.PodLabels(labelled))
+
+	t.Run("AlwaysAllow exempts it regardless of the budget", func(t *testing.T) {
+		pdb := mother.AlwaysAllowUnhealthy(mother.PDB("default", "web", 0, labelled))
+
+		got := engine.CheckEvictable([]*corev1.Pod{broken},
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+
+		if len(got) != 0 {
+			t.Errorf("AlwaysAllow permits evicting an unready pod with zero allowance, got %v", codes(got))
+		}
+	})
+
+	t.Run("default policy exempts it while the application is healthy", func(t *testing.T) {
+		// Evicting an already-broken replica disrupts nothing, so it is not
+		// charged for.
+		pdb := mother.Healthy(mother.PDB("default", "web", 0, labelled), 3, 2)
+
+		got := engine.CheckEvictable([]*corev1.Pod{broken},
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+
+		if len(got) != 0 {
+			t.Errorf("a healthy budget permits evicting an unready pod, got %v", codes(got))
+		}
+	})
+
+	t.Run("default policy charges for it when the application is not healthy", func(t *testing.T) {
+		pdb := mother.Healthy(mother.PDB("default", "web", 0, labelled), 1, 2)
+
+		got := engine.CheckEvictable([]*corev1.Pod{broken},
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+
+		if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
+			t.Errorf("an unhealthy application still guards its budget, got %v", codes(got))
+		}
+	})
+
+	t.Run("a ready pod always draws on the allowance", func(t *testing.T) {
+		pdb := mother.AlwaysAllowUnhealthy(mother.PDB("default", "web", 0, labelled))
+
+		got := engine.CheckEvictable([]*corev1.Pod{healthy},
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+
+		if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
+			t.Errorf("AlwaysAllow applies only to unready pods, got %v", codes(got))
+		}
+	})
+}
+
+func TestBudgetBlockersNameAPod(t *testing.T) {
+	// A blocker that names only a budget cannot be rendered next to the
+	// workload it affects, and explain has to handle every blocker uniformly.
+	labelled := map[string]string{"app": "web"}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web-1", mother.PodLabels(labelled)),
+		mother.Pod("default", "web-2", mother.PodLabels(labelled)),
+	}
+	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("default", "web", 1, labelled)}
+
+	got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig())
+
+	if len(got) != 1 {
+		t.Fatalf("codes = %v", codes(got))
+	}
+	if got[0].Pod == nil {
+		t.Fatal("a shortfall must name an affected pod, as EvictionBlocker.Pod documents")
+	}
+	if got[0].Pod.Namespace != "default" {
+		t.Errorf("named pod = %s/%s", got[0].Pod.Namespace, got[0].Pod.Name)
+	}
+}
+
 func TestPDBsInOtherNamespacesDoNotApply(t *testing.T) {
 	labelled := map[string]string{"app": "web"}
 	pods := []*corev1.Pod{mother.Pod("production", "web-1", mother.PodLabels(labelled))}

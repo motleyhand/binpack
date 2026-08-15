@@ -85,7 +85,9 @@ func CheckEvictable(
 ) []EvictionBlocker {
 	var blockers []EvictionBlocker
 
-	demand := make(map[*policyv1.PodDisruptionBudget]int)
+	// Demand carries a representative pod as well as a count, so a shortfall
+	// can name a workload rather than only a budget.
+	demand := make(map[*policyv1.PodDisruptionBudget]*budgetDemand)
 
 	for _, pod := range evicting {
 		// Matched once and reused: a budget both exempts a kube-system pod
@@ -113,7 +115,19 @@ func CheckEvictable(
 			continue
 		}
 		if len(matched) == 1 {
-			demand[matched[0]]++
+			pdb := matched[0]
+			// An unready pod may be evictable without consuming the budget at
+			// all, in which case counting it would block a drain Kubernetes
+			// would have allowed.
+			if evictableWhileUnready(pod, pdb) {
+				continue
+			}
+			d, ok := demand[pdb]
+			if !ok {
+				d = &budgetDemand{first: pod}
+				demand[pdb] = d
+			}
+			d.count++
 		}
 	}
 
@@ -177,10 +191,11 @@ func checkPod(pod *corev1.Pod, matched []*policyv1.PodDisruptionBudget, cfg Evic
 // drain is many evictions drawing on the same allowances, so two pods of one
 // Deployment on a node with disruptionsAllowed of 1 pass a per-pod check and
 // then half-drain it.
-func checkAllowances(demand map[*policyv1.PodDisruptionBudget]int) []EvictionBlocker {
+func checkAllowances(demand map[*policyv1.PodDisruptionBudget]*budgetDemand) []EvictionBlocker {
 	var blockers []EvictionBlocker
 
-	for pdb, wanted := range demand {
+	for pdb, d := range demand {
+		wanted := d.count
 		// A budget whose controller has not caught up with its spec is
 		// refused by the eviction API outright, whatever its recorded
 		// allowance says — see checkAndDecrement in the eviction subresource.
@@ -188,6 +203,7 @@ func checkAllowances(demand map[*policyv1.PodDisruptionBudget]int) []EvictionBlo
 		// rejected mid-flight.
 		if pdb.Status.ObservedGeneration < pdb.Generation {
 			blockers = append(blockers, EvictionBlocker{
+				Pod:  d.first,
 				Code: BlockedPDBStale,
 				PDB:  pdb.Namespace + "/" + pdb.Name,
 				Message: fmt.Sprintf(
@@ -202,6 +218,7 @@ func checkAllowances(demand map[*policyv1.PodDisruptionBudget]int) []EvictionBlo
 			continue
 		}
 		blockers = append(blockers, EvictionBlocker{
+			Pod:  d.first,
 			Code: BlockedPDBInsufficint,
 			PDB:  pdb.Namespace + "/" + pdb.Name,
 			Message: fmt.Sprintf(
@@ -211,6 +228,48 @@ func checkAllowances(demand map[*policyv1.PodDisruptionBudget]int) []EvictionBlo
 	}
 
 	return blockers
+}
+
+// budgetDemand is how many evictions a drain needs from one budget, and a pod
+// to name when reporting a shortfall.
+type budgetDemand struct {
+	count int
+	first *corev1.Pod
+}
+
+// evictableWhileUnready reports whether an unready pod can be evicted without
+// drawing on its budget's allowance.
+//
+// The eviction subresource skips the budget entirely for a pod that is not
+// Ready, in two cases: when the budget sets AlwaysAllow, and — under the
+// default policy — when the application it guards is currently healthy.
+// Evicting an already-broken replica disrupts nothing, so it is not charged
+// for.
+//
+// Counting such a pod would block a drain Kubernetes would have permitted: a
+// CrashLoopBackOff pod under a zero-allowance budget is evictable, and
+// refusing to move it is exactly the kind of stuck node binpack exists to
+// clear.
+func evictableWhileUnready(pod *corev1.Pod, pdb *policyv1.PodDisruptionBudget) bool {
+	if isPodReady(pod) {
+		return false
+	}
+	if policy := pdb.Spec.UnhealthyPodEvictionPolicy; policy != nil &&
+		*policy == policyv1.AlwaysAllow {
+		return true
+	}
+	// Default and IfHealthyBudget: free only while the guarded application is
+	// meeting its budget.
+	return pdb.Status.CurrentHealthy >= pdb.Status.DesiredHealthy && pdb.Status.DesiredHealthy > 0
+}
+
+func isPodReady(pod *corev1.Pod) bool {
+	for _, c := range pod.Status.Conditions {
+		if c.Type == corev1.PodReady {
+			return c.Status == corev1.ConditionTrue
+		}
+	}
+	return false
 }
 
 // matchingPDBs returns every budget selecting pod, in declaration order.
