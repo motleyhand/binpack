@@ -607,7 +607,12 @@ to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
    here produces a confidently wrong decision no engine unit test can catch
 9. `binpack diagnose`
 10. `binpack run`, dry-run only
-11. Executor: cordon, evict, verify, uncordon; cooldown and anti-thrash state
+11. Executor: cordon, evict, verify, uncordon; cooldown and backoff state.
+    **Blocked on** `collect` reading owner templates: until binpack derives the replacement
+    pod's spec from its controller rather than from the running pod, a pod resized downward in
+    place can be approved for a node its replacement does not fit. Harmless while nothing acts
+    on a decision; not harmless once something does. See
+    [ADR-0006](adr-0006-scheduler-fidelity.md).
 12. Helm chart and RBAC
 13. Release pipeline
 

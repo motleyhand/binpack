@@ -122,6 +122,36 @@ non-default `schedulerName`; scheduling gates; and dynamic resource allocation c
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
 
+#### Known gap: the running pod is a proxy for the replacement
+
+`CanFit` is asked whether a *replacement* pod could be placed, and is handed the *running* one.
+Almost always these agree, and where they do not, binpack currently cannot tell. Two cases are
+known, and they differ in how much they matter.
+
+**A controller template that pins `spec.nodeName`.** Every pod binpack sees is already bound, so
+its own `nodeName` names the node it is leaving and cannot distinguish a pinned template from an
+ordinary scheduling decision. The consequence is bounded: such a pod ignores cordon — setting
+`nodeName` bypasses the scheduler — and reappears on the node being drained rather than going
+Pending, so no scale-up follows and the drain stalls and backs off as
+[ADR-0007](adr-0007-drain-progress-not-deadlines.md) provides for any undetected blocker. It
+costs a wasted drain.
+
+**A pod resized downward in place.** In-place vertical scaling changes a running pod's requests
+without touching its controller's template, so `EffectiveRequests` reports less than the
+replacement will actually ask for. This one is *not* bounded: binpack could approve a node the
+replacement does not fit, leaving it Pending and provoking exactly the scale-up this design
+exists to prevent. A resize still in flight is refused outright, but a completed one leaves no
+marker on the pod — `status.resize` and the resize conditions track pending and in-progress
+operations only.
+
+Both close the same way, by reading the owner's template rather than inferring the replacement
+from the running pod. binpack already needs `ReplicaSet`, `StatefulSet` and `DaemonSet` reads
+for ownership classification, so the plumbing is planned rather than new.
+
+**Reading owner templates is a prerequisite for the executor.** `fit` has no production callers
+today, so the gap costs nothing yet; it must be closed before any code path can act on a
+decision, and the roadmap records that as a dependency rather than a nice-to-have.
+
 The allowlist is applied to **both** the pods being relocated and the pods already resident on
 each prospective destination. Inter-pod affinity is symmetric: the scheduler rejects an incoming
 pod if a pod already on that node declares required anti-affinity matching it. A relocating pod

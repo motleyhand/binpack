@@ -30,13 +30,23 @@ linters:
         # ADR-0006 applies to unmodelled scheduler constraints.
         engine-purity:
           files:
+            # internal/fit is held to the same rule: ADR-0008 gives it no
+            # cluster access either, and it is the package most likely to be
+            # tempted by a client when a predicate needs one more fact.
             - "**/internal/engine/**"
+            - "**/internal/fit/**"
           allow:
             - $gostd
             - github.com/motleyhand/binpack
             - k8s.io/api
             - k8s.io/apimachinery
             - k8s.io/component-helpers
+            # Interfaces only, no implementation: some upstream signatures take
+            # a logger, and logr.Discard satisfies them without doing anything.
+            # k8s.io/klog is deliberately NOT allowed — it is a logging
+            # implementation that writes, and klog.Logger is only an alias for
+            # logr.Logger, so nothing is lost by refusing it.
+            - github.com/go-logr/logr
           deny:
             # $gostd is allowed wholesale for the arithmetic and formatting the
             # engine genuinely needs, so the I/O-capable corners of it are
