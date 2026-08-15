@@ -1,0 +1,62 @@
+version: "2"
+
+linters:
+  default: standard
+  enable:
+    - bodyclose
+    - copyloopvar
+    - depguard
+    - errorlint
+    - gocritic
+    - misspell
+    - nilerr
+    - revive
+    - unconvert
+    - usetesting
+    - wastedassign
+
+  settings:
+    depguard:
+      rules:
+        # ADR-0003: the decision engine is a pure function over plain values.
+        # If it can import a Kubernetes client it will eventually hold one, and
+        # then the logic can no longer be tested without a cluster — and the
+        # CLI and controller can drift apart. Conversion belongs in
+        # internal/collect; fit predicates belong in internal/fit.
+        engine-purity:
+          files:
+            - "**/internal/engine/**"
+          deny:
+            - pkg: k8s.io
+              desc: >-
+                internal/engine must stay free of Kubernetes libraries (ADR-0003).
+                Add the field you need to the engine's own snapshot types and
+                populate it in internal/collect.
+            - pkg: sigs.k8s.io
+              desc: >-
+                internal/engine must stay free of Kubernetes libraries (ADR-0003).
+                Add the field you need to the engine's own snapshot types and
+                populate it in internal/collect.
+
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+
+  exclusions:
+    presets:
+      - comments
+      - std-error-handling
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    goimports:
+      local-prefixes:
+        - github.com/motleyhand/binpack
