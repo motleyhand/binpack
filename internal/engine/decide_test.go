@@ -565,3 +565,50 @@ func TestEveryNodeIsAccountedFor(t *testing.T) {
 		}
 	}
 }
+
+func TestCheckPoolsNamesEveryUnknownPoolInAStableOrder(t *testing.T) {
+	// The names come from a map. An error that reorders itself between runs
+	// is one nobody can diff, match against a log, or assert on.
+	s := cluster([]*corev1.Node{inPool("a")}, nil)
+	cfg := config()
+	cfg.ByPool = map[string]engine.Policy{
+		"zeta-pool":  {Enabled: false},
+		"alpha-pool": {Enabled: false},
+		"mid-pool":   {Enabled: false},
+		poolName:     {Enabled: false},
+	}
+
+	first := engine.CheckPools(s, cfg)
+	if first == nil {
+		t.Fatal("three unknown pools were accepted")
+	}
+	if !strings.Contains(first.Error(), "alpha-pool, mid-pool, zeta-pool") {
+		t.Errorf("unknown pools are not listed in sorted order: %v", first)
+	}
+	// The one that does exist must not be reported.
+	if strings.Contains(first.Error(), poolName) {
+		t.Errorf("a pool that exists was reported as unknown: %v", first)
+	}
+
+	for range 20 {
+		if got := engine.CheckPools(s, cfg); got.Error() != first.Error() {
+			t.Fatalf("the message varies between runs:\n %v\n %v", first, got)
+		}
+	}
+}
+
+func TestCheckPoolsAcceptsAPoolKnownOnlyToTheAutoscaler(t *testing.T) {
+	// A pool scaled to zero has no nodes to carry its label, but the
+	// autoscaler still reports it. Rejecting the override then would take
+	// binpack down over a pool that is merely empty.
+	s := cluster(nil, nil)
+	s.Autoscaler.Groups = []engine.NodeGroup{
+		{ID: poolID, Name: poolName, MinSize: 0, MaxSize: 10, Ready: 0},
+	}
+	cfg := config()
+	cfg.ByPool = map[string]engine.Policy{poolID: {Enabled: false}}
+
+	if err := engine.CheckPools(s, cfg); err != nil {
+		t.Errorf("an empty but autoscaled pool was rejected: %v", err)
+	}
+}

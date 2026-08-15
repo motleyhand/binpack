@@ -105,10 +105,25 @@ func Run(ctx context.Context, opts Options) error {
 		return fmt.Errorf("adding the evaluator: %w", err)
 	}
 
-	if err := mgr.Start(runCtx); err != nil {
-		return fmt.Errorf("running: %w", err)
+	// Sequenced rather than nested: ev.err is only set once Start has
+	// returned, and Go does not define the evaluation order of a plain field
+	// read against a call in the same argument list.
+	startErr := mgr.Start(runCtx)
+	return outcome(startErr, ev.err)
+}
+
+// outcome combines what the manager reported with what a one-shot evaluation
+// recorded.
+//
+// The second is not redundant, which is the whole reason this has a name. A
+// runnable's error is discarded once the manager's stop sequence is engaged,
+// and engaging it is exactly what a one-shot run does, so without this a
+// binpack that failed exits 0. See [evaluator.Start].
+func outcome(managerErr, evaluationErr error) error {
+	if managerErr != nil {
+		return fmt.Errorf("running: %w", managerErr)
 	}
-	return nil
+	return evaluationErr
 }
 
 func managerOptions(opts Options) manager.Options {
@@ -213,6 +228,9 @@ type evaluator struct {
 	opts     Options
 	log      logr.Logger
 	stop     context.CancelFunc
+
+	// err carries a one-shot run's outcome back to [Run]. See Start.
+	err error
 }
 
 // NeedLeaderElection puts the evaluator behind the lease. Everything binpack
@@ -224,8 +242,15 @@ func (e *evaluator) NeedLeaderElection() bool { return true }
 // synced and, when enabled, once this process holds the lease.
 func (e *evaluator) Start(ctx context.Context) error {
 	if e.opts.Once {
-		defer e.stop()
-		return e.evaluate(ctx)
+		// Recorded rather than returned, which looks redundant and is not.
+		// The manager discards a runnable's error once its stop sequence is
+		// engaged — and engaging it is exactly what a one-shot run does — so
+		// an error returned here is logged as "received after stop sequence
+		// was engaged" and thrown away, and the process exits 0 having
+		// failed. Run reads this after Start.
+		e.err = e.evaluate(ctx)
+		e.stop()
+		return nil
 	}
 
 	e.log.Info("binpack is running",
@@ -264,8 +289,30 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 		return fmt.Errorf("reading the cluster: %w", err)
 	}
 
+	// Before deciding, not at startup. A configuration naming a pool that is
+	// not there must not be accepted by `run` while `explain` refuses it —
+	// and of the three commands this is the one that will eventually act on
+	// it, so silently applying the default policy to a pool an operator
+	// believes they switched off is the failure that costs something.
+	if err := engine.CheckPools(snapshot, e.opts.Engine); err != nil {
+		return err
+	}
+
 	decision := engine.Decide(snapshot, e.opts.Engine)
-	e.report(ctx, snapshot, decision)
+
+	if err := e.report(ctx, snapshot, decision); err != nil {
+		if e.opts.Once {
+			// Nothing will retry: this process is about to exit, and its logs
+			// go with it. A CronJob that exits 0 having reported nothing is
+			// indistinguishable from one that found nothing to report.
+			return err
+		}
+		// The next tick re-decides and re-reports, and the recorder will
+		// aggregate it into the same event. Worth knowing about, not worth
+		// stopping for — on a cluster where events are the only reachable
+		// surface, a crash loop would take the logs away too.
+		e.log.Error(err, "could not record the decision on the node")
+	}
 	return nil
 }
 

@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -227,6 +228,31 @@ func TestOnceStopsTheManagerAfterASinglePass(t *testing.T) {
 	if !stopped {
 		t.Error("one-shot mode left the manager running, so the process would never exit")
 	}
+	if ev.err != nil {
+		t.Errorf("a successful pass recorded an error: %v", ev.err)
+	}
+}
+
+func TestOnceCarriesItsFailurePastTheManager(t *testing.T) {
+	// The manager discards a runnable's error once the stop sequence is
+	// engaged, and engaging it is exactly what a one-shot run does. Returning
+	// the error from Start therefore loses it — logged as "received after stop
+	// sequence was engaged" — and the process exits 0 having failed. Found by
+	// running --once against a real cluster with a deliberately broken config
+	// and watching it succeed.
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{}, inPool("a"), statusConfigMap())
+	ev.opts.Engine.ByPool = map[string]engine.Policy{"poool-4g": {Enabled: false}}
+
+	if err := ev.Start(context.Background()); err != nil {
+		t.Fatalf("Start should not return the error, the manager would drop it: %v", err)
+	}
+	if ev.err == nil {
+		t.Fatal("the failure was not recorded, so Run would report success")
+	}
+	if !strings.Contains(ev.err.Error(), "poool-4g") {
+		t.Errorf("recorded error does not say what failed: %v", ev.err)
+	}
 }
 
 func TestRunRefusesToPretendItCanAct(t *testing.T) {
@@ -432,5 +458,114 @@ func TestReportingInstanceFitsWhatTheAPIAccepts(t *testing.T) {
 	// hears about.
 	if got := reportingInstance(); len(got) > 128 || got == "" {
 		t.Errorf("reportingInstance() = %q (%d chars)", got, len(got))
+	}
+}
+
+func TestEvaluateRefusesAnOverrideNamingAPoolThatIsNotThere(t *testing.T) {
+	// The dangerous shape is `enabled: false` on a misspelt name: the operator
+	// believes a pool is switched off, the override is unreachable, and its
+	// nodes quietly take the default enabled policy. `explain` and `diagnose`
+	// already refuse it, and of the three this is the command that will
+	// eventually act on it.
+	cfg := config()
+	cfg.ByPool = map[string]engine.Policy{"poool-4g": {Enabled: false}}
+
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{}, inPool("a"), statusConfigMap())
+	ev.opts.Engine = cfg
+
+	err := ev.evaluate(context.Background())
+	if err == nil {
+		t.Fatal("a typo'd pool override was accepted, and its nodes stay drainable")
+	}
+	if !strings.Contains(err.Error(), "poool-4g") {
+		t.Errorf("error does not name the unknown pool: %v", err)
+	}
+}
+
+func TestEvaluateAcceptsAnOverrideNamingAPoolThatExists(t *testing.T) {
+	cfg := config()
+	cfg.ByPool = map[string]engine.Policy{poolName: {Enabled: false}}
+
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{}, inPool("a"), statusConfigMap())
+	ev.opts.Engine = cfg
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Errorf("a real pool was rejected: %v", err)
+	}
+}
+
+// failingReporter stands in for missing Events RBAC, or any write the API
+// server refuses.
+type failingReporter struct{}
+
+func (failingReporter) emit(context.Context, *corev1.Node, string, string, string) error {
+	return errors.New("events is forbidden: User cannot create resource events")
+}
+
+func TestOnceFailsWhenItCannotReport(t *testing.T) {
+	// Nothing will retry: the process is exiting and its logs go with it. A
+	// CronJob that exits 0 having reported nothing is indistinguishable from
+	// one that found nothing to report.
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{},
+		inPool("a"), inPool("b"), inPool("c"),
+		mother.Pod("default", "web", mother.OnNode("a")),
+		statusConfigMap())
+	ev.reporter = failingReporter{}
+	ev.opts.Once = true
+
+	err := ev.evaluate(context.Background())
+	if err == nil {
+		t.Fatal("a one-shot run reported nothing and called it success")
+	}
+	if !strings.Contains(err.Error(), "recording the decision") {
+		t.Errorf("error does not say what was lost: %v", err)
+	}
+}
+
+func TestTheControllerKeepsGoingWhenItCannotReport(t *testing.T) {
+	// The opposite call, for the opposite reason: the next tick re-decides and
+	// re-reports, and on a cluster where events are the only reachable surface
+	// a crash loop would take the logs away too.
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{},
+		inPool("a"), inPool("b"), inPool("c"),
+		mother.Pod("default", "web", mother.OnNode("a")),
+		statusConfigMap())
+	ev.reporter = failingReporter{}
+	ev.opts.Once = false
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("the controller stopped over one lost event: %v", err)
+	}
+	if !log.contains("could not record the decision") {
+		t.Errorf("the lost event was swallowed entirely:\n%s", strings.Join(log.lines, "\n"))
+	}
+}
+
+func TestRunReportsAOneShotFailureTheManagerCannotCarry(t *testing.T) {
+	// Run cannot be exercised without a cluster, so the rule it applies is
+	// named and tested here instead. Getting it wrong is silent: binpack
+	// fails, says so in its log, and exits 0.
+	evaluation := errors.New("configuration overrides pools that do not exist")
+
+	if got := outcome(nil, evaluation); !errors.Is(got, evaluation) {
+		t.Errorf("outcome(nil, err) = %v, want the evaluation's failure", got)
+	}
+	if got := outcome(nil, nil); got != nil {
+		t.Errorf("outcome(nil, nil) = %v, want success", got)
+	}
+
+	// A manager failure wins: if it could not start, whatever the evaluation
+	// recorded is a consequence rather than the cause.
+	managerErr := errors.New("no such host")
+	got := outcome(managerErr, evaluation)
+	if !errors.Is(got, managerErr) {
+		t.Errorf("outcome(managerErr, _) = %v, want the manager's failure", got)
+	}
+	if !strings.Contains(got.Error(), "running") {
+		t.Errorf("the manager's failure is unlabelled: %v", got)
 	}
 }

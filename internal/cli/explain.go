@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -49,7 +48,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 				return err
 			}
 
-			if err := checkPoolsExist(cfg, snapshot); err != nil {
+			if err := engine.CheckPools(snapshot, engineConfig(cfg)); err != nil {
 				return err
 			}
 
@@ -313,47 +312,4 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
-}
-
-// checkPoolsExist rejects overrides naming a pool discovery did not find.
-//
-// Pools are discovered, never declared, so an entry here adjusts something
-// that exists. A misspelt name would otherwise install an unreachable map
-// entry and the node would quietly take the default policy — which is
-// actively dangerous for `enabled: false`, where the operator believes they
-// have switched a pool off and binpack reports it as drainable.
-func checkPoolsExist(cfg *v1alpha1.Config, s engine.Snapshot) error {
-	if len(cfg.Pools) == 0 {
-		return nil
-	}
-
-	known := map[string]bool{}
-	for _, g := range s.Autoscaler.Groups {
-		known[g.ID] = true
-	}
-	for _, node := range s.Nodes {
-		if name := node.Labels[cfg.Discovery.PoolNameLabel]; name != "" {
-			known[name] = true
-		}
-		if id := node.Labels[cfg.Discovery.NodeGroupIDLabel]; id != "" {
-			known[id] = true
-		}
-	}
-
-	var unknown []string
-	for _, pool := range cfg.Pools {
-		if !known[pool.Name] {
-			unknown = append(unknown, pool.Name)
-		}
-	}
-	if len(unknown) == 0 {
-		return nil
-	}
-
-	sort.Strings(unknown)
-	return fmt.Errorf(
-		"configuration overrides pools that do not exist in this cluster: %s\n"+
-			"pools are discovered, not declared, so an override must name one that is there;\n"+
-			"check for a typo, or remove the entry if the pool is gone",
-		strings.Join(unknown, ", "))
 }

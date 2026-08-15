@@ -30,7 +30,7 @@ const (
 // control plane — where the autoscaler's own logs are unreachable and binpack's
 // may be too — `kubectl describe node` is the only surface a cluster user
 // reliably has. This mirrors how the autoscaler surfaces its own decisions.
-func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Decision) {
+func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Decision) error {
 	if d.Action != engine.Drain || d.Node == nil {
 		// Logged every evaluation rather than only on change. A controller
 		// that goes quiet is indistinguishable from one that has stopped, and
@@ -40,7 +40,7 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 			"nodesConsidered", len(d.Assessments),
 			"nodes", len(s.Nodes),
 			"pods", len(s.Pods))
-		return
+		return nil
 	}
 
 	chosen := chosenAssessment(d)
@@ -63,13 +63,13 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 	note := fmt.Sprintf("binpack would drain this node: %s. No action taken — dry run",
 		relocationSummary(relocating))
 
+	// Returned rather than logged here: whether a lost report is fatal depends
+	// on whether anything will try again, which the caller knows and this does
+	// not.
 	if err := e.reporter.emit(ctx, d.Node, ReasonWouldDrain, ActionConsolidate, note); err != nil {
-		// Logged, not returned. Failing to say what binpack decided is worth
-		// knowing about, but it is not a reason to stop deciding — and on a
-		// cluster where events are the only reachable surface, a crash loop
-		// would remove the logs too.
-		e.log.Error(err, "could not record the decision on the node", "node", d.Node.Name)
+		return fmt.Errorf("recording the decision on %s: %w", d.Node.Name, err)
 	}
+	return nil
 }
 
 func relocationSummary(pods int) string {
