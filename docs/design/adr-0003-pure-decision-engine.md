@@ -1,7 +1,15 @@
 # ADR-0003: The decision engine is a pure function
 
-- **Status:** accepted
+- **Status:** superseded in part by
+  [ADR-0008](adr-0008-engine-uses-api-types.md)
 - **Date:** 2026-08-15
+
+> **The principle here still holds: the decision engine is a pure function over data, performs
+> no I/O, and its tests need no cluster. The enforcement mechanism below — forbidding all
+> Kubernetes imports and mirroring API objects into bespoke types — was replaced. It turned out
+> to be a proxy for "holds no clients", and the mirror types caused the defects it was meant to
+> prevent. See [ADR-0008](adr-0008-engine-uses-api-types.md); the reasoning below is kept as the
+> record of why the property was wanted in the first place.**
 
 ## Context
 

@@ -18,25 +18,39 @@ linters:
   settings:
     depguard:
       rules:
-        # ADR-0003: the decision engine is a pure function over plain values.
-        # If it can import a Kubernetes client it will eventually hold one, and
-        # then the logic can no longer be tested without a cluster — and the
-        # CLI and controller can drift apart. Conversion belongs in
-        # internal/collect; fit predicates belong in internal/fit.
+        # ADR-0008: the decision engine is a pure function over data. It may
+        # name Kubernetes API types — those are inert structs, constructible in
+        # a test literal — but it must never hold anything that talks to a
+        # cluster, or do I/O of any kind.
+        #
+        # An allowlist, not a denylist. A list of clients we remembered can
+        # never be complete: k8s.io/metrics ships one, every cloud SDK ships
+        # one, and the next Kubernetes release may add another. Anything not
+        # named here is refused by default, which is the same reasoning
+        # ADR-0006 applies to unmodelled scheduler constraints.
         engine-purity:
           files:
             - "**/internal/engine/**"
+          allow:
+            - $gostd
+            - github.com/motleyhand/binpack
+            - k8s.io/api
+            - k8s.io/apimachinery
+            - k8s.io/component-helpers
           deny:
-            - pkg: k8s.io
-              desc: >-
-                internal/engine must stay free of Kubernetes libraries (ADR-0003).
-                Add the field you need to the engine's own snapshot types and
-                populate it in internal/collect.
-            - pkg: sigs.k8s.io
-              desc: >-
-                internal/engine must stay free of Kubernetes libraries (ADR-0003).
-                Add the field you need to the engine's own snapshot types and
-                populate it in internal/collect.
+            # $gostd is allowed wholesale for the arithmetic and formatting the
+            # engine genuinely needs, so the I/O-capable corners of it are
+            # named explicitly.
+            - pkg: os
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: os/exec
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: net
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: net/http
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: database/sql
+              desc: internal/engine must perform no I/O (ADR-0008)
 
     revive:
       rules:

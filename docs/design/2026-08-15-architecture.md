@@ -42,21 +42,31 @@ cmd/binpack            thin main(), calls internal/cli
 api/v1alpha1           configuration types (CRD-shaped), defaulting, validation
 
 internal/
-  engine               PURE. no Kubernetes imports. Snapshot -> Decision
-  fit                  FitChecker: can this pod go on this node? upstream logic
-  collect              the ONLY package holding Kubernetes clients. builds a Snapshot
+  engine               Snapshot -> Decision. no clients, no I/O, inputs read-only
+  fit                  can this pod go on this node? upstream predicates. no clients
+  collect              reads cluster state into a Snapshot
+  controller           owns the manager, caches and leader election
+  executor             cordons, evicts, uncordons, writes drain markers
   cli                  cobra commands: explain, diagnose, run, version
-  controller           controller-runtime manager + periodic Runnable
-  executor             cordon, evict, and the uncordon safeguard
-  state                cooldown and anti-thrash memory
+  state                cooldown and backoff bookkeeping
   metrics              Prometheus collectors
 
 charts/binpack         Helm chart, RBAC, ConfigMap
 ```
 
-The dependency graph is deliberately shallow. `engine` depends on nothing but the standard
-library. `collect` depends on Kubernetes client libraries and on `engine`'s types. `cli` and
-`controller` depend on both, and on each other not at all.
+The dependency graph is deliberately shallow, and the line that matters is which packages may
+touch a cluster at all.
+
+| Package | Cluster access |
+|---|---|
+| `engine`, `fit`, `api/v1alpha1` | **None.** API types as data, no clients, no I/O — enforced by a `depguard` allowlist, see [ADR-0008](adr-0008-engine-uses-api-types.md) |
+| `collect` | Reads. Lists nodes, pods, PDBs and the autoscaler status into a `Snapshot`, without transforming them |
+| `controller` | Owns the controller-runtime manager, its caches and leader election |
+| `executor` | Writes. Cordon, uncordon, eviction, and the drain marker annotations |
+
+`collect` is the read adapter rather than the sole owner of cluster access: the manager's caches
+live in `controller`, and every mutation goes through `executor`. Keeping writes in one package
+means the set of things binpack can change to a cluster is enumerable by reading one directory.
 
 ### Data flow
 
@@ -72,8 +82,12 @@ informer cache ──►│             │       Config    ──►  └──
 ```
 
 The CLI path makes one-shot `List` calls. The controller path reads from controller-runtime's
-watch-backed cache. Both produce the same `Snapshot` type, so the engine cannot tell them
-apart — which is what guarantees `explain` describes what `run` will do.
+watch-backed cache. Both produce the same `Snapshot` — Kubernetes objects as returned, not
+translated — so the engine cannot tell them apart, which is what guarantees `explain` describes
+what `run` will do.
+
+Objects reaching the engine are **read-only**. The controller path hands out pointers into a
+shared informer cache, and writing to one corrupts it for every other consumer in the process.
 
 ## Preflight
 
@@ -166,10 +180,9 @@ lightweight main container and a 2GB init container needs 2GB at admission time.
 resource cost of the sandbox itself, and clusters using gVisor or Kata have a non-trivial amount
 of it.
 
-This arithmetic is fiddly and upstream already gets it right, so `internal/collect` uses
-`k8s.io/component-helpers/resource` rather than hand-rolling it. That is precisely the kind of
-work the collect boundary exists for: the engine receives a finished number and stays free of
-Kubernetes libraries.
+This arithmetic is fiddly and upstream already gets it right, so binpack calls
+`k8s.io/component-helpers/resource.PodRequests` rather than hand-rolling it — at the point of
+use, not precomputed into a mirror that can drift from what the scheduler does.
 
 **Pod slots.** `pods` appears in `status.allocatable` but never in a pod's requests, so a
 uniform "subtract request from remaining" loop would never consume a slot, and the simulation
@@ -178,15 +191,15 @@ map therefore carries a synthetic `pods: 1`, added during collection. The kubele
 a real scheduling constraint and a genuine ceiling that clusters hit while showing plenty of
 free CPU and memory.
 
-Synthesising the entry at the collect boundary keeps the engine's arithmetic uniform: it
-subtracts maps from maps and knows nothing about which keys are special.
+The engine adds it when accounting for a placement, so the arithmetic stays uniform: it
+subtracts resource lists from resource lists, with pod count simply one more entry.
 
 #### Fit predicates come from upstream, not from us
 
-Deciding whether a pod can go on a node is delegated to a `FitChecker`, implemented in
-`internal/fit` using Kubernetes' own staging libraries — `resource.PodRequests` for effective
-requests, `nodeaffinity` for selectors and affinity, `corev1` for taints. Hand-rolling this is
-how the defects above arose in the first place.
+Deciding whether a pod can go on a node lives in `internal/fit`, built on Kubernetes' own
+staging libraries — `resource.PodRequests` for effective requests, `nodeaffinity` for selectors
+and affinity, `corev1` for taints — and called directly by the engine. Hand-rolling this is how
+the defects above arose in the first place.
 
 What binpack understands is a **closed allowlist**, never a list of known exceptions. Stage 1
 models `NodeUnschedulable`, `NodeName`, `NodeAffinity` and `nodeSelector`, `NodeResourcesFit`
@@ -585,7 +598,7 @@ to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
 2. Harvested documentation
 3. Go scaffold and CI
 4. `api/v1alpha1` configuration types
-5. `internal/fit`: the `FitChecker`, plus the differential test harness against a real
+5. `internal/fit`: the fit predicate, plus the differential test harness against a real
    `kube-scheduler` running on `envtest`
 6. Engine: `Snapshot` types and the placement simulation
 7. Engine: evictability prediction and `Decision` rendering

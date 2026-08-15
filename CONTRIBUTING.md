@@ -25,19 +25,23 @@ mode so a broken release config fails on the pull request rather than on a tag.
 
 Two rules matter more than style, because the project's credibility rests on them.
 
-### 1. The decision engine is pure
+### 1. The decision engine holds no cluster clients
 
-`internal/engine` must not import `k8s.io/*` or `sigs.k8s.io/*`. It takes a plain `Snapshot`
-value and returns a `Decision` value. Conversion from Kubernetes API objects happens in
-`internal/collect` and nowhere else.
+`internal/engine` takes Kubernetes API objects as data and returns a `Decision`. It may name
+`corev1.Pod` — that is an inert struct you can write in a test literal. It may not hold a
+client, a lister or anything else that talks to a cluster, because that is what would force a
+cluster into its tests.
 
-This is enforced by a `depguard` rule in `.golangci.yml`, so a violating import fails CI rather
-than being caught in review. If you find yourself needing a Kubernetes type inside the engine,
-the right fix is almost always to add the field you need to the engine's own snapshot types.
+Enforced by a `depguard` rule in `.golangci.yml` denying `k8s.io/client-go`,
+`sigs.k8s.io/controller-runtime` and `k8s.io/kubectl`, so a violating import fails CI rather
+than being caught in review.
 
-The reason is in [ADR-0003](docs/design/adr-0003-pure-decision-engine.md): it is what guarantees
-`binpack explain` describes exactly what the controller will do, and it is what makes the
-decision logic testable without a cluster.
+Objects reaching the engine are **read-only**. The controller passes pointers into a shared
+informer cache, and writing to one corrupts it for every other consumer.
+
+The reasoning is in [ADR-0008](docs/design/adr-0008-engine-uses-api-types.md). It guarantees
+`binpack explain` describes exactly what the controller will do, and keeps the decision logic
+testable without a cluster.
 
 ### 2. Engine changes are test-first
 
@@ -48,19 +52,24 @@ decision procedure, and it should be possible to understand what binpack does by
 This discipline applies to `internal/engine`. Frontend wiring — CLI commands, controller setup,
 Helm templates — gets ordinary coverage without the test-first requirement.
 
-### 3. `collect` and `fit` are the risky packages, not the boring ones
+### 3. `fit` is the risky package, not a boring one
 
-It is tempting to treat the Kubernetes adapter layers as plumbing. They are not. Every defect
-found in design review so far was a translation error at that boundary — a resource not
-accounted for, a pod class not recognised, a request computed differently from how the scheduler
-computes it. A wrong number there produces a *confidently wrong* decision that no amount of
-engine unit testing can catch, because the engine's arithmetic will be perfectly correct on bad
-input.
+It is tempting to treat the Kubernetes-facing code as plumbing. It is not. Every defect found in
+design review so far was the same shape — a resource not accounted for, a pod class not
+recognised, a request computed differently from how the scheduler computes it. A wrong answer
+there produces a *confidently wrong* decision that no amount of engine testing can catch,
+because the engine's arithmetic will be perfectly correct on a bad input.
 
-So `internal/collect` gets integration tests against real API fixtures, and `internal/fit` is
-tested against a real `kube-scheduler`. Prefer upstream Kubernetes libraries over hand-rolled
-equivalents in both, even when the hand-rolled version looks obviously correct.
-See [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md).
+So `internal/fit` is tested against a real `kube-scheduler`, and upstream Kubernetes libraries
+are preferred over hand-rolled equivalents even when the hand-rolled version looks obviously
+correct. See [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md).
+
+### 4. Test fixtures: object mothers, then builders
+
+Mothers name archetypes (`mother.SmallNode()`), builders customise them
+(`mother.SmallNode().WithTaint(...)`), and mothers return builders so the two compose. Tests
+should state the one thing they are about, not restate an entire API object — the test table is
+the specification of the decision procedure, so it has to stay readable.
 
 ## Design decisions
 
