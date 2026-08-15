@@ -1,58 +1,110 @@
 # RBAC reference
 
-> **Status: provisional.** These are the permissions the design requires. The authoritative
-> version ships with the Helm chart; until then, treat this as the intended shape rather than a
-> tested manifest.
+> **Status: the read and report permissions are what `binpack run` uses today.** The mutating
+> rules are marked as such and are not yet needed — nothing in this build cordons or evicts. The
+> authoritative manifests ship with the Helm chart.
 
 binpack needs **no cloud provider credentials** on any platform. A Kubernetes role in the
 cluster it runs in is its entire permission surface — see
 [ADR-0004](../design/adr-0004-provider-agnostic-no-cloud-api.md).
 
-## ClusterRole
+Permissions come in three groups, and it is worth granting only the ones you are actually using:
+
+| Group | Needed by | Mutates |
+|---|---|---|
+| Read | `explain`, `diagnose`, `run` | nothing |
+| Report | `run` | Events, and the leader-election Lease |
+| Act | `run` with `dryRun: false` | nodes (cordon and annotations), pod evictions |
+
+## Read
+
+Everything binpack decides is derived from these.
 
 ```yaml
+# ClusterRole
 rules:
-  # Read the cluster state, and cordon/uncordon nodes.
-  # patch also writes the drain marker annotations.
   - apiGroups: [""]
-    resources: [nodes]
-    verbs: [get, list, watch, patch]
-
-  - apiGroups: [""]
-    resources: [pods]
-    verbs: [get, list, watch]
-
-  # Eviction is a create on a subresource, not a delete on the pod.
-  - apiGroups: [""]
-    resources: [pods/eviction]
-    verbs: [create]
-
-  # Ownership: distinguishing DaemonSet pods from relocatable ones.
-  - apiGroups: ["apps"]
-    resources: [daemonsets, replicasets, statefulsets]
+    resources: [nodes, pods]
     verbs: [get, list, watch]
 
   # Predicting evictability before attempting it.
   - apiGroups: ["policy"]
     resources: [poddisruptionbudgets]
     verbs: [get, list, watch]
+```
 
-  # Preflight and pool discovery: the cluster-autoscaler's status ConfigMap.
+The cluster-autoscaler's status ConfigMap is granted separately, as a **Role in `kube-system`**:
+
+```yaml
+# Role, namespace: kube-system
+rules:
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, list, watch]
-    resourceNames: [cluster-autoscaler-status]
-
-  # Explaining decisions on the Node object itself.
-  - apiGroups: [""]
-    resources: [events]
-    verbs: [create, patch]
 ```
 
-Leader election additionally requires `coordination.k8s.io/leases` in binpack's own namespace,
-scoped as a Role rather than a ClusterRole.
+### Why that one is not restricted by name
 
-## Notes on specific permissions
+The obvious rule — a ClusterRole on `configmaps` with
+`resourceNames: [cluster-autoscaler-status]` — does not work, and fails in a way worth
+understanding before you write it.
+
+`resourceNames` restricts a request by the name in its path. `list` and `watch` requests carry
+no name, so they cannot be restricted this way and the rule authorises nothing for them. The
+one-shot commands would work, because they issue a `get`; the controller would not start at
+all, because its cache issues a `list` followed by a `watch`.
+
+Narrowing by namespace is the restriction that does hold. binpack still reads only the one
+object: the cache is configured with a field selector on `metadata.name`, which the API server
+applies, so no other ConfigMap in `kube-system` is ever transmitted or held in memory. The
+difference is that this is binpack declining to read them rather than Kubernetes refusing —
+so grant the Role in `kube-system` alone, and never cluster-wide, where it would cover
+application configuration binpack has no business seeing.
+
+## Report
+
+```yaml
+# ClusterRole
+rules:
+  # Explaining decisions on the Node object itself.
+  - apiGroups: ["events.k8s.io"]
+    resources: [events]
+    verbs: [create, patch, update]
+```
+
+```yaml
+# Role, in binpack's own namespace
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+```
+
+**`events.k8s.io`, not the core group.** binpack writes through the modern events API, so a rule
+granting `""/events` alone will not let it report anything. `update` and `patch` are there
+because the recorder aggregates repeats of an identical event into one object with a count
+rather than writing a new one each time.
+
+**Leases are only for leader election.** Omit them and pass `--leader-election=false` if you run
+a single replica and accept that a rolling update briefly has two. With `--once` they are never
+used at all.
+
+## Act — not yet used
+
+Nothing in this build cordons a node or evicts a pod. These are the permissions the executor
+will need, listed so the shape of the final role is not a surprise:
+
+```yaml
+  # Cordon, uncordon, and the drain marker annotations.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [patch]
+
+  # Eviction is a create on a subresource, not a delete on the pod.
+  - apiGroups: [""]
+    resources: [pods/eviction]
+    verbs: [create]
+```
 
 **`nodes: patch` is the only mutating verb on cluster state.** It covers cordoning, uncordoning,
 and writing the drain marker annotations. binpack never deletes a node — that is the
@@ -64,22 +116,26 @@ it respects PodDisruptionBudgets — unlike `pods: delete`, which does not. binp
 request `pods: delete`, and should not be granted it. That distinction is the difference between
 draining a node and simply killing things on it.
 
-**`configmaps: get` is scoped by `resourceNames`** to the single object binpack reads. This
-matters: an unscoped ConfigMap read across all namespaces would give it access to a great deal
-of application configuration it has no business seeing.
+## Read-only evaluation
 
-## Read-only mode
+`binpack explain` and `binpack diagnose` need only the **Read** group above, and against your
+own kubeconfig they need no in-cluster identity at all.
 
-`binpack explain` and `binpack diagnose` need only the read verbs — `get`, `list`, `watch`. They
-never patch, evict or create events.
-
-This is the recommended way to evaluate binpack: grant a read-only role, run `explain` against
-your own kubeconfig, and read the arithmetic before granting anything that can act.
+This is the recommended way to evaluate binpack: read the arithmetic before granting anything
+that can act. `binpack run` with the Read and Report groups is the next step — it decides on an
+interval and reports on nodes, and still changes nothing.
 
 ## What binpack is never granted
 
 - Any cloud provider API credential
 - `pods: delete`
 - Write access to workloads — Deployments, StatefulSets, PodDisruptionBudgets. `diagnose`
-  reports problems and suggests fixes; it never applies them.
+  reports problems and suggests fixes; it never applies them
+- ConfigMaps outside `kube-system`
 - Secrets, of any kind
+
+`apps` resources — DaemonSets, ReplicaSets, StatefulSets — are also not granted. Pod ownership
+is read from each pod's own `ownerReferences`, so the controllers themselves never need to be
+fetched. That changes if binpack starts reading owner templates to predict a replacement pod's
+spec, which [ADR-0006](../design/adr-0006-scheduler-fidelity.md) records as a known gap; the
+permission will be added in the same change, not before.
