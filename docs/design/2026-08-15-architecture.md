@@ -41,6 +41,7 @@ api/v1alpha1           configuration types (CRD-shaped), defaulting, validation
 
 internal/
   engine               PURE. no Kubernetes imports. Snapshot -> Decision
+  fit                  FitChecker: can this pod go on this node? upstream logic
   collect              the ONLY package holding Kubernetes clients. builds a Snapshot
   cli                  cobra commands: explain, diagnose, run, version
   controller           controller-runtime manager + periodic Runnable
@@ -178,11 +179,21 @@ free CPU and memory.
 Synthesising the entry at the collect boundary keeps the engine's arithmetic uniform: it
 subtracts maps from maps and knows nothing about which keys are special.
 
-#### The simulation approximates the scheduler; it does not reimplement it
+#### Fit predicates come from upstream, not from us
 
-Where binpack cannot model a constraint — a custom scheduler name, an unrecognised plugin, a
-topology spread rule it does not evaluate — the pod is treated as unplaceable and the candidate
-is skipped. Every gap in the model must fail towards refusing to drain.
+Deciding whether a pod can go on a node is delegated to a `FitChecker`, implemented in
+`internal/fit` using Kubernetes' own staging libraries — `resource.PodRequests` for effective
+requests, `nodeaffinity` for selectors and affinity, `corev1` for taints. Hand-rolling this is
+how the defects above arose in the first place.
+
+Two hard constraints are not modelled — required inter-pod (anti-)affinity, and topology spread
+with `whenUnsatisfiable: DoNotSchedule`. Their *presence* is detected, and any candidate holding
+such a pod is refused with that stated as the reason. Their soft counterparts are ignored
+outright, because they affect only the scheduler's scoring, never its filtering.
+
+Every gap in the model must fail towards refusing to drain, and `internal/fit` is tested
+against a real `kube-scheduler` with a one-directional property: if binpack says a pod fits, the
+scheduler must agree. See [ADR-0006](adr-0006-scheduler-fidelity.md).
 
 ### Feasibility is computed on requests, not usage
 
@@ -389,14 +400,18 @@ to alert on: a persistent shortfall means the cluster genuinely needs its nodes.
 2. Harvested documentation
 3. Go scaffold and CI
 4. `api/v1alpha1` configuration types
-5. Engine: `Snapshot` types and the placement simulation
-6. Engine: evictability prediction and `Decision` rendering
-7. `internal/collect`, preflight, and `binpack explain`
-8. `binpack diagnose`
-9. `binpack run`, dry-run only
-10. Executor: cordon, evict, verify, uncordon; cooldown and anti-thrash state
-11. Helm chart and RBAC
-12. Release pipeline
+5. `internal/fit`: the `FitChecker`, plus the differential test harness against a real
+   `kube-scheduler` running on `envtest`
+6. Engine: `Snapshot` types and the placement simulation
+7. Engine: evictability prediction and `Decision` rendering
+8. `internal/collect`, preflight, and `binpack explain`. Integration-tested against real API
+   fixtures — init containers, RuntimeClass overhead, extended resources — since a wrong number
+   here produces a confidently wrong decision no engine unit test can catch
+9. `binpack diagnose`
+10. `binpack run`, dry-run only
+11. Executor: cordon, evict, verify, uncordon; cooldown and anti-thrash state
+12. Helm chart and RBAC
+13. Release pipeline
 
 Each of steps 4 onward gets its own specification before implementation.
 

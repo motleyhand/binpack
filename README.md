@@ -54,6 +54,7 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0003](docs/design/adr-0003-pure-decision-engine.md) | The decision engine as a pure function, and why that guarantees the CLI cannot lie |
 | [ADR-0004](docs/design/adr-0004-provider-agnostic-no-cloud-api.md) | Discovering pool bounds from the autoscaler itself; why binpack holds no cloud credentials |
 | [ADR-0005](docs/design/adr-0005-why-not-a-karpenter-doks-provider.md) | Karpenter compared honestly, and why this project exists anyway |
+| [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md) | Borrowing the scheduler's own logic, and testing against the real one |
 
 Reference documentation, how-to guides and background explanation are being written as the
 implementation lands; this table will grow to cover them.
@@ -66,6 +67,10 @@ implementation lands; this table will grow to cover them.
   3GB pod.
 - **Show your working.** Every decision returns the arithmetic that produced it. `binpack
   explain` is not a separate code path from the controller; it is the same function, printed.
+- **Borrow the scheduler's logic; never guess it.** Fit uses upstream Kubernetes code, and is
+  tested against a real `kube-scheduler` with a one-directional property: if binpack says a pod
+  fits, the scheduler must agree. Where a constraint cannot be modelled, binpack detects it and
+  refuses rather than assuming.
 - **Leave the cluster working.** If a drained node is not removed, binpack uncordons it. Being
   wrong must not cost you capacity.
 - **Safe by default.** Dry-run is the default. Acting is opt-in. binpack refuses to run at all

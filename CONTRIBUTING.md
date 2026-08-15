@@ -44,6 +44,20 @@ decision procedure, and it should be possible to understand what binpack does by
 This discipline applies to `internal/engine`. Frontend wiring — CLI commands, controller setup,
 Helm templates — gets ordinary coverage without the test-first requirement.
 
+### 3. `collect` and `fit` are the risky packages, not the boring ones
+
+It is tempting to treat the Kubernetes adapter layers as plumbing. They are not. Every defect
+found in design review so far was a translation error at that boundary — a resource not
+accounted for, a pod class not recognised, a request computed differently from how the scheduler
+computes it. A wrong number there produces a *confidently wrong* decision that no amount of
+engine unit testing can catch, because the engine's arithmetic will be perfectly correct on bad
+input.
+
+So `internal/collect` gets integration tests against real API fixtures, and `internal/fit` is
+tested against a real `kube-scheduler`. Prefer upstream Kubernetes libraries over hand-rolled
+equivalents in both, even when the hand-rolled version looks obviously correct.
+See [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md).
+
 ## Design decisions
 
 Non-obvious decisions are recorded as ADRs in [`docs/design/`](docs/design/). If you are
