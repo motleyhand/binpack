@@ -21,6 +21,15 @@ make help       # list every target
 CI additionally verifies that `go.mod` and `go.sum` are tidy, and runs GoReleaser in snapshot
 mode so a broken release config fails on the pull request rather than on a tag.
 
+```bash
+make test-differential   # check the fit predicate against the real scheduler
+```
+
+That one lives in its own Go module under `test/differential`, because it depends on
+`k8s.io/kubernetes` and the ~29 replace directives that module requires of every consumer.
+Keeping it separate is what stops any of that reaching the module binpack ships. It runs as its
+own CI job and is not part of `make check`.
+
 ## Architecture rules
 
 Two rules matter more than style, because the project's credibility rests on them.
