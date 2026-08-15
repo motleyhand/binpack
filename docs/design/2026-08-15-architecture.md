@@ -43,22 +43,30 @@ api/v1alpha1           configuration types (CRD-shaped), defaulting, validation
 
 internal/
   engine               Snapshot -> Decision. no clients, no I/O, inputs read-only
-  fit                  can this pod go on this node? upstream predicates
-  collect              the ONLY package holding Kubernetes clients. lists into a Snapshot
+  fit                  can this pod go on this node? upstream predicates. no clients
+  collect              reads cluster state into a Snapshot
+  controller           owns the manager, caches and leader election
+  executor             cordons, evicts, uncordons, writes drain markers
   cli                  cobra commands: explain, diagnose, run, version
-  controller           controller-runtime manager + periodic Runnable
-  executor             cordon, evict, and the uncordon safeguard
-  state                cooldown and anti-thrash memory
+  state                cooldown and backoff bookkeeping
   metrics              Prometheus collectors
 
 charts/binpack         Helm chart, RBAC, ConfigMap
 ```
 
-The dependency graph is deliberately shallow. `engine` and `fit` use Kubernetes API types but
-hold no clients — enforced by a `depguard` rule, see
-[ADR-0008](adr-0008-engine-uses-api-types.md). `collect` is the only package that talks to a
-cluster, and it lists objects rather than transforming them. `cli` and `controller` depend on
-both, and on each other not at all.
+The dependency graph is deliberately shallow, and the line that matters is which packages may
+touch a cluster at all.
+
+| Package | Cluster access |
+|---|---|
+| `engine`, `fit`, `api/v1alpha1` | **None.** API types as data, no clients, no I/O — enforced by a `depguard` allowlist, see [ADR-0008](adr-0008-engine-uses-api-types.md) |
+| `collect` | Reads. Lists nodes, pods, PDBs and the autoscaler status into a `Snapshot`, without transforming them |
+| `controller` | Owns the controller-runtime manager, its caches and leader election |
+| `executor` | Writes. Cordon, uncordon, eviction, and the drain marker annotations |
+
+`collect` is the read adapter rather than the sole owner of cluster access: the manager's caches
+live in `controller`, and every mutation goes through `executor`. Keeping writes in one package
+means the set of things binpack can change to a cluster is enumerable by reading one directory.
 
 ### Data flow
 

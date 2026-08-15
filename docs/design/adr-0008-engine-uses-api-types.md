@@ -72,11 +72,21 @@ type Snapshot struct {
 }
 ```
 
-The enforced rule becomes **no client packages** rather than no Kubernetes packages.
-`internal/engine` may import `k8s.io/api`, `k8s.io/apimachinery` and `k8s.io/component-helpers`;
-it may not import `k8s.io/client-go`, `sigs.k8s.io/controller-runtime` or `k8s.io/kubectl`. That
-is still a `depguard` rule, still fails CI, and now expresses the invariant instead of standing
-in for it.
+The enforced rule becomes **no cluster access and no I/O**, rather than no Kubernetes packages,
+and it is expressed as an **allowlist**: `internal/engine` may import the standard library, this
+module, and `k8s.io/api`, `k8s.io/apimachinery` and `k8s.io/component-helpers`. Anything else is
+refused.
+
+An allowlist rather than a denylist for the same reason
+[ADR-0006](adr-0006-scheduler-fidelity.md) gives for unmodelled scheduler constraints: a list of
+clients we remembered can never be complete. `k8s.io/client-go` is the obvious one, but
+`k8s.io/metrics` ships a clientset too, every cloud SDK ships one, and the next release may add
+another. Refusing by default is the only formulation that stays correct as the ecosystem moves.
+
+The I/O-capable corners of the standard library — `os`, `os/exec`, `net`, `net/http`,
+`database/sql` — are denied explicitly, since the standard library is allowed wholesale for the
+arithmetic and formatting the engine genuinely needs. That is still a `depguard` rule, still
+fails CI, and now expresses the invariant instead of standing in for it.
 
 **Inputs are strictly read-only.** Informers hand back pointers into a shared cache, and mutating
 one corrupts it for every other consumer in the process. The engine must never write to a Node,

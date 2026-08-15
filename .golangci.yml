@@ -21,26 +21,36 @@ linters:
         # ADR-0008: the decision engine is a pure function over data. It may
         # name Kubernetes API types — those are inert structs, constructible in
         # a test literal — but it must never hold anything that talks to a
-        # cluster. A client is what forces a cluster into a test and what makes
-        # behaviour depend on the environment; a type is not.
+        # cluster, or do I/O of any kind.
         #
-        # Allowed: k8s.io/api, k8s.io/apimachinery, k8s.io/component-helpers.
+        # An allowlist, not a denylist. A list of clients we remembered can
+        # never be complete: k8s.io/metrics ships one, every cloud SDK ships
+        # one, and the next Kubernetes release may add another. Anything not
+        # named here is refused by default, which is the same reasoning
+        # ADR-0006 applies to unmodelled scheduler constraints.
         engine-purity:
           files:
             - "**/internal/engine/**"
+          allow:
+            - $gostd
+            - github.com/motleyhand/binpack
+            - k8s.io/api
+            - k8s.io/apimachinery
+            - k8s.io/component-helpers
           deny:
-            - pkg: k8s.io/client-go
-              desc: >-
-                internal/engine must hold no cluster clients (ADR-0008). Take the
-                objects as arguments; listing them is internal/collect's job.
-            - pkg: sigs.k8s.io/controller-runtime
-              desc: >-
-                internal/engine must hold no cluster clients (ADR-0008). The
-                manager, caches and clients belong in internal/controller.
-            - pkg: k8s.io/kubectl
-              desc: >-
-                internal/engine must hold no cluster clients (ADR-0008).
-                Eviction and drain helpers belong in internal/executor.
+            # $gostd is allowed wholesale for the arithmetic and formatting the
+            # engine genuinely needs, so the I/O-capable corners of it are
+            # named explicitly.
+            - pkg: os
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: os/exec
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: net
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: net/http
+              desc: internal/engine must perform no I/O (ADR-0008)
+            - pkg: database/sql
+              desc: internal/engine must perform no I/O (ADR-0008)
 
     revive:
       rules:
