@@ -10,9 +10,11 @@ import (
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
 	corev1 "k8s.io/api/core/v1"
+	eventsv1 "k8s.io/api/events/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -36,6 +38,10 @@ type recordedEvent struct {
 
 // fakeRecorder captures events instead of writing them, so a test can assert
 // on what a cluster user would see in `kubectl describe node`.
+//
+// Note what it cannot show: whether the write ever reached the API server. The
+// real recorder returns before it posts, which is why --once needs a different
+// reporter and why this fake reported success while a live run wrote nothing.
 type fakeRecorder struct{ events []recordedEvent }
 
 func (r *fakeRecorder) Eventf(regarding, _ runtime.Object,
@@ -115,7 +121,7 @@ func newEvaluator(t *testing.T, log *captured, rec *fakeRecorder, objs ...client
 	t.Helper()
 	return &evaluator{
 		reader:   fake.NewClientBuilder().WithObjects(objs...).Build(),
-		recorder: rec,
+		reporter: broadcastReporter{recorder: rec},
 		opts:     Options{Engine: config(), DryRun: true, Interval: time.Minute, Once: true},
 		log:      log.logger(),
 		stop:     func() {},
@@ -328,5 +334,103 @@ func TestTheLeaseIsReleasedOnShutdown(t *testing.T) {
 	}
 	if opts.LeaderElectionID != LeaderElectionID {
 		t.Errorf("lease ID = %q, want the documented %q", opts.LeaderElectionID, LeaderElectionID)
+	}
+}
+
+func TestOnceWritesItsEventBeforeTheProcessExits(t *testing.T) {
+	// The defect a live run found and no fake recorder could: the real
+	// recorder returns before it posts, so a --once process was gone before
+	// the write happened and its CronJob reported nothing at all. A CronJob's
+	// pod logs disappear with it, which makes the event the *only* durable
+	// surface that mode has.
+	objects := []client.Object{
+		inPool("a"), inPool("b"), inPool("c"),
+		mother.Pod("default", "web", mother.OnNode("a")),
+		statusConfigMap(),
+	}
+	c := fake.NewClientBuilder().WithObjects(objects...).Build()
+
+	var log captured
+	ev := &evaluator{
+		reader: c,
+		reporter: directReporter{
+			writer:   c,
+			instance: "binpack-test",
+			now:      func() time.Time { return time.Unix(0, 0).UTC() },
+		},
+		opts: Options{Engine: config(), DryRun: true, Once: true},
+		log:  log.logger(),
+		stop: func() {},
+	}
+
+	if err := ev.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var written eventsv1.EventList
+	if err := c.List(context.Background(), &written); err != nil {
+		t.Fatalf("listing events: %v", err)
+	}
+	if len(written.Items) != 1 {
+		t.Fatalf("got %d events written, want exactly one", len(written.Items))
+	}
+
+	got := written.Items[0]
+	if got.Regarding.Kind != "Node" || got.Regarding.Name == "" {
+		t.Errorf("event does not point at a node: %+v", got.Regarding)
+	}
+	if got.Regarding.Name == "a" {
+		t.Error("chose the only node running anything")
+	}
+	// Cluster-scoped objects have no namespace to inherit, and `kubectl
+	// describe node` looks in default. Filing it anywhere else hides it.
+	if got.Namespace != metav1.NamespaceDefault {
+		t.Errorf("namespace = %q, want %q", got.Namespace, metav1.NamespaceDefault)
+	}
+	if got.ReportingController != reportingController {
+		t.Errorf("reportingController = %q, want %q", got.ReportingController, reportingController)
+	}
+	if got.Reason != ReasonWouldDrain || got.Action != ActionConsolidate {
+		t.Errorf("reason/action = %s/%s, want %s/%s",
+			got.Reason, got.Action, ReasonWouldDrain, ActionConsolidate)
+	}
+	if !strings.Contains(got.Note, "dry run") {
+		t.Errorf("the note does not say nothing was done: %q", got.Note)
+	}
+	if got.EventTime.IsZero() {
+		t.Error("no event time, which the API requires")
+	}
+	// The fake client accepts names the API server rejects, so the rule is
+	// asserted here rather than discovered in a cluster. A generateName of
+	// "<node>." looks reasonable and is refused: the API server validates the
+	// prefix itself as a subdomain, and that ends in a dot.
+	if problems := validation.IsDNS1123Subdomain(got.Name); len(problems) > 0 {
+		t.Errorf("event name %q would be rejected: %v", got.Name, problems)
+	}
+	if got.GenerateName != "" {
+		t.Errorf("generateName %q: the API server validates it as a subdomain in its own right",
+			got.GenerateName)
+	}
+}
+
+func TestTheReporterMatchesTheExecutionModel(t *testing.T) {
+	// The choice is not a preference. A long-running process wants the
+	// recorder's aggregation; a process about to exit needs the write to have
+	// happened. Picking the wrong one is silent in both directions.
+	c := fake.NewClientBuilder().Build()
+
+	if _, ok := reporterForClient(Options{Once: true}, c, nil).(directReporter); !ok {
+		t.Error("one-shot mode uses the asynchronous reporter, and would report nothing")
+	}
+	if _, ok := reporterForClient(Options{Once: false}, c, &fakeRecorder{}).(broadcastReporter); !ok {
+		t.Error("the controller writes an event per tick instead of aggregating")
+	}
+}
+
+func TestReportingInstanceFitsWhatTheAPIAccepts(t *testing.T) {
+	// Capped at 128 characters, and a rejected event is a decision nobody
+	// hears about.
+	if got := reportingInstance(); len(got) > 128 || got == "" {
+		t.Errorf("reportingInstance() = %q (%d chars)", got, len(got))
 	}
 }

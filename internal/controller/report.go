@@ -1,9 +1,8 @@
 package controller
 
 import (
+	"context"
 	"fmt"
-
-	corev1 "k8s.io/api/core/v1"
 
 	"github.com/motleyhand/binpack/internal/engine"
 )
@@ -31,7 +30,7 @@ const (
 // control plane — where the autoscaler's own logs are unreachable and binpack's
 // may be too — `kubectl describe node` is the only surface a cluster user
 // reliably has. This mirrors how the autoscaler surfaces its own decisions.
-func (e *evaluator) report(s engine.Snapshot, d engine.Decision) {
+func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Decision) {
 	if d.Action != engine.Drain || d.Node == nil {
 		// Logged every evaluation rather than only on change. A controller
 		// that goes quiet is indistinguishable from one that has stopped, and
@@ -56,15 +55,21 @@ func (e *evaluator) report(s engine.Snapshot, d engine.Decision) {
 		"podsToRelocate", relocating,
 		"dryRun", e.opts.DryRun)
 
-	// The message is kept stable for a given cluster state on purpose. The
-	// event recorder aggregates repeats of an identical (object, reason,
-	// message) into one Event carrying a count and a first and last timestamp,
-	// so a decision that holds for an hour reads as one line saying so rather
-	// than sixty saying the same thing.
-	e.recorder.Eventf(d.Node, nil, corev1.EventTypeNormal,
-		ReasonWouldDrain, ActionConsolidate,
-		"binpack would drain this node: %s. No action taken — dry run",
+	// The note is kept stable for a given cluster state on purpose. The event
+	// recorder aggregates repeats of an identical (object, reason, note) into
+	// one Event carrying a count and a first and last timestamp, so a decision
+	// that holds for an hour reads as one line saying so rather than sixty
+	// saying the same thing.
+	note := fmt.Sprintf("binpack would drain this node: %s. No action taken — dry run",
 		relocationSummary(relocating))
+
+	if err := e.reporter.emit(ctx, d.Node, ReasonWouldDrain, ActionConsolidate, note); err != nil {
+		// Logged, not returned. Failing to say what binpack decided is worth
+		// knowing about, but it is not a reason to stop deciding — and on a
+		// cluster where events are the only reachable surface, a crash loop
+		// would remove the logs too.
+		e.log.Error(err, "could not record the decision on the node", "node", d.Node.Name)
+	}
 }
 
 func relocationSummary(pods int) string {

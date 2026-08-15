@@ -96,7 +96,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	ev := &evaluator{
 		reader:   mgr.GetClient(),
-		recorder: mgr.GetEventRecorder("binpack"),
+		reporter: reporterFor(opts, mgr),
 		opts:     opts,
 		log:      opts.Log,
 		stop:     stop,
@@ -181,10 +181,35 @@ func dropManagedFields(in any) (any, error) {
 	return in, nil
 }
 
+// reporterFor picks how decisions reach the node, which depends on how long
+// this process is going to live. See [reporter].
+func reporterFor(opts Options, mgr manager.Manager) reporter {
+	// The recorder is built lazily: asking a manager for one starts a
+	// broadcaster, and a Once run has no use for it.
+	var recorder events.EventRecorder
+	if !opts.Once {
+		recorder = mgr.GetEventRecorder(reportingController)
+	}
+	return reporterForClient(opts, mgr.GetClient(), recorder)
+}
+
+// reporterForClient is the choice itself, separated from the manager so it can
+// be exercised without starting one.
+func reporterForClient(opts Options, writer client.Writer, recorder events.EventRecorder) reporter {
+	if opts.Once {
+		return directReporter{
+			writer:   writer,
+			instance: reportingInstance(),
+			now:      time.Now,
+		}
+	}
+	return broadcastReporter{recorder: recorder}
+}
+
 // evaluator is the periodic decision loop.
 type evaluator struct {
 	reader   collect.Reader
-	recorder events.EventRecorder
+	reporter reporter
 	opts     Options
 	log      logr.Logger
 	stop     context.CancelFunc
@@ -240,7 +265,7 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 	}
 
 	decision := engine.Decide(snapshot, e.opts.Engine)
-	e.report(snapshot, decision)
+	e.report(ctx, snapshot, decision)
 	return nil
 }
 
