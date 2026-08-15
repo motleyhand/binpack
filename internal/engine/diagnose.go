@@ -300,12 +300,13 @@ func diagnoseAutoscaler(s Snapshot) []Finding {
 
 func diagnosePools(s Snapshot, cfg Config) []Finding {
 	var findings []Finding
+	names := PoolNames(s, cfg)
 
 	// A pool sitting on its own floor explains a cluster that will not shrink
 	// more completely than anything else here, and is trivially checkable.
 	for _, g := range s.Autoscaler.Groups {
 		if g.MinSize > 0 && g.Size() <= g.MinSize {
-			findings = append(findings, finding(FindingPoolAtMinimum, poolLabel(g.Name, g.ID),
+			findings = append(findings, finding(FindingPoolAtMinimum, poolLabel(names[g.ID], g.ID),
 				fmt.Sprintf("%d node(s), minimum %d", g.Size(), g.MinSize)))
 		}
 	}
@@ -329,14 +330,7 @@ func diagnosePools(s Snapshot, cfg Config) []Finding {
 		counts[id]++
 	}
 	for _, id := range order {
-		name := ""
-		for _, node := range s.Nodes {
-			if node.Labels[cfg.NodeGroupIDLabel] == id {
-				name = node.Labels[cfg.PoolNameLabel]
-				break
-			}
-		}
-		findings = append(findings, finding(FindingPoolNotAutoscaled, poolLabel(name, id),
+		findings = append(findings, finding(FindingPoolNotAutoscaled, poolLabel(names[id], id),
 			fmt.Sprintf("%d node(s)", counts[id])))
 	}
 

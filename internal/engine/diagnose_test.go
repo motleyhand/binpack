@@ -104,7 +104,7 @@ func TestDiagnoseStillReportsBudgetsWithoutAnAutoscaler(t *testing.T) {
 
 func TestDiagnoseReportsAPoolAtItsMinimum(t *testing.T) {
 	s := cluster([]*corev1.Node{inPool("a")}, nil)
-	s.Autoscaler.Groups = []engine.NodeGroup{{ID: poolID, Name: poolName, MinSize: 3, MaxSize: 10, Ready: 3}}
+	s.Autoscaler.Groups = []engine.NodeGroup{{ID: poolID, MinSize: 3, MaxSize: 10, Ready: 3}}
 
 	f := only(t, engine.Diagnose(s, config()), engine.FindingPoolAtMinimum)
 	if f.Subject != poolName {
@@ -122,7 +122,7 @@ func TestDiagnoseReportsAnUnmanagedPoolOncePerPoolNotPerNode(t *testing.T) {
 		sized("static-2", "8Gi", mother.InPool("pool-8g", "static-id")),
 	}
 	s := cluster(nodes, nil)
-	s.Autoscaler.Groups = []engine.NodeGroup{{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: 1}}
+	s.Autoscaler.Groups = []engine.NodeGroup{{ID: poolID, MinSize: 1, MaxSize: 10, Ready: 1}}
 
 	f := only(t, engine.Diagnose(s, config()), engine.FindingPoolNotAutoscaled)
 	if f.Subject != "pool-8g" {
@@ -460,7 +460,7 @@ func TestEveryFindingCarriesItsGuidance(t *testing.T) {
 	s.PDBs = pdbs
 	s.Autoscaler.ScaleDownStatus = "NoCandidates"
 	s.Autoscaler.Groups = []engine.NodeGroup{
-		{ID: poolID, Name: poolName, MinSize: 1, MaxSize: 10, Ready: 1},
+		{ID: poolID, MinSize: 1, MaxSize: 10, Ready: 1},
 	}
 
 	findings := engine.Diagnose(s, config())

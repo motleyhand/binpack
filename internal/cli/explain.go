@@ -153,17 +153,23 @@ type explainView struct {
 			Ready int    `json:"ready"`
 		} `json:"pools"`
 	} `json:"autoscaler"`
-	Action string       `json:"action"`
+	Action string `json:"action"`
+	// Code names the outcome, from the engine's bounded set.
+	Code   string       `json:"code"`
 	Node   string       `json:"node,omitempty"`
 	Reason string       `json:"reason,omitempty"`
 	Nodes  []nodeReport `json:"nodes"`
 }
 
 type nodeReport struct {
-	Name      string   `json:"name"`
-	Pool      string   `json:"pool,omitempty"`
-	Chosen    bool     `json:"chosen,omitempty"`
-	Verdict   string   `json:"verdict"`
+	Name    string `json:"name"`
+	Pool    string `json:"pool,omitempty"`
+	Chosen  bool   `json:"chosen,omitempty"`
+	Verdict string `json:"verdict"`
+	// Code names why a node was skipped, from the engine's bounded set. The
+	// detail says it in prose; this is what a consumer can branch on without
+	// matching a sentence that may be reworded.
+	Code      string   `json:"code,omitempty"`
 	Detail    string   `json:"detail,omitempty"`
 	Relocates int      `json:"relocates,omitempty"`
 	Blockers  []string `json:"blockers,omitempty"`
@@ -200,6 +206,7 @@ func buildView(s engine.Snapshot, d engine.Decision) explainView {
 	}
 
 	v.Action = d.Action.String()
+	v.Code = d.Code
 	v.Reason = d.Reason
 	if d.Node != nil {
 		v.Node = d.Node.Name
@@ -212,29 +219,31 @@ func buildView(s engine.Snapshot, d engine.Decision) explainView {
 }
 
 func reportFor(a engine.NodeAssessment) nodeReport {
-	r := nodeReport{Name: a.Node.Name, Pool: a.Pool, Chosen: a.Chosen}
+	// The verdict comes from the engine rather than being recomputed here.
+	// Two implementations of "what happened to this node" is one more than
+	// can be kept in step, and the metrics read the same one.
+	r := nodeReport{
+		Name: a.Node.Name, Pool: a.Pool, Chosen: a.Chosen,
+		Verdict: a.Verdict(), Code: a.SkipCode,
+	}
 
-	switch {
-	case a.Skipped:
-		r.Verdict, r.Detail = "skipped", a.SkipReason
-	case len(a.Blockers) > 0:
-		r.Verdict = "blocked"
+	switch r.Verdict {
+	case engine.VerdictSkipped:
+		r.Detail = a.SkipReason
+	case engine.VerdictBlocked:
 		r.Detail = "its workload fits elsewhere, but some pods cannot be evicted"
 		for _, b := range a.Blockers {
 			r.Blockers = append(r.Blockers, b.Message)
 		}
-	case a.Simulation != nil && !a.Simulation.Feasible:
-		r.Verdict = "infeasible"
+	case engine.VerdictInfeasible:
 		if a.Simulation.Blocked != nil {
 			r.Detail = a.Simulation.Blocked.Summary
 			r.Refusals = a.Simulation.Blocked.PerNode
 		}
-	case a.Chosen:
-		r.Verdict = "drainable"
-		r.Relocates = len(a.Simulation.Relocated)
 	default:
-		r.Verdict = "drainable"
-		r.Detail = "another node was chosen first"
+		if !a.Chosen {
+			r.Detail = "another node was chosen first"
+		}
 		if a.Simulation != nil {
 			r.Relocates = len(a.Simulation.Relocated)
 		}
