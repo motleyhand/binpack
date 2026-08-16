@@ -309,12 +309,13 @@ func OnNode(name string) PodOption {
 // Terminating marks a pod as shutting down, as the API server does once a
 // delete or an eviction is accepted.
 //
-// Both fields are set because both are real: deletionGracePeriodSeconds records
-// the grace period actually applied, which need not be the one the spec asks
-// for.
-func Terminating(at time.Time, grace time.Duration) PodOption {
+// requestedAt is when deletion was asked for; the deletion timestamp is set to
+// requestedAt + grace, because that is what the API server writes — the field
+// records when the grace period *expires*, not when deletion was requested.
+
+func Terminating(requestedAt time.Time, grace time.Duration) PodOption {
 	return func(p *corev1.Pod) {
-		stamp := metav1.NewTime(at)
+		stamp := metav1.NewTime(requestedAt.Add(grace))
 		p.DeletionTimestamp = &stamp
 		seconds := int64(grace.Seconds())
 		p.DeletionGracePeriodSeconds = &seconds

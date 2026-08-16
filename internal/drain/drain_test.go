@@ -162,19 +162,56 @@ func TestAssess(t *testing.T) {
 	}
 }
 
-func TestTheAppliedGracePeriodWinsOverTheRequestedOne(t *testing.T) {
-	// An eviction may be granted a different grace period from the one the
-	// spec asks for, and the API server records what was actually applied.
-	// Judging against the spec would call a pod stuck 55 minutes early.
-	pod := mother.Pod("default", "a", mother.Terminating(now.Add(-10*time.Minute), time.Hour))
-	spec := int64(60)
+func TestTheDeletionTimestampIsTheDeadline(t *testing.T) {
+	// The API server sets deletionTimestamp to when the grace period *expires*,
+	// not to when deletion was requested. Adding the grace period to it doubles
+	// every deadline, so a pod wedged on a finalizer with an hour's grace would
+	// be reported healthy for a second hour while the node stayed cordoned.
+	//
+	// An hour's grace, requested 63 minutes ago: three minutes past its
+	// deadline, one minute past the slack.
+	pod := mother.Pod("default", "a", mother.Terminating(now.Add(-63*time.Minute), time.Hour))
+
+	got := drain.Assess(drain.State{
+		Node: draining(time.Minute, "1"), Pods: []*corev1.Pod{pod}, Now: now}, policy())
+
+	if got.Code != drain.AbandonStuck {
+		t.Errorf("the pod is 3m past its deadline: got %v/%q (%s)",
+			got.Action, got.Code, got.Reason)
+	}
+}
+
+func TestTheSpecGracePeriodIsNotConsulted(t *testing.T) {
+	// deletionGracePeriodSeconds records the period actually applied, which an
+	// eviction may shorten — but neither it nor the spec's value is an addend,
+	// because the timestamp already accounts for it.
+	pod := mother.Pod("default", "a", mother.Terminating(now.Add(-90*time.Minute), time.Hour))
+	spec := int64(3600)
 	pod.Spec.TerminationGracePeriodSeconds = &spec
 
 	got := drain.Assess(drain.State{
-		Node: draining(10*time.Minute, "1"), Pods: []*corev1.Pod{pod}, Now: now}, policy())
+		Node: draining(time.Minute, "1"), Pods: []*corev1.Pod{pod}, Now: now}, policy())
 
-	if got.Action != drain.Continue {
-		t.Errorf("the pod is 10m into an hour of grace: got %v (%s)", got.Action, got.Reason)
+	if got.Code != drain.AbandonStuck {
+		t.Errorf("30m past its deadline whatever the spec asks for: got %q (%s)",
+			got.Code, got.Reason)
+	}
+}
+
+func TestANodeSeenEmptyForTheFirstTimeGetsTheFullRemovalWindow(t *testing.T) {
+	// The marker records when binpack last looked, not when the node became
+	// empty. A controller returning from a twenty-minute outage to find the
+	// last pod gone must not uncordon and back off a node the autoscaler has
+	// not yet had a chance to remove.
+	got := drain.Assess(drain.State{
+		Node: draining(20*time.Minute, "3"), Now: now}, policy())
+
+	if got.Action != drain.AwaitRemoval {
+		t.Errorf("the node only just became observably empty: got %v/%q (%s)",
+			got.Action, got.Code, got.Reason)
+	}
+	if !got.Progressed {
+		t.Error("three pods became zero, which is progress worth recording")
 	}
 }
 

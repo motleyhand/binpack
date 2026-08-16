@@ -139,6 +139,13 @@ pods, and candidates are ordered least-loaded-first — so without per-node back
 preferentially retries the node that just failed, evicting a few more pods each round. Failed
 drains record exponential backoff on the node itself.
 
+**`deletionTimestamp` is the deadline, not the start of one.** The API server sets it to
+`now + gracePeriodSeconds` at the moment deletion is requested, and preserves that invariant when
+a second delete shortens the period. Adding the grace period to it doubles every deadline, so a
+pod wedged on a finalizer with an hour's grace reads as healthy for a second hour. The test
+suite will not catch this on its own: a fixture built by the same misunderstanding cancels it
+out exactly, so the mother has to model what the API server writes.
+
 **"Node-local" means two different things, and only one of them is stable.** A DaemonSet or
 mirror pod is bound to its node *by nature*; a terminating pod is bound to it *by circumstance*.
 The engine's `Classify` lumps them together because for the simulation both answer "needs no

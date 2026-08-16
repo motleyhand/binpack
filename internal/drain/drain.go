@@ -31,11 +31,6 @@ import (
 // configurable: it describes how Kubernetes behaves, not a preference.
 const Slack = 2 * time.Minute
 
-// defaultGrace is what the kubelet uses when a pod names no grace period. Only
-// reached for a pod that has neither spec.terminationGracePeriodSeconds nor the
-// deletion-time value the API server records, which ordinary pods both have.
-const defaultGrace = 30 * time.Second
-
 // State is everything the judgement reads.
 type State struct {
 	// Node carries the drain markers. Read-only.
@@ -180,9 +175,15 @@ func Assess(s State, policy Policy) Assessment {
 		// The removal clock runs from the last progress, which for an empty
 		// node is the last pod leaving it. A different question from the stall
 		// timeout, which is why it is a different bound.
-		if since, known := sinceProgress(s.Node, s.Now); known && since > policy.RemovalTimeout {
+		// Guarded by !progressed for the same reason the stall bound is: a node
+		// observed empty for the first time became empty *now*, whatever the
+		// marker says. Without this, a controller returning from a twenty-minute
+		// outage to find the last pod gone would uncordon and back off a node
+		// the autoscaler has not yet had a chance to remove.
+		if since, known := sinceProgress(s.Node, s.Now); !progressed && known &&
+			since > policy.RemovalTimeout {
 			return Assessment{
-				Action: Abandon, Code: AbandonNotRemoved, Progressed: progressed,
+				Action: Abandon, Code: AbandonNotRemoved,
 				Reason: fmt.Sprintf(
 					"the node has been empty for %s and the cluster-autoscaler has not removed it",
 					round(since)),
@@ -236,24 +237,21 @@ func terminatingWithinGrace(pods []*corev1.Pod, now time.Time) bool {
 
 // terminationDeadline is when the kubelet should have finished with a pod.
 //
-// The grace period comes from the object's own deletionGracePeriodSeconds
-// first, which the API server sets to the value actually applied — an eviction
-// or a delete may override what the spec asks for, and the spec would then be
-// the wrong number to judge against.
+// It is the deletion timestamp itself, with nothing added. The API server sets
+// that field to the moment the grace period *expires* — `now + gracePeriod` at
+// the point deletion is requested — rather than to when deletion was asked
+// for, and preserves that invariant when a second delete shortens the period,
+// moving the timestamp back by the old grace and forward by the new. See
+// BeforeDelete in k8s.io/apiserver/pkg/registry/rest/delete.go.
+//
+// deletionGracePeriodSeconds is therefore bookkeeping here, not an addend:
+// adding it would double every deadline, and a pod wedged on a finalizer with
+// an hour's grace would be called healthy for a second hour.
 func terminationDeadline(pod *corev1.Pod) (time.Time, bool) {
 	if pod.DeletionTimestamp == nil {
 		return time.Time{}, false
 	}
-
-	grace := defaultGrace
-	switch {
-	case pod.DeletionGracePeriodSeconds != nil:
-		grace = time.Duration(*pod.DeletionGracePeriodSeconds) * time.Second
-	case pod.Spec.TerminationGracePeriodSeconds != nil:
-		grace = time.Duration(*pod.Spec.TerminationGracePeriodSeconds) * time.Second
-	}
-
-	return pod.DeletionTimestamp.Add(grace), true
+	return pod.DeletionTimestamp.Time, true
 }
 
 func recordedRemaining(node *corev1.Node) (int, bool) {
