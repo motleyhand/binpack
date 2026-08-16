@@ -43,6 +43,62 @@ jobs:
       - name: Smoke test the binary
         run: ./bin/binpack version
 
+  chart:
+    name: helm chart
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: azure/setup-helm@v4
+
+      - name: Lint
+        run: helm lint charts/binpack
+
+      # Rendered with the defaults and with everything switched on, because a
+      # template only referenced under a condition is one `helm lint` never
+      # parses — and the conditional paths are the RBAC and the monitors,
+      # which is where a mistake costs the most.
+      - name: Render with defaults
+        run: helm template binpack charts/binpack --namespace binpack-system
+
+      - name: Render with every option enabled
+        run: |
+          helm template binpack charts/binpack --namespace binpack-system \
+            --set rbac.allowDraining=true \
+            --set metrics.podMonitor.enabled=true \
+            --set metrics.serviceMonitor.enabled=true \
+            --set metrics.service.enabled=true \
+            --set leaderElection.enabled=false \
+            --set serviceAccount.create=false
+
+      # podLabels is exposed for arbitrary additions, so it can name a
+      # selector label. Appending it would produce either a duplicate YAML key
+      # or a Deployment whose selector no longer matches its own template, and
+      # the API server rejects the second — after install, on someone's
+      # cluster.
+      - name: Pod labels cannot displace the selector labels
+        run: |
+          helm template binpack charts/binpack --namespace binpack-system \
+            --set 'podLabels.app\.kubernetes\.io/name=hijacked' \
+            --set podLabels.team=platform > /tmp/labels.yaml
+          grep -q "app.kubernetes.io/name: binpack" /tmp/labels.yaml
+          grep -q "team: platform" /tmp/labels.yaml
+          if grep -q "hijacked" /tmp/labels.yaml; then
+            echo "podLabels displaced a selector label"; exit 1
+          fi
+
+      # The rendered manifests must be something a cluster would accept, which
+      # neither lint nor template checks: both are happy with a well-formed
+      # document naming a field that does not exist.
+      - name: Validate the rendered manifests against the API schema
+        run: |
+          helm template binpack charts/binpack --namespace binpack-system \
+            --set rbac.allowDraining=true > /tmp/rendered.yaml
+          curl -sSL -o /tmp/kubeconform.tar.gz \
+            https://github.com/yannh/kubeconform/releases/download/v0.6.7/kubeconform-linux-amd64.tar.gz
+          tar -xzf /tmp/kubeconform.tar.gz -C /tmp
+          /tmp/kubeconform -strict -summary /tmp/rendered.yaml
+
   differential:
     name: differential (vs real scheduler)
     runs-on: ubuntu-latest

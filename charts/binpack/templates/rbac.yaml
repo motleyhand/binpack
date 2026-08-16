@@ -1,0 +1,129 @@
+{{- if .Values.rbac.create }}
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "binpack.fullname" . }}
+  labels: {{- include "binpack.labels" . | nindent 4 }}
+rules:
+  # Read the cluster state every decision is derived from.
+  - apiGroups: [""]
+    resources: [nodes, pods]
+    verbs: [get, list, watch]
+
+  # Predicting evictability before attempting it.
+  - apiGroups: ["policy"]
+    resources: [poddisruptionbudgets]
+    verbs: [get, list, watch]
+
+  # Pod templates: what a controller would create to replace an evicted pod.
+  # Read-only, and never written — scaling a workload down would be a far
+  # blunter instrument than moving its pods.
+  - apiGroups: ["apps"]
+    resources: [replicasets, statefulsets, daemonsets]
+    verbs: [get, list, watch]
+  - apiGroups: ["batch"]
+    resources: [jobs]
+    verbs: [get, list, watch]
+
+  # Explaining decisions on the Node object itself. events.k8s.io, not the
+  # core group: binpack writes through the modern events API, and a rule
+  # granting ""/events alone would let it report nothing.
+  - apiGroups: ["events.k8s.io"]
+    resources: [events]
+    verbs: [create, patch, update]
+{{- if .Values.rbac.allowDraining }}
+
+  # Cordon, uncordon, and the drain marker annotations. The only mutating verb
+  # on cluster state: binpack never deletes a node, since that is the
+  # cluster-autoscaler's job and the division is the whole design.
+  - apiGroups: [""]
+    resources: [nodes]
+    verbs: [patch]
+
+  # Eviction is a create on a subresource, and unlike pods: delete it respects
+  # PodDisruptionBudgets. binpack does not request pods: delete and should not
+  # be granted it.
+  - apiGroups: [""]
+    resources: [pods/eviction]
+    verbs: [create]
+{{- end }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "binpack.fullname" . }}
+  labels: {{- include "binpack.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {{ include "binpack.fullname" . }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "binpack.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+---
+# The cluster-autoscaler's status, scoped to kube-system rather than restricted
+# by resourceNames.
+#
+# resourceNames restricts a request by the name in its path, and list and watch
+# requests carry none — so a ClusterRole naming cluster-autoscaler-status would
+# authorise `binpack explain`, which issues a get, and authorise nothing for
+# the controller, whose cache issues a list followed by a watch. Narrowing by
+# namespace is the restriction that actually holds. binpack still reads only
+# the one object: its cache carries a field selector the API server applies.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "binpack.fullname" . }}-autoscaler-status
+  namespace: kube-system
+  labels: {{- include "binpack.labels" . | nindent 4 }}
+rules:
+  - apiGroups: [""]
+    resources: [configmaps]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "binpack.fullname" . }}-autoscaler-status
+  namespace: kube-system
+  labels: {{- include "binpack.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "binpack.fullname" . }}-autoscaler-status
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "binpack.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- if .Values.leaderElection.enabled }}
+---
+# Leader election only. Omit it and set leaderElection.enabled=false if you
+# accept that a rolling update briefly runs two.
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: {{ include "binpack.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "binpack.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["coordination.k8s.io"]
+    resources: [leases]
+    verbs: [get, list, watch, create, update, patch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: {{ include "binpack.fullname" . }}-leader-election
+  namespace: {{ .Release.Namespace }}
+  labels: {{- include "binpack.labels" . | nindent 4 }}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: {{ include "binpack.fullname" . }}-leader-election
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "binpack.serviceAccountName" . }}
+    namespace: {{ .Release.Namespace }}
+{{- end }}
+{{- end }}

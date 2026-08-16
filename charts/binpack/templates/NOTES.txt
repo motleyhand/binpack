@@ -1,0 +1,29 @@
+binpack {{ .Chart.AppVersion }} is installed in namespace {{ .Release.Namespace }}.
+
+{{ if .Values.config.dryRun -}}
+It is in DRY RUN: it decides everything and changes nothing.
+
+Watch what it would do:
+
+  kubectl -n {{ .Release.Namespace }} logs -l app.kubernetes.io/name={{ include "binpack.name" . }} -f
+
+Every decision also lands as an Event on the node itself, which needs no access
+to binpack's logs at all:
+
+  kubectl describe node <node> | sed -n '/^Events:/,$p'
+{{- else -}}
+It is configured to ACT (dryRun: false). This build cannot: it refuses to start
+rather than reporting decisions nobody carries out, so expect a crash loop until
+you set config.dryRun=true.
+{{- end }}
+
+Before trusting it, ask what is stopping this cluster shrinking today:
+
+  kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "binpack.fullname" . }} -- binpack diagnose
+
+That works without binpack installed at all, and usually finds something the
+autoscaler is blocked on too.
+{{ if not .Values.rbac.allowDraining }}
+RBAC currently grants read and report only. rbac.allowDraining=true adds the
+cordon and eviction verbs, and is not needed until a build that can act.
+{{- end }}

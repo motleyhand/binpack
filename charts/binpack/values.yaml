@@ -1,0 +1,129 @@
+# binpack decides whether draining one node would leave every one of its pods
+# schedulable elsewhere, and drains it only when the answer is yes.
+
+image:
+  repository: ghcr.io/motleyhand/binpack
+  # Defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+# binpack's own configuration, rendered into a ConfigMap. Every field is
+# optional: pools and their bounds are discovered from the cluster-autoscaler,
+# so an empty document is a working configuration.
+#
+# See docs/reference/configuration.md. Check a document before applying it with
+# `binpack config validate -f values-fragment.yaml`.
+config:
+  # Decide everything, change nothing. Acting is opt-in, deliberately: a tool
+  # that drains nodes should be one you switched on, not one you inherited.
+  #
+  # Leave this true until `binpack explain` has told you something you agree
+  # with. Note that this build cannot act at all — it refuses to start with
+  # dryRun: false rather than pretending — so changing it now only produces a
+  # crash loop.
+  dryRun: true
+  interval: 1m0s
+
+rbac:
+  # The ClusterRole, the kube-system Role for the autoscaler's status, and the
+  # bindings. Turn off only if you manage RBAC separately.
+  create: true
+  # Grant the verbs the executor will need. Nothing in this build uses them,
+  # and granting a permission before the code that needs it is how a role
+  # outlives its justification.
+  allowDraining: false
+
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# One replica is the right number: only the leader acts, so a second is a
+# warm spare rather than more throughput.
+replicaCount: 1
+
+leaderElection:
+  # On by default. A single replica still runs two pods during a rolling
+  # update, and two binpacks draining at once is precisely what the lease
+  # prevents.
+  enabled: true
+
+metrics:
+  enabled: true
+  port: 8080
+
+  # Prometheus operator discovery. Set one of these; both need the operator's
+  # CRDs, and both need `labels` to match your Prometheus's selector — check it
+  # with:
+  #
+  #   kubectl get prometheus -A -o jsonpath='{.items[*].spec.podMonitorSelector}'
+  #
+  # A PodMonitor is the better fit and is why the Service is off by default.
+  # Prometheus does not scrape through a Service's ClusterIP — the operator
+  # resolves its Endpoints and scrapes each pod directly — so a Service exists
+  # only to give a ServiceMonitor something to select, and binpack serves
+  # nothing to anyone. Use the ServiceMonitor path if your Prometheus is
+  # configured to discover only those.
+  podMonitor:
+    enabled: false
+    interval: 60s
+    labels: {}
+
+  serviceMonitor:
+    enabled: false
+    interval: 60s
+    labels: {}
+
+  service:
+    # Only useful alongside serviceMonitor.enabled, or to scrape by hand.
+    enabled: false
+
+probes:
+  port: 8081
+
+# Measured, not guessed. Against a 4-node, 145-pod cluster binpack settles at
+# 43 MiB resident (21 MiB heap in use) and spends about half a second per
+# evaluation — roughly 10m of CPU at the default one-minute interval.
+#
+# Memory scales with the number of objects cached, not with load: every pod,
+# node and disruption budget, plus the pod template of each controller. The
+# fixed cost of the Go runtime and client-go dominates on a small cluster, so
+# do not read 43 MiB / 145 pods as a per-pod figure — but do raise the limit
+# on a large one, where the initial LIST of every pod is the peak rather than
+# the steady state.
+#
+# There is deliberately no CPU limit. Throttling a controller that wakes once a
+# minute buys nothing and turns a slow evaluation into a stalled one.
+resources:
+  requests:
+    cpu: 10m
+    memory: 64Mi
+  limits:
+    memory: 256Mi
+
+podAnnotations: {}
+podLabels: {}
+
+podSecurityContext:
+  runAsNonRoot: true
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: [ALL]
+
+nodeSelector: {}
+tolerations: []
+affinity: {}
+
+# binpack is relocatable like any other workload and is not special-cased: a
+# drain that moves it simply resumes on the new node, and the lease means the
+# replacement does not act until the old one has stopped.
+priorityClassName: ""
