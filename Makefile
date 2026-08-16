@@ -52,8 +52,12 @@ test-differential: ## Check the fit predicate against the real scheduler
 check-workflows: ## Check the GitHub workflows parse and stay consistent
 	python3 hack/check-workflows.py
 
+.PHONY: check-image-user
+check-image-user: ## Check the image declares a numeric non-root user
+	python3 hack/check-image-user.py
+
 .PHONY: check
-check: lint test build smoke check-workflows ## Everything CI runs (except test-differential)
+check: lint test build smoke check-workflows check-image-user ## Everything CI runs (except test-differential)
 
 .PHONY: clean
 clean: ## Remove build output

@@ -110,6 +110,14 @@ podLabels: {}
 
 podSecurityContext:
   runAsNonRoot: true
+  # Numeric, and stated here as well as in the image. runAsNonRoot makes the
+  # kubelet verify the user before starting the container, and it cannot do
+  # that from a name — so an image declaring `nonroot` rather than 65532 fails
+  # to start with "cannot verify user is non-root". Setting it in the chart
+  # means that holds even for someone pointing image.repository at a build of
+  # their own.
+  runAsUser: 65532
+  runAsGroup: 65532
   seccompProfile:
     type: RuntimeDefault
 
