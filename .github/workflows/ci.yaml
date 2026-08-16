@@ -43,6 +43,12 @@ jobs:
       - name: Smoke test the binary
         run: ./bin/binpack version
 
+      # The workflows parse, and release.yaml — which runs only on tags — can
+      # actually run the `make check` it calls. Both were broken here once.
+      - name: Check the workflows
+        run: python3 hack/check-workflows.py
+
+
   chart:
     name: helm chart
     runs-on: ubuntu-latest
@@ -134,6 +140,12 @@ jobs:
         with:
           go-version-file: go.mod
           cache: true
+
+      # dockers_v2 builds linux/arm64 as well, which needs emulation on an
+      # amd64 runner. Without these the snapshot fails here for a reason that
+      # has nothing to do with the config being wrong.
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
 
       # Builds every target and the container image without publishing
       # anything, so a broken release config fails here rather than on a tag.

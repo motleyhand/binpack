@@ -48,8 +48,12 @@ smoke: build ## Run the built binary once
 test-differential: ## Check the fit predicate against the real scheduler
 	cd test/differential && go test ./...
 
+.PHONY: check-workflows
+check-workflows: ## Check the GitHub workflows parse and stay consistent
+	python3 hack/check-workflows.py
+
 .PHONY: check
-check: lint test build smoke ## Everything CI runs (except test-differential)
+check: lint test build smoke check-workflows ## Everything CI runs (except test-differential)
 
 .PHONY: clean
 clean: ## Remove build output

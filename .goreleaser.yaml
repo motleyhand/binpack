@@ -1,7 +1,9 @@
-# Build and packaging only. Publishing — GHCR, the Homebrew tap, the Helm chart
-# as an OCI artifact — is added with the release pipeline, once there is
-# something worth releasing. CI runs `release --snapshot --skip=publish` on
-# every pull request so a broken config fails there rather than on a tag.
+# Releases binpack: binaries, a multi-platform container image on GHCR, and a
+# GitHub release. The Helm chart is pushed separately by the release workflow,
+# since its version is locked to this one and Helm speaks OCI directly.
+#
+# CI runs `release --snapshot --clean --skip=publish` on every pull request, so
+# a broken config fails on the PR rather than on a tag.
 version: 2
 
 project_name: binpack
@@ -41,26 +43,35 @@ checksum:
 snapshot:
   version_template: "{{ incpatch .Version }}-snapshot"
 
-# GoReleaser warns that `dockers` is being phased out in favour of
-# `dockers_v2`. Migrating with the publishing configuration in the release
-# pipeline step, rather than guessing at a schema that is not yet in the
-# published schema.json. See the architecture spec's roadmap.
-dockers:
-  # Single-arch for now: multi-arch needs QEMU and a manifest, which arrives
-  # with the publishing config rather than cluttering a build-only check.
-  - image_templates:
-      - ghcr.io/motleyhand/binpack:{{ .Version }}
+# dockers_v2, not the `dockers` block GoReleaser has been warning about. It
+# builds every platform from one entry and pushes a manifest itself, so the
+# separate docker_manifests section the old form needed is gone.
+#
+# Deferred twice waiting for the schema: `dockers_v2` was absent from
+# GoReleaser's published schema.json when this config was first written, and
+# guessing at somebody else's format is how a release breaks on the tag rather
+# than on the pull request. It is there now, and this follows it.
+dockers_v2:
+  - images:
+      - ghcr.io/motleyhand/binpack
     dockerfile: Dockerfile
-    use: buildx
-    goos: linux
-    goarch: amd64
-    skip_push: true
-    build_flag_templates:
-      - --platform=linux/amd64
-      - --label=org.opencontainers.image.source=https://github.com/motleyhand/binpack
-      - --label=org.opencontainers.image.version={{ .Version }}
-      - --label=org.opencontainers.image.revision={{ .FullCommit }}
-      - --label=org.opencontainers.image.licenses=Apache-2.0
+    # arm64 because managed Kubernetes increasingly is: Graviton on EKS, Ampere
+    # on GKE and DOKS. A tool for reducing node cost that only runs on amd64
+    # would be an odd thing.
+    platforms:
+      - linux/amd64
+      - linux/arm64
+    tags:
+      - "{{ .Version }}"
+      # Only for a real, non-prerelease tag: `latest` pointing at a release
+      # candidate is how somebody installs one by accident.
+      - "{{ if not .Prerelease }}latest{{ end }}"
+    labels:
+      org.opencontainers.image.source: https://github.com/motleyhand/binpack
+      org.opencontainers.image.description: Consolidate nodes a managed cluster-autoscaler will not remove
+      org.opencontainers.image.version: "{{ .Version }}"
+      org.opencontainers.image.revision: "{{ .FullCommit }}"
+      org.opencontainers.image.licenses: Apache-2.0
 
 changelog:
   use: github
@@ -72,4 +83,16 @@ changelog:
       - "^chore:"
 
 release:
+  # Drafted rather than published outright: a release is the one action here
+  # that cannot be taken back, and the tag has already built everything by the
+  # time anyone reads it.
   draft: true
+  footer: |
+    ## Install
+
+    ```bash
+    helm install binpack oci://ghcr.io/motleyhand/charts/binpack \
+      --version {{ .Version }} --namespace binpack-system --create-namespace
+    ```
+
+    Dry run by default. See [the install guide](https://github.com/motleyhand/binpack/blob/main/docs/how-to/install-binpack.md).

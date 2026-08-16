@@ -69,6 +69,7 @@ add. If those fixes solve it, you might not need this.
 |---|---|
 | [Configuration](docs/reference/configuration.md) | Every field, what it does, and why headroom is not a percentage |
 | [Diagnostics](docs/reference/diagnostics.md) | Every `binpack diagnose` code, its severity, and the fix |
+| [Versioning](docs/reference/versioning.md) | What a version number covers, what is public API, and what 0.x means |
 | [Metrics](docs/reference/metrics.md) | Every `binpack_` series, what to alert on, and why prose is never a label |
 | [Helm chart](charts/binpack) | Values, RBAC, and what each permission is for |
 | [RBAC](docs/reference/rbac.md) | Every permission binpack needs, and what it is deliberately never granted |

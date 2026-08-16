@@ -631,11 +631,10 @@ alongside its prose: see [the metrics reference](../reference/metrics.md).
     so the replacement-versus-running gap that made acting unsound is closed. See
     [ADR-0006](adr-0006-scheduler-fidelity.md).
 12. Helm chart and RBAC
-13. Release pipeline. **Includes migrating `.goreleaser.yaml` from `dockers` to `dockers_v2`**,
-    which GoReleaser now warns is being phased out. Deliberately deferred to here rather than
-    done piecemeal: the publishing configuration is written in this step anyway, and the new
-    schema is not yet in GoReleaser's published `schema.json`, so it should be verified against
-    the version CI actually runs rather than guessed at.
+13. Release pipeline. GHCR image for amd64 and arm64, binaries, and the Helm chart as an OCI
+    artifact, all from one tag with the chart's version stamped from it. `dockers_v2` migration
+    done here as planned, once the schema it needed had actually been published. See
+    [versioning](../reference/versioning.md).
 
 Each of steps 4 onward gets its own specification before implementation.
 

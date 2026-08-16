@@ -30,20 +30,16 @@ function.
 
 ## Install
 
-> **Nothing is published yet.** There is no chart in a registry and no image on GHCR — the
-> release pipeline is the last item on the roadmap. Until it lands, installing means building
-> the image yourself, and the commands below say how. This section will be replaced by a single
-> `helm install oci://…` when there is something to install.
-
-Build and push an image somewhere your cluster can pull from:
-
 ```bash
-make build
-docker build -t <your-registry>/binpack:dev .
-docker push <your-registry>/binpack:dev
+helm install binpack oci://ghcr.io/motleyhand/charts/binpack \
+  --namespace binpack-system --create-namespace
 ```
 
-Then install the chart from a checkout:
+The chart and the image it names are released together and carry the same version, so there is
+no compatibility matrix — see [versioning](../reference/versioning.md).
+
+To run an unreleased build instead, install the chart from a checkout and point it at an image
+you have pushed somewhere the cluster can pull from:
 
 ```bash
 helm install binpack ./charts/binpack \
@@ -52,13 +48,13 @@ helm install binpack ./charts/binpack \
   --set image.tag=dev
 ```
 
-On a local cluster you can skip the registry — `kind load docker-image` and `minikube image load`
-both put an image where the kubelet will find it, with `image.pullPolicy=IfNotPresent`.
+On a local cluster `kind load docker-image` and `minikube image load` both put an image where the
+kubelet will find it, with `image.pullPolicy=IfNotPresent`.
 
 **None of this is necessary to evaluate binpack.** `binpack diagnose` and `binpack explain` run
-against your own kubeconfig — `go build ./cmd/binpack` for now, published binaries with the same
-release pipeline — need no in-cluster identity, and are the recommended way to decide whether the
-controller is worth installing at all.
+against your own kubeconfig from the [release binaries](https://github.com/motleyhand/binpack/releases),
+need no in-cluster identity, and are the recommended way to decide whether the controller is
+worth installing at all.
 
 The chart's defaults are the ones to start with:
 
