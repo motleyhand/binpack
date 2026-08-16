@@ -125,7 +125,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: azure/setup-helm@v4
+      - uses: azure/setup-helm@v5
 
       # Through the environment rather than interpolated into the script:
       # ${{ }} is substituted before the shell ever sees it, so a value
