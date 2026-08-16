@@ -778,3 +778,122 @@ func TestTheReserveKeepsRuntimeClassOverhead(t *testing.T) {
 		t.Error("the reserve measured the containers and forgot the sandbox they run in")
 	}
 }
+
+func TestTheProbeCarriesEverySourceOfSize(t *testing.T) {
+	// Whatever resource.PodRequests reads has to reach the probe, or the
+	// reserve measures something smaller than the pod it named and approves a
+	// drain that should have been refused.
+	for _, tc := range []struct {
+		name string
+		opt  mother.PodOption
+	}{
+		{"native sidecar", mother.WithSidecar("proxy", "100m", "1Gi")},
+		{"init container peak", mother.WithInitContainer("migrate", "100m", "2Gi")},
+		{"runtimeclass overhead", mother.WithOverhead("100m", "1Gi")},
+		// Pod-level requests replace the container aggregate where set, so a
+		// pod whose containers ask for almost nothing can still be large.
+		{"pod-level resources", mother.WithPodLevelResources("100m", "1536Mi")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := sized("candidate", "8Gi")
+			// 512Mi of containers plus 1Gi from the feature under test, against
+			// a destination holding one already and 1Gi to spare.
+			destination := sized("destination", "2560Mi")
+			big := mother.Pod("default", "big", mother.OnNode("destination"),
+				mother.Requests("100m", "512Mi"), tc.opt)
+			pods := []*corev1.Pod{big}
+
+			cfg := defaultCfg()
+			cfg.ReserveForLargestPod = true
+
+			sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+				mother.Templates(pods...), candidate, cfg)
+
+			if sim.Feasible {
+				t.Errorf("the probe lost the pod's %s and measured it too small", tc.name)
+			}
+		})
+	}
+}
+
+func TestTheProbeDropsWhatOnlyConstrainsAParticularPod(t *testing.T) {
+	// A host port makes fit refuse a pod outright. Copied into a size-only
+	// probe it would refuse every destination, so one such workload anywhere
+	// in the cluster would block every drain — the failure the probe exists to
+	// prevent, reached by another route.
+	candidate, destination := mother.LargeNode("candidate"), mother.LargeNode("destination")
+	hostPorted := mother.Pod("default", "ingress", mother.OnNode("destination"),
+		mother.WithHostPort(8080))
+	pods := []*corev1.Pod{hostPorted}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if !sim.Feasible {
+		t.Errorf("the reserve refused over a host port rather than over capacity: %s",
+			sim.Blocked.Summary)
+	}
+}
+
+func TestPreferencesAreNotConstraints(t *testing.T) {
+	// Preferred affinity and ScheduleAnyway spreads affect scoring and never
+	// filter, so a webhook adding one cannot make a placement fail — and fit
+	// deliberately accepts both. Refusing over them would disable
+	// consolidation for something that cannot change where a pod may go.
+	candidate, destination := mother.LargeNode("candidate"), mother.LargeNode("destination")
+	pod := mother.Pod("default", "web", mother.OnNode("candidate"))
+	pod.Spec.Affinity = &corev1.Affinity{
+		PodAntiAffinity: &corev1.PodAntiAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+				Weight: 100,
+				PodAffinityTerm: corev1.PodAffinityTerm{
+					TopologyKey:   corev1.LabelHostname,
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "web"}},
+				},
+			}},
+		},
+	}
+	pod.Spec.TopologySpreadConstraints = []corev1.TopologySpreadConstraint{{
+		MaxSkew: 1, TopologyKey: "topology.kubernetes.io/zone",
+		WhenUnsatisfiable: corev1.ScheduleAnyway,
+	}}
+	pods := []*corev1.Pod{pod}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, pod) // the template has neither
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		templates, candidate, defaultCfg())
+
+	if !sim.Feasible {
+		t.Errorf("refused over a preference that cannot filter: %s", sim.Blocked.Summary)
+	}
+}
+
+func TestAVolumeRewrittenUnderTheSameNameIsRefused(t *testing.T) {
+	// Merging by name keeps the template's version, so admission turning a
+	// placement-neutral emptyDir into a PVC of the same name would be
+	// discarded — and the replacement would pass fit while the real one is
+	// bound to a volume. Neither source is the more constraining in general,
+	// so this refuses rather than choosing.
+	candidate, destination := mother.LargeNode("candidate"), mother.LargeNode("destination")
+	pod := mother.Pod("default", "web", mother.OnNode("candidate"), mother.WithPVC("data"))
+	pods := []*corev1.Pod{pod}
+
+	templates := mother.Templates(pods...)
+	// Same name, placement-neutral source.
+	mother.TemplateFor(templates, pod, mother.WithEmptyDir("data"))
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("kept the template's emptyDir over the claim the pod actually has")
+	}
+	if !sim.Blocked.NoTemplate {
+		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
+	}
+}

@@ -217,6 +217,22 @@ func PausePod(namespace, name string, opts ...PodOption) *corev1.Pod {
 	}, opts...)...)
 }
 
+// WithPodLevelResources sets requests on the pod rather than on a container.
+//
+// An alpha field behind the PodLevelResources gate, and where it is set the
+// scheduler reserves it in place of the container aggregate — so a pod whose
+// containers ask for almost nothing can still be large.
+func WithPodLevelResources(cpu, memory string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Resources = &corev1.ResourceRequirements{
+			Requests: corev1.ResourceList{
+				corev1.ResourceCPU:    resource.MustParse(cpu),
+				corev1.ResourceMemory: resource.MustParse(memory),
+			},
+		}
+	}
+}
+
 // Requests replaces the first container's requests.
 func Requests(cpu, memory string) PodOption {
 	return func(p *corev1.Pod) {

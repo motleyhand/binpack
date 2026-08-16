@@ -402,7 +402,7 @@ func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec
 	// Constraints the running pod carries and the template does not are
 	// admission's work, and unlike the fields above they cannot be merged. See
 	// [restrictiveDivergence].
-	if restrictiveDivergence(template, pod) != "" {
+	if restrictiveDivergence(template, pod) != "" || mutatedVolume(template, pod) != "" {
 		return nil, false
 	}
 	// NodeName comes from the template and nowhere else, which is what makes a
@@ -472,6 +472,27 @@ func addMissingVolumes(replacement, running *corev1.Pod) {
 	}
 }
 
+// mutatedVolume reports a volume whose name appears on both sides with a
+// different source.
+//
+// Merging by name alone would keep the template's version, so admission
+// rewriting a placement-neutral emptyDir into a PVC of the same name would be
+// discarded — and the replacement would pass fit while the real one is bound
+// to a volume. Neither source can be called the more constraining of the two in
+// general, so this refuses rather than choosing.
+func mutatedVolume(template *corev1.PodTemplateSpec, running *corev1.Pod) string {
+	declared := make(map[string]corev1.VolumeSource, len(template.Spec.Volumes))
+	for _, v := range template.Spec.Volumes {
+		declared[v.Name] = v.VolumeSource
+	}
+	for _, v := range running.Spec.Volumes {
+		if was, ok := declared[v.Name]; ok && !equality.Semantic.DeepEqual(was, v.VolumeSource) {
+			return v.Name
+		}
+	}
+	return ""
+}
+
 // restrictiveDivergence reports a constraint the running pod carries that its
 // template does not, naming the first found.
 //
@@ -498,12 +519,20 @@ func restrictiveDivergence(template *corev1.PodTemplateSpec, running *corev1.Pod
 	switch {
 	case !maps.Equal(template.Spec.NodeSelector, running.Spec.NodeSelector):
 		return "nodeSelector"
-	case !equality.Semantic.DeepEqual(template.Spec.Affinity, running.Spec.Affinity):
+	// Only the required terms. Preferred affinity affects scoring and never
+	// filters, so a webhook adding one cannot make a placement fail — and fit
+	// deliberately accepts it. Refusing over it would disable consolidation
+	// for something that cannot change where a pod can go.
+	case !equality.Semantic.DeepEqual(
+		requiredAffinity(template.Spec.Affinity), requiredAffinity(running.Spec.Affinity)):
 		return "affinity"
 	case template.Spec.SchedulerName != running.Spec.SchedulerName:
 		return "schedulerName"
+	// Likewise, ScheduleAnyway is a preference. ADR-0006 ignores the soft
+	// counterparts of every constraint for exactly this reason.
 	case !equality.Semantic.DeepEqual(
-		template.Spec.TopologySpreadConstraints, running.Spec.TopologySpreadConstraints):
+		hardSpread(template.Spec.TopologySpreadConstraints),
+		hardSpread(running.Spec.TopologySpreadConstraints)):
 		return "topologySpreadConstraints"
 	case !equality.Semantic.DeepEqual(
 		template.Spec.RuntimeClassName, running.Spec.RuntimeClassName):
@@ -512,19 +541,80 @@ func restrictiveDivergence(template *corev1.PodTemplateSpec, running *corev1.Pod
 	return ""
 }
 
+// requiredAffinity keeps only the terms that filter, discarding preferences.
+func requiredAffinity(a *corev1.Affinity) *corev1.Affinity {
+	if a == nil {
+		return nil
+	}
+	out := &corev1.Affinity{}
+	if a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		out.NodeAffinity = &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		}
+	}
+	if a.PodAffinity != nil && len(a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+		out.PodAffinity = &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		}
+	}
+	if a.PodAntiAffinity != nil && len(a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+		out.PodAntiAffinity = &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		}
+	}
+	if out.NodeAffinity == nil && out.PodAffinity == nil && out.PodAntiAffinity == nil {
+		return nil
+	}
+	return out
+}
+
+// hardSpread keeps only the constraints that refuse a placement.
+func hardSpread(cs []corev1.TopologySpreadConstraint) []corev1.TopologySpreadConstraint {
+	var out []corev1.TopologySpreadConstraint
+	for _, c := range cs {
+		if c.WhenUnsatisfiable == corev1.DoNotSchedule {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
 // sizeProbe is a pod carrying the resource shape of another and nothing else.
 //
-// Containers, init containers and RuntimeClass overhead are kept, since those
-// are what EffectiveRequests reads. Volumes, selectors, affinity, tolerations
-// and scheduler name are dropped: they decide where a *particular* pod may go,
-// and the headroom question is about capacity for a pod of this size.
+// Rebuilt field by field rather than copied and stripped, because the question
+// is which fields *contribute to size* and everything else is a liability. A
+// host port copied along with a container makes fit refuse the probe on every
+// node, so one such workload anywhere in the cluster would block every drain —
+// the same failure this probe was introduced to fix, arriving by a different
+// route.
+//
+// What size means here is whatever resource.PodRequests reads: the regular
+// containers, the init-container peak, native sidecars kept running (hence
+// their restart policy), RuntimeClass overhead, and pod-level requests where
+// the cluster has them.
 func sizeProbe(pod *corev1.Pod) *corev1.Pod {
+	shape := func(cs []corev1.Container, keepRestartPolicy bool) []corev1.Container {
+		out := make([]corev1.Container, 0, len(cs))
+		for _, c := range cs {
+			only := corev1.Container{Name: c.Name, Resources: *c.Resources.DeepCopy()}
+			if keepRestartPolicy {
+				only.RestartPolicy = c.RestartPolicy
+			}
+			out = append(out, only)
+		}
+		return out
+	}
+
 	return &corev1.Pod{
 		ObjectMeta: *pod.ObjectMeta.DeepCopy(),
 		Spec: corev1.PodSpec{
-			Containers:     pod.Spec.DeepCopy().Containers,
-			InitContainers: pod.Spec.DeepCopy().InitContainers,
+			Containers: shape(pod.Spec.Containers, false),
+			// A native sidecar is an init container with an Always restart
+			// policy, and it is added to the running total rather than folded
+			// into the init peak. Dropping the policy would understate it.
+			InitContainers: shape(pod.Spec.InitContainers, true),
 			Overhead:       pod.Spec.Overhead.DeepCopy(),
+			Resources:      pod.Spec.Resources.DeepCopy(),
 		},
 	}
 }
