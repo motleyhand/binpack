@@ -31,6 +31,9 @@ def image_user() -> str | None:
 def main() -> int:
     problems = []
 
+    # Numeric *and* non-zero, which are two requirements and not one. A named
+    # user cannot be verified; uid 0 verifies fine and is root. Checking only
+    # the first would be a check reporting a property it never established.
     user = image_user()
     if user is None:
         problems.append("Dockerfile sets no USER, so the image runs as root")
@@ -39,20 +42,26 @@ def main() -> int:
             f"Dockerfile sets USER {user!r}, which a kubelet cannot verify against "
             "runAsNonRoot; use the numeric uid"
         )
+    elif int(user.split(":")[0]) == 0:
+        problems.append(f"Dockerfile sets USER {user!r}, which is root")
 
     values = (ROOT / "charts/binpack/values.yaml").read_text()
-    if "runAsNonRoot: true" in values and not re.search(r"^\s+runAsUser: \d+", values, re.M):
-        problems.append(
-            "the chart sets runAsNonRoot without a numeric runAsUser, so it depends "
-            "entirely on the image declaring one"
-        )
+    if "runAsNonRoot: true" in values:
+        match = re.search(r"^\s+runAsUser: (\d+)", values, re.M)
+        if match is None:
+            problems.append(
+                "the chart sets runAsNonRoot without a numeric runAsUser, so it depends "
+                "entirely on the image declaring one"
+            )
+        elif int(match.group(1)) == 0:
+            problems.append("the chart sets runAsUser: 0, which is root and contradicts runAsNonRoot")
 
     for problem in problems:
         print(problem)
     if problems:
         return 1
 
-    print(f"the image declares USER {user}, and the chart sets a numeric runAsUser")
+    print(f"the image declares USER {user}, and the chart sets a non-root numeric runAsUser")
     return 0
 
 
