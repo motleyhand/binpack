@@ -25,9 +25,10 @@ rules:
     resources: [jobs]
     verbs: [get, list, watch]
 
-  # Explaining decisions on the Node object itself. events.k8s.io, not the
-  # core group: binpack writes through the modern events API, and a rule
-  # granting ""/events alone would let it report nothing.
+  # Explaining decisions on the Node object itself. binpack writes these
+  # through the modern events API, so a rule granting only ""/events would let
+  # it report nothing. Leader election is the other way round and is granted
+  # separately below — the two APIs are both in use, for different reasons.
   - apiGroups: ["events.k8s.io"]
     resources: [events]
     verbs: [create, patch, update]
@@ -110,6 +111,15 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch]
+
+  # Leader election announces itself on the Lease through client-go's legacy
+  # recorder, which writes to the *core* group — unlike binpack's own events.
+  # Scoped here rather than to the ClusterRole because these events are about
+  # a Lease in this namespace, and because they stop existing entirely when
+  # leader election is off.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding

@@ -106,10 +106,24 @@ rules:
     verbs: [get, list, watch, create, update, patch]
 ```
 
-**`events.k8s.io`, not the core group.** binpack writes through the modern events API, so a rule
-granting `""/events` alone will not let it report anything. `update` and `patch` are there
-because the recorder aggregates repeats of an identical event into one object with a count
-rather than writing a new one each time.
+**Both events APIs are in use, for different reasons.** binpack writes its own decisions through
+the modern `events.k8s.io` API, so a rule granting `""/events` alone will not let it report
+anything. `update` and `patch` are there because the recorder aggregates repeats of an identical
+event into one object with a count rather than writing a new one each time.
+
+Leader election is the other way round: it announces itself on the Lease through client-go's
+legacy recorder, which writes to the **core** group. That grant is on the leader-election Role
+rather than the ClusterRole, because those events are about a Lease in binpack's own namespace
+and because they stop existing entirely when leader election is off.
+
+Granting one and not the other fails quietly. Missing `events.k8s.io` costs the decision events —
+the thing `kubectl describe node` is for. Missing `""/events` costs only a log line at startup,
+since the leader-election recorder does not retry:
+
+```
+Server rejected event (will not retry!) err="events is forbidden: ...
+cannot create resource \"events\" in API group \"\""
+```
 
 **Leases are only for leader election.** Omit them and pass `--leader-election=false` if you run
 a single replica and accept that a rolling update briefly has two. With `--once` they are never
