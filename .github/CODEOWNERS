@@ -1,0 +1,7 @@
+# Review is required on everything, and the maintainer merges.
+#
+# The catch-all is deliberate rather than lazy: this repository is small, and
+# a per-path list would mostly restate it while going stale as directories
+# move. Add specific owners here when there is more than one person to route
+# to, not before.
+* @TamasSzigeti
