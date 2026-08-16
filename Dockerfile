@@ -14,7 +14,12 @@ FROM gcr.io/distroless/static:nonroot
 ARG TARGETPLATFORM
 COPY $TARGETPLATFORM/binpack /usr/local/bin/binpack
 
-USER nonroot:nonroot
+# Numeric, not the `nonroot` name distroless also provides. A kubelet enforcing
+# runAsNonRoot has to decide whether the image's user is root *before* starting
+# it, and it cannot resolve a name against an image it has not run — so a named
+# user fails with "has non-numeric user (nonroot), cannot verify user is
+# non-root" on any cluster with that guard on. 65532 is what `nonroot` is.
+USER 65532:65532
 
 ENTRYPOINT ["/usr/local/bin/binpack"]
 CMD ["run"]

@@ -48,6 +48,11 @@ jobs:
       - name: Check the workflows
         run: python3 hack/check-workflows.py
 
+      # A named USER builds, lints and validates cleanly, and then fails to
+      # start on any cluster enforcing runAsNonRoot. Nothing else here sees it.
+      - name: Check the image user is numeric
+        run: python3 hack/check-image-user.py
+
 
   chart:
     name: helm chart
