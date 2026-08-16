@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -234,7 +235,11 @@ func checkHeadroom(
 		if !occupies(pod) || Classify(pod, cfg.ExpendablePriorityCutoff) != Relocatable {
 			continue
 		}
-		next, ok := replacement(pod, templates)
+		// Sized, not validated for relocation: this pod is not being moved, and
+		// its placement constraints are discarded by sizeProbe regardless. An
+		// unreadable template still blocks, because without one there is no
+		// size to reserve for.
+		next, ok := sizedReplacement(pod, templates)
 		if !ok {
 			return &Blocked{
 				Pod: pod,
@@ -252,12 +257,27 @@ func checkHeadroom(
 		return nil
 	}
 
+	// Asked about a pod of that *shape*, not about that pod. The reserve is a
+	// margin — "leave room for something as big as your biggest workload" —
+	// and was never a claim that one specific pod must be placeable.
+	//
+	// The difference is not academic. A StatefulSet's claim makes its pod
+	// unmodellable to fit, so asking about the pod itself refuses every
+	// destination on every cluster with a PVC-backed StatefulSet, turning the
+	// default reserve into "never drain anything" — and reporting it as "no
+	// room", which is not what happened.
+	//
+	// Size still comes from the real replacement, so nothing is
+	// under-estimated: only the constraints that make a specific pod
+	// unplaceable are dropped.
+	probe := sizeProbe(largest)
+
 	refusals := make(map[string]string, len(destinations))
 	for _, node := range destinations {
-		if ok, _ := fit.CanFit(largest, node, remaining[node.Name], residents[node.Name]); ok {
+		if ok, _ := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name]); ok {
 			return nil
 		}
-		refusals[node.Name] = "no room for the largest relocatable pod"
+		refusals[node.Name] = "no room for a pod the size of the largest relocatable one"
 	}
 
 	return &Blocked{
@@ -360,7 +380,40 @@ func ControllerOf(pod *corev1.Pod) (OwnerRef, bool) {
 // is not a safe direction and only the set the replacement will actually carry
 // is right. Identity stays the running pod's, so anything reported names an
 // object an operator can go and look at.
+// replacement is [sizedReplacement] plus the checks that decide whether this
+// pod can be *moved*.
+//
+// Placement constraints the running pod carries and its template does not are
+// admission's work, and there is no safe merge for most of them: a required
+// affinity term is not something you can take the larger of. Refusing is the
+// allowlist rule, and it is counted.
+//
+// Separate from sizing because the reserve asks a different question. It scans
+// every relocatable pod in the cluster to find the largest, and it is not
+// moving any of them — so a webhook-mutated workload on some unrelated node
+// would otherwise make every candidate refuse, which is the third route to the
+// same "one pod blocks all drains" failure this change has now closed.
 func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec) (*corev1.Pod, bool) {
+	out, ok := sizedReplacement(pod, templates)
+	if !ok {
+		return nil, false
+	}
+	ref, _ := ControllerOf(pod)
+	template := templates[ref]
+	if restrictiveDivergence(template, pod) != "" || mutatedVolume(template, pod) != "" {
+		return nil, false
+	}
+	return out, true
+}
+
+// sizedReplacement is the pod a controller would create, as far as its
+// resource shape goes.
+//
+// Everything that decides where a particular pod may go is left to
+// [replacement]. What remains is what the reserve needs: the template's spec,
+// with requests raised to the running pod's and any volume it has but the
+// template does not carried over.
+func sizedReplacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec) (*corev1.Pod, bool) {
 	ref, owned := ControllerOf(pod)
 	if !owned {
 		return nil, false
@@ -381,6 +434,8 @@ func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec
 	}
 	out.Labels = maps.Clone(template.Labels)
 	raiseRequests(out, pod)
+	addMissingVolumes(out, pod)
+
 	// NodeName comes from the template and nowhere else, which is what makes a
 	// pinned template visible: every running pod names a node, so inheriting
 	// it would hide exactly the case worth catching.
@@ -425,5 +480,172 @@ func raiseRequests(replacement, running *corev1.Pod) {
 	// running pod carries it and the template does not.
 	if replacement.Spec.Overhead == nil {
 		replacement.Spec.Overhead = running.Spec.Overhead.DeepCopy()
+	}
+}
+
+// addMissingVolumes carries over any volume the running pod has and the
+// template does not.
+//
+// Two sources, both legitimate: a StatefulSet's volumeClaimTemplates become
+// pod volumes without appearing in spec.template, and admission injects
+// volumes for meshes and secret stores. Merging rather than refusing is safe
+// because a volume can only *add* placement constraints — a PVC binds the pod
+// to its volume's zone, a hostPath to whatever provides it — never remove one.
+func addMissingVolumes(replacement, running *corev1.Pod) {
+	present := map[string]bool{}
+	for _, v := range replacement.Spec.Volumes {
+		present[v.Name] = true
+	}
+	for _, v := range running.Spec.Volumes {
+		if !present[v.Name] {
+			replacement.Spec.Volumes = append(replacement.Spec.Volumes, *v.DeepCopy())
+		}
+	}
+}
+
+// mutatedVolume reports a volume whose name appears on both sides with a
+// different source.
+//
+// Merging by name alone would keep the template's version, so admission
+// rewriting a placement-neutral emptyDir into a PVC of the same name would be
+// discarded — and the replacement would pass fit while the real one is bound
+// to a volume. Neither source can be called the more constraining of the two in
+// general, so this refuses rather than choosing.
+func mutatedVolume(template *corev1.PodTemplateSpec, running *corev1.Pod) string {
+	declared := make(map[string]corev1.VolumeSource, len(template.Spec.Volumes))
+	for _, v := range template.Spec.Volumes {
+		declared[v.Name] = v.VolumeSource
+	}
+	for _, v := range running.Spec.Volumes {
+		if was, ok := declared[v.Name]; ok && !equality.Semantic.DeepEqual(was, v.VolumeSource) {
+			return v.Name
+		}
+	}
+	return ""
+}
+
+// restrictiveDivergence reports a constraint the running pod carries that its
+// template does not, naming the first found.
+//
+// Only fields that *narrow* where a pod may go are checked, and that is the
+// whole design. Measured against a real cluster, the fields split three ways:
+//
+//   - Additive: containers and volumes. The running pod may have more, from an
+//     injected sidecar or a volumeClaimTemplate. Merged, since more of either
+//     can only narrow placement further.
+//   - Permissive: tolerations. The API server adds two NoExecute tolerations to
+//     every pod, so these always differ. The template's are used as-is: fewer
+//     tolerations means the replacement tolerates less, which costs a missed
+//     destination rather than a wrong one.
+//   - Restrictive: these. A nodeSelector or required affinity present only after
+//     admission makes the replacement look freer than it is, and binpack would
+//     approve a destination the scheduler refuses — leaving the pod Pending and
+//     provoking the scale-up it exists to prevent.
+//
+// An earlier attempt compared every field and refused 80 of 122 pods, all of it
+// API-server defaulting; the conclusion drawn then was that the check could not
+// work. It was comparing the wrong things. Restricted to these five, the same
+// cluster diverges on none.
+func restrictiveDivergence(template *corev1.PodTemplateSpec, running *corev1.Pod) string {
+	switch {
+	case !maps.Equal(template.Spec.NodeSelector, running.Spec.NodeSelector):
+		return "nodeSelector"
+	// Only the required terms. Preferred affinity affects scoring and never
+	// filters, so a webhook adding one cannot make a placement fail — and fit
+	// deliberately accepts it. Refusing over it would disable consolidation
+	// for something that cannot change where a pod can go.
+	case !equality.Semantic.DeepEqual(
+		requiredAffinity(template.Spec.Affinity), requiredAffinity(running.Spec.Affinity)):
+		return "affinity"
+	case template.Spec.SchedulerName != running.Spec.SchedulerName:
+		return "schedulerName"
+	// Likewise, ScheduleAnyway is a preference. ADR-0006 ignores the soft
+	// counterparts of every constraint for exactly this reason.
+	case !equality.Semantic.DeepEqual(
+		hardSpread(template.Spec.TopologySpreadConstraints),
+		hardSpread(running.Spec.TopologySpreadConstraints)):
+		return "topologySpreadConstraints"
+	case !equality.Semantic.DeepEqual(
+		template.Spec.RuntimeClassName, running.Spec.RuntimeClassName):
+		return "runtimeClassName"
+	}
+	return ""
+}
+
+// requiredAffinity keeps only the terms that filter, discarding preferences.
+func requiredAffinity(a *corev1.Affinity) *corev1.Affinity {
+	if a == nil {
+		return nil
+	}
+	out := &corev1.Affinity{}
+	if a.NodeAffinity != nil && a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution != nil {
+		out.NodeAffinity = &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: a.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		}
+	}
+	if a.PodAffinity != nil && len(a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+		out.PodAffinity = &corev1.PodAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: a.PodAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		}
+	}
+	if a.PodAntiAffinity != nil && len(a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution) > 0 {
+		out.PodAntiAffinity = &corev1.PodAntiAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: a.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution,
+		}
+	}
+	if out.NodeAffinity == nil && out.PodAffinity == nil && out.PodAntiAffinity == nil {
+		return nil
+	}
+	return out
+}
+
+// hardSpread keeps only the constraints that refuse a placement.
+func hardSpread(cs []corev1.TopologySpreadConstraint) []corev1.TopologySpreadConstraint {
+	var out []corev1.TopologySpreadConstraint
+	for _, c := range cs {
+		if c.WhenUnsatisfiable == corev1.DoNotSchedule {
+			out = append(out, c)
+		}
+	}
+	return out
+}
+
+// sizeProbe is a pod carrying the resource shape of another and nothing else.
+//
+// Rebuilt field by field rather than copied and stripped, because the question
+// is which fields *contribute to size* and everything else is a liability. A
+// host port copied along with a container makes fit refuse the probe on every
+// node, so one such workload anywhere in the cluster would block every drain —
+// the same failure this probe was introduced to fix, arriving by a different
+// route.
+//
+// What size means here is whatever resource.PodRequests reads: the regular
+// containers, the init-container peak, native sidecars kept running (hence
+// their restart policy), RuntimeClass overhead, and pod-level requests where
+// the cluster has them.
+func sizeProbe(pod *corev1.Pod) *corev1.Pod {
+	shape := func(cs []corev1.Container, keepRestartPolicy bool) []corev1.Container {
+		out := make([]corev1.Container, 0, len(cs))
+		for _, c := range cs {
+			only := corev1.Container{Name: c.Name, Resources: *c.Resources.DeepCopy()}
+			if keepRestartPolicy {
+				only.RestartPolicy = c.RestartPolicy
+			}
+			out = append(out, only)
+		}
+		return out
+	}
+
+	return &corev1.Pod{
+		ObjectMeta: *pod.ObjectMeta.DeepCopy(),
+		Spec: corev1.PodSpec{
+			Containers: shape(pod.Spec.Containers, false),
+			// A native sidecar is an init container with an Always restart
+			// policy, and it is added to the running total rather than folded
+			// into the init peak. Dropping the policy would understate it.
+			InitContainers: shape(pod.Spec.InitContainers, true),
+			Overhead:       pod.Spec.Overhead.DeepCopy(),
+			Resources:      pod.Spec.Resources.DeepCopy(),
+		},
 	}
 }
