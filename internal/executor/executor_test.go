@@ -171,15 +171,27 @@ func TestEvictDistinguishesItsFailures(t *testing.T) {
 		// A budget refusing right now. Its allowance is recomputed as replicas
 		// become healthy, so the same eviction may succeed a moment later.
 		{"budget exhausted", apierrors.NewTooManyRequests("nope", 1), executor.ErrEvictionBlocked},
-		// Two budgets covering one pod. The API does not arbitrate between
-		// them and returns 500 rather than a retryable 429 — retrying is how a
-		// drain hangs forever.
-		{"refused outright", apierrors.NewInternalError(errors.New("multiple budgets")),
+		// Two budgets covering one pod, in the eviction subresource's own
+		// words. The API does not arbitrate between them and returns 500
+		// rather than a retryable 429 — retrying is how a drain hangs forever.
+		{"refused outright", apierrors.NewInternalError(errors.New(
+			"This pod has more than one PodDisruptionBudget, which the eviction subresource does not support.")),
 			executor.ErrEvictionImpossible},
+		// Also a 500, and nothing to do with budgets. Abandoning a drain over
+		// an etcd hiccup or a webhook timeout would give up on one that works
+		// a moment later, and those are far commoner than the case above.
+		{"transient server error", apierrors.NewInternalError(errors.New("etcdserver: request timed out")), nil},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := executor.Evict(ctx(), evictor{tc.from}, pod)
 			switch {
+			case tc.name == "transient server error":
+				if errors.Is(err, executor.ErrEvictionImpossible) {
+					t.Errorf("a transient 500 was classified as permanent: %v", err)
+				}
+				if !apierrors.IsInternalError(err) {
+					t.Errorf("the original error should still be inspectable, got %v", err)
+				}
 			case tc.want == nil && err != nil:
 				t.Errorf("wanted success, got %v", err)
 			case tc.want != nil && !errors.Is(err, tc.want):

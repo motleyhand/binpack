@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -116,6 +117,19 @@ var (
 	ErrEvictionImpossible = errors.New("the eviction API refuses this pod outright")
 )
 
+// multiplePDBs is the eviction subresource's own wording for the one 500 that
+// is permanent, from pkg/registry/core/pod/storage/eviction.go.
+//
+// Matching on a message is unpleasant and is the only signal there is: the
+// status carries no reason or cause distinguishing it, just code 500. So the
+// choice is which way to be wrong when the wording changes, and this errs
+// towards *retrying*. A permanent refusal treated as transient makes a drain
+// stall, which the progress bound already catches and backs off from; a
+// transient failure treated as permanent abandons a drain that would have
+// worked, and etcd hiccups and webhook timeouts are far commoner than a pod
+// under two budgets.
+const multiplePDBs = "more than one PodDisruptionBudget"
+
 // Evict asks the API server to remove a pod, respecting disruption budgets.
 //
 // A create against the eviction subresource, not a delete. The difference is
@@ -139,7 +153,7 @@ func Evict(ctx context.Context, w Writer, pod *corev1.Pod) error {
 		return nil
 	case apierrors.IsTooManyRequests(err):
 		return fmt.Errorf("%s/%s: %w", pod.Namespace, pod.Name, ErrEvictionBlocked)
-	case apierrors.IsInternalError(err):
+	case apierrors.IsInternalError(err) && strings.Contains(err.Error(), multiplePDBs):
 		return fmt.Errorf("%s/%s: %w", pod.Namespace, pod.Name, ErrEvictionImpossible)
 	default:
 		return fmt.Errorf("evicting %s/%s: %w", pod.Namespace, pod.Name, err)
