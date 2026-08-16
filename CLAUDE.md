@@ -139,6 +139,14 @@ pods, and candidates are ordered least-loaded-first — so without per-node back
 preferentially retries the node that just failed, evicting a few more pods each round. Failed
 drains record exponential backoff on the node itself.
 
+**"Node-local" means two different things, and only one of them is stable.** A DaemonSet or
+mirror pod is bound to its node *by nature*; a terminating pod is bound to it *by circumstance*.
+The engine's `Classify` lumps them together because for the simulation both answer "needs no
+destination" — but a drain is waiting on precisely the terminating ones, and reusing that class
+reports an occupied node as empty. Hence `engine.NodeBound` for the narrow question. Completed
+pods are the mirror image: real objects that never leave on their own, so counting them stalls
+every drain of the node they landed on.
+
 **Slow is not stuck.** A wall-clock drain deadline cannot tell a pod with a one-hour
 `terminationGracePeriodSeconds` from one wedged on a finalizer. Bound the *absence of progress*
 instead, and count "terminating within its grace period" as progress so long shutdowns need no

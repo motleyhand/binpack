@@ -451,7 +451,7 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 	g := newGrouped(staticNodes(s, cfg))
 
 	for _, pod := range s.Pods {
-		if !occupies(pod) || isNodeLocal(pod) {
+		if !Occupies(pod) || isNodeLocal(pod) {
 			continue
 		}
 

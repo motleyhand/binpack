@@ -12,6 +12,8 @@
 package mother
 
 import (
+	"time"
+
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
@@ -302,6 +304,21 @@ func WithOverhead(cpu, memory string) PodOption {
 // OnNode binds the pod to a node.
 func OnNode(name string) PodOption {
 	return func(p *corev1.Pod) { p.Spec.NodeName = name }
+}
+
+// Terminating marks a pod as shutting down, as the API server does once a
+// delete or an eviction is accepted.
+//
+// Both fields are set because both are real: deletionGracePeriodSeconds records
+// the grace period actually applied, which need not be the one the spec asks
+// for.
+func Terminating(at time.Time, grace time.Duration) PodOption {
+	return func(p *corev1.Pod) {
+		stamp := metav1.NewTime(at)
+		p.DeletionTimestamp = &stamp
+		seconds := int64(grace.Seconds())
+		p.DeletionGracePeriodSeconds = &seconds
+	}
 }
 
 // WithHostPort claims a host port, which binpack does not model.
