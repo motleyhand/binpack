@@ -41,6 +41,39 @@ jobs:
       - name: Verify
         run: make check
 
+      # GoReleaser creates the release itself, as a draft, and fills it. If one
+      # already exists and is published it is immutable, and the upload fails
+      # after everything has been built — with a registry error that says
+      # nothing about the cause.
+      #
+      # That happens when a release is created in the web UI, which publishes
+      # it and creates the tag as a side effect, triggering this workflow
+      # against a release that is already frozen. Tag from the command line
+      # instead; see docs/reference/versioning.md.
+      - name: No published release exists for this tag yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          # Assigned separately on failure, not piped: a 404 from gh api
+          # writes the error body to stdout *and* exits non-zero, so appending
+          # "absent" to it would leave a value matching neither case — and
+          # refuse every legitimate release.
+          state=$(gh api "repos/$GITHUB_REPOSITORY/releases/tags/$TAG" \
+                    --jq '"\(.draft) \(.immutable)"' 2>/dev/null) || state=absent
+          case "$state" in
+            absent)     echo "no release for $TAG yet; GoReleaser will create one" ;;
+            "true "*)   echo "a draft release exists for $TAG; GoReleaser will fill it" ;;
+            *)
+              echo "::error::A published release already exists for $TAG."
+              echo "Publishing freezes a release, so its assets can no longer be uploaded."
+              echo "This is what creating a release in the web UI does: it publishes"
+              echo "immediately and creates the tag, which triggers this workflow too late."
+              echo "Push a tag instead — see docs/reference/versioning.md — and let this"
+              echo "workflow create the release."
+              exit 1 ;;
+          esac
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 

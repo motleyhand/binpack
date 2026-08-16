@@ -87,3 +87,20 @@ than trusted.
 
 The GitHub release is created as a **draft**. Everything is built and pushed by the time anyone
 reads it; publishing is the last human step, and the only one here that is irreversible.
+
+### Push a tag, do not create a release
+
+Creating a release in GitHub's web UI **publishes it immediately** and creates the tag as a side
+effect. The tag then triggers this workflow, which arrives to find a release that already
+exists and is already published.
+
+With immutable releases enabled that is fatal: publishing freezes a release, so no assets can be
+attached, and the run fails after building everything with a registry error that says nothing
+about the cause. Without immutability it merely produces a release nobody drafted.
+
+The workflow refuses up front rather than discovering this at the upload, but the fix is to push
+the tag and let the workflow own the release. Immutability is worth keeping — it is doing the
+right thing, and freezing a *complete* release is the point.
+
+v0.1.1 was lost this way: its image reached the registry, its chart and binaries did not, and the
+version was skipped rather than reused, since a published release cannot be refilled.
