@@ -185,30 +185,40 @@ admission chain, which is far outside what this project should do. It is bounded
 placement the scheduler refuses, which stalls the drain and backs off rather than causing a
 scale-up, because the pod is rejected rather than left unschedulable somewhere new.
 
-#### Open: admission-added placement constraints
+#### Closed: admission-added placement constraints
 
 Requests are merged safely because the larger of two figures is meaningful. Placement
 constraints are not: a mutating webhook that adds a `nodeSelector`, a required affinity term, a
 toleration, a scheduler name or a volume leaves the template looking *less* constrained than the
 pod the scheduler will receive, and there is no "larger of" for an affinity term.
 
-The obvious remedy — refuse whenever the running pod carries a constraint its template does not
-— was implemented and then withdrawn, because measuring it showed it refuses almost everything.
-On a real cluster with no service mesh it produced **80 refusals across essentially every
-workload**, none of them from a webhook. The API server defaults fields that no template carries:
-the `node.kubernetes.io/not-ready` and `unreachable` tolerations added to every pod, a
-`schedulerName` of `default-scheduler`, the projected service-account token volume. A naive
-comparison measures defaulting, not divergence.
+The obvious remedy — refuse whenever the running pod carries a constraint its template does not —
+was implemented and withdrawn once, because it refused **80 of 122 pods** on a real cluster, none
+of them from a webhook. That measurement was right and the conclusion drawn from it was wrong: it
+was not evidence the check could not work, but that it was comparing the wrong things.
 
-Closing it properly therefore needs a comparison that knows what the API server adds on its own,
-so that it can refuse on a webhook's `nodeSelector` while ignoring a defaulted toleration. That
-is a real piece of work and it is recorded here rather than approximated, because an
-approximation that refuses every pod on every cluster is worse than the gap: binpack would be
-sound and useless, and nobody would run it long enough to benefit.
+Measuring again, by field and excluding pods that are never relocated, the differences separate
+into three kinds:
 
-The gap is bounded in the same way as the others. A replacement the scheduler refuses is a pod
-that never becomes Pending on another node, so the drain stalls and backs off rather than
-provoking a scale-up.
+| Kind | Fields | Divergence on a real cluster | Treatment |
+|---|---|---|---|
+| Permissive | tolerations | 150 of 150 | Use the template's. The API server adds two `NoExecute` tolerations to every pod; tolerating *less* costs a missed destination, never a wrong one |
+| Additive | containers, volumes | 137 of 150 | Merge. An injected sidecar or a `volumeClaimTemplate` can only narrow placement further |
+| Restrictive | `nodeSelector`, affinity, topology spread, `schedulerName`, `runtimeClassName` | **0 of 122** | Refuse. These make the replacement look freer than it is |
+
+Nearly all of the original 80 were the projected service-account token volume and the two
+defaulted tolerations. The remaining affinity differences were DaemonSet pods, which the
+DaemonSet controller pins with `matchFields: metadata.name` and which binpack never relocates.
+
+So the check refuses only on the fields where a missing constraint is unsound, and on the cluster
+that made the first attempt look unworkable it now refuses nothing at all.
+
+**The gap was not bounded, and this ADR previously said it was.** The reasoning given — that the
+scheduler rejects the pod, so the drain stalls and backs off — does not hold. Once a pod is
+evicted its replacement is not aimed at the node binpack chose; the scheduler places it wherever
+it fits, and if an admission-added constraint means it fits nowhere it goes Pending, which is
+precisely what makes the autoscaler add a node. The drain would *complete*, so no backoff would
+ever fire: binpack would cause the scale-up it exists to prevent, and report success.
 
 **Verifying the first case mattered more than it looks.** The obvious cheaper fix — compare the
 pod's requests against what its container statuses report as allocated — does not work, and the

@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -252,12 +253,27 @@ func checkHeadroom(
 		return nil
 	}
 
+	// Asked about a pod of that *shape*, not about that pod. The reserve is a
+	// margin — "leave room for something as big as your biggest workload" —
+	// and was never a claim that one specific pod must be placeable.
+	//
+	// The difference is not academic. A StatefulSet's claim makes its pod
+	// unmodellable to fit, so asking about the pod itself refuses every
+	// destination on every cluster with a PVC-backed StatefulSet, turning the
+	// default reserve into "never drain anything" — and reporting it as "no
+	// room", which is not what happened.
+	//
+	// Size still comes from the real replacement, so nothing is
+	// under-estimated: only the constraints that make a specific pod
+	// unplaceable are dropped.
+	probe := sizeProbe(largest)
+
 	refusals := make(map[string]string, len(destinations))
 	for _, node := range destinations {
-		if ok, _ := fit.CanFit(largest, node, remaining[node.Name], residents[node.Name]); ok {
+		if ok, _ := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name]); ok {
 			return nil
 		}
-		refusals[node.Name] = "no room for the largest relocatable pod"
+		refusals[node.Name] = "no room for a pod the size of the largest relocatable one"
 	}
 
 	return &Blocked{
@@ -381,6 +397,14 @@ func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec
 	}
 	out.Labels = maps.Clone(template.Labels)
 	raiseRequests(out, pod)
+	addMissingVolumes(out, pod)
+
+	// Constraints the running pod carries and the template does not are
+	// admission's work, and unlike the fields above they cannot be merged. See
+	// [restrictiveDivergence].
+	if restrictiveDivergence(template, pod) != "" {
+		return nil, false
+	}
 	// NodeName comes from the template and nowhere else, which is what makes a
 	// pinned template visible: every running pod names a node, so inheriting
 	// it would hide exactly the case worth catching.
@@ -425,5 +449,82 @@ func raiseRequests(replacement, running *corev1.Pod) {
 	// running pod carries it and the template does not.
 	if replacement.Spec.Overhead == nil {
 		replacement.Spec.Overhead = running.Spec.Overhead.DeepCopy()
+	}
+}
+
+// addMissingVolumes carries over any volume the running pod has and the
+// template does not.
+//
+// Two sources, both legitimate: a StatefulSet's volumeClaimTemplates become
+// pod volumes without appearing in spec.template, and admission injects
+// volumes for meshes and secret stores. Merging rather than refusing is safe
+// because a volume can only *add* placement constraints — a PVC binds the pod
+// to its volume's zone, a hostPath to whatever provides it — never remove one.
+func addMissingVolumes(replacement, running *corev1.Pod) {
+	present := map[string]bool{}
+	for _, v := range replacement.Spec.Volumes {
+		present[v.Name] = true
+	}
+	for _, v := range running.Spec.Volumes {
+		if !present[v.Name] {
+			replacement.Spec.Volumes = append(replacement.Spec.Volumes, *v.DeepCopy())
+		}
+	}
+}
+
+// restrictiveDivergence reports a constraint the running pod carries that its
+// template does not, naming the first found.
+//
+// Only fields that *narrow* where a pod may go are checked, and that is the
+// whole design. Measured against a real cluster, the fields split three ways:
+//
+//   - Additive: containers and volumes. The running pod may have more, from an
+//     injected sidecar or a volumeClaimTemplate. Merged, since more of either
+//     can only narrow placement further.
+//   - Permissive: tolerations. The API server adds two NoExecute tolerations to
+//     every pod, so these always differ. The template's are used as-is: fewer
+//     tolerations means the replacement tolerates less, which costs a missed
+//     destination rather than a wrong one.
+//   - Restrictive: these. A nodeSelector or required affinity present only after
+//     admission makes the replacement look freer than it is, and binpack would
+//     approve a destination the scheduler refuses — leaving the pod Pending and
+//     provoking the scale-up it exists to prevent.
+//
+// An earlier attempt compared every field and refused 80 of 122 pods, all of it
+// API-server defaulting; the conclusion drawn then was that the check could not
+// work. It was comparing the wrong things. Restricted to these five, the same
+// cluster diverges on none.
+func restrictiveDivergence(template *corev1.PodTemplateSpec, running *corev1.Pod) string {
+	switch {
+	case !maps.Equal(template.Spec.NodeSelector, running.Spec.NodeSelector):
+		return "nodeSelector"
+	case !equality.Semantic.DeepEqual(template.Spec.Affinity, running.Spec.Affinity):
+		return "affinity"
+	case template.Spec.SchedulerName != running.Spec.SchedulerName:
+		return "schedulerName"
+	case !equality.Semantic.DeepEqual(
+		template.Spec.TopologySpreadConstraints, running.Spec.TopologySpreadConstraints):
+		return "topologySpreadConstraints"
+	case !equality.Semantic.DeepEqual(
+		template.Spec.RuntimeClassName, running.Spec.RuntimeClassName):
+		return "runtimeClassName"
+	}
+	return ""
+}
+
+// sizeProbe is a pod carrying the resource shape of another and nothing else.
+//
+// Containers, init containers and RuntimeClass overhead are kept, since those
+// are what EffectiveRequests reads. Volumes, selectors, affinity, tolerations
+// and scheduler name are dropped: they decide where a *particular* pod may go,
+// and the headroom question is about capacity for a pod of this size.
+func sizeProbe(pod *corev1.Pod) *corev1.Pod {
+	return &corev1.Pod{
+		ObjectMeta: *pod.ObjectMeta.DeepCopy(),
+		Spec: corev1.PodSpec{
+			Containers:     pod.Spec.DeepCopy().Containers,
+			InitContainers: pod.Spec.DeepCopy().InitContainers,
+			Overhead:       pod.Spec.Overhead.DeepCopy(),
+		},
 	}
 }
