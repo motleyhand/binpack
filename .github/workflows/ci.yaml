@@ -43,6 +43,19 @@ jobs:
       - name: Smoke test the binary
         run: ./bin/binpack version
 
+      # release.yaml runs `make check` too, and runs only on tags, so a tool
+      # missing from it is invisible until somebody tags.
+      - name: The release workflow can run make check
+        run: python3 hack/check-release-workflow.py
+
+  chart:")[0]
+          missing = setup_actions(build) - setup_actions(release)
+          if missing:
+              print("release.yaml also runs `make check` but does not set up:", ", ".join(sorted(missing)))
+              sys.exit(1)
+          print("the release workflow provisions everything the build job does")
+          EOF
+
   chart:
     name: helm chart
     runs-on: ubuntu-latest

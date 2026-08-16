@@ -27,6 +27,14 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # `make check` starts with `make lint`, so the linter has to be here as
+      # well as in the build job. Pinned to the same version: a release that
+      # fails on a lint rule the pull request never ran is a release blocked by
+      # a disagreement between two workflows.
+      - uses: golangci/golangci-lint-action@v9
+        with:
+          version: v2.12.2
+
       # Everything CI runs, again. A tag skipping the tests it was cut from is
       # how a release gets published from a commit nobody verified — the branch
       # may have been green hours and several merges ago.
