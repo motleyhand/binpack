@@ -897,3 +897,79 @@ func TestAVolumeRewrittenUnderTheSameNameIsRefused(t *testing.T) {
 		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
 	}
 }
+
+func TestAnAdmissionMutatedPodElsewhereDoesNotBlockTheReserve(t *testing.T) {
+	// The reserve scans every relocatable pod in the cluster to find the
+	// largest, and moves none of them. A webhook-added selector on some
+	// unrelated node says nothing about how much room to leave — and refusing
+	// over it would let one such workload block every drain, which is the
+	// third route to that failure in this change alone.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+
+	// Nothing on the candidate, so the drain is trivially feasible and the
+	// reserve is the only question.
+	mutated := mother.Pod("other", "mesh-injected", mother.OnNode("destination"),
+		mother.WithNodeSelector("disk", "ssd"))
+	pods := []*corev1.Pod{mutated}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, mutated) // the template lacks the selector
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		templates, candidate, cfg)
+
+	if !sim.Feasible {
+		t.Errorf("a mutated pod on another node blocked the reserve: %s", sim.Blocked.Summary)
+	}
+}
+
+func TestRelocatingThatSamePodIsStillRefused(t *testing.T) {
+	// The counterpart: the identical divergence must still stop the drain when
+	// the pod is one that has to move. Sizing and moving ask different
+	// questions of the same object.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	mutated := mother.Pod("other", "mesh-injected", mother.OnNode("candidate"),
+		mother.WithNodeSelector("disk", "ssd"))
+	pods := []*corev1.Pod{mutated}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, mutated)
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("planned to move a pod whose template is missing its selector")
+	}
+	if !sim.Blocked.NoTemplate {
+		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
+	}
+}
+
+func TestTheReserveStillNeedsATemplateToSizeAgainst(t *testing.T) {
+	// Sizing tolerates a placement difference; it cannot tolerate having no
+	// template at all, because then there is no size to reserve for.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	exotic := mother.Pod("default", "shard-0", mother.OnNode("destination"),
+		mother.OwnedBy("KafkaCluster", "events"))
+	pods := []*corev1.Pod{exotic}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if sim.Feasible {
+		t.Fatal("reserved headroom while unable to size the cluster's largest pod")
+	}
+	if !sim.Blocked.NoTemplate {
+		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
+	}
+}

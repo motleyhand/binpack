@@ -235,7 +235,11 @@ func checkHeadroom(
 		if !occupies(pod) || Classify(pod, cfg.ExpendablePriorityCutoff) != Relocatable {
 			continue
 		}
-		next, ok := replacement(pod, templates)
+		// Sized, not validated for relocation: this pod is not being moved, and
+		// its placement constraints are discarded by sizeProbe regardless. An
+		// unreadable template still blocks, because without one there is no
+		// size to reserve for.
+		next, ok := sizedReplacement(pod, templates)
 		if !ok {
 			return &Blocked{
 				Pod: pod,
@@ -376,7 +380,40 @@ func ControllerOf(pod *corev1.Pod) (OwnerRef, bool) {
 // is not a safe direction and only the set the replacement will actually carry
 // is right. Identity stays the running pod's, so anything reported names an
 // object an operator can go and look at.
+// replacement is [sizedReplacement] plus the checks that decide whether this
+// pod can be *moved*.
+//
+// Placement constraints the running pod carries and its template does not are
+// admission's work, and there is no safe merge for most of them: a required
+// affinity term is not something you can take the larger of. Refusing is the
+// allowlist rule, and it is counted.
+//
+// Separate from sizing because the reserve asks a different question. It scans
+// every relocatable pod in the cluster to find the largest, and it is not
+// moving any of them — so a webhook-mutated workload on some unrelated node
+// would otherwise make every candidate refuse, which is the third route to the
+// same "one pod blocks all drains" failure this change has now closed.
 func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec) (*corev1.Pod, bool) {
+	out, ok := sizedReplacement(pod, templates)
+	if !ok {
+		return nil, false
+	}
+	ref, _ := ControllerOf(pod)
+	template := templates[ref]
+	if restrictiveDivergence(template, pod) != "" || mutatedVolume(template, pod) != "" {
+		return nil, false
+	}
+	return out, true
+}
+
+// sizedReplacement is the pod a controller would create, as far as its
+// resource shape goes.
+//
+// Everything that decides where a particular pod may go is left to
+// [replacement]. What remains is what the reserve needs: the template's spec,
+// with requests raised to the running pod's and any volume it has but the
+// template does not carried over.
+func sizedReplacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec) (*corev1.Pod, bool) {
 	ref, owned := ControllerOf(pod)
 	if !owned {
 		return nil, false
@@ -399,12 +436,6 @@ func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec
 	raiseRequests(out, pod)
 	addMissingVolumes(out, pod)
 
-	// Constraints the running pod carries and the template does not are
-	// admission's work, and unlike the fields above they cannot be merged. See
-	// [restrictiveDivergence].
-	if restrictiveDivergence(template, pod) != "" || mutatedVolume(template, pod) != "" {
-		return nil, false
-	}
 	// NodeName comes from the template and nowhere else, which is what makes a
 	// pinned template visible: every running pod names a node, so inheriting
 	// it would hide exactly the case worth catching.
