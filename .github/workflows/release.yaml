@@ -41,6 +41,64 @@ jobs:
       - name: Verify
         run: make check
 
+      # GoReleaser creates the release itself, as a draft, and fills it. If one
+      # already exists and is published it is immutable, and the upload fails
+      # after everything has been built — with a registry error that says
+      # nothing about the cause.
+      #
+      # That happens when a release is created in the web UI, which publishes
+      # it and creates the tag as a side effect, triggering this workflow
+      # against a release that is already frozen. Tag from the command line
+      # instead; see docs/reference/versioning.md.
+      - name: No published release exists for this tag yet
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+
+          # The HTTP status, read explicitly rather than inferred from an exit
+          # code. Only 404 means "no release yet"; treating every failure that
+          # way would let rate limiting, an outage or a bad token look like
+          # permission to continue — and the run would then fail at the upload,
+          # which is the thing this step exists to prevent.
+          code=$(curl -sS -o /tmp/release.json -w '%{http_code}' \
+                   -H "Authorization: Bearer $GH_TOKEN" \
+                   -H "Accept: application/vnd.github+json" \
+                   -H "X-GitHub-Api-Version: 2022-11-28" \
+                   "https://api.github.com/repos/$GITHUB_REPOSITORY/releases/tags/$TAG") \
+            || code=000
+
+          case "$code" in
+            404)
+              echo "No release exists for $TAG yet; GoReleaser will create one."
+              ;;
+            200)
+              if [ "$(jq -r .draft /tmp/release.json)" = "true" ]; then
+                echo "A draft release exists for $TAG; GoReleaser will fill it."
+              else
+                echo "::error::A published release already exists for $TAG."
+                echo "Publishing freezes a release, so its assets can no longer be uploaded."
+                echo "This is what creating a release in the web UI does: it publishes"
+                echo "immediately and creates the tag, which triggers this workflow too late."
+                echo "Push a tag instead — see docs/reference/versioning.md — and let this"
+                echo "workflow create the release."
+                exit 1
+              fi
+              ;;
+            *)
+              # 000 is curl itself failing — DNS, TLS, a dropped connection.
+              # Note this fallback refuses; the earlier version of this step
+              # fell back to "no release exists", which is the same shape of
+              # code pointed the unsafe way.
+              echo "::error::Could not determine whether a release exists for $TAG (HTTP $code)."
+              echo "Refusing to continue: a failed lookup is not evidence that none exists,"
+              echo "and proceeding would fail at the upload after building everything."
+              cat /tmp/release.json
+              exit 1
+              ;;
+          esac
+
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
 
