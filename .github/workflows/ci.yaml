@@ -149,7 +149,7 @@ jobs:
       # dockers_v2 builds linux/arm64 as well, which needs emulation on an
       # amd64 runner. Without these the snapshot fails here for a reason that
       # has nothing to do with the config being wrong.
-      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v3
 
       # Builds every target and the container image without publishing
