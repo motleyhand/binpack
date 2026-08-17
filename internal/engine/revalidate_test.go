@@ -169,3 +169,89 @@ func TestRevalidateTreatsAMissingNodeAsGone(t *testing.T) {
 		t.Error("the assessment should still name the node it was asked about")
 	}
 }
+
+// reserving is a cluster where the drain of "a" is feasible but leaves nowhere
+// for a pod the size of the largest relocatable one — so the reserve refuses it
+// and nothing else does.
+func reserving(t *testing.T, extra ...mother.NodeOption) (engine.Snapshot, engine.Config) {
+	t.Helper()
+	pods := []*corev1.Pod{
+		mother.Pod("default", "small", mother.OnNode("a"), mother.Requests("100m", "1Gi")),
+		mother.Pod("default", "large", mother.OnNode("b"), mother.Requests("100m", "2Gi")),
+	}
+	s := cluster([]*corev1.Node{inPool("a", extra...), inPool("b")}, pods)
+
+	cfg := config()
+	cfg.Default.Sim.ReserveForLargestPod = true
+	return s, cfg
+}
+
+func TestTheReserveRefusesADrainThatHasNotStarted(t *testing.T) {
+	// The other half of the pair below: without this, the test that the reserve
+	// stops applying would pass against a cluster where it never applied.
+	s, cfg := reserving(t, draining()...)
+	s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = ""
+
+	if got := engine.Revalidate(s, "a", cfg); got.Verdict() == engine.VerdictDrainable {
+		t.Error("the reserve should refuse this drain before anything has been evicted")
+	}
+}
+
+func TestTheReserveStopsApplyingOncePodsHaveLeft(t *testing.T) {
+	// Re-asking a preference after the work has begun does not undo the work.
+	// It abandons a half-drained node, which leaves the cluster worse than
+	// either finishing or never starting — and on a real cluster it bounced a
+	// pod off every node in the pool in turn. See ADR-0009.
+	s, cfg := reserving(t, draining()...)
+	s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = "some-uid@2026-08-17T12:00:00Z"
+
+	got := engine.Revalidate(s, "a", cfg)
+
+	if got.Verdict() != engine.VerdictDrainable {
+		t.Errorf("a committed drain was abandoned by a preference: %q (%s)",
+			got.Verdict(), revalidationDetail(got))
+	}
+}
+
+func TestSoundnessIsStillReAskedAfterPodsHaveLeft(t *testing.T) {
+	// The distinction is preference versus soundness, not "checks before" and
+	// "no checks after". A drain whose remaining pods no longer fit anywhere
+	// must still stop, however much work has been done.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "huge", mother.OnNode("a"), mother.Requests("100m", "3Gi")),
+		mother.Pod("default", "filler", mother.OnNode("b"), mother.Requests("100m", "3Gi")),
+	}
+	s := cluster([]*corev1.Node{inPool("a", draining()...), inPool("b")}, pods)
+	s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = "some-uid@2026-08-17T12:00:00Z"
+
+	if got := engine.Revalidate(s, "a", config()); got.Verdict() != engine.VerdictInfeasible {
+		t.Errorf("got %q, want the drain stopped: its pods no longer fit", got.Verdict())
+	}
+}
+
+func TestEvictabilityIsStillReAskedAfterPodsHaveLeft(t *testing.T) {
+	// The other soundness question. A budget that stops allowing disruption
+	// mid-drain must stop the drain, however much work has been done — binpack
+	// must never be the thing that took an application below its declared
+	// availability, and no amount of sunk cost changes that.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web", mother.OnNode("a"),
+			mother.PodLabels(map[string]string{"app": "web"})),
+	}
+	s := cluster([]*corev1.Node{inPool("a", draining()...), inPool("b")}, pods)
+	s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = "some-uid@2026-08-17T12:00:00Z"
+	s.PDBs = []*policyv1.PodDisruptionBudget{
+		mother.PDB("default", "web", 0, map[string]string{"app": "web"}),
+	}
+
+	if got := engine.Revalidate(s, "a", config()); got.Verdict() != engine.VerdictBlocked {
+		t.Errorf("got %q, want the drain stopped: its pods cannot be evicted", got.Verdict())
+	}
+}
+
+func revalidationDetail(a engine.NodeAssessment) string {
+	if a.Simulation != nil && a.Simulation.Blocked != nil {
+		return a.Simulation.Blocked.Summary
+	}
+	return a.SkipReason
+}

@@ -366,7 +366,9 @@ func Decide(s Snapshot, cfg Config) Decision {
 
 	for i := range candidates {
 		a := candidates[i]
-		if drainable(s, a, cfg.PolicyFor(a.Group, a.Pool)) && chosen < 0 {
+		// Never committed: this is the decision, and nothing has been evicted
+		// on the strength of it yet.
+		if drainable(s, a, cfg.PolicyFor(a.Group, a.Pool), false) && chosen < 0 {
 			chosen = len(assessments)
 		}
 		assessments = append(assessments, *a)
@@ -396,22 +398,32 @@ func Decide(s Snapshot, cfg Config) Decision {
 // mid-drain revalidation asking the question differently is the failure that
 // matters here: binpack would cordon a node on one basis and evict its pods on
 // another, with nothing to reveal the disagreement.
-func drainable(s Snapshot, a *NodeAssessment, policy Policy) bool {
-	sim := Simulate(s.Nodes, s.Pods, s.Templates, a.Node, policy.Sim)
-	a.Simulation = &sim
-	if !sim.Feasible {
+func drainable(s Snapshot, a *NodeAssessment, policy Policy, committed bool) bool {
+	// Once pods have started leaving, only the questions whose answers make a
+	// drain *unsound* are re-asked. The rest are preferences about whether it
+	// was a good idea, and re-asking those after the work has begun does not
+	// undo the work — it abandons a half-drained node and leaves the cluster
+	// worse than either finishing or never starting. See ADR-0009.
+	sim := policy.Sim
+	if committed {
+		sim.ReserveForLargestPod = false
+	}
+
+	simulation := Simulate(s.Nodes, s.Pods, s.Templates, a.Node, sim)
+	a.Simulation = &simulation
+	if !simulation.Feasible {
 		return false
 	}
 
-	if policy.MaxPodsPerDrain > 0 && len(sim.Relocated) > policy.MaxPodsPerDrain {
+	if !committed && policy.MaxPodsPerDrain > 0 && len(simulation.Relocated) > policy.MaxPodsPerDrain {
 		a.Skipped = true
 		a.SkipCode = SkipTooManyPods
 		a.SkipReason = fmt.Sprintf("would relocate %d pods, above the limit of %d",
-			len(sim.Relocated), policy.MaxPodsPerDrain)
+			len(simulation.Relocated), policy.MaxPodsPerDrain)
 		return false
 	}
 
-	evicting := append(append([]*corev1.Pod{}, podsOf(sim.Relocated)...), sim.Evicted...)
+	evicting := append(append([]*corev1.Pod{}, podsOf(simulation.Relocated)...), simulation.Evicted...)
 	if blockers := CheckEvictable(evicting, s.PDBs, policy.Evict); len(blockers) > 0 {
 		a.Blockers = blockers
 		return false
@@ -469,7 +481,14 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 		return a
 	}
 
-	drainable(s, &a, cfg.PolicyFor(a.Group, a.Pool))
+	// Committed once the drain has evicted something, which the node records
+	// itself: the marker naming the replacement it is waiting for is written
+	// with the first eviction and cleared only when the drain ends. Read here
+	// rather than passed in, so a caller cannot disagree with the node about
+	// what has already happened.
+	committed := node.Annotations[AnnotationDrainAwaiting] != ""
+
+	drainable(s, &a, cfg.PolicyFor(a.Group, a.Pool), committed)
 	return a
 }
 
