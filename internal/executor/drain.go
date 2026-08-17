@@ -51,10 +51,18 @@ type Step struct {
 // evaluation, against the post-cordon pod set.
 func Begin(ctx context.Context, w Writer, node *corev1.Node, now time.Time) error {
 	stamp := now.UTC().Format(time.RFC3339)
-	if err := Annotate(ctx, w, node, map[string]string{
-		engine.AnnotationDrainStarted:  stamp,
-		engine.AnnotationDrainProgress: stamp,
-	}); err != nil {
+	if err := patchMeta(ctx, w, node,
+		// A label as well as the markers, because `kubectl get nodes` shows a
+		// cordoned node as SchedulingDisabled and says nothing about who did
+		// it — binpack, a human, or something else entirely. A label rather
+		// than a taint: taints are an array, so setting one means replacing
+		// the whole list, on a field the cluster-autoscaler is editing on
+		// these same nodes. A label is a map key and merge-patches cleanly.
+		map[string]string{engine.LabelDraining: "true"},
+		map[string]string{
+			engine.AnnotationDrainStarted:  stamp,
+			engine.AnnotationDrainProgress: stamp,
+		}); err != nil {
 		return fmt.Errorf("marking node %s: %w", node.Name, err)
 	}
 	return Cordon(ctx, w, node)
@@ -213,16 +221,18 @@ func Abandon(
 	// neither does. A node that forgot it was draining but never recorded the
 	// failure would be retried immediately, and it is now the emptiest
 	// candidate in the pool.
-	err := Annotate(ctx, w, node, map[string]string{
-		engine.AnnotationDrainStarted:       "",
-		engine.AnnotationDrainProgress:      "",
-		engine.AnnotationDrainPodsRemaining: "",
-		engine.AnnotationDrainAwaiting:      "",
+	err := patchMeta(ctx, w, node,
+		map[string]string{engine.LabelDraining: ""},
+		map[string]string{
+			engine.AnnotationDrainStarted:       "",
+			engine.AnnotationDrainProgress:      "",
+			engine.AnnotationDrainPodsRemaining: "",
+			engine.AnnotationDrainAwaiting:      "",
 
-		engine.AnnotationDrainAttempts: strconv.Itoa(attempts),
-		engine.AnnotationBackoffUntil:  until.UTC().Format(time.RFC3339),
-		engine.AnnotationLastFailure:   reason,
-	})
+			engine.AnnotationDrainAttempts: strconv.Itoa(attempts),
+			engine.AnnotationBackoffUntil:  until.UTC().Format(time.RFC3339),
+			engine.AnnotationLastFailure:   reason,
+		})
 	if err != nil {
 		return Step{}, fmt.Errorf("recording the failed drain on %s: %w", node.Name, err)
 	}

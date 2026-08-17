@@ -1,7 +1,7 @@
-# Annotations
+# Annotations and labels
 
-binpack reads one annotation you set, and writes six of its own. All are on **nodes**; it
-annotates no other kind of object.
+binpack reads one annotation you set, and writes six of its own, plus one label. All are on
+**nodes**; it annotates and labels no other kind of object.
 
 The keys are fixed rather than configurable: one thing to document, one thing to grep for, and
 no possibility of two clusters disagreeing about what protects a node.
@@ -87,8 +87,18 @@ mid-drain — the repair is to clear the markers and uncordon:
 
 ```bash
 kubectl annotate node NODE binpack.motleyhand.com/drain-started- binpack.motleyhand.com/drain-progress- binpack.motleyhand.com/drain-pods-remaining- binpack.motleyhand.com/drain-awaiting-
+```
+
+```bash
+kubectl label node NODE binpack.motleyhand.com/draining-
+```
+
+```bash
 kubectl uncordon NODE
 ```
+
+The label goes too. binpack never reads it, so nothing clears it for you — and a node still
+reporting `draining=true` after the drain has ended makes the label worth nothing.
 
 binpack itself repairs the commoner half of this: a node carrying `drain-started` that is *not*
 cordoned is one where the process stopped between the two writes, and the next evaluation
@@ -99,3 +109,27 @@ cordons it and re-checks rather than acting on a stale view.
 - [Metrics](metrics.md) — `binpack_nodes_in_backoff` and `binpack_drains_abandoned_total`
 - [Configuration](configuration.md) — `stallTimeout` and `removalTimeout`
 - [ADR-0007](../design/adr-0007-drain-progress-not-deadlines.md) — why progress, not deadlines
+
+## The label
+
+### `binpack.motleyhand.com/draining`
+
+Set to `"true"` on a node binpack is currently draining, and removed when that drain ends —
+in the same write as the markers, so a node is never labelled without them or the reverse.
+
+```bash
+kubectl get nodes -L binpack.motleyhand.com/draining
+```
+
+It exists because `kubectl get nodes` reports a cordoned node as `SchedulingDisabled` and says
+nothing about who cordoned it: binpack, a person, or something else. The annotations already
+answer that, but only under `kubectl describe`.
+
+A label rather than a taint, though a taint is what the cluster-autoscaler uses for its own
+equivalent markers. Taints are an array, so setting one means replacing the whole list — on a
+field the cluster-autoscaler is editing on these same nodes during a scale-down. Every other
+write binpack makes is a merge patch built from a bare object precisely so it can never clobber
+a concurrent change, and a label keeps that property because it is a map key.
+
+The label is a signal, not state. binpack never reads it, and nothing changes if you remove it
+by hand; the annotations are what a drain is recovered from.
