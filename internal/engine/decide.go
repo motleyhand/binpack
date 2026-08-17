@@ -734,18 +734,33 @@ func commonestSkip(assessments []NodeAssessment) (string, int) {
 
 // summarise turns a set of rejections into one sentence. "Nothing to do" is
 // not an answer; an operator wants to know which wall was hit.
+// Considered counts the nodes that were actually assessed as candidates,
+// which is fewer than the nodes looked at: those ruled out before any
+// simulation ran were never candidates.
+//
+// Exported because the log line and the prose have to agree. They used the
+// same word for two different counts — "4 nodes considered" beside a reason
+// reading "2 node(s) considered" — and of the two, the one that excludes
+// skipped nodes is the useful answer.
+func Considered(assessments []NodeAssessment) int {
+	n := 0
+	for _, a := range assessments {
+		if !a.Skipped {
+			n++
+		}
+	}
+	return n
+}
+
 func summarise(assessments []NodeAssessment) string {
-	var considered, infeasible, blocked int
+	considered := Considered(assessments)
+	var infeasible, blocked int
 	for _, a := range assessments {
 		switch {
 		case a.Blockers != nil:
 			blocked++
-			considered++
 		case a.Simulation != nil && !a.Simulation.Feasible:
 			infeasible++
-			considered++
-		case !a.Skipped:
-			considered++
 		}
 	}
 
