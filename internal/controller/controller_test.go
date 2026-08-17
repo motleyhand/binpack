@@ -456,19 +456,14 @@ func TestOnceCarriesItsFailurePastTheManager(t *testing.T) {
 	}
 }
 
-func TestRunRefusesToPretendItCanAct(t *testing.T) {
-	// Someone who sets dryRun: false has decided binpack should act. Running
-	// anyway and logging "would drain" would leave them believing it is acting
-	// for as long as it takes them to check a node.
+func TestActingIsOptInButPermitted(t *testing.T) {
+	// dryRun: false used to be refused outright, because there was no executor
+	// behind it. Now it is the mode an operator chooses, so the refusal must
+	// be gone — and the default must still be the one that changes nothing.
 	err := Run(context.Background(), Options{DryRun: false})
 
-	if err == nil {
-		t.Fatal("dryRun: false was accepted by a build with no executor")
-	}
-	for _, want := range []string{"dryRun", "not implemented"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error does not mention %q: %v", want, err)
-		}
+	if err != nil && strings.Contains(err.Error(), "not implemented") {
+		t.Errorf("dryRun: false is still refused: %v", err)
 	}
 }
 

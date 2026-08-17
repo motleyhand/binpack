@@ -74,6 +74,7 @@ add. If those fixes solve it, you might not need this.
 | [Annotations](docs/reference/annotations.md) | The one you set, the six binpack writes, and how to read a drain in flight |
 | [Helm chart](charts/binpack) | Values, RBAC, and what each permission is for |
 | [RBAC](docs/reference/rbac.md) | Every permission binpack needs, and what it is deliberately never granted |
+| [Let binpack drain nodes](docs/how-to/let-binpack-drain-nodes.md) | Turning off dry run: what to read first, and what it can then do |
 | [Fix a silently broken Metrics API](docs/how-to/fix-metrics-api-on-managed-kubernetes.md) | When `kubectl top` returns nothing and your HPAs are quietly inert |
 
 ### Design

@@ -82,6 +82,29 @@ jobs:
             --set leaderElection.enabled=false \
             --set serviceAccount.create=false
 
+      # A chart that installs cleanly and then cannot work is the failure worth
+      # catching at render time: binpack would hold its lease, serve its
+      # metrics, and be refused by RBAC on every eviction. Asserted in both
+      # directions, since a guard that always fails is as wrong as one that
+      # never does.
+      - name: Acting without the permissions to act is refused
+        run: |
+          set +e
+          for args in "--set config.dryRun=false" \
+                      "--set config.dryRun=false --set rbac.create=false"; do
+            out=$(helm template binpack charts/binpack --namespace binpack-system $args 2>&1)
+            if [ $? -eq 0 ]; then
+              echo "rendered with $args, which would install a binpack that cannot act"; exit 1
+            fi
+            case "$out" in
+              *dryRun*) ;;
+              *) echo "refused $args without explaining why:"; echo "$out"; exit 1 ;;
+            esac
+          done
+          set -e
+          helm template binpack charts/binpack --namespace binpack-system \
+            --set config.dryRun=false --set rbac.allowDraining=true > /dev/null
+
       # podLabels is exposed for arbitrary additions, so it can name a
       # selector label. Appending it would produce either a duplicate YAML key
       # or a Deployment whose selector no longer matches its own template, and

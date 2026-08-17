@@ -12,9 +12,17 @@ to binpack's logs at all:
 
   kubectl describe node <node> | sed -n '/^Events:/,$p'
 {{- else -}}
-It is configured to ACT (dryRun: false). This build cannot: it refuses to start
-rather than reporting decisions nobody carries out, so expect a crash loop until
-you set config.dryRun=true.
+It is configured to ACT (dryRun: false). It will cordon nodes, evict pods
+through the eviction API, and annotate nodes with drain state. It deletes
+nothing — the cluster-autoscaler removes the emptied node.
+
+Watch what it does:
+
+  kubectl get events --field-selector reason=Draining -A --sort-by=.lastTimestamp
+
+Set config.dryRun=true to go back to deciding without acting. A drain already in
+progress is then left exactly as it is, cordoned and marked, rather than being
+advanced or undone.
 {{- end }}
 
 Before trusting it, ask what is stopping this cluster shrinking today:

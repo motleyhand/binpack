@@ -47,8 +47,10 @@ type Options struct {
 	// Interval is how often the cluster is evaluated.
 	Interval time.Duration
 
-	// DryRun decides everything and changes nothing. The default, and the
-	// only mode this build implements — the executor is a later step.
+	// DryRun decides everything and changes nothing: no cordon, no eviction,
+	// no annotation. The default, and the mode to run first — the decisions
+	// are identical either way, so a week of events on nodes tells you what
+	// binpack would have done before it does any of it.
 	DryRun bool
 
 	// Once evaluates a single time and exits, for running binpack as a
@@ -66,16 +68,6 @@ type Options struct {
 // Run starts binpack and blocks until ctx is cancelled, or until one
 // evaluation completes when Options.Once is set.
 func Run(ctx context.Context, opts Options) error {
-	// Refused rather than quietly degraded. Someone who sets dryRun: false has
-	// decided binpack should act; running anyway and only logging "would
-	// drain" would leave them believing it is acting for as long as it takes
-	// them to check a node.
-	if !opts.DryRun {
-		return fmt.Errorf(
-			"dryRun is false, but this build cannot act on a decision: the executor is not " +
-				"implemented yet. Set dryRun: true to run binpack as a reporter")
-	}
-
 	mgr, err := manager.New(opts.RestConfig, managerOptions(opts))
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
