@@ -235,7 +235,10 @@ const (
 	SkipDrainInProgress      = "drain-in-progress"
 	// SkipGone: the node is no longer in the cluster, which for a drain in
 	// progress is success rather than a skip.
-	SkipGone         = "gone"
+	SkipGone = "gone"
+	// SkipUncordoned: a drain is marked on the node but the node is
+	// schedulable, so it is still accepting pods.
+	SkipUncordoned   = "uncordoned"
 	SkipBackoff      = "backoff"
 	SkipCordoned     = "cordoned"
 	SkipProtectedPod = "protected-pod"
@@ -571,6 +574,20 @@ func eligibility(
 
 	case backoffActive(node, s.Now):
 		a.Skipped, a.SkipCode, a.SkipReason = true, SkipBackoff, backoffReason(node)
+
+	case resuming && !node.Spec.Unschedulable:
+		// Marked but schedulable: either the controller stopped between
+		// writing the marker and cordoning, or someone uncordoned a drain in
+		// flight. Either way the node is still accepting pods, which is the
+		// race the cordon exists to close — evicting from it could relocate
+		// work whose fit and PDB demand were never assessed.
+		//
+		// Refused rather than tolerated, because a pure function cannot fix
+		// it. The caller's move is to cordon and let the next evaluation
+		// revalidate against a fresh snapshot; proceeding on this one would
+		// be reasoning about a node whose pod set can still grow.
+		a.Skipped, a.SkipCode = true, SkipUncordoned
+		a.SkipReason = "a drain is marked on this node but it is not cordoned, so it is still accepting pods"
 
 	case !resuming && node.Spec.Unschedulable:
 		// Already cordoned by someone else. Draining it would not be

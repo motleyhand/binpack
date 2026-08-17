@@ -135,6 +135,26 @@ func TestRevalidateStopsADrainTheClusterHasOvertaken(t *testing.T) {
 	}
 }
 
+func TestRevalidateRefusesAMarkedNodeThatIsNotCordoned(t *testing.T) {
+	// The controller stopping between writing the marker and cordoning, or
+	// somebody uncordoning a drain in flight. The node is accepting pods
+	// again, so anything evicted from it could be relocating work whose fit
+	// and PDB demand were never assessed — the race the cordon closes.
+	s := cluster([]*corev1.Node{
+		inPool("a", mother.NodeAnnotations(map[string]string{
+			engine.AnnotationDrainStarted: now.Add(-5 * time.Minute).Format(time.RFC3339),
+		})),
+		inPool("b"), inPool("c"),
+	}, nil)
+
+	got := engine.Revalidate(s, "a", config())
+
+	if !got.Skipped || got.SkipCode != engine.SkipUncordoned {
+		t.Errorf("got skipped=%v code=%q (%s), want %q",
+			got.Skipped, got.SkipCode, got.SkipReason, engine.SkipUncordoned)
+	}
+}
+
 func TestRevalidateTreatsAMissingNodeAsGone(t *testing.T) {
 	// The autoscaler removing the node is what a drain is working towards, so
 	// finding it absent is success arriving early rather than an error.
