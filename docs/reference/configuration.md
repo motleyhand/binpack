@@ -85,7 +85,18 @@ short interval is not expensive. One node is drained per evaluation regardless.
 reached, and they are reported through logs, Kubernetes Events and metrics without any node
 being touched.
 
-Defaults to `true`. A tool that drains nodes should be opted into acting.
+`false` lets it act: cordon a node, annotate it, uncordon it, and evict a pod through the
+eviction API. Those four, and nothing else — binpack deletes no object, and the emptied node is
+removed by the cluster-autoscaler.
+
+Defaults to `true`. A tool that drains nodes should be opted into acting. The Helm chart also
+requires `rbac.allowDraining: true` alongside `dryRun: false`, and refuses the install rather
+than letting binpack decide to drain and then be refused by RBAC on every attempt.
+
+Switching back to `true` while a drain is in progress leaves that drain exactly as it is —
+cordoned and marked, neither advanced nor undone. Uncordoning would itself be a change, which is
+the one thing dry run promises not to make. See
+[Let binpack drain nodes](../how-to/let-binpack-drain-nodes.md).
 
 ### `discovery.nodeGroupIDLabel`
 

@@ -27,9 +27,12 @@ func newRunCommand(opts *options) *cobra.Command {
 		Use:   "run",
 		Short: "Run binpack as a controller",
 		Long: "Evaluates the cluster on an interval and reports what binpack would do.\n\n" +
-			"This build is dry-run only: it decides and reports, and changes nothing. Running\n" +
-			"with dryRun: false is refused rather than quietly ignored, so nobody is left\n" +
-			"believing binpack is acting when it cannot.\n\n" +
+			"Defaults to dry run, which decides everything and changes nothing. The decisions\n" +
+			"are identical either way, so running it that way first tells you exactly what it\n" +
+			"would have done — set dryRun: false when you are content with the answers.\n\n" +
+			"Acting means four changes and no others: cordon a node, annotate it, uncordon it,\n" +
+			"and evict a pod through the eviction API so disruption budgets are respected.\n" +
+			"binpack deletes nothing; the cluster-autoscaler removes the emptied node.\n\n" +
 			"Decisions surface as Kubernetes Events on the node as well as in the log, because\n" +
 			"on a managed control plane `kubectl describe node` is the one place a cluster user\n" +
 			"can reliably look — the same way the cluster-autoscaler's own decisions surface.\n\n" +

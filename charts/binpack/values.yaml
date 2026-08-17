@@ -32,9 +32,14 @@ rbac:
   # The ClusterRole, the kube-system Role for the autoscaler's status, and the
   # bindings. Turn off only if you manage RBAC separately.
   create: true
-  # Grant the verbs the executor will need. Nothing in this build uses them,
-  # and granting a permission before the code that needs it is how a role
-  # outlives its justification.
+  # Grant the verbs binpack needs to act: patching nodes, and creating pod
+  # evictions. Required when config.dryRun is false, and refused by the chart
+  # if you set one without the other — that combination installs cleanly and
+  # then fails on every attempt, which is a worse way to find out.
+  #
+  # Left off by default so an install can only ever report until somebody
+  # decides otherwise, and so the permission and the intent are granted in the
+  # same change.
   allowDraining: false
 
 serviceAccount:

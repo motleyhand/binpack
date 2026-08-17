@@ -17,6 +17,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/events"
@@ -47,8 +48,10 @@ type Options struct {
 	// Interval is how often the cluster is evaluated.
 	Interval time.Duration
 
-	// DryRun decides everything and changes nothing. The default, and the
-	// only mode this build implements — the executor is a later step.
+	// DryRun decides everything and changes nothing: no cordon, no eviction,
+	// no annotation. The default, and the mode to run first — the decisions
+	// are identical either way, so a week of events on nodes tells you what
+	// binpack would have done before it does any of it.
 	DryRun bool
 
 	// Once evaluates a single time and exits, for running binpack as a
@@ -66,16 +69,6 @@ type Options struct {
 // Run starts binpack and blocks until ctx is cancelled, or until one
 // evaluation completes when Options.Once is set.
 func Run(ctx context.Context, opts Options) error {
-	// Refused rather than quietly degraded. Someone who sets dryRun: false has
-	// decided binpack should act; running anyway and only logging "would
-	// drain" would leave them believing it is acting for as long as it takes
-	// them to check a node.
-	if !opts.DryRun {
-		return fmt.Errorf(
-			"dryRun is false, but this build cannot act on a decision: the executor is not " +
-				"implemented yet. Set dryRun: true to run binpack as a reporter")
-	}
-
 	mgr, err := manager.New(opts.RestConfig, managerOptions(opts))
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
@@ -479,13 +472,38 @@ func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string)
 	case step.Failed:
 		metrics.DrainAbandoned(step.Code)
 		e.log.Info("drain abandoned", "node", name, "code", step.Code, "reason", step.Reason)
+		e.emitDrainEnded(ctx, name, ReasonDrainAbandoned,
+			fmt.Sprintf("binpack stopped draining this node: %s. It has been uncordoned",
+				step.Reason))
 	case step.Done:
 		metrics.DrainCompleted()
 		e.log.Info("drain complete", "node", name, "reason", step.Reason)
+		e.emitDrainEnded(ctx, name, ReasonDrained,
+			"binpack finished draining this node and the cluster-autoscaler removed it")
 	default:
+		// Intermediate steps stay in the log. One eviction per evaluation
+		// would otherwise put an event on the node for every pod, and the
+		// events worth reading are how the drain started and how it ended.
 		e.log.Info("drain advanced", "node", name, "step", step.Code, "reason", step.Reason)
 	}
 	return nil
+}
+
+// emitDrainEnded records how a drain finished on the node it happened to.
+//
+// Built from the name rather than taken from the snapshot, because the
+// successful case is exactly the one where the node is already gone — and that
+// event is still worth writing. It outlives the object, which is the point: it
+// is the record that the node binpack drained is the node that disappeared.
+//
+// Logged rather than returned on failure. The drain itself has already
+// happened; losing the note about it is not a reason to fail an evaluation
+// that will not be repeated.
+func (e *evaluator) emitDrainEnded(ctx context.Context, name, reason, note string) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if err := e.reporter.emit(ctx, node, reason, ActionConsolidate, note); err != nil {
+		e.log.Error(err, "could not record how the drain ended", "node", name)
+	}
 }
 
 // drainPolicy resolves the drain bounds for the pool the node belongs to.

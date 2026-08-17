@@ -144,6 +144,52 @@ func withDrainBounds(c engine.Config) engine.Config {
 	return c
 }
 
+func TestTheEventSaysWhichModeBinpackIsIn(t *testing.T) {
+	// The event is the one surface a cluster user reliably has on a managed
+	// control plane. One saying "No action taken — dry run" while pods are
+	// being evicted is worse than no event at all: it tells them the opposite
+	// of what is happening.
+	for _, tc := range []struct {
+		name     string
+		dryRun   bool
+		reason   string
+		mentions string
+		forbids  string
+	}{
+		{"deciding only", true, ReasonWouldDrain, "dry run", "is draining"},
+		{"acting", false, ReasonDraining, "is draining", "No action taken"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var log captured
+			rec := &fakeRecorder{}
+			ev := newEvaluator(t, &log, rec,
+				inPool("a"), inPool("b"), inPool("c"),
+				mother.Pod("default", "web", mother.OnNode("a")),
+				statusConfigMap(),
+			)
+			ev.opts.DryRun = tc.dryRun
+
+			if err := ev.evaluate(context.Background()); err != nil {
+				t.Fatalf("evaluate: %v", err)
+			}
+			if len(rec.events) == 0 {
+				t.Fatal("no event was recorded for the chosen node")
+			}
+
+			got := rec.events[0]
+			if got.reason != tc.reason {
+				t.Errorf("reason = %s, want %s", got.reason, tc.reason)
+			}
+			if !strings.Contains(got.note, tc.mentions) {
+				t.Errorf("note does not mention %q: %s", tc.mentions, got.note)
+			}
+			if strings.Contains(got.note, tc.forbids) {
+				t.Errorf("note claims %q while in the other mode: %s", tc.forbids, got.note)
+			}
+		})
+	}
+}
+
 func TestEvaluateEmitsAnEventOnTheNodeItWouldDrain(t *testing.T) {
 	// The event is the point: on a managed control plane, `kubectl describe
 	// node` is the one surface a cluster user reliably has, and binpack's own
@@ -312,6 +358,49 @@ func TestACompletedDrainIsCounted(t *testing.T) {
 	if ev.active != "" {
 		t.Errorf("the finished drain is still remembered as %q", ev.active)
 	}
+
+	// And it says so where somebody will find it. The event outlives the node,
+	// which is the point: it is the record that the node binpack drained is
+	// the node that disappeared.
+	if !recorded(rec, ReasonDrained) {
+		t.Errorf("no %s event was written; the only record is a log line and a counter",
+			ReasonDrained)
+	}
+}
+
+func TestAnAbandonedDrainSaysSoOnTheNode(t *testing.T) {
+	// The sentence explaining what stopped it is the whole value here, and a
+	// log line is the one place a cluster user on a managed control plane
+	// cannot reach.
+	var log captured
+	rec := &fakeRecorder{}
+	// A drain marked long ago with no progress since: stalled, so the first
+	// evaluation that picks it up abandons it.
+	stalled := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted:  time.Now().Add(-time.Hour).Format(time.RFC3339),
+		engine.AnnotationDrainProgress: time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, stalled,
+		mother.Pod("default", "stuck", mother.OnNode("a")),
+		inPool("b"), inPool("c"), statusConfigMap())
+	ev.opts.DryRun = false
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if !recorded(rec, ReasonDrainAbandoned) {
+		t.Errorf("no %s event was written for a drain that gave up", ReasonDrainAbandoned)
+	}
+}
+
+func recorded(rec *fakeRecorder, reason string) bool {
+	for _, e := range rec.events {
+		if e.reason == reason {
+			return true
+		}
+	}
+	return false
 }
 
 func TestAMarkerClearedBySomebodyElseIsNotBinpacksDrain(t *testing.T) {
@@ -456,19 +545,14 @@ func TestOnceCarriesItsFailurePastTheManager(t *testing.T) {
 	}
 }
 
-func TestRunRefusesToPretendItCanAct(t *testing.T) {
-	// Someone who sets dryRun: false has decided binpack should act. Running
-	// anyway and logging "would drain" would leave them believing it is acting
-	// for as long as it takes them to check a node.
+func TestActingIsOptInButPermitted(t *testing.T) {
+	// dryRun: false used to be refused outright, because there was no executor
+	// behind it. Now it is the mode an operator chooses, so the refusal must
+	// be gone — and the default must still be the one that changes nothing.
 	err := Run(context.Background(), Options{DryRun: false})
 
-	if err == nil {
-		t.Fatal("dryRun: false was accepted by a build with no executor")
-	}
-	for _, want := range []string{"dryRun", "not implemented"} {
-		if !strings.Contains(err.Error(), want) {
-			t.Errorf("error does not mention %q: %v", want, err)
-		}
+	if err != nil && strings.Contains(err.Error(), "not implemented") {
+		t.Errorf("dryRun: false is still refused: %v", err)
 	}
 }
 
