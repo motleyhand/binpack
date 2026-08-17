@@ -9,6 +9,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -26,7 +27,9 @@ import (
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
 
 	"github.com/motleyhand/binpack/internal/collect"
+	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
+	"github.com/motleyhand/binpack/internal/executor"
 	"github.com/motleyhand/binpack/internal/metrics"
 )
 
@@ -99,6 +102,7 @@ func Run(ctx context.Context, opts Options) error {
 
 	ev := &evaluator{
 		reader:   mgr.GetClient(),
+		writer:   mgr.GetClient(),
 		reporter: reporterFor(opts, mgr),
 		opts:     opts,
 		log:      opts.Log,
@@ -261,6 +265,7 @@ func reporterForClient(opts Options, writer client.Writer, recorder events.Event
 // evaluator is the periodic decision loop.
 type evaluator struct {
 	reader   collect.Reader
+	writer   executor.Writer
 	reporter reporter
 	opts     Options
 	log      logr.Logger
@@ -339,6 +344,18 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 		return err
 	}
 
+	// Step 0 of the drain protocol: resume before deciding.
+	//
+	// A drain can legitimately outlast many intervals, and without this every
+	// one of those intervals would be free to select a second node. "One node
+	// per run" quietly assumed a run was short.
+	if node := draining(snapshot); node != "" {
+		metrics.Observe(snapshot, engine.Decision{Code: engine.CodeDraining,
+			Reason: "a drain is in progress on " + node}, e.opts.Engine,
+			time.Since(started).Seconds())
+		return e.advance(ctx, snapshot, node)
+	}
+
 	decision := engine.Decide(snapshot, e.opts.Engine)
 	metrics.Observe(snapshot, decision, e.opts.Engine, time.Since(started).Seconds())
 
@@ -355,7 +372,90 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 		// surface, a crash loop would take the logs away too.
 		e.log.Error(err, "could not record the decision on the node")
 	}
+
+	if decision.Action != engine.Drain || e.opts.DryRun {
+		return nil
+	}
+
+	// Marked and cordoned, and nothing evicted. Until the node is
+	// unschedulable its pod set can still grow, so what leaves it is the next
+	// evaluation's decision, against the post-cordon set.
+	e.log.Info("draining node", "node", decision.Node.Name)
+	if err := executor.Begin(ctx, e.writer, decision.Node, snapshot.Now); err != nil {
+		return fmt.Errorf("starting the drain of %s: %w", decision.Node.Name, err)
+	}
+	metrics.DrainStarted()
 	return nil
+}
+
+// draining names the node binpack is part-way through draining, if any.
+//
+// Sorted, so two markers left by some earlier confusion produce the same
+// answer every evaluation rather than whichever the cache listed first. One
+// drain at a time is the invariant; picking deterministically means the second
+// marker is resolved rather than alternated with.
+func draining(s engine.Snapshot) string {
+	var names []string
+	for _, node := range s.Nodes {
+		if node.Annotations[engine.AnnotationDrainStarted] != "" {
+			names = append(names, node.Name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+// advance moves an in-progress drain on by one step.
+func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string) error {
+	if e.opts.DryRun {
+		// Reachable: dryRun can be switched on while a drain is running. The
+		// node is cordoned and binpack has been told to change nothing, which
+		// leaves saying so as the only honest option — the alternative is
+		// uncordoning, and that is a change.
+		e.log.Info("a drain is in progress but dryRun is set; leaving it alone", "node", name)
+		return nil
+	}
+
+	step, err := executor.Advance(ctx, e.writer, s, name, e.opts.Engine, e.drainPolicy(name, s))
+	if err != nil {
+		return fmt.Errorf("advancing the drain of %s: %w", name, err)
+	}
+
+	switch {
+	case step.Failed:
+		metrics.DrainAbandoned(step.Code)
+		e.log.Info("drain abandoned", "node", name, "code", step.Code, "reason", step.Reason)
+	case step.Done:
+		metrics.DrainCompleted()
+		e.log.Info("drain complete", "node", name, "reason", step.Reason)
+	default:
+		e.log.Info("drain advanced", "node", name, "step", step.Code, "reason", step.Reason)
+	}
+	return nil
+}
+
+// drainPolicy resolves the drain bounds for the pool the node belongs to.
+//
+// Per pool rather than global, because everything else about a policy is: a
+// pool of batch workers with hour-long shutdowns and a pool of web replicas
+// have no business sharing a stall timeout.
+func (e *evaluator) drainPolicy(name string, s engine.Snapshot) drain.Policy {
+	for _, node := range s.Nodes {
+		if node.Name != name {
+			continue
+		}
+		p := e.opts.Engine.PolicyFor(
+			node.Labels[e.opts.Engine.NodeGroupIDLabel],
+			node.Labels[e.opts.Engine.PoolNameLabel])
+		return drain.Policy{StallTimeout: p.StallTimeout, RemovalTimeout: p.RemovalTimeout}
+	}
+	return drain.Policy{
+		StallTimeout:   e.opts.Engine.Default.StallTimeout,
+		RemovalTimeout: e.opts.Engine.Default.RemovalTimeout,
+	}
 }
 
 var _ manager.LeaderElectionRunnable = (*evaluator)(nil)

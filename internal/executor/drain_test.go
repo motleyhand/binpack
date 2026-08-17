@@ -463,7 +463,7 @@ func TestAReplacementTheSchedulerRefusedEndsTheDrain(t *testing.T) {
 		t.Fatalf("Advance: %v", err)
 	}
 
-	if step.Code != executor.StepUnschedulable || !step.Failed {
+	if step.Code != drain.AbandonUnschedulable || !step.Failed {
 		t.Errorf("expected the drain abandoned, got %+v", step)
 	}
 	if !strings.Contains(step.Reason, "default/orphan") {
@@ -494,7 +494,7 @@ func TestOneRefusedReplacementEndsTheDrainWhateverItsSiblingsDid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Advance: %v", err)
 	}
-	if step.Code != executor.StepUnschedulable {
+	if step.Code != drain.AbandonUnschedulable {
 		t.Errorf("expected the drain abandoned, got %+v", step)
 	}
 	if !strings.Contains(step.Reason, "default/refused") {

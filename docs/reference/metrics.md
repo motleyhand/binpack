@@ -71,6 +71,7 @@ alerts rather than being folded into this one:
 | `no-autoscaler` | No live cluster-autoscaler; binpack will not act |
 | `no-candidates` | Every node was ruled out before any simulation ran |
 | `none-feasible` | Nodes were simulated and none could be emptied |
+| `draining` | A drain was already under way, so this evaluation advanced it rather than deciding afresh |
 
 The last two are worth telling apart: `no-candidates` is a configuration answer, `none-feasible`
 is a capacity one.
@@ -107,6 +108,38 @@ reporting" must not look the same.
 
 These are the same codes `binpack explain --output json` reports per node, so a dashboard and an
 investigation use one vocabulary.
+
+### Drains
+
+| Metric | Type | Labels | Meaning |
+|---|---|---|---|
+| `binpack_drains_started_total` | counter | — | Drains begun, by marking and cordoning a node |
+| `binpack_drains_completed_total` | counter | — | Drains that ended with the autoscaler removing the node |
+| `binpack_drains_abandoned_total` | counter | `reason` | Drains handed back by uncordoning, by reason code |
+| `binpack_nodes_in_backoff` | gauge | — | Nodes excluded because a drain of them recently failed |
+| `binpack_drain_attempts_max` | gauge | — | The highest consecutive failed-drain count on any node |
+
+`reason` is one of:
+
+| Code | Meaning |
+|---|---|
+| `stuck` | A pod is past its termination deadline — a finalizer, a volume that will not detach, or an unhealthy kubelet |
+| `stalled` | Nothing moved for `stallTimeout`, and nothing was shutting down |
+| `not-removed` | The node was emptied but the autoscaler did not remove it within `removalTimeout` |
+| `replacement-unschedulable` | A pod that moved off the node could not be placed anywhere |
+| `unaccounted-pods` | Pods remained that the simulation had not accounted for |
+
+Any of the skip codes above can also appear, when the cluster changed underneath a drain and
+revalidation stopped it — a scale-up beginning, a pool reaching its minimum, an operator
+annotating the node.
+
+A rising `binpack_drains_abandoned_total` is worth attention whatever the reason: every
+abandoned drain is churn that bought nothing. `binpack_drain_attempts_max` climbing means the
+same node keeps failing, and the backoff behind it doubles from 30 minutes to a daily retry.
+
+Deliberately no node label on either gauge. Node names would carry into the monitoring system,
+which the rest of this surface avoids, and the question worth alerting on — is binpack failing
+repeatedly — is answered without them. `binpack diagnose` names the node.
 
 ### Pools
 

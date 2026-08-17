@@ -87,8 +87,9 @@ func config() engine.Config {
 	}
 }
 
-func inPool(name string) *corev1.Node {
-	return mother.LargeNode(name, mother.InPool(poolName, poolID))
+func inPool(name string, opts ...mother.NodeOption) *corev1.Node {
+	return mother.LargeNode(name, append([]mother.NodeOption{
+		mother.InPool(poolName, poolID)}, opts...)...)
 }
 
 func statusConfigMap() client.Object {
@@ -121,8 +122,10 @@ nodeGroups:
 
 func newEvaluator(t *testing.T, log *captured, rec *fakeRecorder, objs ...client.Object) *evaluator {
 	t.Helper()
+	c := fake.NewClientBuilder().WithObjects(objs...).Build()
 	return &evaluator{
-		reader:   fake.NewClientBuilder().WithObjects(objs...).Build(),
+		reader:   c,
+		writer:   c,
 		reporter: broadcastReporter{recorder: rec},
 		opts:     Options{Engine: config(), DryRun: true, Interval: time.Minute, Once: true},
 		log:      log.logger(),
@@ -191,6 +194,101 @@ func TestEvaluateSaysSomethingWhenThereIsNothingToDo(t *testing.T) {
 	}
 	if !log.contains("nothing to do") {
 		t.Errorf("said nothing at all:\n%s", strings.Join(log.lines, "\n"))
+	}
+}
+
+func TestDryRunChangesNothingAtAll(t *testing.T) {
+	// The guarantee the whole 0.1 line is sold on, asserted rather than
+	// argued. It decides everything and writes nothing: no cordon, no marker,
+	// nothing but an event saying what it would have done.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		inPool("a"), inPool("b"), inPool("c"),
+		mother.Pod("default", "web", mother.OnNode("a")),
+		statusConfigMap(),
+	)
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	var nodes corev1.NodeList
+	if err := ev.reader.(client.Client).List(context.Background(), &nodes); err != nil {
+		t.Fatalf("listing nodes: %v", err)
+	}
+	for _, n := range nodes.Items {
+		if n.Spec.Unschedulable {
+			t.Errorf("node %s was cordoned in dry run", n.Name)
+		}
+		for key := range n.Annotations {
+			if strings.HasPrefix(key, "binpack.motleyhand.com/") {
+				t.Errorf("node %s was annotated %s in dry run", n.Name, key)
+			}
+		}
+	}
+	// And it did decide: an assertion that nothing happened is satisfied by a
+	// controller that did nothing at all.
+	if len(rec.events) != 1 {
+		t.Errorf("got %d events, want one saying what it would have done", len(rec.events))
+	}
+}
+
+func TestADrainInProgressPreemptsANewDecision(t *testing.T) {
+	// Step 0 of the protocol. A drain can legitimately outlast many intervals,
+	// and without this every one of those intervals would be free to cordon a
+	// second node — "one node per run" quietly assumed a run was short.
+	var log captured
+	rec := &fakeRecorder{}
+	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted: time.Now().Add(-time.Minute).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, draining, inPool("b"), inPool("c"), statusConfigMap())
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if len(rec.events) != 0 {
+		t.Errorf("a new decision was reported while a drain was running: %+v", rec.events)
+	}
+	for _, name := range []string{"b", "c"} {
+		var n corev1.Node
+		if err := ev.reader.(client.Client).Get(
+			context.Background(), client.ObjectKey{Name: name}, &n); err != nil {
+			t.Fatalf("reading node %s: %v", name, err)
+		}
+		if n.Spec.Unschedulable {
+			t.Errorf("node %s was cordoned while a drain was already in progress", name)
+		}
+	}
+}
+
+func TestDryRunLeavesADrainInProgressAlone(t *testing.T) {
+	// Reachable: dryRun can be switched on while a drain is running. The node
+	// is cordoned and binpack has been told to change nothing, and uncordoning
+	// would itself be a change — so saying so is the only honest option.
+	var log captured
+	rec := &fakeRecorder{}
+	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted: time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, draining, inPool("b"), statusConfigMap())
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	var n corev1.Node
+	if err := ev.reader.(client.Client).Get(
+		context.Background(), client.ObjectKey{Name: "a"}, &n); err != nil {
+		t.Fatalf("reading node a: %v", err)
+	}
+	if !n.Spec.Unschedulable || n.Annotations[engine.AnnotationDrainStarted] == "" {
+		t.Error("dry run changed the node it was told to leave alone")
+	}
+	if !log.contains("dryRun") {
+		t.Error("nothing in the log says why the drain is not moving")
 	}
 }
 

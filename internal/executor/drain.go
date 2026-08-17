@@ -22,12 +22,6 @@ const (
 	StepWaiting      = "waiting"
 	StepAwaitRemoval = "awaiting-removal"
 	StepRemoved      = "removed"
-
-	// StepUnschedulable: a pod that moved off this node could not be placed.
-	// The simulation proved a valid assignment existed; the scheduler is not
-	// obliged to choose that one, and this is what it looks like when it
-	// chose differently.
-	StepUnschedulable = "replacement-unschedulable"
 )
 
 // Step is what one evaluation did to a drain.
@@ -120,7 +114,7 @@ func Advance(
 			// Unschedulable — so this is detected rather than inferred from a
 			// timeout, and it names the pod. Uncordoning is also the repair:
 			// this node is where that pod can go.
-			return Abandon(ctx, w, a.Node, StepUnschedulable, fmt.Sprintf(
+			return Abandon(ctx, w, a.Node, drain.AbandonUnschedulable, fmt.Sprintf(
 				"pod %s/%s could not be scheduled after moving off this node",
 				pod.Namespace, pod.Name), s.Now)
 
@@ -167,7 +161,7 @@ func Advance(
 		// Pods remain that the simulation did not name. Rather than guess at
 		// them, hand the node back: acting on a set binpack cannot account for
 		// is exactly what the allowlist exists to prevent.
-		return Abandon(ctx, w, a.Node, "unaccounted-pods", fmt.Sprintf(
+		return Abandon(ctx, w, a.Node, drain.AbandonUnaccounted, fmt.Sprintf(
 			"%d pods remain that the simulation did not account for", len(pods)), s.Now)
 	}
 

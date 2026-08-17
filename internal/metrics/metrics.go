@@ -11,11 +11,14 @@
 package metrics
 
 import (
+	"strconv"
 	"sync/atomic"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
@@ -127,6 +130,40 @@ var (
 			"needs the nodes it has, and no amount of consolidation will change that.",
 	})
 
+	// Drain outcomes. Counters rather than gauges, and ungated: they are
+	// cumulative, meaningful from zero, and only the leader ever increments
+	// them, so a standby serving zeroes is telling the truth.
+	drainsStarted = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "binpack_drains_started_total",
+		Help: "Drains binpack began, by marking and cordoning a node.",
+	})
+
+	drainsCompleted = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: "binpack_drains_completed_total",
+		Help: "Drains that ended with the cluster-autoscaler removing the node.",
+	})
+
+	drainsAbandoned = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: "binpack_drains_abandoned_total",
+		Help: "Drains handed back by uncordoning the node, by reason code. " +
+			"Alert on a rising rate: every one of these is churn that bought nothing.",
+	}, []string{"reason"})
+
+	// Backoff depth, not backoff per node. A node label would carry names into
+	// the monitoring system, which this package deliberately does not do — and
+	// the question worth alerting on is whether binpack is failing repeatedly,
+	// which these answer without naming anything.
+	nodesInBackoff = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "binpack_nodes_in_backoff",
+		Help: "Nodes excluded from consideration because a drain of them recently failed.",
+	})
+
+	drainAttemptsMax = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: "binpack_drain_attempts_max",
+		Help: "The highest consecutive failed-drain count recorded on any node. " +
+			"A cluster where this climbs is one where binpack cannot do its job.",
+	})
+
 	poolNodes = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "binpack_pool_nodes",
 		Help: "Nodes registered and ready in each autoscaling pool, as the " +
@@ -152,12 +189,30 @@ var (
 // counter absent from a scrape is harder to reason about than one at zero.
 var state = newGated(
 	lastEvaluation, autoscalerUp, nodes, skipped, drainable, unmodelled,
-	poolNodes, poolMin, poolMax,
+	poolNodes, poolMin, poolMax, nodesInBackoff, drainAttemptsMax,
 )
 
 func init() {
-	metrics.Registry.MustRegister(evaluations, evaluationErrors, evaluationDuration, state)
+	// Every abandon reason gets a zero series up front. A counter that only
+	// appears once it has fired makes rate() alerts silently useless until the
+	// first occurrence — which is exactly the moment somebody needed them.
+	for _, code := range drain.AbandonCodes() {
+		drainsAbandoned.WithLabelValues(code)
+	}
+
+	metrics.Registry.MustRegister(
+		evaluations, evaluationErrors, evaluationDuration,
+		drainsStarted, drainsCompleted, drainsAbandoned, state)
 }
+
+// DrainStarted records a node being marked and cordoned.
+func DrainStarted() { drainsStarted.Inc() }
+
+// DrainCompleted records a drain that ended with the node removed.
+func DrainCompleted() { drainsCompleted.Inc() }
+
+// DrainAbandoned records a drain handed back, under the code that ended it.
+func DrainAbandoned(reason string) { drainsAbandoned.WithLabelValues(reason).Inc() }
 
 // Failed records an evaluation that could not be completed.
 //
@@ -184,6 +239,7 @@ func Observe(s engine.Snapshot, d engine.Decision, cfg engine.Config, took float
 	state.publish(func() {
 		observeNodes(d)
 		observePools(s, cfg)
+		observeBackoff(s)
 	})
 }
 
@@ -257,6 +313,28 @@ func observePools(s engine.Snapshot, cfg engine.Config) {
 		poolMin.WithLabelValues(label).Set(float64(g.MinSize))
 		poolMax.WithLabelValues(label).Set(float64(g.MaxSize))
 	}
+}
+
+// observeBackoff reports how much failure binpack is currently carrying.
+//
+// Read from the nodes rather than counted as drains are abandoned, so a
+// restarted controller reports the truth immediately: the state lives on the
+// nodes precisely so it outlives the process.
+func observeBackoff(s engine.Snapshot) {
+	var inBackoff, deepest float64
+	for _, node := range s.Nodes {
+		until, err := time.Parse(time.RFC3339, node.Annotations[engine.AnnotationBackoffUntil])
+		if err != nil || !s.Now.Before(until) {
+			continue
+		}
+		inBackoff++
+		if n, err := strconv.Atoi(node.Annotations[engine.AnnotationDrainAttempts]); err == nil &&
+			float64(n) > deepest {
+			deepest = float64(n)
+		}
+	}
+	nodesInBackoff.Set(inBackoff)
+	drainAttemptsMax.Set(deepest)
 }
 
 func boolAsFloat(b bool) float64 {

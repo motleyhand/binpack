@@ -97,7 +97,29 @@ const (
 	// it. Uncordoning matters more than usual here — an empty cordoned node is
 	// pure waste.
 	AbandonNotRemoved = "not-removed"
+
+	// AbandonUnschedulable: a pod that moved off the node could not be placed.
+	// The simulation proved a valid assignment existed; the scheduler is not
+	// obliged to choose that one, and this is what it looks like when it chose
+	// differently. Decided by the executor, which can see the replacement,
+	// but named here so every reason a drain ends is in one list.
+	AbandonUnschedulable = "replacement-unschedulable"
+
+	// AbandonUnaccounted: pods remain that the simulation did not name. What
+	// binpack understands is an allowlist, so an unrecognised set is a reason
+	// to hand the node back rather than to guess.
+	AbandonUnaccounted = "unaccounted-pods"
 )
+
+// AbandonCodes is every reason a drain can end that binpack decides for
+// itself. The engine's skip codes can also end one, when the cluster changes
+// underneath it.
+func AbandonCodes() []string {
+	return []string{
+		AbandonStuck, AbandonStalled, AbandonNotRemoved,
+		AbandonUnschedulable, AbandonUnaccounted,
+	}
+}
 
 // Assessment is the answer, and what to record on the node.
 type Assessment struct {

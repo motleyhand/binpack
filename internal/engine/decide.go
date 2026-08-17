@@ -172,7 +172,14 @@ type Policy struct {
 	MaxPodsPerDrain      int
 	CooldownAfterScaleUp time.Duration
 	CooldownAfterDrain   time.Duration
-	ExcludedNamespaces   []string
+
+	// StallTimeout and RemovalTimeout bound a drain in progress. The engine
+	// does not read them — it decides, and a drain is under way long after it
+	// has — but a policy resolved per pool has to carry them, or the executor
+	// would have to resolve pools a second time and could disagree.
+	StallTimeout       time.Duration
+	RemovalTimeout     time.Duration
+	ExcludedNamespaces []string
 }
 
 // Config is what the engine needs to decide. The CLI and controller build it
@@ -252,7 +259,10 @@ const (
 
 // Decision codes: the outcome of a whole evaluation.
 const (
-	CodeDrain        = "drain"
+	CodeDrain = "drain"
+	// CodeDraining: a drain is already under way, so this evaluation advanced
+	// it rather than deciding afresh.
+	CodeDraining     = "draining"
 	CodeNoAutoscaler = "no-autoscaler"
 	// CodeNoCandidates: every node was ruled out before any simulation ran.
 	CodeNoCandidates = "no-candidates"
