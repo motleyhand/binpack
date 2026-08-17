@@ -9,6 +9,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"time"
 
@@ -68,7 +70,44 @@ type Options struct {
 
 // Run starts binpack and blocks until ctx is cancelled, or until one
 // evaluation completes when Options.Once is set.
+// cooldownIsUnenforceable reports the pool whose after-drain cooldown a
+// one-shot run could not honour, if there is one.
+//
+// A drain outlives many evaluations, and in --once mode each of those is a
+// separate process. The completion timestamp lives in memory — a successful
+// drain deletes the node that would otherwise have recorded it — so a CronJob
+// starts every invocation having forgotten that it ever drained anything, and
+// the cooldown never applies.
+//
+// Refused rather than quietly degraded, and refused only when it would matter:
+// a dry run changes nothing to need settling after.
+func cooldownIsUnenforceable(opts Options) (string, time.Duration, bool) {
+	if !opts.Once || opts.DryRun {
+		return "", 0, false
+	}
+	if d := opts.Engine.Default.CooldownAfterDrain; d > 0 {
+		return "the default policy", d, true
+	}
+	for _, name := range slices.Sorted(maps.Keys(opts.Engine.ByPool)) {
+		if d := opts.Engine.ByPool[name].CooldownAfterDrain; d > 0 {
+			return "pool " + name, d, true
+		}
+	}
+	return "", 0, false
+}
+
 func Run(ctx context.Context, opts Options) error {
+	// Before anything else, because the alternative is a safety control that
+	// is configured, reported as configured, and silently inert.
+	if where, d, unenforceable := cooldownIsUnenforceable(opts); unenforceable {
+		return fmt.Errorf(
+			"--once cannot honour cooldown.afterDrain (%s sets %s): each run is a new process, "+
+				"and a completed drain leaves nothing in the cluster to measure from, so the "+
+				"cooldown would never apply. Run binpack as a Deployment, or set "+
+				"cooldown.afterDrain: 0 to say that consecutive drains are acceptable",
+			where, d)
+	}
+
 	mgr, err := manager.New(opts.RestConfig, managerOptions(opts))
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
@@ -269,6 +308,19 @@ type evaluator struct {
 	// drainInProgress.
 	active string
 
+	// lastDrain is when this process last completed one, which is what
+	// cooldown.afterDrain measures from.
+	//
+	// In memory rather than on an object, because a successful drain is
+	// exactly the case where there is no object left to write it on — the node
+	// it happened to has been deleted. A restart therefore forgets it, and
+	// [engine.Snapshot.LastDrain] already says what that costs: the cooldown
+	// does not apply, and the worst case is one drain sooner than intended.
+	// Persisting it would mean a new API object, a new permission and a new
+	// failure mode, to protect against a restart that happens to fall inside
+	// one cooldown window.
+	lastDrain time.Time
+
 	// err carries a one-shot run's outcome back to [Run]. See Start.
 	err error
 }
@@ -353,6 +405,11 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 			time.Since(started).Seconds())
 		return e.advance(ctx, snapshot, node)
 	}
+
+	// Filled in by the controller rather than read from the cluster: it is the
+	// one thing in a snapshot that is not observable there, because a
+	// completed drain deletes the node that would have recorded it.
+	snapshot.LastDrain = e.lastDrain
 
 	decision := engine.Decide(snapshot, e.opts.Engine)
 	metrics.Observe(snapshot, decision, e.opts.Engine, time.Since(started).Seconds())
@@ -476,6 +533,10 @@ func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string)
 			fmt.Sprintf("binpack stopped draining this node: %s. It has been uncordoned",
 				step.Reason))
 	case step.Done:
+		// Only a drain that finished. An abandoned one already records
+		// per-node backoff, and letting it start a cluster-wide cooldown as
+		// well would punish every other node for one node's failure.
+		e.lastDrain = s.Now
 		metrics.DrainCompleted()
 		e.log.Info("drain complete", "node", name, "reason", step.Reason)
 		e.emitDrainEnded(ctx, name, ReasonDrained,
