@@ -94,7 +94,17 @@ func Advance(
 		return Step{Code: StepRemoved, Done: true,
 			Reason: "the cluster-autoscaler removed the node"}, nil
 
-	case a.SkipCode == engine.SkipBeingRemoved:
+	case engine.BeingRemoved(a.Node):
+		// Asked of the node directly rather than read from the skip code,
+		// because eligibility reports one reason and a node can satisfy
+		// several. The likeliest overlap is the one this must survive: the
+		// autoscaler deleting a node is frequently *what brings the pool to
+		// its minimum*, so pool-at-minimum would be reported instead, this
+		// branch would be skipped, and the drain abandoned — uncordoning a
+		// node mid-deletion, which is the single thing the branch exists to
+		// prevent. A scale-up elsewhere, or an operator annotating the node,
+		// reach it the same way.
+		//
 		// The autoscaler owns the node now. Not abandoned — abandoning
 		// uncordons, and uncordoning a node another component is deleting is
 		// two controllers disagreeing about whether it accepts pods. Not

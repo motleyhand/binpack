@@ -795,3 +795,50 @@ func TestASoftDeletionCandidateDoesNotStopADrain(t *testing.T) {
 		t.Errorf("got %+v, want the drain to carry on", step)
 	}
 }
+
+func TestTheHandoverSurvivesEveryOtherReasonToStop(t *testing.T) {
+	// eligibility reports one reason, and a node can satisfy several. The
+	// first of these is not a corner case: the autoscaler deleting a node is
+	// frequently what brings the pool to its minimum, so a handover that lost
+	// to pool-at-minimum would uncordon the node mid-deletion nearly every
+	// time it mattered.
+	for _, tc := range []struct {
+		name string
+		to   func(*engine.Snapshot)
+	}{
+		{"the pool reached its minimum, because of this very deletion",
+			func(s *engine.Snapshot) { s.Autoscaler.Groups[0].MinSize = 2 }},
+		{"a scale-up began elsewhere",
+			func(s *engine.Snapshot) { s.Autoscaler.ScaleUpInProgress = true }},
+		{"an operator annotated the node",
+			func(s *engine.Snapshot) {
+				s.Nodes[0].Annotations[engine.AnnotationSkip] = "true"
+			}},
+		{"the autoscaler's status went stale",
+			func(s *engine.Snapshot) { s.Autoscaler.LastProbe = at.Add(-time.Hour) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			n := marked("a", time.Hour, time.Hour, "1")
+			n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{
+				Key: engine.TaintToBeDeleted, Effect: corev1.TaintEffectNoSchedule})
+
+			s := snapshot([]*corev1.Node{n, node("b")},
+				[]*corev1.Pod{mother.Pod("default", "left", mother.OnNode("a"))})
+			tc.to(&s)
+			c := clientFor(s)
+
+			step, err := executor.Advance(
+				context.Background(), c, s, "a", engineConfig(), drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+
+			if step.Code != executor.StepHandedOver {
+				t.Errorf("got %+v, want the handover to win", step)
+			}
+			if nodeFrom(t, c, "a").Spec.Unschedulable == false {
+				t.Error("binpack uncordoned a node the autoscaler is deleting")
+			}
+		})
+	}
+}
