@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 // Annotations binpack writes on nodes. Fixed keys, not configurable: one thing
@@ -232,10 +233,16 @@ const (
 	SkipPoolAtMinimum        = "pool-at-minimum"
 	SkipAnnotated            = "annotated-skip"
 	SkipDrainInProgress      = "drain-in-progress"
-	SkipBackoff              = "backoff"
-	SkipCordoned             = "cordoned"
-	SkipProtectedPod         = "protected-pod"
-	SkipTooManyPods          = "too-many-pods"
+	// SkipGone: the node is no longer in the cluster, which for a drain in
+	// progress is success rather than a skip.
+	SkipGone = "gone"
+	// SkipUncordoned: a drain is marked on the node but the node is
+	// schedulable, so it is still accepting pods.
+	SkipUncordoned   = "uncordoned"
+	SkipBackoff      = "backoff"
+	SkipCordoned     = "cordoned"
+	SkipProtectedPod = "protected-pod"
+	SkipTooManyPods  = "too-many-pods"
 )
 
 // Decision codes: the outcome of a whole evaluation.
@@ -332,32 +339,7 @@ func Decide(s Snapshot, cfg Config) Decision {
 
 	for i := range candidates {
 		a := candidates[i]
-		policy := cfg.PolicyFor(a.Group, a.Pool)
-
-		sim := Simulate(s.Nodes, s.Pods, s.Templates, a.Node, policy.Sim)
-		a.Simulation = &sim
-		if !sim.Feasible {
-			assessments = append(assessments, *a)
-			continue
-		}
-
-		if policy.MaxPodsPerDrain > 0 && len(sim.Relocated) > policy.MaxPodsPerDrain {
-			a.Skipped = true
-			a.SkipCode = SkipTooManyPods
-			a.SkipReason = fmt.Sprintf("would relocate %d pods, above the limit of %d",
-				len(sim.Relocated), policy.MaxPodsPerDrain)
-			assessments = append(assessments, *a)
-			continue
-		}
-
-		evicting := append(append([]*corev1.Pod{}, podsOf(sim.Relocated)...), sim.Evicted...)
-		if blockers := CheckEvictable(evicting, s.PDBs, policy.Evict); len(blockers) > 0 {
-			a.Blockers = blockers
-			assessments = append(assessments, *a)
-			continue
-		}
-
-		if chosen < 0 {
+		if drainable(s, a, cfg.PolicyFor(a.Group, a.Pool)) && chosen < 0 {
 			chosen = len(assessments)
 		}
 		assessments = append(assessments, *a)
@@ -378,6 +360,90 @@ func Decide(s Snapshot, cfg Config) Decision {
 		Reason:      summarise(assessments),
 		Assessments: assessments,
 	}
+}
+
+// drainable simulates a node and reports whether its pods could go elsewhere,
+// filling in the assessment with what it found.
+//
+// Shared by [Decide] and [Revalidate] rather than written twice. Selection and
+// mid-drain revalidation asking the question differently is the failure that
+// matters here: binpack would cordon a node on one basis and evict its pods on
+// another, with nothing to reveal the disagreement.
+func drainable(s Snapshot, a *NodeAssessment, policy Policy) bool {
+	sim := Simulate(s.Nodes, s.Pods, s.Templates, a.Node, policy.Sim)
+	a.Simulation = &sim
+	if !sim.Feasible {
+		return false
+	}
+
+	if policy.MaxPodsPerDrain > 0 && len(sim.Relocated) > policy.MaxPodsPerDrain {
+		a.Skipped = true
+		a.SkipCode = SkipTooManyPods
+		a.SkipReason = fmt.Sprintf("would relocate %d pods, above the limit of %d",
+			len(sim.Relocated), policy.MaxPodsPerDrain)
+		return false
+	}
+
+	evicting := append(append([]*corev1.Pod{}, podsOf(sim.Relocated)...), sim.Evicted...)
+	if blockers := CheckEvictable(evicting, s.PDBs, policy.Evict); len(blockers) > 0 {
+		a.Blockers = blockers
+		return false
+	}
+
+	return true
+}
+
+// Revalidate re-asks, of one named node, the question that selected it.
+//
+// A drain is not one decision followed by a batch of evictions: the cluster
+// keeps moving underneath it, and a drain can legitimately outlast many
+// evaluation intervals. The snapshot that chose this node is stale by the time
+// anything is evicted — the scheduler may have bound new pods to it between
+// the decision and the cordon, pods whose fit, evictability and PDB demand
+// were never assessed.
+//
+// So this runs the whole procedure again against the node as it is now, using
+// the same code that selected it, and ignoring only binpack's own marker and
+// cordon. The [NodeAssessment.Verdict] is drainable or it is not; anything
+// else means the drain must stop, and SkipReason or Blockers say why in terms
+// an operator can act on.
+//
+// A node absent from the snapshot returns skipped rather than an error: the
+// cluster-autoscaler removing it is the outcome a drain is working towards.
+func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
+	var node *corev1.Node
+	for _, n := range s.Nodes {
+		if n.Name == name {
+			node = n
+			break
+		}
+	}
+	if node == nil {
+		return NodeAssessment{
+			Node:       &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}},
+			Skipped:    true,
+			SkipCode:   SkipGone,
+			SkipReason: "the node is no longer in the cluster",
+		}
+	}
+
+	// Checked here as well as per-node: an autoscaler that has died mid-drain
+	// means nothing will ever remove this node, so continuing to empty it
+	// would strand the cordon.
+	if live, why := s.Autoscaler.Live(s.Now); !live {
+		a := NodeAssessment{Node: node, Group: node.Labels[cfg.NodeGroupIDLabel],
+			Pool: node.Labels[cfg.PoolNameLabel]}
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipNotAutoscaled, why
+		return a
+	}
+
+	a := eligibility(s, cfg, groupsByID(s), protectedNamespaces(s, cfg), node, true)
+	if a.Skipped {
+		return a
+	}
+
+	drainable(s, &a, cfg.PolicyFor(a.Group, a.Pool))
+	return a
 }
 
 // outcomeCode distinguishes a cluster where nothing was even eligible from one
@@ -437,59 +503,11 @@ func cooling(s Snapshot, policy Policy) (code, reason string, cooling bool) {
 // a reason recorded for every exclusion so explain can account for the whole
 // cluster rather than only the interesting part.
 func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []NodeAssessment) {
-	groups := make(map[string]NodeGroup, len(s.Autoscaler.Groups))
-	for _, g := range s.Autoscaler.Groups {
-		groups[g.ID] = g
-	}
-
+	groups := groupsByID(s)
 	protected := protectedNamespaces(s, cfg)
 
 	for _, node := range s.Nodes {
-		a := NodeAssessment{
-			Node:  node,
-			Group: node.Labels[cfg.NodeGroupIDLabel],
-			Pool:  node.Labels[cfg.PoolNameLabel],
-		}
-
-		policy := cfg.PolicyFor(a.Group, a.Pool)
-		group, managed := groups[a.Group]
-		coolCode, cooldown, cooling := cooling(s, policy)
-
-		switch {
-		case !managed:
-			// Absent from the autoscaler's status means it does not manage
-			// this pool, so nothing would ever remove the node.
-			a.Skipped, a.SkipCode, a.SkipReason = true, SkipNotAutoscaled, "not part of an autoscaling pool"
-
-		case !policy.Enabled:
-			a.Skipped, a.SkipCode, a.SkipReason = true, SkipPoolDisabled, "binpack is disabled for this pool"
-
-		case cooling:
-			a.Skipped, a.SkipCode, a.SkipReason = true, coolCode, cooldown
-
-		case group.Size() <= group.MinSize:
-			a.Skipped, a.SkipCode = true, SkipPoolAtMinimum
-			a.SkipReason = fmt.Sprintf(
-				"pool %s is at its minimum size (%d)", displayPool(a), group.MinSize)
-
-		case node.Annotations[AnnotationSkip] == "true":
-			a.Skipped, a.SkipCode, a.SkipReason = true, SkipAnnotated, "annotated "+AnnotationSkip
-
-		case node.Annotations[AnnotationDrainStarted] != "":
-			a.Skipped, a.SkipCode, a.SkipReason = true, SkipDrainInProgress, "a drain is already in progress on this node"
-
-		case backoffActive(node, s.Now):
-			a.Skipped, a.SkipCode, a.SkipReason = true, SkipBackoff, backoffReason(node)
-
-		case node.Spec.Unschedulable:
-			// Already cordoned by someone else. Draining it would not be
-			// binpack's to finish, and it is not accepting work anyway.
-			a.Skipped, a.SkipCode, a.SkipReason = true, SkipCordoned, "already cordoned"
-
-		case protected[node.Name] != "":
-			a.Skipped, a.SkipCode, a.SkipReason = true, SkipProtectedPod, protected[node.Name]
-		}
-
+		a := eligibility(s, cfg, groups, protected, node, false)
 		if a.Skipped {
 			ruledOut = append(ruledOut, a)
 			continue
@@ -498,6 +516,89 @@ func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []
 	}
 
 	return candidates, ruledOut
+}
+
+func groupsByID(s Snapshot) map[string]NodeGroup {
+	groups := make(map[string]NodeGroup, len(s.Autoscaler.Groups))
+	for _, g := range s.Autoscaler.Groups {
+		groups[g.ID] = g
+	}
+	return groups
+}
+
+// eligibility rules a node in or out before any simulation runs.
+//
+// resuming is set when the caller is binpack revisiting a drain it started
+// itself, and suppresses exactly the two checks binpack is the cause of: its
+// own drain marker, and the cordon it applied. Every other check still
+// applies, and that is the point of re-running them — a scale-up that began
+// after the cordon, a pool that has since reached its minimum, or an operator
+// annotating the node mid-drain all mean the drain should stop.
+func eligibility(
+	s Snapshot, cfg Config,
+	groups map[string]NodeGroup, protected map[string]string,
+	node *corev1.Node, resuming bool,
+) NodeAssessment {
+	a := NodeAssessment{
+		Node:  node,
+		Group: node.Labels[cfg.NodeGroupIDLabel],
+		Pool:  node.Labels[cfg.PoolNameLabel],
+	}
+
+	policy := cfg.PolicyFor(a.Group, a.Pool)
+	group, managed := groups[a.Group]
+	coolCode, cooldown, cooling := cooling(s, policy)
+
+	switch {
+	case !managed:
+		// Absent from the autoscaler's status means it does not manage
+		// this pool, so nothing would ever remove the node.
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipNotAutoscaled, "not part of an autoscaling pool"
+
+	case !policy.Enabled:
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipPoolDisabled, "binpack is disabled for this pool"
+
+	case cooling:
+		a.Skipped, a.SkipCode, a.SkipReason = true, coolCode, cooldown
+
+	case group.Size() <= group.MinSize:
+		a.Skipped, a.SkipCode = true, SkipPoolAtMinimum
+		a.SkipReason = fmt.Sprintf(
+			"pool %s is at its minimum size (%d)", displayPool(a), group.MinSize)
+
+	case node.Annotations[AnnotationSkip] == "true":
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipAnnotated, "annotated "+AnnotationSkip
+
+	case !resuming && node.Annotations[AnnotationDrainStarted] != "":
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipDrainInProgress, "a drain is already in progress on this node"
+
+	case backoffActive(node, s.Now):
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipBackoff, backoffReason(node)
+
+	case resuming && !node.Spec.Unschedulable:
+		// Marked but schedulable: either the controller stopped between
+		// writing the marker and cordoning, or someone uncordoned a drain in
+		// flight. Either way the node is still accepting pods, which is the
+		// race the cordon exists to close — evicting from it could relocate
+		// work whose fit and PDB demand were never assessed.
+		//
+		// Refused rather than tolerated, because a pure function cannot fix
+		// it. The caller's move is to cordon and let the next evaluation
+		// revalidate against a fresh snapshot; proceeding on this one would
+		// be reasoning about a node whose pod set can still grow.
+		a.Skipped, a.SkipCode = true, SkipUncordoned
+		a.SkipReason = "a drain is marked on this node but it is not cordoned, so it is still accepting pods"
+
+	case !resuming && node.Spec.Unschedulable:
+		// Already cordoned by someone else. Draining it would not be
+		// binpack's to finish, and it is not accepting work anyway.
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipCordoned, "already cordoned"
+
+	case protected[node.Name] != "":
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipProtectedPod, protected[node.Name]
+	}
+
+	return a
 }
 
 // protectedNamespaces marks nodes hosting a pod binpack must not evict.
