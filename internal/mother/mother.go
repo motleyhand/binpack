@@ -18,6 +18,7 @@ import (
 	policyv1 "k8s.io/api/policy/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
 	"github.com/motleyhand/binpack/internal/engine"
@@ -156,8 +157,12 @@ func Pod(namespace, name string, opts ...PodOption) *corev1.Pod {
 			Namespace: namespace,
 			Name:      name,
 			OwnerReferences: []metav1.OwnerReference{
+				// A UID, because every real owner reference has one and
+				// binpack correlates a replacement pod to its controller by
+				// it. A fixture without one would make a drain's wait for the
+				// replacement untestable, and untested.
 				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name + "-rs",
-					Controller: ptr(true)},
+					UID: ownerUID(name + "-rs"), Controller: ptr(true)},
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -321,6 +326,24 @@ func Terminating(requestedAt time.Time, grace time.Duration) PodOption {
 		p.DeletionGracePeriodSeconds = &seconds
 	}
 }
+
+// ControlledBy replaces the pod's controller with a named one binpack can read
+// a template for, so several pods can share an owner — a Deployment's
+// replicas, or the pod a controller creates to replace an evicted one.
+func ControlledBy(kind, name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.OwnerReferences = []metav1.OwnerReference{{
+			APIVersion: "apps/v1", Kind: kind, Name: name,
+			UID: ownerUID(name), Controller: ptr(true),
+		}}
+	}
+}
+
+// OwnerUID is the UID [ControlledBy] gives a named controller, so a test can name
+// what a drain is waiting for without reaching into a pod to read it.
+func OwnerUID(name string) types.UID { return ownerUID(name) }
+
+func ownerUID(name string) types.UID { return types.UID("uid-" + name) }
 
 // WithHostPort claims a host port, which binpack does not model.
 func WithHostPort(port int32) PodOption {
@@ -493,7 +516,8 @@ func Bare() PodOption {
 func OwnedBy(kind, name string) PodOption {
 	return func(p *corev1.Pod) {
 		p.OwnerReferences = []metav1.OwnerReference{
-			{APIVersion: "example.com/v1", Kind: kind, Name: name, Controller: ptr(true)},
+			{APIVersion: "example.com/v1", Kind: kind, Name: name,
+				UID: ownerUID(name), Controller: ptr(true)},
 		}
 	}
 }

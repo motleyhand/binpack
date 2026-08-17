@@ -323,21 +323,139 @@ func TestNothingIsEvictedWhileAPodIsStillTerminating(t *testing.T) {
 	}
 }
 
-func TestAReplacementTheSchedulerRefusedEndsTheDrain(t *testing.T) {
-	// binpack does not place pods and cannot steer the scheduler. When a
-	// relocated pod comes back Pending, the prediction was wrong, and saying
-	// which pod could not be placed is far more use than waiting for the
-	// stall timeout to report "no progress".
-	replacement := mother.Pod("default", "orphan")
-	replacement.CreationTimestamp.Time = at.Add(-time.Minute)
-	replacement.Status.Phase = corev1.PodPending
-	replacement.Status.Conditions = []corev1.PodCondition{{
-		Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
-		Reason: corev1.PodReasonUnschedulable,
-	}}
+// pending builds a pod a controller has created but the scheduler has not
+// placed. unschedulable marks the ones it has tried and given up on.
+func pending(name, owner string, created time.Time, unschedulable bool) *corev1.Pod {
+	p := mother.Pod("default", name, mother.ControlledBy("ReplicaSet", owner))
+	p.CreationTimestamp.Time = created
+	p.Status.Phase = corev1.PodPending
+	p.Status.Conditions = nil
+	if unschedulable {
+		p.Status.Conditions = []corev1.PodCondition{{
+			Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
+			Reason: corev1.PodReasonUnschedulable,
+		}}
+	}
+	return p
+}
+
+// awaitingNode is a node mid-drain that has already evicted a pod of `owner`
+// and is waiting for the replacement.
+func awaitingNode(name, owner string, evictedAgo time.Duration) *corev1.Node {
+	n := marked(name, 20*time.Minute, evictedAgo, "1")
+	n.Annotations[engine.AnnotationDrainAwaiting] = string(mother.OwnerUID(owner)) +
+		"@" + at.Add(-evictedAgo).Format(time.RFC3339)
+	return n
+}
+
+func TestNothingIsEvictedUntilTheReplacementIsBound(t *testing.T) {
+	// "In flight" has to mean bound, not merely gone from this node. An
+	// evicted pod disappears well before its replacement is placed, and
+	// evicting the next one in that window would put two replacements in
+	// flight against a simulation that assumed one.
+	// The evicted pod's controller already has a replica elsewhere, which is
+	// the ordinary case for a Deployment. Answering "landed" from that one
+	// would let the drain run straight on without the replacement ever
+	// existing, so the pod must also be newer than the eviction.
+	sibling := pending("sibling", "web-rs", at.Add(-time.Hour), false)
+	sibling.Spec.NodeName = "b"
+
+	pods := []*corev1.Pod{
+		mother.Pod("default", "stayer", mother.OnNode("a")),
+		sibling,
+		// Created, not yet placed, and the scheduler has not refused it.
+		pending("replacement", "web-rs", at.Add(-30*time.Second), false),
+	}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code != executor.StepWaiting {
+		t.Errorf("expected the drain to wait, got %+v", step)
+	}
+
+	var left corev1.PodList
+	if err := c.List(context.Background(), &left); err != nil {
+		t.Fatalf("listing pods: %v", err)
+	}
+	if len(left.Items) != 3 {
+		t.Errorf("a pod was evicted before the previous replacement landed: %d of 3 remain",
+			len(left.Items))
+	}
+}
+
+func TestABoundReplacementLetsTheDrainProceed(t *testing.T) {
+	replacement := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+	replacement.Spec.NodeName = "b"
 
 	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), replacement}
-	s := snapshot([]*corev1.Node{marked("a", 10*time.Minute, time.Minute, "2"), node("b")}, pods)
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+
+	step, err := executor.Advance(context.Background(), clientFor(s), s, "a",
+		engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code != executor.StepEvicted {
+		t.Errorf("expected the drain to proceed, got %+v", step)
+	}
+}
+
+func TestAnEvictionRecordsWhatItIsWaitingFor(t *testing.T) {
+	pods := []*corev1.Pod{mother.Pod("default", "one", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, time.Minute, "1"), node("b")}, pods)
+	c := clientFor(s)
+
+	if _, err := executor.Advance(
+		context.Background(), c, s, "a", engineConfig(), drainPolicy()); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	got := nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainAwaiting]
+	if !strings.HasPrefix(got, string(mother.OwnerUID("one-rs"))+"@") {
+		t.Errorf("the drain did not record the controller it is waiting on: %q", got)
+	}
+}
+
+func TestABarePodEndsTheDrainBeforeAnythingIsEvicted(t *testing.T) {
+	// Nothing would recreate it, so binpack cannot say what its replacement
+	// would request — and refuses the node rather than guessing. Worth pinning
+	// because it is why the drain protocol never has to wait for a replacement
+	// that will never exist.
+	pods := []*corev1.Pod{mother.Pod("default", "orphan", mother.OnNode("a"), mother.Bare())}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, time.Minute, "1"), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if !step.Failed || !strings.Contains(step.Reason, "orphan") {
+		t.Errorf("expected the drain refused, naming the pod: %+v", step)
+	}
+
+	var left corev1.PodList
+	if err := c.List(context.Background(), &left); err != nil {
+		t.Fatalf("listing pods: %v", err)
+	}
+	if len(left.Items) != 1 {
+		t.Error("a pod was evicted from a node binpack could not account for")
+	}
+}
+
+func TestAReplacementTheSchedulerRefusedEndsTheDrain(t *testing.T) {
+	// binpack does not place pods and cannot steer the scheduler. When the
+	// replacement comes back Pending the prediction was wrong, and naming the
+	// pod beats waiting for the stall timeout to report "no progress".
+	// Uncordoning is also the repair: this node is where that pod can go.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "stayer", mother.OnNode("a")),
+		pending("orphan", "web-rs", at.Add(-30*time.Second), true),
+	}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
 	c := clientFor(s)
 
 	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
@@ -356,29 +474,78 @@ func TestAReplacementTheSchedulerRefusedEndsTheDrain(t *testing.T) {
 	}
 }
 
-func TestALongStandingPendingPodDoesNotBlockEveryDrain(t *testing.T) {
-	// Bounded to pods created after the drain began. A cluster with one
-	// chronically unplaceable pod would otherwise never consolidate at all,
-	// which is a worse failure than the one being guarded against.
-	old := mother.Pod("default", "ancient")
-	old.CreationTimestamp.Time = at.Add(-24 * time.Hour)
-	old.Status.Phase = corev1.PodPending
-	old.Status.Conditions = []corev1.PodCondition{{
-		Type: corev1.PodScheduled, Status: corev1.ConditionFalse,
-		Reason: corev1.PodReasonUnschedulable,
-	}}
+func TestOneRefusedReplacementEndsTheDrainWhateverItsSiblingsDid(t *testing.T) {
+	// A controller can produce several pods after an eviction — a rollout, a
+	// scale-up — and one landing does not make another one's refusal go away.
+	// Listed with the bound pod first, so an implementation that returned on
+	// the first match it happened to see would call this healthy.
+	bound := pending("landed", "web-rs", at.Add(-30*time.Second), false)
+	bound.Spec.NodeName = "b"
 
-	pods := []*corev1.Pod{mother.Pod("default", "movable", mother.OnNode("a")), old}
-	s := snapshot([]*corev1.Node{marked("a", 10*time.Minute, time.Minute, "2"), node("b")}, pods)
+	pods := []*corev1.Pod{
+		mother.Pod("default", "stayer", mother.OnNode("a")),
+		bound,
+		pending("refused", "web-rs", at.Add(-20*time.Second), true),
+	}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
 
 	step, err := executor.Advance(context.Background(), clientFor(s), s, "a",
 		engineConfig(), drainPolicy())
 	if err != nil {
 		t.Fatalf("Advance: %v", err)
 	}
+	if step.Code != executor.StepUnschedulable {
+		t.Errorf("expected the drain abandoned, got %+v", step)
+	}
+	if !strings.Contains(step.Reason, "default/refused") {
+		t.Errorf("the reason should name the pod that could not be placed: %q", step.Reason)
+	}
+}
 
+func TestSomebodyElsesUnschedulablePodDoesNotEndTheDrain(t *testing.T) {
+	// A workload deployed with impossible requests, while this drain happens
+	// to be running. Correlating by controller rather than by time alone is
+	// what keeps binpack from abandoning a healthy drain and claiming, wrongly,
+	// that the pod had moved off this node.
+	replacement := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+	replacement.Spec.NodeName = "b"
+
+	pods := []*corev1.Pod{
+		mother.Pod("default", "stayer", mother.OnNode("a")),
+		replacement,
+		pending("someone-elses", "batch-rs", at.Add(-10*time.Second), true),
+	}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+
+	step, err := executor.Advance(context.Background(), clientFor(s), s, "a",
+		engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Failed {
+		t.Errorf("an unrelated workload ended the drain: %+v", step)
+	}
+}
+
+func TestACompletedPodIsNotAnInFlightEviction(t *testing.T) {
+	// A Succeeded pod held by a finalizer is not occupying the node, so the
+	// assessment does not count it. Treating it as in flight would wait on it
+	// every evaluation while evictable pods sat there, until the drain was
+	// abandoned as stalled.
+	done := mother.Pod("default", "finished", mother.OnNode("a"),
+		mother.Terminating(at.Add(-time.Hour), time.Minute))
+	done.Status.Phase = corev1.PodSucceeded
+
+	pods := []*corev1.Pod{done, mother.Pod("default", "movable", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, time.Minute, "2"), node("b")}, pods)
+
+	step, err := executor.Advance(context.Background(), clientFor(s), s, "a",
+		engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
 	if step.Code != executor.StepEvicted {
-		t.Errorf("expected the drain to proceed, got %+v", step)
+		t.Errorf("expected the evictable pod to be evicted, got %+v", step)
 	}
 }
 

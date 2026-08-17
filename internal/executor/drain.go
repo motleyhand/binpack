@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"strconv"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/types"
 
 	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
@@ -104,16 +107,32 @@ func Advance(
 		return Abandon(ctx, w, a.Node, a.SkipCode, revalidationReason(a), s.Now)
 	}
 
-	pods := podsOn(s, name)
+	// A replacement owed by an earlier eviction settles what happens next,
+	// before anything else is considered. binpack does not place pods and
+	// cannot steer the scheduler: the simulation proves a valid assignment
+	// exists, not that the scheduler will choose it. Keeping one replacement
+	// in flight is the whole of what binpack can do about that, and it only
+	// works if "in flight" means bound rather than merely gone from here.
+	if owner, since, ok := awaiting(a.Node); ok {
+		switch state, pod := replacementFor(s, owner, since); state {
+		case refused:
+			// The scheduler said so itself — PodScheduled=False, reason
+			// Unschedulable — so this is detected rather than inferred from a
+			// timeout, and it names the pod. Uncordoning is also the repair:
+			// this node is where that pod can go.
+			return Abandon(ctx, w, a.Node, StepUnschedulable, fmt.Sprintf(
+				"pod %s/%s could not be scheduled after moving off this node",
+				pod.Namespace, pod.Name), s.Now)
 
-	if pod := unschedulableSince(s, a.Node); pod != nil {
-		// Detected, not inferred from a timeout. The stall bound would catch
-		// this eventually and report "no progress"; naming the pod that could
-		// not be placed says what actually happened.
-		return Abandon(ctx, w, a.Node, StepUnschedulable, fmt.Sprintf(
-			"pod %s/%s could not be scheduled anywhere after moving off this node",
-			pod.Namespace, pod.Name), s.Now)
+		case awaited:
+			return Step{Code: StepWaiting,
+				Reason: "waiting for the replacement pod to be scheduled"}, nil
+		}
+		// landed: the next eviction overwrites this marker, so there is
+		// nothing to clear.
 	}
+
+	pods := podsOn(s, name)
 
 	assessment := drain.Assess(
 		drain.State{Node: a.Node, Pods: pods, Now: s.Now}, policy)
@@ -163,6 +182,11 @@ func Advance(
 	if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
 		return Step{}, err
 	}
+	if err := Annotate(ctx, w, a.Node, map[string]string{
+		engine.AnnotationDrainAwaiting: awaitingMarker(next, s.Now),
+	}); err != nil {
+		return Step{}, err
+	}
 
 	return Step{Code: StepEvicted,
 		Reason: fmt.Sprintf("evicted pod %s/%s", next.Namespace, next.Name)}, nil
@@ -194,6 +218,7 @@ func Abandon(
 		engine.AnnotationDrainStarted:       "",
 		engine.AnnotationDrainProgress:      "",
 		engine.AnnotationDrainPodsRemaining: "",
+		engine.AnnotationDrainAwaiting:      "",
 
 		engine.AnnotationDrainAttempts: strconv.Itoa(attempts),
 		engine.AnnotationBackoffUntil:  until.UTC().Format(time.RFC3339),
@@ -232,9 +257,16 @@ func podsOn(s engine.Snapshot, name string) []*corev1.Pod {
 	return on
 }
 
+// terminating finds a pod on the node that is on its way out.
+//
+// Filtered exactly as [drain.Assess] filters, and that is the point rather
+// than a coincidence: a Succeeded or Failed pod held by a finalizer is not
+// occupying the node, so the assessment does not count it — and a helper that
+// called it in flight would wait on it every evaluation while other pods sat
+// there evictable, until the drain was abandoned as stalled.
 func terminating(pods []*corev1.Pod) *corev1.Pod {
 	for _, pod := range pods {
-		if pod.DeletionTimestamp != nil && !engine.NodeBound(pod) {
+		if pod.DeletionTimestamp != nil && !engine.NodeBound(pod) && engine.Occupies(pod) {
 			return pod
 		}
 	}
@@ -268,32 +300,86 @@ func nextToEvict(sim *engine.Simulation, on []*corev1.Pod) *corev1.Pod {
 	return nil
 }
 
-// unschedulableSince finds a pod the scheduler has given up on since this
-// drain started.
-//
-// The scheduler sets PodScheduled=False with reason Unschedulable after trying
-// and failing, so this is a statement of fact rather than a guess from
-// elapsed time. Bounded to pods created after the drain began: a cluster with
-// a chronically unplaceable pod would otherwise never consolidate at all,
-// which is a much worse failure than the one being guarded against.
-func unschedulableSince(s engine.Snapshot, node *corev1.Node) *corev1.Pod {
-	started, err := time.Parse(time.RFC3339, node.Annotations[engine.AnnotationDrainStarted])
-	if err != nil {
-		return nil
-	}
+// replacement reports what has become of the pod a controller owes this drain.
+type replacement int
 
+const (
+	// awaited: the controller has not produced a bound pod yet. Either it has
+	// not created one, or the scheduler has not placed it.
+	awaited replacement = iota
+	// landed: a pod of that controller is bound to a node. The drain may
+	// proceed to the next eviction.
+	landed
+	// refused: the scheduler tried and could not place it.
+	refused
+)
+
+// awaiting reads the controller this drain is waiting on, and since when.
+func awaiting(node *corev1.Node) (types.UID, time.Time, bool) {
+	owner, stamp, found := strings.Cut(node.Annotations[engine.AnnotationDrainAwaiting], "@")
+	if !found || owner == "" {
+		return "", time.Time{}, false
+	}
+	since, err := time.Parse(time.RFC3339, stamp)
+	if err != nil {
+		return "", time.Time{}, false
+	}
+	return types.UID(owner), since, true
+}
+
+// replacementFor looks for the pod a controller created after one of its pods
+// was evicted from the draining node.
+//
+// Correlated by controller UID rather than by time alone. An unrelated
+// workload deployed with impossible requests would otherwise abandon a
+// perfectly healthy drain and claim, wrongly, that its pod had moved off this
+// node. Created-after matters too: a Deployment with replicas elsewhere
+// already has bound pods, and one of those would answer "landed" before the
+// replacement existed.
+func replacementFor(s engine.Snapshot, owner types.UID, since time.Time) (replacement, *corev1.Pod) {
+	// Every candidate is examined rather than the first match returned. A
+	// controller can have several pods newer than the eviction — a rollout, a
+	// scale-up — and returning on whichever the snapshot happened to list
+	// first would make the answer depend on iteration order. Refused wins:
+	// a pod the scheduler could not place is the fact worth acting on,
+	// whatever its siblings are doing.
+	var landedPod, pendingPod *corev1.Pod
 	for _, pod := range s.Pods {
-		if pod.Spec.NodeName != "" || pod.CreationTimestamp.Time.Before(started) {
+		ref := metav1.GetControllerOf(pod)
+		if ref == nil || ref.UID != owner || pod.CreationTimestamp.Before(&metav1.Time{Time: since}) {
 			continue
 		}
+		if pod.Spec.NodeName != "" {
+			landedPod = pod
+			continue
+		}
+		pendingPod = pod
 		for _, c := range pod.Status.Conditions {
 			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse &&
 				c.Reason == corev1.PodReasonUnschedulable {
-				return pod
+				return refused, pod
 			}
 		}
 	}
-	return nil
+
+	if landedPod != nil {
+		return landed, landedPod
+	}
+	return awaited, pendingPod
+}
+
+// awaitingMarker records which controller owes this drain a pod, so the next
+// evaluation can tell whether it landed.
+//
+// The nil case guards a dereference rather than describing a reachable state:
+// a pod with no readable controller template makes the node infeasible, so the
+// engine refuses the drain long before anything is evicted.
+func awaitingMarker(pod *corev1.Pod, now time.Time) string {
+	ref := metav1.GetControllerOf(pod)
+	if ref == nil {
+		return ""
+	}
+	return string(ref.UID) + "@" + now.UTC().Format(time.RFC3339)
 }
 
 // revalidationReason renders why a node stopped being drainable, in the terms
