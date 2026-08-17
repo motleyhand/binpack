@@ -21,6 +21,17 @@ const (
 	// ReasonWouldDrain is a drain binpack has decided on but will not perform,
 	// because it is running in dry-run.
 	ReasonWouldDrain = "WouldDrain"
+
+	// ReasonDraining is the same decision, acted on. A separate reason rather
+	// than a different note, so the two can never be confused by anything
+	// filtering events — including a person skimming `kubectl describe node`.
+	ReasonDraining = "Draining"
+
+	// ReasonDrained and ReasonDrainAbandoned are how a drain ended. Both are
+	// worth an event: the first is what binpack exists to do, and the second
+	// carries the sentence saying what stopped it.
+	ReasonDrained        = "Drained"
+	ReasonDrainAbandoned = "DrainAbandoned"
 )
 
 // report records a decision where somebody will find it.
@@ -49,7 +60,7 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 		relocating = len(chosen.Simulation.Relocated)
 	}
 
-	e.log.Info("would drain",
+	e.log.Info(map[bool]string{true: "would drain", false: "draining"}[e.opts.DryRun],
 		"node", d.Node.Name,
 		"pool", poolOf(chosen),
 		"podsToRelocate", relocating,
@@ -60,13 +71,24 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 	// one Event carrying a count and a first and last timestamp, so a decision
 	// that holds for an hour reads as one line saying so rather than sixty
 	// saying the same thing.
-	note := fmt.Sprintf("binpack would drain this node: %s. No action taken — dry run",
+	// The note is chosen by mode, not decorated with it. An event reading
+	// "No action taken — dry run" while pods are being evicted is worse than
+	// no event at all: it is the one surface a cluster user reliably has, and
+	// it would be telling them the opposite of what is happening.
+	reason, note := ReasonWouldDrain, fmt.Sprintf(
+		"binpack would drain this node: %s. No action taken — dry run",
 		relocationSummary(relocating))
+	if !e.opts.DryRun {
+		reason, note = ReasonDraining, fmt.Sprintf(
+			"binpack is draining this node: %s. Pods are evicted one at a time, and the "+
+				"cluster-autoscaler removes the node once it is empty",
+			relocationSummary(relocating))
+	}
 
 	// Returned rather than logged here: whether a lost report is fatal depends
 	// on whether anything will try again, which the caller knows and this does
 	// not.
-	if err := e.reporter.emit(ctx, d.Node, ReasonWouldDrain, ActionConsolidate, note); err != nil {
+	if err := e.reporter.emit(ctx, d.Node, reason, ActionConsolidate, note); err != nil {
 		return fmt.Errorf("recording the decision on %s: %w", d.Node.Name, err)
 	}
 	return nil

@@ -86,8 +86,8 @@ jobs:
       # catching at render time: binpack would hold its lease, serve its
       # metrics, and be refused by RBAC on every eviction. Asserted in both
       # directions, since a guard that always fails is as wrong as one that
-      # never does.
-      - name: Acting without the permissions to act is refused
+      # never does — and externally managed RBAC must still be able to act.
+      - name: Acting without acknowledging the permissions is refused
         run: |
           set +e
           for args in "--set config.dryRun=false" \
@@ -102,8 +102,11 @@ jobs:
             esac
           done
           set -e
-          helm template binpack charts/binpack --namespace binpack-system \
-            --set config.dryRun=false --set rbac.allowDraining=true > /dev/null
+          for args in "--set config.dryRun=false --set rbac.allowDraining=true" \
+                      "--set config.dryRun=false --set rbac.create=false --set rbac.allowDraining=true"; do
+            helm template binpack charts/binpack --namespace binpack-system $args > /dev/null \
+              || { echo "refused a valid acting configuration: $args"; exit 1; }
+          done
 
       # podLabels is exposed for arbitrary additions, so it can name a
       # selector label. Appending it would produce either a duplicate YAML key

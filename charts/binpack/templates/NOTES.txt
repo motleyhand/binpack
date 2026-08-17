@@ -16,9 +16,12 @@ It is configured to ACT (dryRun: false). It will cordon nodes, evict pods
 through the eviction API, and annotate nodes with drain state. It deletes
 nothing — the cluster-autoscaler removes the emptied node.
 
-Watch what it does:
+Watch what it does. Draining is a drain starting, Drained is one the
+cluster-autoscaler finished, DrainAbandoned carries the sentence saying what
+stopped it:
 
-  kubectl get events --field-selector reason=Draining -A --sort-by=.lastTimestamp
+  kubectl get events -A --sort-by=.lastTimestamp \
+    --field-selector reason=Draining
 
 Set config.dryRun=true to go back to deciding without acting. A drain already in
 progress is then left exactly as it is, cordoned and marked, rather than being

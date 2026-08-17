@@ -73,9 +73,21 @@ the cluster-autoscaler, which is the component whose job that is.
 
 ## After
 
+binpack writes three events per drain, on the node itself:
+
+| Reason | Meaning |
+|---|---|
+| `Draining` | A drain has started on this node |
+| `Drained` | It finished, and the cluster-autoscaler removed the node |
+| `DrainAbandoned` | It stopped, the node is uncordoned, and the note says why |
+
 ```bash
-kubectl get events --field-selector reason=Draining -A --sort-by=.lastTimestamp
+kubectl get events -A --sort-by=.lastTimestamp --field-selector reason=DrainAbandoned
 ```
+
+In dry run the first of these is `WouldDrain` instead, and says so in its note. The reason
+differs rather than only the wording, so nothing filtering events can confuse a drain that
+happened with one that was merely decided on.
 
 The metrics worth watching are `binpack_drains_completed_total` against
 `binpack_drains_abandoned_total`, and `binpack_drain_attempts_max`. A cluster where abandonments

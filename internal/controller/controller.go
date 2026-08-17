@@ -17,6 +17,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/events"
@@ -471,13 +472,38 @@ func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string)
 	case step.Failed:
 		metrics.DrainAbandoned(step.Code)
 		e.log.Info("drain abandoned", "node", name, "code", step.Code, "reason", step.Reason)
+		e.emitDrainEnded(ctx, name, ReasonDrainAbandoned,
+			fmt.Sprintf("binpack stopped draining this node: %s. It has been uncordoned",
+				step.Reason))
 	case step.Done:
 		metrics.DrainCompleted()
 		e.log.Info("drain complete", "node", name, "reason", step.Reason)
+		e.emitDrainEnded(ctx, name, ReasonDrained,
+			"binpack finished draining this node and the cluster-autoscaler removed it")
 	default:
+		// Intermediate steps stay in the log. One eviction per evaluation
+		// would otherwise put an event on the node for every pod, and the
+		// events worth reading are how the drain started and how it ended.
 		e.log.Info("drain advanced", "node", name, "step", step.Code, "reason", step.Reason)
 	}
 	return nil
+}
+
+// emitDrainEnded records how a drain finished on the node it happened to.
+//
+// Built from the name rather than taken from the snapshot, because the
+// successful case is exactly the one where the node is already gone — and that
+// event is still worth writing. It outlives the object, which is the point: it
+// is the record that the node binpack drained is the node that disappeared.
+//
+// Logged rather than returned on failure. The drain itself has already
+// happened; losing the note about it is not a reason to fail an evaluation
+// that will not be repeated.
+func (e *evaluator) emitDrainEnded(ctx context.Context, name, reason, note string) {
+	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	if err := e.reporter.emit(ctx, node, reason, ActionConsolidate, note); err != nil {
+		e.log.Error(err, "could not record how the drain ended", "node", name)
+	}
 }
 
 // drainPolicy resolves the drain bounds for the pool the node belongs to.
