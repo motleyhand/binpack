@@ -112,8 +112,18 @@ To hand a node back yourself:
 
 ```bash
 kubectl annotate node NODE binpack.motleyhand.com/drain-started- binpack.motleyhand.com/drain-progress- binpack.motleyhand.com/drain-pods-remaining- binpack.motleyhand.com/drain-awaiting-
+```
+
+```bash
+kubectl label node NODE binpack.motleyhand.com/draining-
+```
+
+```bash
 kubectl uncordon NODE
 ```
+
+The label goes too. binpack never reads it, so nothing clears it for you — and a node still
+reporting `draining=true` after the drain has ended makes the label worth nothing.
 
 ## What binpack cannot promise
 

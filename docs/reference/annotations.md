@@ -87,8 +87,18 @@ mid-drain — the repair is to clear the markers and uncordon:
 
 ```bash
 kubectl annotate node NODE binpack.motleyhand.com/drain-started- binpack.motleyhand.com/drain-progress- binpack.motleyhand.com/drain-pods-remaining- binpack.motleyhand.com/drain-awaiting-
+```
+
+```bash
+kubectl label node NODE binpack.motleyhand.com/draining-
+```
+
+```bash
 kubectl uncordon NODE
 ```
+
+The label goes too. binpack never reads it, so nothing clears it for you — and a node still
+reporting `draining=true` after the drain has ended makes the label worth nothing.
 
 binpack itself repairs the commoner half of this: a node carrying `drain-started` that is *not*
 cordoned is one where the process stopped between the two writes, and the next evaluation
