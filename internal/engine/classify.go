@@ -75,6 +75,24 @@ func Classify(pod *corev1.Pod, expendableCutoff int32) PodClass {
 }
 
 func isNodeLocal(pod *corev1.Pod) bool {
+	// Already on its way out: it needs no destination and no eviction.
+	//
+	// Note this is node-local by *circumstance* rather than by nature, and the
+	// two come apart outside the simulation — a drain in progress is waiting
+	// on exactly these pods. See [NodeBound].
+	return NodeBound(pod) || pod.DeletionTimestamp != nil
+}
+
+// NodeBound reports whether a pod is tied to its node by nature: it does not
+// move when the node goes away, it ceases to exist with it, and an equivalent
+// already runs elsewhere.
+//
+// Separate from [Classify]'s [NodeLocal] because that answers the simulation's
+// question — does this pod need a destination — and a terminating pod does
+// not, while still occupying the node it is leaving. A drain waiting for pods
+// to go needs this narrower predicate; classifying a terminating pod as
+// nothing to do with the drain would report an occupied node as empty.
+func NodeBound(pod *corev1.Pod) bool {
 	for _, owner := range pod.OwnerReferences {
 		if owner.Kind == "DaemonSet" {
 			return true
@@ -83,11 +101,8 @@ func isNodeLocal(pod *corev1.Pod) bool {
 	// A mirror pod is a static pod managed directly by a kubelet. It cannot
 	// be evicted at all, and the kubelet recreates it from an on-disk
 	// manifest.
-	if _, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
-		return true
-	}
-	// Already on its way out: it needs no destination and no eviction.
-	return pod.DeletionTimestamp != nil
+	_, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]
+	return mirror
 }
 
 // podPriority resolves a pod's priority. Admission normally populates it from
@@ -100,12 +115,12 @@ func podPriority(pod *corev1.Pod) int32 {
 	return 0
 }
 
-// occupies reports whether a pod still holds resources on its node.
+// Occupies reports whether a pod still holds resources on its node.
 //
 // Terminated pods have released theirs; everything else, including a pod that
 // is terminating but has not gone yet, still counts. Erring towards "occupies"
 // keeps the simulation conservative, which is the safe direction.
-func occupies(pod *corev1.Pod) bool {
+func Occupies(pod *corev1.Pod) bool {
 	switch pod.Status.Phase {
 	case corev1.PodSucceeded, corev1.PodFailed:
 		return false

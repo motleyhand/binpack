@@ -14,10 +14,20 @@ import (
 // to document, one thing to grep for, and no possibility of two clusters
 // disagreeing about what protects a node.
 const (
-	AnnotationSkip         = "binpack.motleyhand.com/skip"
-	AnnotationDrainStarted = "binpack.motleyhand.com/drain-started"
-	AnnotationBackoffUntil = "binpack.motleyhand.com/backoff-until"
-	AnnotationLastFailure  = "binpack.motleyhand.com/last-failure"
+	AnnotationSkip = "binpack.motleyhand.com/skip"
+
+	// Drain markers. Together these are the whole recovery state of a drain in
+	// progress: they live on the node rather than in process memory because
+	// the failure an in-memory timer guards against and the failure that
+	// destroys it are the same class of event.
+	AnnotationDrainStarted       = "binpack.motleyhand.com/drain-started"
+	AnnotationDrainProgress      = "binpack.motleyhand.com/drain-progress"
+	AnnotationDrainPodsRemaining = "binpack.motleyhand.com/drain-pods-remaining"
+
+	// Backoff markers, recorded when a drain is abandoned.
+	AnnotationDrainAttempts = "binpack.motleyhand.com/drain-attempts"
+	AnnotationBackoffUntil  = "binpack.motleyhand.com/backoff-until"
+	AnnotationLastFailure   = "binpack.motleyhand.com/last-failure"
 )
 
 // MaxStatusAge is how stale the autoscaler's status may be before binpack
@@ -506,7 +516,7 @@ func protectedNamespaces(s Snapshot, cfg Config) map[string]string {
 
 	out := make(map[string]string)
 	for _, pod := range s.Pods {
-		if pod.Spec.NodeName == "" || !occupies(pod) {
+		if pod.Spec.NodeName == "" || !Occupies(pod) {
 			continue
 		}
 		node, known := byName[pod.Spec.NodeName]
@@ -549,7 +559,7 @@ func backoffReason(node *corev1.Node) string {
 func workloadOn(s Snapshot, node *corev1.Node) int64 {
 	var total int64
 	for _, pod := range s.Pods {
-		if pod.Spec.NodeName != node.Name || !occupies(pod) {
+		if pod.Spec.NodeName != node.Name || !Occupies(pod) {
 			continue
 		}
 		if isNodeLocal(pod) {

@@ -92,7 +92,7 @@ func Simulate(
 	running := map[*corev1.Pod]*corev1.Pod{}
 
 	for _, pod := range byNode[candidate.Name] {
-		if !occupies(pod) {
+		if !Occupies(pod) {
 			continue
 		}
 		switch Classify(pod, cfg.ExpendablePriorityCutoff) {
@@ -133,7 +133,7 @@ func Simulate(
 
 		free := fit.Allocatable(node)
 		for _, pod := range byNode[node.Name] {
-			if !occupies(pod) {
+			if !Occupies(pod) {
 				continue
 			}
 			fit.Subtract(free, fit.EffectiveRequests(pod))
@@ -232,7 +232,7 @@ func checkHeadroom(
 	// and not a missed one. Skipping had that backwards.
 	var largest, largestRunning *corev1.Pod
 	for _, pod := range pods {
-		if !occupies(pod) || Classify(pod, cfg.ExpendablePriorityCutoff) != Relocatable {
+		if !Occupies(pod) || Classify(pod, cfg.ExpendablePriorityCutoff) != Relocatable {
 			continue
 		}
 		// Sized, not validated for relocation: this pod is not being moved, and
