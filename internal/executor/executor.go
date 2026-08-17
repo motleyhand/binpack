@@ -61,7 +61,19 @@ func Uncordon(ctx context.Context, w Writer, node *corev1.Node) error {
 // election mid-drain must be able to find out what it was doing. See
 // ADR-0007.
 func Annotate(ctx context.Context, w Writer, node *corev1.Node, annotations map[string]string) error {
-	if len(annotations) == 0 {
+	return patchMeta(ctx, w, node, nil, annotations)
+}
+
+// patchMeta sets labels and annotations in one patch, removing those given an
+// empty value.
+//
+// One patch rather than two because a merge patch on metadata carries both, and
+// a drain marker that appeared without its label — or outlived it — would make
+// the label a thing an operator learns not to trust.
+func patchMeta(
+	ctx context.Context, w Writer, node *corev1.Node, labels, annotations map[string]string,
+) error {
+	if len(labels) == 0 && len(annotations) == 0 {
 		return nil
 	}
 
@@ -71,20 +83,29 @@ func Annotate(ctx context.Context, w Writer, node *corev1.Node, annotations map[
 	//
 	// A nil value deletes the key, which is how a finished drain clears its
 	// own marker.
-	values := make(map[string]*string, len(annotations))
-	for key, value := range annotations {
-		if value == "" {
-			values[key] = nil
-			continue
+	nullable := func(in map[string]string) map[string]*string {
+		out := make(map[string]*string, len(in))
+		for key, value := range in {
+			if value == "" {
+				out[key] = nil
+				continue
+			}
+			out[key] = &value
 		}
-		values[key] = &value
+		return out
 	}
 
-	patch, err := json.Marshal(map[string]any{
-		"metadata": map[string]any{"annotations": values},
-	})
+	meta := map[string]any{}
+	if len(labels) > 0 {
+		meta["labels"] = nullable(labels)
+	}
+	if len(annotations) > 0 {
+		meta["annotations"] = nullable(annotations)
+	}
+
+	patch, err := json.Marshal(map[string]any{"metadata": meta})
 	if err != nil {
-		return fmt.Errorf("building the annotation patch for %s: %w", node.Name, err)
+		return fmt.Errorf("building the metadata patch for %s: %w", node.Name, err)
 	}
 
 	return patchNode(ctx, w, node, string(patch))

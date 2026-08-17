@@ -17,6 +17,12 @@ import (
 const (
 	AnnotationSkip = "binpack.motleyhand.com/skip"
 
+	// LabelDraining marks a node binpack is currently draining, so that
+	// `kubectl get nodes -L` says who cordoned it. Carried alongside the
+	// markers below rather than instead of them: the annotations are the
+	// state, this is the signal.
+	LabelDraining = "binpack.motleyhand.com/draining"
+
 	// Drain markers. Together these are the whole recovery state of a drain in
 	// progress: they live on the node rather than in process memory because
 	// the failure an in-memory timer guards against and the failure that

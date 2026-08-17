@@ -611,3 +611,72 @@ func (r *recorder) Patch(
 	r.patches = append(r.patches, string(data))
 	return r.Writer.Patch(ctx, obj, patch, opts...)
 }
+
+func TestTheDrainingLabelAppearsAndGoesWithTheMarkers(t *testing.T) {
+	// `kubectl get nodes` shows a cordoned node as SchedulingDisabled and says
+	// nothing about who did it. The label says binpack — and it has to go when
+	// the drain does, or it becomes a thing an operator learns not to trust.
+	n := node("a")
+	c := clientFor(snapshot([]*corev1.Node{n, node("b")}, nil))
+
+	if err := executor.Begin(context.Background(), c, n, at); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if got := nodeFrom(t, c, "a").Labels[engine.LabelDraining]; got != "true" {
+		t.Errorf("the draining label was not set: %q", got)
+	}
+
+	if _, err := executor.Abandon(
+		context.Background(), c, n, "test", "because", at); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+
+	after := nodeFrom(t, c, "a")
+	if _, present := after.Labels[engine.LabelDraining]; present {
+		t.Errorf("the draining label outlived the drain: %v", after.Labels)
+	}
+	if after.Annotations[engine.AnnotationDrainStarted] != "" {
+		t.Error("the markers outlived the drain")
+	}
+}
+
+func TestTheLabelAndTheMarkersMoveInOneWrite(t *testing.T) {
+	// Separately would let a node exist marked-but-unlabelled, or the reverse,
+	// for as long as it takes the second write to land — or forever, if it
+	// fails. A merge patch on metadata carries both, so there is no reason to
+	// take that risk.
+	n := node("a")
+	c := clientFor(snapshot([]*corev1.Node{n, node("b")}, nil))
+	rec := &recorder{Writer: c}
+
+	if err := executor.Begin(context.Background(), rec, n, at); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+
+	if len(rec.patches) != 2 {
+		t.Fatalf("expected one metadata patch and one cordon, got %d", len(rec.patches))
+	}
+	if !strings.Contains(rec.patches[0], engine.LabelDraining) ||
+		!strings.Contains(rec.patches[0], engine.AnnotationDrainStarted) {
+		t.Errorf("the label and the marker were not written together: %s", rec.patches[0])
+	}
+}
+
+func TestOtherLabelsAreLeftAlone(t *testing.T) {
+	// A node carries labels from its provider and from anything else in the
+	// cluster. Clobbering those would be its own incident.
+	n := node("a")
+	c := clientFor(snapshot([]*corev1.Node{n, node("b")}, nil))
+
+	if err := executor.Begin(context.Background(), c, n, at); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+	if _, err := executor.Abandon(
+		context.Background(), c, n, "test", "because", at); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+
+	if got := nodeFrom(t, c, "a").Labels["pool-label"]; got != poolName {
+		t.Errorf("a label binpack does not own was lost: %q", got)
+	}
+}
