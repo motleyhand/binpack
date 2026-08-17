@@ -955,3 +955,68 @@ func TestTheLoggedCountAgreesWithTheReasonBesideIt(t *testing.T) {
 		t.Errorf("the two nodes ruled out before simulation are not accounted for: %s", line)
 	}
 }
+
+func TestACompletedDrainStartsTheCooldown(t *testing.T) {
+	// cooldown.afterDrain was configurable, documented, and measured from a
+	// field nothing ever set — so it could never fire, and binpack would drain
+	// a node and pick another on the very next evaluation.
+	var log captured
+	rec := &fakeRecorder{}
+	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted: time.Now().Add(-time.Minute).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, draining, inPool("b"), inPool("c"), statusConfigMap())
+	ev.opts.DryRun = false
+	ev.opts.Engine.Default.CooldownAfterDrain = 30 * time.Minute
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if ev.active != "a" {
+		t.Fatalf("setup: the drain was not picked up, active = %q", ev.active)
+	}
+
+	// The autoscaler removes the node, which completes the drain.
+	if err := ev.reader.(client.Client).Delete(context.Background(), draining); err != nil {
+		t.Fatalf("deleting node a: %v", err)
+	}
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if ev.lastDrain.IsZero() {
+		t.Fatal("the completed drain was not recorded, so the cooldown measures from nothing")
+	}
+
+	// The next evaluation must decline, and say why in the documented terms.
+	log.lines = nil
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if !log.contains("letting the cluster settle") {
+		t.Errorf("no cooldown after a completed drain: %v", log.lines)
+	}
+}
+
+func TestAnAbandonedDrainDoesNotStartTheCooldown(t *testing.T) {
+	// Backoff is already recorded on the node that failed. A cluster-wide
+	// cooldown as well would punish every other node for one node's failure,
+	// and the two exist precisely to be different instruments.
+	var log captured
+	stalled := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted:  time.Now().Add(-time.Hour).Format(time.RFC3339),
+		engine.AnnotationDrainProgress: time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, &fakeRecorder{}, stalled,
+		mother.Pod("default", "stuck", mother.OnNode("a")),
+		inPool("b"), inPool("c"), statusConfigMap())
+	ev.opts.DryRun = false
+	ev.opts.Engine.Default.CooldownAfterDrain = 30 * time.Minute
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if !ev.lastDrain.IsZero() {
+		t.Error("an abandoned drain started a cluster-wide cooldown")
+	}
+}

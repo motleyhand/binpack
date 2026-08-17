@@ -206,6 +206,13 @@ Suppress action cluster-wide for a period after the cluster grew, and after binp
 **successful** drain. The first mirrors the autoscaler's own `scale-down-delay-after-add`; the
 second lets the cluster settle before binpack considers removing another node.
 
+`afterScaleUp` is measured from what the cluster-autoscaler publishes about itself, so it
+survives a binpack restart. `afterDrain` is measured from binpack's own memory of the drain,
+because a successful drain deletes the node that would otherwise have recorded it — so a restart
+or a change of leader inside the cooldown window forgets it, and the next drain may come sooner
+than the interval you configured. Both are also distinct from the per-node backoff that follows
+a *failed* drain, which lives on the node and does survive a restart.
+
 Distinct from `backoff`, which is per-node and follows a *failed* drain.
 
 ### `policy.exclusions.namespaces`

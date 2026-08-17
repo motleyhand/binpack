@@ -269,6 +269,19 @@ type evaluator struct {
 	// drainInProgress.
 	active string
 
+	// lastDrain is when this process last completed one, which is what
+	// cooldown.afterDrain measures from.
+	//
+	// In memory rather than on an object, because a successful drain is
+	// exactly the case where there is no object left to write it on — the node
+	// it happened to has been deleted. A restart therefore forgets it, and
+	// [engine.Snapshot.LastDrain] already says what that costs: the cooldown
+	// does not apply, and the worst case is one drain sooner than intended.
+	// Persisting it would mean a new API object, a new permission and a new
+	// failure mode, to protect against a restart that happens to fall inside
+	// one cooldown window.
+	lastDrain time.Time
+
 	// err carries a one-shot run's outcome back to [Run]. See Start.
 	err error
 }
@@ -353,6 +366,11 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 			time.Since(started).Seconds())
 		return e.advance(ctx, snapshot, node)
 	}
+
+	// Filled in by the controller rather than read from the cluster: it is the
+	// one thing in a snapshot that is not observable there, because a
+	// completed drain deletes the node that would have recorded it.
+	snapshot.LastDrain = e.lastDrain
 
 	decision := engine.Decide(snapshot, e.opts.Engine)
 	metrics.Observe(snapshot, decision, e.opts.Engine, time.Since(started).Seconds())
@@ -476,6 +494,10 @@ func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string)
 			fmt.Sprintf("binpack stopped draining this node: %s. It has been uncordoned",
 				step.Reason))
 	case step.Done:
+		// Only a drain that finished. An abandoned one already records
+		// per-node backoff, and letting it start a cluster-wide cooldown as
+		// well would punish every other node for one node's failure.
+		e.lastDrain = s.Now
 		metrics.DrainCompleted()
 		e.log.Info("drain complete", "node", name, "reason", step.Reason)
 		e.emitDrainEnded(ctx, name, ReasonDrained,
