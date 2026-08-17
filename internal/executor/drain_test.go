@@ -151,8 +151,11 @@ func TestEveryEndingHandsTheNodeBack(t *testing.T) {
 			to:   func(s *engine.Snapshot) { s.Autoscaler.Groups[0].MinSize = 3 },
 		},
 		{
+			// No skip code on this one: the verdict is what names it, and
+			// publishing an empty label would put a value outside the
+			// documented vocabulary into the metric.
 			name: "the remaining pods no longer fit",
-			code: "",
+			code: engine.VerdictInfeasible,
 			pods: []*corev1.Pod{
 				mother.Pod("default", "huge", mother.OnNode("a"), mother.Requests("100m", "6Gi")),
 				mother.Pod("default", "fill-b", mother.OnNode("b"), mother.Requests("100m", "6Gi")),
@@ -463,7 +466,7 @@ func TestAReplacementTheSchedulerRefusedEndsTheDrain(t *testing.T) {
 		t.Fatalf("Advance: %v", err)
 	}
 
-	if step.Code != executor.StepUnschedulable || !step.Failed {
+	if step.Code != drain.AbandonUnschedulable || !step.Failed {
 		t.Errorf("expected the drain abandoned, got %+v", step)
 	}
 	if !strings.Contains(step.Reason, "default/orphan") {
@@ -494,7 +497,7 @@ func TestOneRefusedReplacementEndsTheDrainWhateverItsSiblingsDid(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Advance: %v", err)
 	}
-	if step.Code != executor.StepUnschedulable {
+	if step.Code != drain.AbandonUnschedulable {
 		t.Errorf("expected the drain abandoned, got %+v", step)
 	}
 	if !strings.Contains(step.Reason, "default/refused") {

@@ -22,12 +22,6 @@ const (
 	StepWaiting      = "waiting"
 	StepAwaitRemoval = "awaiting-removal"
 	StepRemoved      = "removed"
-
-	// StepUnschedulable: a pod that moved off this node could not be placed.
-	// The simulation proved a valid assignment existed; the scheduler is not
-	// obliged to choose that one, and this is what it looks like when it
-	// chose differently.
-	StepUnschedulable = "replacement-unschedulable"
 )
 
 // Step is what one evaluation did to a drain.
@@ -104,7 +98,12 @@ func Advance(
 		// The cluster moved underneath the drain. Nothing here distinguishes
 		// a drain that has evicted nothing from one that is half done: both
 		// end the same way, with the node handed back.
-		return Abandon(ctx, w, a.Node, a.SkipCode, revalidationReason(a), s.Now)
+		//
+		// The verdict rather than the skip code, because a node that became
+		// infeasible or blocked carries no skip code at all — and publishing
+		// an empty label would put a value outside the documented vocabulary
+		// into the metric, on the two outcomes most worth telling apart.
+		return Abandon(ctx, w, a.Node, revalidationCode(a), revalidationReason(a), s.Now)
 	}
 
 	// A replacement owed by an earlier eviction settles what happens next,
@@ -120,7 +119,7 @@ func Advance(
 			// Unschedulable — so this is detected rather than inferred from a
 			// timeout, and it names the pod. Uncordoning is also the repair:
 			// this node is where that pod can go.
-			return Abandon(ctx, w, a.Node, StepUnschedulable, fmt.Sprintf(
+			return Abandon(ctx, w, a.Node, drain.AbandonUnschedulable, fmt.Sprintf(
 				"pod %s/%s could not be scheduled after moving off this node",
 				pod.Namespace, pod.Name), s.Now)
 
@@ -167,7 +166,7 @@ func Advance(
 		// Pods remain that the simulation did not name. Rather than guess at
 		// them, hand the node back: acting on a set binpack cannot account for
 		// is exactly what the allowlist exists to prevent.
-		return Abandon(ctx, w, a.Node, "unaccounted-pods", fmt.Sprintf(
+		return Abandon(ctx, w, a.Node, drain.AbandonUnaccounted, fmt.Sprintf(
 			"%d pods remain that the simulation did not account for", len(pods)), s.Now)
 	}
 
@@ -380,6 +379,15 @@ func awaitingMarker(pod *corev1.Pod, now time.Time) string {
 		return ""
 	}
 	return string(ref.UID) + "@" + now.UTC().Format(time.RFC3339)
+}
+
+// revalidationCode names why a node stopped being drainable, as a label a
+// metric can carry: a skip code when there is one, and the verdict otherwise.
+func revalidationCode(a engine.NodeAssessment) string {
+	if a.SkipCode != "" {
+		return a.SkipCode
+	}
+	return a.Verdict()
 }
 
 // revalidationReason renders why a node stopped being drainable, in the terms

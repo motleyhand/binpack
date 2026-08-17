@@ -137,6 +137,8 @@ func enginePolicy(p v1alpha1.PoolPolicy) engine.Policy {
 		MaxPodsPerDrain:      p.MaxPodsPerDrain,
 		CooldownAfterScaleUp: p.CooldownAfterScaleUp,
 		CooldownAfterDrain:   p.CooldownAfterDrain,
+		StallTimeout:         p.StallTimeout,
+		RemovalTimeout:       p.RemovalTimeout,
 		ExcludedNamespaces:   p.ExcludedNamespaces,
 	}
 }

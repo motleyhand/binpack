@@ -19,6 +19,7 @@ import (
 	"k8s.io/apimachinery/pkg/util/validation"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
@@ -87,8 +88,9 @@ func config() engine.Config {
 	}
 }
 
-func inPool(name string) *corev1.Node {
-	return mother.LargeNode(name, mother.InPool(poolName, poolID))
+func inPool(name string, opts ...mother.NodeOption) *corev1.Node {
+	return mother.LargeNode(name, append([]mother.NodeOption{
+		mother.InPool(poolName, poolID)}, opts...)...)
 }
 
 func statusConfigMap() client.Object {
@@ -121,13 +123,25 @@ nodeGroups:
 
 func newEvaluator(t *testing.T, log *captured, rec *fakeRecorder, objs ...client.Object) *evaluator {
 	t.Helper()
+	c := fake.NewClientBuilder().WithObjects(objs...).Build()
 	return &evaluator{
-		reader:   fake.NewClientBuilder().WithObjects(objs...).Build(),
+		reader:   c,
+		writer:   c,
 		reporter: broadcastReporter{recorder: rec},
-		opts:     Options{Engine: config(), DryRun: true, Interval: time.Minute, Once: true},
-		log:      log.logger(),
-		stop:     func() {},
+		opts: Options{Engine: withDrainBounds(config()), DryRun: true,
+			Interval: time.Minute, Once: true},
+		log:  log.logger(),
+		stop: func() {},
 	}
+}
+
+// withDrainBounds gives the policy the timeouts a real one is defaulted to.
+// Zero means "any elapsed time is too long", so a config without them makes
+// every resumed drain abandon on its first evaluation.
+func withDrainBounds(c engine.Config) engine.Config {
+	c.Default.StallTimeout = 10 * time.Minute
+	c.Default.RemovalTimeout = 15 * time.Minute
+	return c
 }
 
 func TestEvaluateEmitsAnEventOnTheNodeItWouldDrain(t *testing.T) {
@@ -191,6 +205,192 @@ func TestEvaluateSaysSomethingWhenThereIsNothingToDo(t *testing.T) {
 	}
 	if !log.contains("nothing to do") {
 		t.Errorf("said nothing at all:\n%s", strings.Join(log.lines, "\n"))
+	}
+}
+
+func TestDryRunChangesNothingAtAll(t *testing.T) {
+	// The guarantee the whole 0.1 line is sold on, asserted rather than
+	// argued. It decides everything and writes nothing: no cordon, no marker,
+	// nothing but an event saying what it would have done.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		inPool("a"), inPool("b"), inPool("c"),
+		mother.Pod("default", "web", mother.OnNode("a")),
+		statusConfigMap(),
+	)
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	var nodes corev1.NodeList
+	if err := ev.reader.(client.Client).List(context.Background(), &nodes); err != nil {
+		t.Fatalf("listing nodes: %v", err)
+	}
+	for _, n := range nodes.Items {
+		if n.Spec.Unschedulable {
+			t.Errorf("node %s was cordoned in dry run", n.Name)
+		}
+		for key := range n.Annotations {
+			if strings.HasPrefix(key, "binpack.motleyhand.com/") {
+				t.Errorf("node %s was annotated %s in dry run", n.Name, key)
+			}
+		}
+	}
+	// And it did decide: an assertion that nothing happened is satisfied by a
+	// controller that did nothing at all.
+	if len(rec.events) != 1 {
+		t.Errorf("got %d events, want one saying what it would have done", len(rec.events))
+	}
+}
+
+func TestADrainInProgressPreemptsANewDecision(t *testing.T) {
+	// Step 0 of the protocol. A drain can legitimately outlast many intervals,
+	// and without this every one of those intervals would be free to cordon a
+	// second node — "one node per run" quietly assumed a run was short.
+	var log captured
+	rec := &fakeRecorder{}
+	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted: time.Now().Add(-time.Minute).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, draining, inPool("b"), inPool("c"), statusConfigMap())
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if len(rec.events) != 0 {
+		t.Errorf("a new decision was reported while a drain was running: %+v", rec.events)
+	}
+	for _, name := range []string{"b", "c"} {
+		var n corev1.Node
+		if err := ev.reader.(client.Client).Get(
+			context.Background(), client.ObjectKey{Name: name}, &n); err != nil {
+			t.Fatalf("reading node %s: %v", name, err)
+		}
+		if n.Spec.Unschedulable {
+			t.Errorf("node %s was cordoned while a drain was already in progress", name)
+		}
+	}
+}
+
+func TestACompletedDrainIsCounted(t *testing.T) {
+	// A successful drain is precisely the case where the evidence disappears:
+	// the autoscaler removes the node and the markers go with it. Without
+	// remembering the node, the completed counter would only ever increment
+	// for drains that failed to finish.
+	var log captured
+	rec := &fakeRecorder{}
+	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted: time.Now().Add(-time.Minute).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, draining, inPool("b"), inPool("c"), statusConfigMap())
+	ev.opts.DryRun = false
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if ev.active != "a" {
+		t.Fatalf("setup: the drain was not picked up, active = %q", ev.active)
+	}
+
+	// The autoscaler removes it, taking the annotations with it.
+	c := ev.reader.(client.Client)
+	if err := c.Delete(context.Background(), draining); err != nil {
+		t.Fatalf("deleting node a: %v", err)
+	}
+
+	before := completedDrains(t)
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if got := completedDrains(t) - before; got != 1 {
+		t.Errorf("the completed drain was counted %v times, want once", got)
+	}
+	if ev.active != "" {
+		t.Errorf("the finished drain is still remembered as %q", ev.active)
+	}
+}
+
+func TestAMarkerClearedBySomebodyElseIsNotBinpacksDrain(t *testing.T) {
+	// The node is still there but nobody marked it. Continuing would be acting
+	// on a drain binpack no longer has a record of starting.
+	var log captured
+	rec := &fakeRecorder{}
+	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted: time.Now().Add(-time.Minute).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, draining, inPool("b"), statusConfigMap())
+	ev.opts.DryRun = false
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	c := ev.reader.(client.Client)
+	var live corev1.Node
+	if err := c.Get(context.Background(), client.ObjectKey{Name: "a"}, &live); err != nil {
+		t.Fatalf("reading node a: %v", err)
+	}
+	live.Annotations = nil
+	if err := c.Update(context.Background(), &live); err != nil {
+		t.Fatalf("clearing the marker: %v", err)
+	}
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	// It is free to decide afresh — and on this cluster it does. What must not
+	// happen is binpack going on advancing a drain of a node nobody marked.
+	if ev.active == "a" {
+		t.Error("still advancing a drain of a node whose marker was cleared")
+	}
+}
+
+func TestAnUnmarkedNodeIsForgottenRatherThanRemembered(t *testing.T) {
+	// A name kept after the marker went would later read a node deleted for
+	// some unrelated reason — a pool resize, a manual kubectl delete — as a
+	// drain binpack completed.
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{}, inPool("a"), inPool("b"), statusConfigMap())
+	ev.active = "a"
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if ev.active != "" {
+		t.Errorf("still remembering a drain of an unmarked node: %q", ev.active)
+	}
+}
+
+func TestDryRunLeavesADrainInProgressAlone(t *testing.T) {
+	// Reachable: dryRun can be switched on while a drain is running. The node
+	// is cordoned and binpack has been told to change nothing, and uncordoning
+	// would itself be a change — so saying so is the only honest option.
+	var log captured
+	rec := &fakeRecorder{}
+	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted: time.Now().Add(-time.Hour).Format(time.RFC3339),
+	}))
+	ev := newEvaluator(t, &log, rec, draining, inPool("b"), statusConfigMap())
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	var n corev1.Node
+	if err := ev.reader.(client.Client).Get(
+		context.Background(), client.ObjectKey{Name: "a"}, &n); err != nil {
+		t.Fatalf("reading node a: %v", err)
+	}
+	if !n.Spec.Unschedulable || n.Annotations[engine.AnnotationDrainStarted] == "" {
+		t.Error("dry run changed the node it was told to leave alone")
+	}
+	if !log.contains("dryRun") {
+		t.Error("nothing in the log says why the drain is not moving")
 	}
 }
 
@@ -605,4 +805,22 @@ func TestControllersAreTrimmedBeforeCaching(t *testing.T) {
 	if trimmed.Annotations != nil {
 		t.Error("annotations are still cached, including last-applied-configuration")
 	}
+}
+
+// completedDrains reads the counter through the same registry a scrape would.
+// A direct handle would pass against a series nobody publishes; this cannot.
+func completedDrains(t *testing.T) float64 {
+	t.Helper()
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "binpack_drains_completed_total" {
+			continue
+		}
+		return f.GetMetric()[0].GetCounter().GetValue()
+	}
+	t.Fatal("binpack_drains_completed_total is not published at all")
+	return 0
 }

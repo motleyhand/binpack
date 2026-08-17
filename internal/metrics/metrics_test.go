@@ -12,6 +12,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
 )
@@ -145,7 +146,11 @@ func TestGaugesForgetWhatNoLongerApplies(t *testing.T) {
 		Assessments: []engine.NodeAssessment{assess(engine.VerdictDrainable, "")},
 	}, config(), 0.01)
 
-	if strings.Contains(gather(t), engine.SkipCordoned) {
+	// The exact series, not the bare code. Abandonment reasons share this
+	// vocabulary and are seeded at zero deliberately, so a substring search
+	// over the whole scrape now matches those too and would pass regardless of
+	// what the gauge did.
+	if strings.Contains(gather(t), `binpack_nodes_skipped{code="`+engine.SkipCordoned+`"}`) {
 		t.Errorf("a skip code that no longer applies is still reported:\n%s", gather(t))
 	}
 }
@@ -423,5 +428,52 @@ func TestUnmodelledNodesAreCountedApartFromOrdinaryShortfalls(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(unmodelled); got != 1 {
 		t.Errorf("binpack_nodes_unmodelled = %v, want only the unreadable one", got)
+	}
+}
+
+func TestEveryAbandonReasonHasAZeroSeries(t *testing.T) {
+	// A counter that only appears once it has fired makes a rate() alert
+	// silently useless until the first occurrence — the moment somebody needed
+	// it. All three sources reach this counter, so all three must be seeded.
+	scrape := gather(t)
+
+	var want []string
+	want = append(want, drain.AbandonCodes()...)
+	want = append(want, engine.SkipCodes()...)
+	want = append(want, engine.VerdictInfeasible, engine.VerdictBlocked)
+
+	for _, code := range want {
+		series := `binpack_drains_abandoned_total{reason="` + code + `"}`
+		if !strings.Contains(scrape, series) {
+			t.Errorf("%s is missing, so an alert on it cannot fire", series)
+		}
+	}
+}
+
+func TestBackoffDepthOutlivesTheBackoffWindow(t *testing.T) {
+	// The attempt count stands until a drain of the node succeeds. Gating the
+	// depth on the deadline would make it fall to zero during every retry
+	// window and climb back only on the next failure, which reads as recovery
+	// from the one thing worth alerting on.
+	now := time.Now()
+	expired := mother.LargeNode("a", mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainAttempts: "3",
+		engine.AnnotationBackoffUntil:  now.Add(-time.Minute).Format(time.RFC3339),
+	}))
+	active := mother.LargeNode("b", mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainAttempts: "1",
+		engine.AnnotationBackoffUntil:  now.Add(time.Hour).Format(time.RFC3339),
+	}))
+
+	s := snapshot()
+	s.Nodes = []*corev1.Node{expired, active}
+	s.Now = now
+	Observe(s, engine.Decision{Code: engine.CodeNoCandidates}, config(), 0.01)
+
+	if got := testutil.ToFloat64(drainAttemptsMax); got != 3 {
+		t.Errorf("drain_attempts_max = %v, want 3 — the expired node still has three failures", got)
+	}
+	if got := testutil.ToFloat64(nodesInBackoff); got != 1 {
+		t.Errorf("nodes_in_backoff = %v, want 1 — only one deadline is still in the future", got)
 	}
 }
