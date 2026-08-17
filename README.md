@@ -93,6 +93,7 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md) | Borrowing the scheduler's own logic, and testing against the real one |
 | [ADR-0007](docs/design/adr-0007-drain-progress-not-deadlines.md) | Why drains are bounded by progress rather than deadlines, and why failures back off |
 | [ADR-0008](docs/design/adr-0008-engine-uses-api-types.md) | Why the engine uses Kubernetes API types directly, and what the purity rule was really protecting |
+| [ADR-0009](docs/design/adr-0009-revalidation-asks-soundness-not-preference.md) | Revalidation re-asks soundness, not preference |
 
 Configuration and metrics references are written as the implementation lands.
 
