@@ -1020,3 +1020,75 @@ func TestAnAbandonedDrainDoesNotStartTheCooldown(t *testing.T) {
 		t.Error("an abandoned drain started a cluster-wide cooldown")
 	}
 }
+
+func TestOnceRefusesACooldownItCannotHonour(t *testing.T) {
+	// Every --once run is a new process, and a completed drain deletes the
+	// node that would have recorded it — so the cooldown measures from a value
+	// that is always zero. A safety control that is configured, reported as
+	// configured, and silently inert is worse than one that is absent.
+	for _, tc := range []struct {
+		name    string
+		refused bool
+		to      func(*Options)
+	}{
+		{
+			name: "acting on a schedule, with a cooldown configured",
+			// The whole point: this is the combination that cannot work.
+			refused: true,
+			to:      func(o *Options) { o.Engine.Default.CooldownAfterDrain = 15 * time.Minute },
+		},
+		{
+			name:    "a pool sets one, even though the default does not",
+			refused: true,
+			to: func(o *Options) {
+				o.Engine.ByPool = map[string]engine.Policy{
+					"gpu": {CooldownAfterDrain: 15 * time.Minute},
+				}
+			},
+		},
+		{
+			name: "the cooldown is switched off deliberately",
+			to:   func(o *Options) { o.Engine.Default.CooldownAfterDrain = 0 },
+		},
+		{
+			// Nothing changes, so there is nothing to settle after.
+			name: "deciding only",
+			to: func(o *Options) {
+				o.DryRun = true
+				o.Engine.Default.CooldownAfterDrain = 15 * time.Minute
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := Options{Once: true, DryRun: false, Engine: config()}
+			tc.to(&opts)
+
+			err := Run(context.Background(), opts)
+			refused := err != nil && strings.Contains(err.Error(), "cooldown.afterDrain")
+
+			if refused != tc.refused {
+				t.Errorf("refused = %v, want %v (err: %v)", refused, tc.refused, err)
+			}
+			if tc.refused && !strings.Contains(err.Error(), "Deployment") {
+				t.Errorf("the refusal does not say how to resolve it: %v", err)
+			}
+		})
+	}
+}
+
+func TestADeploymentIsNotRefusedItsCooldown(t *testing.T) {
+	// The mode that can honour it must not be caught by the guard: binpack
+	// running as a Deployment holds the timestamp for as long as it runs.
+	err := Run(context.Background(), Options{
+		Once: false, DryRun: false,
+		Engine: func() engine.Config {
+			c := config()
+			c.Default.CooldownAfterDrain = 15 * time.Minute
+			return c
+		}(),
+	})
+
+	if err != nil && strings.Contains(err.Error(), "cooldown.afterDrain") {
+		t.Errorf("a Deployment was refused a cooldown it can honour: %v", err)
+	}
+}

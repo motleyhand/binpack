@@ -210,8 +210,17 @@ second lets the cluster settle before binpack considers removing another node.
 survives a binpack restart. `afterDrain` is measured from binpack's own memory of the drain,
 because a successful drain deletes the node that would otherwise have recorded it — so a restart
 or a change of leader inside the cooldown window forgets it, and the next drain may come sooner
-than the interval you configured. Both are also distinct from the per-node backoff that follows
-a *failed* drain, which lives on the node and does survive a restart.
+than the interval you configured.
+
+That memory is why **`afterDrain` cannot be honoured by `run --once`**. Every invocation is a
+new process, so a scheduled run starts having forgotten that it ever drained anything, and the
+cooldown would never apply at all. binpack refuses that combination at startup rather than
+reporting a setting it will not enforce; run it as a Deployment, or set `afterDrain: 0` to say
+that consecutive drains are acceptable. A dry-run `--once` is unaffected, since nothing changes
+for the cluster to settle after.
+
+Both are distinct from the per-node backoff that follows a *failed* drain, which lives on the
+node and does survive a restart — and is therefore the one bound that works in every mode.
 
 Distinct from `backoff`, which is per-node and follows a *failed* drain.
 

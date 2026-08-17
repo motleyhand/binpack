@@ -9,6 +9,8 @@ package controller
 import (
 	"context"
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"time"
 
@@ -68,7 +70,44 @@ type Options struct {
 
 // Run starts binpack and blocks until ctx is cancelled, or until one
 // evaluation completes when Options.Once is set.
+// cooldownIsUnenforceable reports the pool whose after-drain cooldown a
+// one-shot run could not honour, if there is one.
+//
+// A drain outlives many evaluations, and in --once mode each of those is a
+// separate process. The completion timestamp lives in memory — a successful
+// drain deletes the node that would otherwise have recorded it — so a CronJob
+// starts every invocation having forgotten that it ever drained anything, and
+// the cooldown never applies.
+//
+// Refused rather than quietly degraded, and refused only when it would matter:
+// a dry run changes nothing to need settling after.
+func cooldownIsUnenforceable(opts Options) (string, time.Duration, bool) {
+	if !opts.Once || opts.DryRun {
+		return "", 0, false
+	}
+	if d := opts.Engine.Default.CooldownAfterDrain; d > 0 {
+		return "the default policy", d, true
+	}
+	for _, name := range slices.Sorted(maps.Keys(opts.Engine.ByPool)) {
+		if d := opts.Engine.ByPool[name].CooldownAfterDrain; d > 0 {
+			return "pool " + name, d, true
+		}
+	}
+	return "", 0, false
+}
+
 func Run(ctx context.Context, opts Options) error {
+	// Before anything else, because the alternative is a safety control that
+	// is configured, reported as configured, and silently inert.
+	if where, d, unenforceable := cooldownIsUnenforceable(opts); unenforceable {
+		return fmt.Errorf(
+			"--once cannot honour cooldown.afterDrain (%s sets %s): each run is a new process, "+
+				"and a completed drain leaves nothing in the cluster to measure from, so the "+
+				"cooldown would never apply. Run binpack as a Deployment, or set "+
+				"cooldown.afterDrain: 0 to say that consecutive drains are acceptable",
+			where, d)
+	}
+
 	mgr, err := manager.New(opts.RestConfig, managerOptions(opts))
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
