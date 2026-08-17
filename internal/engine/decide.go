@@ -42,6 +42,36 @@ const (
 	AnnotationLastFailure   = "binpack.motleyhand.com/last-failure"
 )
 
+// Taints the cluster-autoscaler puts on nodes it is removing. Its constants,
+// not binpack's — from cluster-autoscaler/utils/taints/taints.go — so they are
+// named here once rather than spelled out at each use.
+//
+// Only the committed one is acted on. DeletionCandidateOfClusterAutoscaler is
+// PreferNoSchedule and means the autoscaler considers the node unneeded, which
+// is an opinion rather than a decision; ToBeDeletedByClusterAutoscaler is
+// NoSchedule and means it has started removing it.
+const (
+	TaintToBeDeleted       = "ToBeDeletedByClusterAutoscaler"
+	TaintDeletionCandidate = "DeletionCandidateOfClusterAutoscaler"
+)
+
+// BeingRemoved reports whether the cluster-autoscaler has committed to deleting
+// this node.
+//
+// The node is the autoscaler's from that moment: it is draining the node
+// itself, and binpack evicting alongside it is duplicated work at best. Worse,
+// binpack's own bounds would eventually abandon the drain and uncordon a node
+// the autoscaler is actively deleting — two components disagreeing about
+// whether a node should accept pods.
+func BeingRemoved(node *corev1.Node) bool {
+	for _, taint := range node.Spec.Taints {
+		if taint.Key == TaintToBeDeleted {
+			return true
+		}
+	}
+	return false
+}
+
 // MaxStatusAge is how stale the autoscaler's status may be before binpack
 // treats it as abandoned. The autoscaler scans every ten seconds by default,
 // so minutes of silence means it is gone rather than busy.
@@ -268,7 +298,10 @@ const (
 	SkipGone = "gone"
 	// SkipUncordoned: a drain is marked on the node but the node is
 	// schedulable, so it is still accepting pods.
-	SkipUncordoned   = "uncordoned"
+	SkipUncordoned = "uncordoned"
+	// SkipBeingRemoved: the cluster-autoscaler has committed to deleting the
+	// node and is draining it itself.
+	SkipBeingRemoved = "being-removed"
 	SkipBackoff      = "backoff"
 	SkipCordoned     = "cordoned"
 	SkipProtectedPod = "protected-pod"
@@ -640,6 +673,14 @@ func eligibility(
 		// be reasoning about a node whose pod set can still grow.
 		a.Skipped, a.SkipCode = true, SkipUncordoned
 		a.SkipReason = "a drain is marked on this node but it is not cordoned, so it is still accepting pods"
+
+	case BeingRemoved(node):
+		// Taints rather than spec.unschedulable, so the cordon check below
+		// does not catch this. Skipped whether or not binpack started the
+		// drain: once the autoscaler is removing a node, there is nothing left
+		// for binpack to decide about it.
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipBeingRemoved,
+			"the cluster-autoscaler is already removing this node"
 
 	case !resuming && node.Spec.Unschedulable:
 		// Already cordoned by someone else. Draining it would not be
