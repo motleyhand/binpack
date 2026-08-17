@@ -98,7 +98,12 @@ func Advance(
 		// The cluster moved underneath the drain. Nothing here distinguishes
 		// a drain that has evicted nothing from one that is half done: both
 		// end the same way, with the node handed back.
-		return Abandon(ctx, w, a.Node, a.SkipCode, revalidationReason(a), s.Now)
+		//
+		// The verdict rather than the skip code, because a node that became
+		// infeasible or blocked carries no skip code at all — and publishing
+		// an empty label would put a value outside the documented vocabulary
+		// into the metric, on the two outcomes most worth telling apart.
+		return Abandon(ctx, w, a.Node, revalidationCode(a), revalidationReason(a), s.Now)
 	}
 
 	// A replacement owed by an earlier eviction settles what happens next,
@@ -374,6 +379,15 @@ func awaitingMarker(pod *corev1.Pod, now time.Time) string {
 		return ""
 	}
 	return string(ref.UID) + "@" + now.UTC().Format(time.RFC3339)
+}
+
+// revalidationCode names why a node stopped being drainable, as a label a
+// metric can carry: a skip code when there is one, and the verdict otherwise.
+func revalidationCode(a engine.NodeAssessment) string {
+	if a.SkipCode != "" {
+		return a.SkipCode
+	}
+	return a.Verdict()
 }
 
 // revalidationReason renders why a node stopped being drainable, in the terms

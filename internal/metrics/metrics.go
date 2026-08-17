@@ -196,7 +196,17 @@ func init() {
 	// Every abandon reason gets a zero series up front. A counter that only
 	// appears once it has fired makes rate() alerts silently useless until the
 	// first occurrence — which is exactly the moment somebody needed them.
+	//
+	// All three sources, because all three reach this counter: the reasons
+	// binpack decides for itself, the skip codes revalidation can stop a drain
+	// with, and the two verdicts that carry no skip code.
 	for _, code := range drain.AbandonCodes() {
+		drainsAbandoned.WithLabelValues(code)
+	}
+	for _, code := range engine.SkipCodes() {
+		drainsAbandoned.WithLabelValues(code)
+	}
+	for _, code := range []string{engine.VerdictInfeasible, engine.VerdictBlocked} {
 		drainsAbandoned.WithLabelValues(code)
 	}
 
@@ -323,14 +333,20 @@ func observePools(s engine.Snapshot, cfg engine.Config) {
 func observeBackoff(s engine.Snapshot) {
 	var inBackoff, deepest float64
 	for _, node := range s.Nodes {
-		until, err := time.Parse(time.RFC3339, node.Annotations[engine.AnnotationBackoffUntil])
-		if err != nil || !s.Now.Before(until) {
-			continue
-		}
-		inBackoff++
+		// Two questions, two conditions. A node whose backoff has expired is a
+		// candidate again but has not succeeded at anything — its attempt
+		// count stands until a drain of it works, and that is the number the
+		// gauge documents. Gating the depth on the deadline too would make it
+		// fall to zero during every retry window and climb back only on the
+		// next failure, which reads as recovery.
 		if n, err := strconv.Atoi(node.Annotations[engine.AnnotationDrainAttempts]); err == nil &&
 			float64(n) > deepest {
 			deepest = float64(n)
+		}
+
+		until, err := time.Parse(time.RFC3339, node.Annotations[engine.AnnotationBackoffUntil])
+		if err == nil && s.Now.Before(until) {
+			inBackoff++
 		}
 	}
 	nodesInBackoff.Set(inBackoff)

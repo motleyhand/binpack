@@ -131,7 +131,12 @@ investigation use one vocabulary.
 
 Any of the skip codes above can also appear, when the cluster changed underneath a drain and
 revalidation stopped it — a scale-up beginning, a pool reaching its minimum, an operator
-annotating the node.
+annotating the node. So can `infeasible` and `blocked`, for the two outcomes that carry no skip
+code: the remaining pods stopped fitting elsewhere, and a disruption budget stopped allowing
+their eviction.
+
+Every one of these has a series from startup, at zero. A counter that only appears once it has
+fired makes a `rate()` alert silently useless until the first occurrence.
 
 A rising `binpack_drains_abandoned_total` is worth attention whatever the reason: every
 abandoned drain is churn that bought nothing. `binpack_drain_attempts_max` climbing means the

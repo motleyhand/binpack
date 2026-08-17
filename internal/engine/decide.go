@@ -222,6 +222,18 @@ func (a Action) String() string {
 	return "none"
 }
 
+// SkipCodes is every reason a node can be ruled out. Enumerable because these
+// are metric label values: a counter that only appears once it has fired makes
+// a rate() alert silently useless until the first occurrence.
+func SkipCodes() []string {
+	return []string{
+		SkipNotAutoscaled, SkipPoolDisabled, SkipScaleUpInProgress,
+		SkipCooldownAfterScaleUp, SkipCooldownAfterDrain, SkipPoolAtMinimum,
+		SkipAnnotated, SkipDrainInProgress, SkipGone, SkipUncordoned,
+		SkipBackoff, SkipCordoned, SkipProtectedPod, SkipTooManyPods,
+	}
+}
+
 // Verdicts: what binpack concluded about one node, as a bounded value.
 //
 // The prose says why in a sentence an operator can act on; these name the

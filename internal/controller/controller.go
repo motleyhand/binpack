@@ -271,6 +271,11 @@ type evaluator struct {
 	log      logr.Logger
 	stop     context.CancelFunc
 
+	// active is the node this process last saw a drain on, kept so the drain
+	// can be counted as complete once the node and its markers are gone. See
+	// drainInProgress.
+	active string
+
 	// err carries a one-shot run's outcome back to [Run]. See Start.
 	err error
 }
@@ -349,7 +354,7 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 	// A drain can legitimately outlast many intervals, and without this every
 	// one of those intervals would be free to select a second node. "One node
 	// per run" quietly assumed a run was short.
-	if node := draining(snapshot); node != "" {
+	if node := e.drainInProgress(snapshot); node != "" {
 		metrics.Observe(snapshot, engine.Decision{Code: engine.CodeDraining,
 			Reason: "a drain is in progress on " + node}, e.opts.Engine,
 			time.Since(started).Seconds())
@@ -385,16 +390,49 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 		return fmt.Errorf("starting the drain of %s: %w", decision.Node.Name, err)
 	}
 	metrics.DrainStarted()
+	e.active = decision.Node.Name
 	return nil
 }
 
-// draining names the node binpack is part-way through draining, if any.
+// drainInProgress names the node binpack is part-way through draining.
+//
+// It also remembers the last one, because a successful drain is exactly the
+// case where the evidence disappears: the autoscaler removes the node and the
+// markers go with it. Without this the completion is unobservable — the
+// completed-drain counter would only ever increment for drains that failed to
+// finish, which is the opposite of useful.
+//
+// Process memory rather than an annotation, and that is fine here precisely
+// because it is only a metric. Everything a *recovery* needs still lives on
+// the nodes; the worst a restart costs is one uncounted drain.
+func (e *evaluator) drainInProgress(s engine.Snapshot) string {
+	if name := marked(s); name != "" {
+		e.active = name
+		return name
+	}
+
+	if e.active != "" && !present(s, e.active) {
+		// Gone, so [executor.Advance] will report the removal and write
+		// nothing. Left to it rather than counted here, so there is one place
+		// that decides what the end of a drain means.
+		return e.active
+	}
+
+	// Either nothing was running, or the node is still there with its marker
+	// cleared by something other than binpack. The second is no longer
+	// binpack's drain, and acting on it would be acting on a node nobody
+	// marked.
+	e.active = ""
+	return ""
+}
+
+// marked names the node carrying a drain marker.
 //
 // Sorted, so two markers left by some earlier confusion produce the same
 // answer every evaluation rather than whichever the cache listed first. One
 // drain at a time is the invariant; picking deterministically means the second
 // marker is resolved rather than alternated with.
-func draining(s engine.Snapshot) string {
+func marked(s engine.Snapshot) string {
 	var names []string
 	for _, node := range s.Nodes {
 		if node.Annotations[engine.AnnotationDrainStarted] != "" {
@@ -406,6 +444,15 @@ func draining(s engine.Snapshot) string {
 		return ""
 	}
 	return names[0]
+}
+
+func present(s engine.Snapshot, name string) bool {
+	for _, node := range s.Nodes {
+		if node.Name == name {
+			return true
+		}
+	}
+	return false
 }
 
 // advance moves an in-progress drain on by one step.
@@ -422,6 +469,10 @@ func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string)
 	step, err := executor.Advance(ctx, e.writer, s, name, e.opts.Engine, e.drainPolicy(name, s))
 	if err != nil {
 		return fmt.Errorf("advancing the drain of %s: %w", name, err)
+	}
+
+	if step.Done {
+		e.active = ""
 	}
 
 	switch {
