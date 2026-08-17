@@ -46,9 +46,15 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 		// Logged every evaluation rather than only on change. A controller
 		// that goes quiet is indistinguishable from one that has stopped, and
 		// this is the line that says otherwise.
+		// Considered means the same thing here as in the reason sentence
+		// beside it. It did not: this counted every node looked at, including
+		// those ruled out before any simulation ran, so the line read
+		// "nodesConsidered: 4" next to "2 node(s) considered".
+		considered := engine.Considered(d.Assessments)
 		e.log.Info("nothing to do",
 			"reason", d.Reason,
-			"nodesConsidered", len(d.Assessments),
+			"nodesConsidered", considered,
+			"nodesSkipped", len(d.Assessments)-considered,
 			"nodes", len(s.Nodes),
 			"pods", len(s.Pods))
 		return nil

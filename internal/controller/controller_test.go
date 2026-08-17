@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -907,4 +908,50 @@ func completedDrains(t *testing.T) float64 {
 	}
 	t.Fatal("binpack_drains_completed_total is not published at all")
 	return 0
+}
+
+func TestTheLoggedCountAgreesWithTheReasonBesideIt(t *testing.T) {
+	// Seen in a live cluster: `"reason":"2 node(s) considered, none whose
+	// workload fits elsewhere","nodesConsidered":4`. One line, one word, two
+	// counts — the field counted every node looked at, the sentence counted
+	// only those that reached a simulation. Nodes ruled out beforehand were
+	// never candidates, so the sentence had it right.
+	var log captured
+	// Two nodes binpack will not consider — one annotated, one cordoned by
+	// somebody else — beside two it will.
+	skipped := inPool("skip-me", mother.NodeAnnotations(
+		map[string]string{engine.AnnotationSkip: "true"}))
+	ev := newEvaluator(t, &log, &fakeRecorder{},
+		skipped, inPool("cordoned", mother.Cordoned()), inPool("a"), inPool("b"),
+		// Enough on both candidates that neither can take the other's pods.
+		mother.Pod("default", "big-a", mother.OnNode("a"), mother.Requests("100m", "3Gi")),
+		mother.Pod("default", "big-b", mother.OnNode("b"), mother.Requests("100m", "3Gi")),
+		statusConfigMap(),
+	)
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	var line string
+	for _, l := range log.lines {
+		if strings.Contains(l, "nothing to do") {
+			line = l
+		}
+	}
+	if line == "" {
+		t.Fatalf("no decision was logged: %v", log.lines)
+	}
+
+	// The sentence's own number, whatever it is, must be the field's number.
+	m := regexp.MustCompile(`(\d+) node\(s\) considered`).FindStringSubmatch(line)
+	if m == nil {
+		t.Fatalf("the reason did not report a count: %s", line)
+	}
+	if !strings.Contains(line, `"nodesConsidered"=`+m[1]) {
+		t.Errorf("the reason says %s considered, the field disagrees: %s", m[1], line)
+	}
+	if !strings.Contains(line, `"nodesSkipped"=2`) {
+		t.Errorf("the two nodes ruled out before simulation are not accounted for: %s", line)
+	}
 }
