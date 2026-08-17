@@ -24,6 +24,11 @@ const (
 	AnnotationDrainStarted       = "binpack.motleyhand.com/drain-started"
 	AnnotationDrainProgress      = "binpack.motleyhand.com/drain-progress"
 	AnnotationDrainPodsRemaining = "binpack.motleyhand.com/drain-pods-remaining"
+	// AnnotationDrainAwaiting names the controller whose replacement pod the
+	// drain is waiting to see bound, as "<owner UID>@<RFC3339>". Evicting the
+	// next pod before this one has landed would put two replacements in
+	// flight against a simulation that assumed one.
+	AnnotationDrainAwaiting = "binpack.motleyhand.com/drain-awaiting"
 
 	// Backoff markers, recorded when a drain is abandoned.
 	AnnotationDrainAttempts = "binpack.motleyhand.com/drain-attempts"
