@@ -71,6 +71,13 @@ Four changes, and no others:
 It deletes nothing. Pods leave because an eviction was accepted; the emptied node is removed by
 the cluster-autoscaler, which is the component whose job that is.
 
+And it stops when the autoscaler takes over. Once a node carries
+`ToBeDeletedByClusterAutoscaler`, the autoscaler has committed to removing it and is draining it
+itself — so binpack stops evicting, leaves the node cordoned, and waits for it to go. Uncordoning
+at that point would be two controllers disagreeing about whether a node accepts pods. The softer
+`DeletionCandidateOfClusterAutoscaler` is only an opinion that the node is unneeded, and does not
+stop a drain.
+
 ## After
 
 binpack writes three events per drain, on the node itself:

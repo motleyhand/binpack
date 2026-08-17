@@ -680,3 +680,118 @@ func TestOtherLabelsAreLeftAlone(t *testing.T) {
 		t.Errorf("a label binpack does not own was lost: %q", got)
 	}
 }
+
+// beingRemoved adds the taint the cluster-autoscaler sets once it has
+// committed to deleting a node.
+func beingRemoved() mother.NodeOption {
+	return mother.Tainted(engine.TaintToBeDeleted, "1786971071", corev1.TaintEffectNoSchedule)
+}
+
+func TestADrainTheAutoscalerHasTakenOverIsNotAbandoned(t *testing.T) {
+	// Abandoning uncordons, and uncordoning a node another component is
+	// actively deleting is two controllers disagreeing about whether it
+	// accepts pods. The drain is also, in every sense that matters, going
+	// fine — so there is nothing to abandon.
+	n := marked("a", time.Hour, time.Hour, "3")
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{
+		Key: engine.TaintToBeDeleted, Effect: corev1.TaintEffectNoSchedule})
+
+	pods := []*corev1.Pod{mother.Pod("default", "still-here", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{n, node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Code != executor.StepHandedOver {
+		t.Errorf("got %+v, want the drain handed over", step)
+	}
+	if step.Failed || step.Done {
+		t.Error("a handover is neither a failure nor the end of the drain")
+	}
+
+	after := nodeFrom(t, c, "a")
+	if !after.Spec.Unschedulable {
+		t.Error("binpack uncordoned a node the autoscaler is deleting")
+	}
+	if after.Annotations[engine.AnnotationDrainStarted] == "" {
+		t.Error("the markers were cleared, so the completion will go unrecorded")
+	}
+	if after.Annotations[engine.AnnotationBackoffUntil] != "" {
+		t.Error("a handover was recorded as a failed drain")
+	}
+
+	var left corev1.PodList
+	if err := c.List(context.Background(), &left); err != nil {
+		t.Fatalf("listing pods: %v", err)
+	}
+	if len(left.Items) != 1 {
+		t.Error("binpack evicted alongside the autoscaler")
+	}
+}
+
+func TestAHandoverKeepsTheStallClockFromRunning(t *testing.T) {
+	// If the autoscaler changes its mind and drops its taint, the drain comes
+	// back to binpack. Without this it would come back with a stall clock that
+	// had been running throughout, and be abandoned on the spot.
+	n := marked("a", time.Hour, time.Hour, "3")
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{
+		Key: engine.TaintToBeDeleted, Effect: corev1.TaintEffectNoSchedule})
+	s := snapshot([]*corev1.Node{n, node("b")}, nil)
+	c := clientFor(s)
+
+	if _, err := executor.Advance(
+		context.Background(), c, s, "a", engineConfig(), drainPolicy()); err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	got := nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainProgress]
+	if got != at.UTC().Format(time.RFC3339) {
+		t.Errorf("progress was not recorded during the handover: %q", got)
+	}
+}
+
+func TestANodeTheAutoscalerIsRemovingIsNeverChosen(t *testing.T) {
+	// It is not necessarily cordoned — the autoscaler uses a taint — so the
+	// cordon check does not cover this. Choosing it would start a drain of a
+	// node that is already going away.
+	s := snapshot([]*corev1.Node{node("a", beingRemoved()), node("b"), node("c")}, nil)
+
+	d := engine.Decide(s, engineConfig())
+
+	for _, a := range d.Assessments {
+		if a.Node.Name != "a" {
+			continue
+		}
+		if !a.Skipped || a.SkipCode != engine.SkipBeingRemoved {
+			t.Errorf("got skipped=%v code=%q, want %q", a.Skipped, a.SkipCode, engine.SkipBeingRemoved)
+		}
+	}
+	if d.Node != nil && d.Node.Name == "a" {
+		t.Error("binpack chose a node the autoscaler is already removing")
+	}
+}
+
+func TestASoftDeletionCandidateDoesNotStopADrain(t *testing.T) {
+	// PreferNoSchedule, and it means the autoscaler considers the node
+	// unneeded — an opinion, not a decision. Treating it as a handover would
+	// stall every drain binpack starts, since a node it is emptying is exactly
+	// one the autoscaler starts calling unneeded.
+	n := marked("a", time.Minute, time.Minute, "1")
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{
+		Key: engine.TaintDeletionCandidate, Effect: corev1.TaintEffectPreferNoSchedule})
+
+	pods := []*corev1.Pod{mother.Pod("default", "movable", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{n, node("b")}, pods)
+
+	step, err := executor.Advance(context.Background(), clientFor(s), s, "a",
+		engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code != executor.StepEvicted {
+		t.Errorf("got %+v, want the drain to carry on", step)
+	}
+}

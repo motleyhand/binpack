@@ -22,6 +22,10 @@ const (
 	StepWaiting      = "waiting"
 	StepAwaitRemoval = "awaiting-removal"
 	StepRemoved      = "removed"
+
+	// StepHandedOver: the cluster-autoscaler has committed to deleting the
+	// node and is draining it itself.
+	StepHandedOver = "handed-over"
 )
 
 // Step is what one evaluation did to a drain.
@@ -89,6 +93,31 @@ func Advance(
 		// annotations went with the node.
 		return Step{Code: StepRemoved, Done: true,
 			Reason: "the cluster-autoscaler removed the node"}, nil
+
+	case a.SkipCode == engine.SkipBeingRemoved:
+		// The autoscaler owns the node now. Not abandoned — abandoning
+		// uncordons, and uncordoning a node another component is deleting is
+		// two controllers disagreeing about whether it accepts pods. Not
+		// advanced either: it is evicting the same pods, and doubling that up
+		// gains nothing.
+		//
+		// The markers stay, so the drain is still binpack's to observe. When
+		// the node goes, the next evaluation records the completion it would
+		// otherwise have missed — on the cluster where this was found, binpack
+		// scored two abandonments for an operation that succeeded.
+		//
+		// Progress is recorded because there is progress: the autoscaler is
+		// emptying the node. Without it, an autoscaler that changed its mind
+		// and removed its taint would hand back a drain whose stall clock had
+		// been running the whole time, and the next evaluation would abandon
+		// it on the spot.
+		if err := Annotate(ctx, w, a.Node, map[string]string{
+			engine.AnnotationDrainProgress: s.Now.UTC().Format(time.RFC3339),
+		}); err != nil {
+			return Step{}, err
+		}
+		return Step{Code: StepHandedOver,
+			Reason: "the cluster-autoscaler is removing this node"}, nil
 
 	case a.SkipCode == engine.SkipUncordoned:
 		// Marked but schedulable, so a previous evaluation stopped between
