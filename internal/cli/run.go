@@ -45,7 +45,7 @@ func newRunCommand(opts *options) *cobra.Command {
 			"instead of a Deployment.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := loadConfigOrDefaults(path, cmd.InOrStdin())
+			cfg, source, err := loadConfigOrDefaults(path, cmd.InOrStdin())
 			if err != nil {
 				return err
 			}
@@ -63,6 +63,7 @@ func newRunCommand(opts *options) *cobra.Command {
 			ctrl.SetLogger(log)
 
 			settings := cfg.Settings()
+			log.WithName("binpack").Info("configuration loaded", "from", source)
 			return controller.Run(cmd.Context(), controller.Options{
 				RestConfig:              restCfg,
 				Engine:                  engineConfig(cfg),

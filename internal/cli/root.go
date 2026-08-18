@@ -56,6 +56,12 @@ func (o outputFormat) valid() bool {
 type options struct {
 	output outputFormat
 	out    io.Writer
+
+	// configSource names where the configuration came from, and is reported
+	// with every verdict. A command that answers about a binpack configured
+	// differently from the one running is answering a different question, and
+	// nothing else in the output reveals which one it answered.
+	configSource string
 }
 
 // NewRootCommand builds the command tree. out receives normal output, which

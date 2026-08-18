@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"time"
 
@@ -33,7 +34,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 			"decision function the controller runs, so what it prints is what would happen.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := loadConfigOrDefaults(path, cmd.InOrStdin())
+			cfg, source, err := loadConfigOrDefaults(path, cmd.InOrStdin())
 			if err != nil {
 				return err
 			}
@@ -53,6 +54,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 			}
 
 			decision := engine.Decide(snapshot, engineConfig(cfg))
+			opts.configSource = source
 			return renderExplain(opts, snapshot, decision)
 		},
 	}
@@ -98,17 +100,52 @@ func clientFor(kubeconfig, kubecontext string) (collect.Reader, error) {
 	return client.New(restCfg, client.Options{})
 }
 
-func loadConfigOrDefaults(path string, stdin interface{ Read([]byte) (int, error) }) (*v1alpha1.Config, error) {
+// DeployedConfig is where the Helm chart mounts binpack's configuration.
+//
+// Used as the default for -f so that `kubectl exec deploy/binpack -- binpack
+// explain` answers about the binpack running beside it, rather than about one
+// configured with defaults. Those are different questions, and explain exists
+// to answer the first.
+const DeployedConfig = "/etc/binpack/config.yaml"
+
+// deployedConfig is the path actually consulted, so a test can exercise the
+// branch that matters most: the one that makes `kubectl exec ... -- binpack
+// explain` answer about the deployed configuration. Without a seam it only
+// runs on a machine that happens to have that file, which is no machine any
+// test runs on.
+var deployedConfig = DeployedConfig
+
+// loadConfigOrDefaults resolves the configuration and says where it came from.
+//
+// The source is returned rather than inferred by the caller because every
+// command reports it. A tool that prints a verdict without saying what it read
+// is one whose output cannot be checked — and a configuration that silently
+// failed to arrive looks exactly like one that arrived and said nothing.
+func loadConfigOrDefaults(
+	path string, stdin interface{ Read([]byte) (int, error) },
+) (*v1alpha1.Config, string, error) {
 	if path == "" {
+		if _, err := os.Stat(deployedConfig); err == nil {
+			data, err := os.ReadFile(deployedConfig)
+			if err != nil {
+				return nil, "", fmt.Errorf("reading %s: %w", deployedConfig, err)
+			}
+			cfg, err := v1alpha1.Load(data)
+			return cfg, deployedConfig, err
+		}
+
 		// An empty document is a working configuration: pools and their
 		// bounds are discovered, so there is nothing an operator must supply.
-		return v1alpha1.Load(nil)
+		cfg, err := v1alpha1.Load(nil)
+		return cfg, "built-in defaults", err
 	}
+
 	data, err := readConfigInput(path, stdin)
 	if err != nil {
-		return nil, err
+		return nil, "", err
 	}
-	return v1alpha1.Load(data)
+	cfg, err := v1alpha1.Load(data)
+	return cfg, path, err
 }
 
 // engineConfig translates the configuration API into what the engine needs.
@@ -155,6 +192,11 @@ type explainView struct {
 			Ready int    `json:"ready"`
 		} `json:"pools"`
 	} `json:"autoscaler"`
+	// Config names where the configuration came from. Reported so a verdict
+	// can be checked against the settings that produced it — a command run
+	// without -f answers about built-in defaults, which is a different
+	// question from what the deployed binpack will do.
+	Config string `json:"config"`
 	Action string `json:"action"`
 	// Code names the outcome, from the engine's bounded set.
 	Code   string       `json:"code"`
@@ -183,6 +225,7 @@ type nodeReport struct {
 
 func renderExplain(opts *options, s engine.Snapshot, d engine.Decision) error {
 	view := buildView(s, d)
+	view.Config = opts.configSource
 
 	if opts.output == outputJSON {
 		enc := json.NewEncoder(opts.out)
@@ -259,6 +302,13 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 		if _, err := fmt.Fprintf(opts.out, format, args...); err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	// First, because everything below it is conditional on this. A reader who
+	// skips it can still check the verdict against the settings; a reader who
+	// never sees it cannot.
+	if opts.configSource != "" {
+		p("config: %s\n\n", opts.configSource)
 	}
 
 	// The same liveness check Decide uses, so this line cannot contradict the

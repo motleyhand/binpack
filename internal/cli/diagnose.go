@@ -79,7 +79,7 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			cfg, err := loadConfigOrDefaults(path, cmd.InOrStdin())
+			cfg, source, err := loadConfigOrDefaults(path, cmd.InOrStdin())
 			if err != nil {
 				return err
 			}
@@ -97,6 +97,7 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 				return err
 			}
 
+			opts.configSource = source
 			findings := engine.Diagnose(snapshot, engineConfig(cfg))
 			if err := renderDiagnose(opts, findings); err != nil {
 				return err
@@ -200,6 +201,14 @@ func renderDiagnoseText(opts *options, findings []engine.Finding) error {
 		if _, err := fmt.Fprintf(opts.out, format, args...); err != nil {
 			errs = append(errs, err)
 		}
+	}
+
+	// Text only. diagnose's JSON is a flat array of findings, documented as
+	// such, and wrapping it in an object to carry one string would break every
+	// consumer for a field they can determine from how they invoked it. explain
+	// reports it in both because its JSON is already a document.
+	if opts.configSource != "" {
+		p("config: %s\n\n", opts.configSource)
 	}
 
 	if len(findings) == 0 {
