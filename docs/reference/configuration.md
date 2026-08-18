@@ -200,6 +200,34 @@ A node in backoff is skipped, and `explain` reports why, including the recorded 
 There is deliberately no permanent give-up: that would need a human to clear an annotation, and
 a node blocked by something transient would stay skipped forever.
 
+## Leader election
+
+Not part of the configuration file: these are flags, set by the chart under `leaderElection`.
+
+binpack does not use controller-runtime's default lease timings. Those — 15s lease, 10s renew
+deadline, 2s retry — suit a controller that reconciles constantly, where seconds of lost
+leadership are seconds of unhandled events. binpack evaluates once a minute and keeps a drain's
+state on the node being drained, so a slow handover costs it nothing: the next leader reads the
+same markers and carries on.
+
+What a restart *does* cost is the little binpack holds in memory — the after-drain cooldown, and
+the record that lets a completed drain be counted once its node has gone. So the defaults are
+sized to ride out a control-plane hiccup instead:
+
+| Flag | Default | |
+|---|---|---|
+| `--lease-duration` | `60s` | how long the lease is held before another replica may take it |
+| `--renew-deadline` | `40s` | how long the leader keeps trying before giving up and exiting |
+| `--retry-period` | `10s` | how often the lease is renewed or contested |
+
+The trade is failover latency: a leader that genuinely dies leaves the next one waiting up to
+`--lease-duration`. For a controller that does nothing for a minute at a time, that is not a
+cost worth optimising against a restart every time the API server is briefly slow.
+
+`--renew-deadline` must be shorter than `--lease-duration`, and `--retry-period` shorter than
+`--renew-deadline`. binpack refuses to start otherwise, rather than letting the manager fail
+deeper with a message about a leader elector instead of about the flags you set.
+
 ### `policy.cooldown.afterScaleUp` and `policy.cooldown.afterDrain`
 
 Suppress action cluster-wide for a period after the cluster grew, and after binpack completed a

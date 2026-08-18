@@ -1092,3 +1092,96 @@ func TestADeploymentIsNotRefusedItsCooldown(t *testing.T) {
 		t.Errorf("a Deployment was refused a cooldown it can honour: %v", err)
 	}
 }
+
+func TestTheLeaseIsSizedForBinpacksCadence(t *testing.T) {
+	// controller-runtime's defaults — 15s/10s/2s — suit a controller that
+	// reconciles constantly. binpack evaluates once a minute, so two five-second
+	// API-server timeouts should not cost it the lease: that restart discards
+	// the after-drain cooldown and the in-flight drain's completion, both of
+	// which were justified on restarts being rare.
+	out := managerOptions(Options{LeaderElection: true})
+
+	if out.LeaseDuration == nil || *out.LeaseDuration != DefaultLeaseDuration {
+		t.Errorf("lease duration: got %v, want %s", out.LeaseDuration, DefaultLeaseDuration)
+	}
+	if out.RenewDeadline == nil || *out.RenewDeadline != DefaultRenewDeadline {
+		t.Errorf("renew deadline: got %v, want %s", out.RenewDeadline, DefaultRenewDeadline)
+	}
+	if out.RetryPeriod == nil || *out.RetryPeriod != DefaultRetryPeriod {
+		t.Errorf("retry period: got %v, want %s", out.RetryPeriod, DefaultRetryPeriod)
+	}
+
+	// The whole point: the observed failure was two renewals timing out five
+	// seconds apart, which the previous 10s deadline could not survive.
+	if DefaultRenewDeadline <= 15*time.Second {
+		t.Errorf("a renew deadline of %s still loses the lease to a brief API-server stall",
+			DefaultRenewDeadline)
+	}
+}
+
+func TestTheLeaseTimingsAreOverridable(t *testing.T) {
+	out := managerOptions(Options{
+		LeaderElection: true,
+		LeaseDuration:  90 * time.Second,
+		RenewDeadline:  60 * time.Second,
+		RetryPeriod:    15 * time.Second,
+	})
+
+	if *out.LeaseDuration != 90*time.Second || *out.RenewDeadline != 60*time.Second ||
+		*out.RetryPeriod != 15*time.Second {
+		t.Errorf("got %v/%v/%v, want the values supplied",
+			*out.LeaseDuration, *out.RenewDeadline, *out.RetryPeriod)
+	}
+}
+
+func TestLeaseTimingsThatCannotWorkAreRefused(t *testing.T) {
+	// client-go rejects these too, but from inside the manager and in terms of
+	// a leader elector rather than the flags somebody set.
+	for _, tc := range []struct {
+		name     string
+		opts     Options
+		mentions string
+	}{
+		{
+			// The dangerous one: a leader can keep acting on a lease another
+			// replica has already taken.
+			name: "renewing for longer than the lease lasts",
+			opts: Options{LeaderElection: true,
+				LeaseDuration: 30 * time.Second, RenewDeadline: 30 * time.Second},
+			mentions: "renew deadline",
+		},
+		{
+			name: "no room to retry before giving up",
+			opts: Options{LeaderElection: true,
+				RenewDeadline: 20 * time.Second, RetryPeriod: 20 * time.Second},
+			mentions: "retry period",
+		},
+		{
+			name: "the defaults themselves",
+			opts: Options{LeaderElection: true},
+		},
+		{
+			// A one-shot run never elects a leader, so timings it will never
+			// apply are not a reason to refuse it.
+			name: "timings a one-shot run will never use",
+			opts: Options{Once: true, LeaseDuration: time.Second, RenewDeadline: time.Hour},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkLease(tc.opts)
+
+			if tc.mentions == "" {
+				if err != nil {
+					t.Errorf("binpack's own defaults were refused: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("accepted timings that cannot work")
+			}
+			if !strings.Contains(err.Error(), tc.mentions) {
+				t.Errorf("error does not name the offending setting (%q): %v", tc.mentions, err)
+			}
+		})
+	}
+}

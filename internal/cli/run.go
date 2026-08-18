@@ -1,6 +1,8 @@
 package cli
 
 import (
+	"time"
+
 	"github.com/spf13/cobra"
 	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -19,6 +21,9 @@ func newRunCommand(opts *options) *cobra.Command {
 		once                    bool
 		leaderElection          bool
 		leaderElectionNamespace string
+		leaseDuration           time.Duration
+		renewDeadline           time.Duration
+		retryPeriod             time.Duration
 		metricsAddress          string
 		probeAddress            string
 	)
@@ -67,6 +72,9 @@ func newRunCommand(opts *options) *cobra.Command {
 				Once:                    once,
 				LeaderElection:          leaderElection,
 				LeaderElectionNamespace: leaderElectionNamespace,
+				LeaseDuration:           leaseDuration,
+				RenewDeadline:           renewDeadline,
+				RetryPeriod:             retryPeriod,
 				MetricsAddress:          metricsAddress,
 				ProbeAddress:            probeAddress,
 			})
@@ -76,6 +84,12 @@ func newRunCommand(opts *options) *cobra.Command {
 	cmd.Flags().StringVarP(&path, "file", "f", "", "configuration file (defaults apply when absent)")
 	cmd.Flags().StringVar(&kubeconfig, "kubeconfig", "", "path to a kubeconfig (defaults to in-cluster, then the usual rules)")
 	cmd.Flags().StringVar(&kubecontext, "context", "", "kubeconfig context to use")
+	cmd.Flags().DurationVar(&leaseDuration, "lease-duration", controller.DefaultLeaseDuration,
+		"how long a leader election lease is held before another replica may take it")
+	cmd.Flags().DurationVar(&renewDeadline, "renew-deadline", controller.DefaultRenewDeadline,
+		"how long the leader keeps trying to renew before giving up and exiting")
+	cmd.Flags().DurationVar(&retryPeriod, "retry-period", controller.DefaultRetryPeriod,
+		"how often the lease is renewed or contested")
 	cmd.Flags().BoolVar(&once, "once", false,
 		"evaluate once and exit, for running as a CronJob rather than a Deployment")
 	// On by default. A single replica still runs two pods during a rolling

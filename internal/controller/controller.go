@@ -41,6 +41,33 @@ import (
 // two deployments to disagree about which lease means what.
 const LeaderElectionID = "binpack.motleyhand.com"
 
+// Lease timings, and why they are not controller-runtime's defaults.
+//
+// Those defaults — 15s/10s/2s — suit a controller that reconciles constantly,
+// where seconds of lost leadership are seconds of unhandled events. binpack
+// evaluates once a minute and keeps a drain's state on the node it is
+// draining, so a slow handover costs nothing: the next leader reads the same
+// markers and carries on.
+//
+// What a restart *does* cost is the little binpack holds in memory. The
+// after-drain cooldown is measured from a completed drain this process
+// remembers, and the completion of a drain whose node has already gone is
+// counted from the same memory. Both were justified on restarts being rare —
+// and a two-replica-second API-server hiccup restarting the process makes them
+// less rare than that argument assumed. It is also correlated in the worst
+// way: the control plane is slowest exactly when the cluster is churning,
+// which is when binpack is most likely to be mid-drain.
+//
+// So the lease is sized to ride out a control-plane hiccup instead. The cost
+// is failover latency — a leader that genuinely dies leaves the next one
+// waiting up to LeaseDuration — which for a controller that does nothing for
+// a minute at a time is not a cost at all.
+const (
+	DefaultLeaseDuration = 60 * time.Second
+	DefaultRenewDeadline = 40 * time.Second
+	DefaultRetryPeriod   = 10 * time.Second
+)
+
 // Options configures a run.
 type Options struct {
 	RestConfig *rest.Config
@@ -64,8 +91,14 @@ type Options struct {
 
 	LeaderElection          bool
 	LeaderElectionNamespace string
-	MetricsAddress          string
-	ProbeAddress            string
+
+	// LeaseDuration, RenewDeadline and RetryPeriod tune the lease. Zero means
+	// binpack's own defaults above, not controller-runtime's.
+	LeaseDuration  time.Duration
+	RenewDeadline  time.Duration
+	RetryPeriod    time.Duration
+	MetricsAddress string
+	ProbeAddress   string
 }
 
 // Run starts binpack and blocks until ctx is cancelled, or until one
@@ -97,6 +130,13 @@ func cooldownIsUnenforceable(opts Options) (string, time.Duration, bool) {
 }
 
 func Run(ctx context.Context, opts Options) error {
+	// Refused rather than left to fail deeper: client-go rejects these
+	// orderings too, but from inside the manager, with a message about a
+	// leader elector rather than about the flags somebody set.
+	if err := checkLease(opts); err != nil {
+		return err
+	}
+
 	// Before anything else, because the alternative is a safety control that
 	// is configured, reported as configured, and silently inert.
 	if where, d, unenforceable := cooldownIsUnenforceable(opts); unenforceable {
@@ -192,7 +232,49 @@ func managerOptions(opts Options) manager.Options {
 	// the old and new pods are alive.
 	out.LeaderElectionReleaseOnCancel = true
 
+	out.LeaseDuration = orDefault(opts.LeaseDuration, DefaultLeaseDuration)
+	out.RenewDeadline = orDefault(opts.RenewDeadline, DefaultRenewDeadline)
+	out.RetryPeriod = orDefault(opts.RetryPeriod, DefaultRetryPeriod)
+
 	return out
+}
+
+// checkLease refuses timings that cannot work.
+//
+// A renew deadline at or past the lease duration means the leader can still
+// believe it holds a lease another replica has already taken — two binpacks
+// draining at once, which is the one thing the lease exists to prevent. A
+// retry period at or past the renew deadline leaves no room to retry at all.
+func checkLease(opts Options) error {
+	// Only when the lease is actually used. A one-shot run skips leader
+	// election entirely, and refusing it over timings it will never apply
+	// would be a spurious failure in the mode with no operator watching.
+	if opts.Once || !opts.LeaderElection {
+		return nil
+	}
+
+	lease := orDefault(opts.LeaseDuration, DefaultLeaseDuration)
+	renew := orDefault(opts.RenewDeadline, DefaultRenewDeadline)
+	retry := orDefault(opts.RetryPeriod, DefaultRetryPeriod)
+
+	switch {
+	case *renew >= *lease:
+		return fmt.Errorf(
+			"renew deadline (%s) must be shorter than the lease duration (%s), or a leader "+
+				"can keep acting on a lease another replica has already taken", *renew, *lease)
+	case *retry >= *renew:
+		return fmt.Errorf(
+			"retry period (%s) must be shorter than the renew deadline (%s), or there is no "+
+				"room to retry a renewal before giving up", *retry, *renew)
+	}
+	return nil
+}
+
+func orDefault(d, fallback time.Duration) *time.Duration {
+	if d <= 0 {
+		d = fallback
+	}
+	return &d
 }
 
 // cacheOptions keeps the watch-backed cache to what binpack actually reads.
