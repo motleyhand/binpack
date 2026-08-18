@@ -57,6 +57,23 @@ leaderElection:
   # prevents.
   enabled: true
 
+  # Lease timings. Left unset so the binary owns the defaults — it sizes them
+  # for a controller that evaluates once a minute, which tolerates a slow
+  # handover far better than it tolerates restarting on a control-plane
+  # hiccup. Set them only if your API server is slower still.
+  #
+  #   leaseDuration: 60s   how long the lease is held before another replica may take it
+  #   renewDeadline: 40s   how long the leader keeps trying before giving up and exiting
+  #   retryPeriod:   10s   how often the lease is renewed or contested
+  #
+  # renewDeadline must be shorter than leaseDuration, and longer than
+  # retryPeriod times 1.2 — retries are jittered, and client-go refuses
+  # timings that leave no room for that. binpack checks the same thing at
+  # startup rather than letting the pod crash-loop on it.
+  leaseDuration: ""
+  renewDeadline: ""
+  retryPeriod: ""
+
 metrics:
   enabled: true
   port: 8080

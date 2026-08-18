@@ -49,6 +49,15 @@ spec:
             - --file=/etc/binpack/config.yaml
             - --leader-election={{ .Values.leaderElection.enabled }}
             - --leader-election-namespace={{ .Release.Namespace }}
+            {{- with .Values.leaderElection.leaseDuration }}
+            - --lease-duration={{ . }}
+            {{- end }}
+            {{- with .Values.leaderElection.renewDeadline }}
+            - --renew-deadline={{ . }}
+            {{- end }}
+            {{- with .Values.leaderElection.retryPeriod }}
+            - --retry-period={{ . }}
+            {{- end }}
             - --metrics-bind-address={{ if .Values.metrics.enabled }}:{{ .Values.metrics.port }}{{ else }}0{{ end }}
             - --health-probe-bind-address=:{{ .Values.probes.port }}
           ports:

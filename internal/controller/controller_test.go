@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/leaderelection"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -1090,5 +1091,148 @@ func TestADeploymentIsNotRefusedItsCooldown(t *testing.T) {
 
 	if err != nil && strings.Contains(err.Error(), "cooldown.afterDrain") {
 		t.Errorf("a Deployment was refused a cooldown it can honour: %v", err)
+	}
+}
+
+func TestTheLeaseIsSizedForBinpacksCadence(t *testing.T) {
+	// controller-runtime's defaults — 15s/10s/2s — suit a controller that
+	// reconciles constantly. binpack evaluates once a minute, so two five-second
+	// API-server timeouts should not cost it the lease: that restart discards
+	// the after-drain cooldown and the in-flight drain's completion, both of
+	// which were justified on restarts being rare.
+	out := managerOptions(Options{LeaderElection: true})
+
+	if out.LeaseDuration == nil || *out.LeaseDuration != DefaultLeaseDuration {
+		t.Errorf("lease duration: got %v, want %s", out.LeaseDuration, DefaultLeaseDuration)
+	}
+	if out.RenewDeadline == nil || *out.RenewDeadline != DefaultRenewDeadline {
+		t.Errorf("renew deadline: got %v, want %s", out.RenewDeadline, DefaultRenewDeadline)
+	}
+	if out.RetryPeriod == nil || *out.RetryPeriod != DefaultRetryPeriod {
+		t.Errorf("retry period: got %v, want %s", out.RetryPeriod, DefaultRetryPeriod)
+	}
+
+	// The whole point: the observed failure was two renewals timing out five
+	// seconds apart, which the previous 10s deadline could not survive.
+	if DefaultRenewDeadline <= 15*time.Second {
+		t.Errorf("a renew deadline of %s still loses the lease to a brief API-server stall",
+			DefaultRenewDeadline)
+	}
+}
+
+func TestTheLeaseTimingsAreOverridable(t *testing.T) {
+	out := managerOptions(Options{
+		LeaderElection: true,
+		LeaseDuration:  90 * time.Second,
+		RenewDeadline:  60 * time.Second,
+		RetryPeriod:    15 * time.Second,
+	})
+
+	if *out.LeaseDuration != 90*time.Second || *out.RenewDeadline != 60*time.Second ||
+		*out.RetryPeriod != 15*time.Second {
+		t.Errorf("got %v/%v/%v, want the values supplied",
+			*out.LeaseDuration, *out.RenewDeadline, *out.RetryPeriod)
+	}
+}
+
+func TestLeaseTimingsThatCannotWorkAreRefused(t *testing.T) {
+	// client-go rejects these too, but from inside the manager and in terms of
+	// a leader elector rather than the flags somebody set.
+	for _, tc := range []struct {
+		name     string
+		opts     Options
+		mentions string
+	}{
+		{
+			// The dangerous one: a leader can keep acting on a lease another
+			// replica has already taken.
+			name: "renewing for longer than the lease lasts",
+			opts: Options{LeaderElection: true,
+				LeaseDuration: 30 * time.Second, RenewDeadline: 30 * time.Second},
+			mentions: "renew deadline",
+		},
+		{
+			// Nominally ordered, and still refused: retries are jittered, so
+			// the last one before the deadline can land 1.2x late. This exact
+			// combination passes an unjittered check and then crash-loops the
+			// pod on a message about a leader elector.
+			name: "a renew deadline inside the retry period's jitter",
+			opts: Options{LeaderElection: true, LeaseDuration: 60 * time.Second,
+				RenewDeadline: 10 * time.Second, RetryPeriod: 9 * time.Second},
+			mentions: "jitter",
+		},
+		{
+			name: "no room to retry before giving up",
+			opts: Options{LeaderElection: true,
+				RenewDeadline: 20 * time.Second, RetryPeriod: 20 * time.Second},
+			mentions: "retry period",
+		},
+		{
+			name: "the defaults themselves",
+			opts: Options{LeaderElection: true},
+		},
+		{
+			// A one-shot run never elects a leader, so timings it will never
+			// apply are not a reason to refuse it.
+			name: "timings a one-shot run will never use",
+			opts: Options{Once: true, LeaseDuration: time.Second, RenewDeadline: time.Hour},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			err := checkLease(tc.opts)
+
+			if tc.mentions == "" {
+				if err != nil {
+					t.Errorf("binpack's own defaults were refused: %v", err)
+				}
+				return
+			}
+			if err == nil {
+				t.Fatal("accepted timings that cannot work")
+			}
+			if !strings.Contains(err.Error(), tc.mentions) {
+				t.Errorf("error does not name the offending setting (%q): %v", tc.mentions, err)
+			}
+		})
+	}
+}
+
+func TestWhatBinpackAcceptsClientGoAlsoAccepts(t *testing.T) {
+	// The check exists to fail early with a message about the flags somebody
+	// set. It is only worth having if it agrees with the validation it is
+	// standing in front of — so this asks client-go directly rather than
+	// restating its rules, which would be the same drift in a second place.
+	for _, tc := range []struct {
+		name                string
+		lease, renew, retry time.Duration
+	}{
+		{"binpack's defaults", 0, 0, 0},
+		{"a slower control plane", 120 * time.Second, 90 * time.Second, 20 * time.Second},
+		{"controller-runtime's own defaults", 15 * time.Second, 10 * time.Second, 2 * time.Second},
+		{"tight but legal", 10 * time.Second, 5 * time.Second, 4 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := Options{LeaderElection: true,
+				LeaseDuration: tc.lease, RenewDeadline: tc.renew, RetryPeriod: tc.retry}
+
+			if err := checkLease(opts); err != nil {
+				t.Skipf("binpack refuses these, so client-go never sees them: %v", err)
+			}
+
+			out := managerOptions(opts)
+			_, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+				LeaseDuration: *out.LeaseDuration,
+				RenewDeadline: *out.RenewDeadline,
+				RetryPeriod:   *out.RetryPeriod,
+			})
+
+			// It rejects the nil lock and nil callbacks too, which is not what
+			// is being asked. Only a timing complaint means the two disagree.
+			for _, timing := range []string{"leaseDuration", "renewDeadline", "retryPeriod"} {
+				if err != nil && strings.Contains(err.Error(), timing) {
+					t.Errorf("binpack accepted timings client-go refuses: %v", err)
+				}
+			}
+		})
 	}
 }
