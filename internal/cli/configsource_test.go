@@ -100,3 +100,29 @@ func TestTheDefaultPathIsWhereTheChartMountsIt(t *testing.T) {
 			"deployment can drift apart unnoticed", DeployedConfig)
 	}
 }
+
+func TestAnUnreadableDeployedConfigIsNotSilentlyDefaulted(t *testing.T) {
+	// Only "no such file" may fall back. A configuration that is present but
+	// unreadable is a broken deployment, and answering with built-in defaults
+	// would put the authority of the reported source behind settings nobody
+	// chose — which is the exact failure the source line exists to prevent.
+	//
+	// A directory rather than a chmod, because a test running as root would
+	// read a 0000 file quite happily and this must fail everywhere.
+	t.Cleanup(func(orig string) func() {
+		return func() { deployedConfig = orig }
+	}(deployedConfig))
+	deployedConfig = t.TempDir()
+
+	cfg, source, err := loadConfigOrDefaults("", strings.NewReader(""))
+
+	if err == nil {
+		t.Fatalf("an unreadable configuration was accepted, reporting %q", source)
+	}
+	if cfg != nil {
+		t.Error("a configuration was returned alongside the error")
+	}
+	if !strings.Contains(err.Error(), deployedConfig) {
+		t.Errorf("the error does not name the file it could not read: %v", err)
+	}
+}

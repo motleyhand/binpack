@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
 	"os"
 	"sort"
 	"time"
@@ -125,13 +126,20 @@ func loadConfigOrDefaults(
 	path string, stdin interface{ Read([]byte) (int, error) },
 ) (*v1alpha1.Config, string, error) {
 	if path == "" {
-		if _, err := os.Stat(deployedConfig); err == nil {
-			data, err := os.ReadFile(deployedConfig)
-			if err != nil {
-				return nil, "", fmt.Errorf("reading %s: %w", deployedConfig, err)
-			}
+		// Read first and ask questions after, rather than probing with Stat.
+		// Two reasons: a file that exists at the probe and not at the read is
+		// a gap this cannot have, and — the one that matters — only "no such
+		// file" may fall back. A configuration that is present but unreadable
+		// is a broken deployment, and reporting "built-in defaults" for it
+		// would put the authority of the reported source behind an answer
+		// about settings nobody chose.
+		data, err := os.ReadFile(deployedConfig)
+		switch {
+		case err == nil:
 			cfg, err := v1alpha1.Load(data)
 			return cfg, deployedConfig, err
+		case !errors.Is(err, fs.ErrNotExist):
+			return nil, "", fmt.Errorf("reading %s: %w", deployedConfig, err)
 		}
 
 		// An empty document is a working configuration: pools and their
