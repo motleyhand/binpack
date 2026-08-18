@@ -66,8 +66,10 @@ leaderElection:
   #   renewDeadline: 40s   how long the leader keeps trying before giving up and exiting
   #   retryPeriod:   10s   how often the lease is renewed or contested
   #
-  # renewDeadline must be shorter than leaseDuration, and retryPeriod shorter
-  # than renewDeadline; binpack refuses to start otherwise.
+  # renewDeadline must be shorter than leaseDuration, and longer than
+  # retryPeriod times 1.2 — retries are jittered, and client-go refuses
+  # timings that leave no room for that. binpack checks the same thing at
+  # startup rather than letting the pod crash-loop on it.
   leaseDuration: ""
   renewDeadline: ""
   retryPeriod: ""

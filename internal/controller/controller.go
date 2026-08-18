@@ -23,6 +23,7 @@ import (
 	"k8s.io/apimachinery/pkg/fields"
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/events"
+	"k8s.io/client-go/tools/leaderelection"
 	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
@@ -257,15 +258,27 @@ func checkLease(opts Options) error {
 	renew := orDefault(opts.RenewDeadline, DefaultRenewDeadline)
 	retry := orDefault(opts.RetryPeriod, DefaultRetryPeriod)
 
+	// The jitter factor is client-go's own constant rather than a copy of its
+	// value: a copy would be a second place for it to be wrong, and the whole
+	// point of checking here is to agree with what will be checked later.
+	floor := time.Duration(leaderelection.JitterFactor * float64(*retry))
+
 	switch {
 	case *renew >= *lease:
 		return fmt.Errorf(
 			"renew deadline (%s) must be shorter than the lease duration (%s), or a leader "+
 				"can keep acting on a lease another replica has already taken", *renew, *lease)
-	case *retry >= *renew:
+	case *renew <= floor:
+		// Retries are jittered, so the last one before the deadline can land
+		// up to JitterFactor late. A renew deadline that only just exceeds the
+		// unjittered retry period leaves no room for that, and client-go
+		// refuses it — this says so in terms of the flags rather than letting
+		// the manager fail with "renewDeadline must be greater than
+		// retryPeriod*JitterFactor".
 		return fmt.Errorf(
-			"retry period (%s) must be shorter than the renew deadline (%s), or there is no "+
-				"room to retry a renewal before giving up", *retry, *renew)
+			"renew deadline (%s) must be longer than the retry period (%s) plus its jitter "+
+				"(%s), or there is no room to retry a renewal before giving up",
+			*renew, *retry, floor)
 	}
 	return nil
 }

@@ -18,6 +18,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/util/validation"
+	"k8s.io/client-go/tools/leaderelection"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -1151,6 +1152,16 @@ func TestLeaseTimingsThatCannotWorkAreRefused(t *testing.T) {
 			mentions: "renew deadline",
 		},
 		{
+			// Nominally ordered, and still refused: retries are jittered, so
+			// the last one before the deadline can land 1.2x late. This exact
+			// combination passes an unjittered check and then crash-loops the
+			// pod on a message about a leader elector.
+			name: "a renew deadline inside the retry period's jitter",
+			opts: Options{LeaderElection: true, LeaseDuration: 60 * time.Second,
+				RenewDeadline: 10 * time.Second, RetryPeriod: 9 * time.Second},
+			mentions: "jitter",
+		},
+		{
 			name: "no room to retry before giving up",
 			opts: Options{LeaderElection: true,
 				RenewDeadline: 20 * time.Second, RetryPeriod: 20 * time.Second},
@@ -1181,6 +1192,46 @@ func TestLeaseTimingsThatCannotWorkAreRefused(t *testing.T) {
 			}
 			if !strings.Contains(err.Error(), tc.mentions) {
 				t.Errorf("error does not name the offending setting (%q): %v", tc.mentions, err)
+			}
+		})
+	}
+}
+
+func TestWhatBinpackAcceptsClientGoAlsoAccepts(t *testing.T) {
+	// The check exists to fail early with a message about the flags somebody
+	// set. It is only worth having if it agrees with the validation it is
+	// standing in front of — so this asks client-go directly rather than
+	// restating its rules, which would be the same drift in a second place.
+	for _, tc := range []struct {
+		name                string
+		lease, renew, retry time.Duration
+	}{
+		{"binpack's defaults", 0, 0, 0},
+		{"a slower control plane", 120 * time.Second, 90 * time.Second, 20 * time.Second},
+		{"controller-runtime's own defaults", 15 * time.Second, 10 * time.Second, 2 * time.Second},
+		{"tight but legal", 10 * time.Second, 5 * time.Second, 4 * time.Second},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			opts := Options{LeaderElection: true,
+				LeaseDuration: tc.lease, RenewDeadline: tc.renew, RetryPeriod: tc.retry}
+
+			if err := checkLease(opts); err != nil {
+				t.Skipf("binpack refuses these, so client-go never sees them: %v", err)
+			}
+
+			out := managerOptions(opts)
+			_, err := leaderelection.NewLeaderElector(leaderelection.LeaderElectionConfig{
+				LeaseDuration: *out.LeaseDuration,
+				RenewDeadline: *out.RenewDeadline,
+				RetryPeriod:   *out.RetryPeriod,
+			})
+
+			// It rejects the nil lock and nil callbacks too, which is not what
+			// is being asked. Only a timing complaint means the two disagree.
+			for _, timing := range []string{"leaseDuration", "renewDeadline", "retryPeriod"} {
+				if err != nil && strings.Contains(err.Error(), timing) {
+					t.Errorf("binpack accepted timings client-go refuses: %v", err)
+				}
 			}
 		})
 	}

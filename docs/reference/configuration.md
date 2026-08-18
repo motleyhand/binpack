@@ -224,9 +224,14 @@ The trade is failover latency: a leader that genuinely dies leaves the next one 
 `--lease-duration`. For a controller that does nothing for a minute at a time, that is not a
 cost worth optimising against a restart every time the API server is briefly slow.
 
-`--renew-deadline` must be shorter than `--lease-duration`, and `--retry-period` shorter than
-`--renew-deadline`. binpack refuses to start otherwise, rather than letting the manager fail
-deeper with a message about a leader elector instead of about the flags you set.
+`--renew-deadline` must be shorter than `--lease-duration`, and longer than `--retry-period`
+*plus its jitter*: retries are jittered by a factor of 1.2, so the last one before the deadline
+can land that much late, and client-go refuses timings that leave no room for it. `60s/10s/9s`
+looks ordered and is rejected, because 10s is inside 9s × 1.2.
+
+binpack checks the same thing at startup, using client-go's own jitter constant rather than a
+copy of its value, and says so in terms of the flags you set rather than letting the manager
+fail deeper with `renewDeadline must be greater than retryPeriod*JitterFactor`.
 
 ### `policy.cooldown.afterScaleUp` and `policy.cooldown.afterDrain`
 
