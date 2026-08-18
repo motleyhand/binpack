@@ -319,3 +319,31 @@ error.
 several.
 
 **Durations are strings**: `30s`, `10m`, `1h30m`.
+
+## Which configuration a command used
+
+`explain`, `diagnose` and `run` all report where their configuration came from, and it is the
+first thing they print:
+
+```
+config: /etc/binpack/config.yaml
+```
+
+or, when none was given and none is mounted:
+
+```
+config: built-in defaults
+```
+
+With no `-f`, they read `/etc/binpack/config.yaml` if it exists — which is where the Helm chart
+mounts it, so this inside the pod answers about the binpack running beside it rather than about
+one configured with defaults:
+
+```bash
+kubectl -n binpack exec deploy/binpack -- binpack explain
+```
+
+The two answer different questions, and before the source was reported nothing in the output
+said which one you had. A verdict you cannot check against the settings that produced it is a
+verdict you have to take on trust.
+

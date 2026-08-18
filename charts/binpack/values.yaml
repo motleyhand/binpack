@@ -22,9 +22,11 @@ config:
   # that drains nodes should be one you switched on, not one you inherited.
   #
   # Leave this true until `binpack explain` has told you something you agree
-  # with. Note that this build cannot act at all — it refuses to start with
-  # dryRun: false rather than pretending — so changing it now only produces a
-  # crash loop.
+  # with — the decisions are identical either way, so a week of events on nodes
+  # tells you exactly what it would have done. Setting it false also requires
+  # rbac.allowDraining: true; the chart refuses one without the other.
+  #
+  # See docs/how-to/let-binpack-drain-nodes.md.
   dryRun: true
   interval: 1m0s
 
