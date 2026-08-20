@@ -36,6 +36,11 @@
 // Filter set and fails on any member the oracle neither runs nor exempts —
 // and an exemption has to name the internal/fit refusal that keeps binpack
 // away from the plugin's input, and that refusal is run.
+//
+// Where a refusal is narrower than the plugin it stands in for, the exemption
+// also carries the input that falls through it, asserted to still fall
+// through. So the gap is a defect on the record rather than a sentence, and
+// closing it in internal/fit fails that test until the record is deleted.
 package differential
 
 import (

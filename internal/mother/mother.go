@@ -400,16 +400,28 @@ func WithInlineCSIVolume(name, driver string) PodOption {
 	}
 }
 
-// WithRequiredAntiAffinity declares required pod anti-affinity, which is
-// symmetric: it can reject an incoming pod as well as constrain this one.
+// WithRequiredAntiAffinity declares required pod anti-affinity at the hostname
+// topology, which is symmetric: it can reject an incoming pod as well as
+// constrain this one.
 func WithRequiredAntiAffinity(labelKey, labelValue string) PodOption {
+	return WithRequiredAntiAffinityAt(corev1.LabelHostname, labelKey, labelValue)
+}
+
+// WithRequiredAntiAffinityAt declares the same term at an arbitrary topology.
+//
+// The distinction is the whole of the difference between what binpack checks
+// and what the scheduler checks. A hostname-keyed term rejects only the node
+// the declaring pod sits on; a term keyed wider — zone, region — rejects every
+// node in that domain, including empty ones binpack would otherwise consider a
+// destination.
+func WithRequiredAntiAffinityAt(topologyKey, labelKey, labelValue string) PodOption {
 	return func(p *corev1.Pod) {
 		if p.Spec.Affinity == nil {
 			p.Spec.Affinity = &corev1.Affinity{}
 		}
 		p.Spec.Affinity.PodAntiAffinity = &corev1.PodAntiAffinity{
 			RequiredDuringSchedulingIgnoredDuringExecution: []corev1.PodAffinityTerm{{
-				TopologyKey: corev1.LabelHostname,
+				TopologyKey: topologyKey,
 				LabelSelector: &metav1.LabelSelector{
 					MatchLabels: map[string]string{labelKey: labelValue},
 				},

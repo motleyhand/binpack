@@ -358,9 +358,20 @@ type exemption struct {
 	// stops agreeing rather than staying reassuring.
 	//
 	// A witness, not a proof of closure. It shows the refusal exists, not
-	// that it covers every input the plugin sees; where the coverage is known
-	// to be narrower than the plugin's, why says so.
+	// that it covers every input the plugin sees.
 	refused func() fit.Reason
+	// gap is an input this plugin rejects and internal/fit does not, for an
+	// exemption whose refusal is narrower than the plugin it stands in for.
+	//
+	// It is not a limitation binpack has accepted. It is an unsound
+	// acceptance — binpack approving a destination the scheduler refuses —
+	// and the reason it is written here rather than left in prose is that
+	// prose cannot stop a green coverage test from reading as coverage. The
+	// test asserts the gap is still open, which means one cannot be declared
+	// where none exists, and that closing it in internal/fit fails here. The
+	// record deletes itself when the defect is fixed instead of rotting into
+	// a false statement about a package that has moved on.
+	gap func() fit.Reason
 }
 
 // exempt records, for each default Filter plugin the oracle does not run, the
@@ -428,17 +439,20 @@ var exempt = map[string][]exemption{
 			},
 		},
 		{
-			// The one exemption here that is narrower than the plugin it stands
-			// in for, which is why it is written out rather than summarised.
+			// This exemption does not hold all the way, and gap below is where
+			// it stops holding. Upstream rejects every node in the term's
+			// topology domain; binpack looks only at the candidate node's own
+			// residents, so a zone-keyed term on a neighbouring node is
+			// invisible to it and the destination is approved.
 			why: "fit.UnsupportedDestination refuses a node whose residents declare " +
 				"required anti-affinity that could match the incoming pod — the " +
 				"symmetric direction, which checking the incoming pod alone would " +
-				"miss. It is narrower than the plugin: it compares the incoming pod " +
-				"against the residents of the one candidate node, while upstream " +
-				"counts matching pods across the term's whole topology domain, so a " +
-				"term keyed on anything but the hostname is not covered by it. " +
-				"Accepts takes a single node and could not adjudicate that " +
-				"difference even if this plugin were built here.",
+				"miss. It does not cover the plugin: upstream counts matching pods " +
+				"across the term's whole topology domain, so a term keyed on " +
+				"anything wider than the hostname rejects nodes that hold no " +
+				"matching pod of their own, and binpack accepts them. Building the " +
+				"plugin here would not settle it either, because Accepts models a " +
+				"single node and the disagreement is between nodes.",
 			refused: func() fit.Reason {
 				return fit.UnsupportedDestination(
 					mother.Pod("default", "web", mother.PodLabels(map[string]string{"app": "web"})),
@@ -446,6 +460,26 @@ var exempt = map[string][]exemption{
 					[]*corev1.Pod{mother.Pod("default", "sitting",
 						mother.OnNode("n"), mother.WithRequiredAntiAffinity("app", "web"))},
 				)
+			},
+			gap: func() fit.Reason {
+				const zone = corev1.LabelTopologyZone
+				inZone := mother.NodeLabels(map[string]string{zone: "z1"})
+
+				// Node b hosts the pod whose anti-affinity spans the zone.
+				// Node c is in the same zone and holds nothing at all.
+				byNode := map[*corev1.Node][]*corev1.Pod{
+					mother.SmallNode("b", inZone): {mother.Pod("default", "sitting",
+						mother.OnNode("b"), mother.WithRequiredAntiAffinityAt(zone, "app", "web"))},
+				}
+				c := mother.SmallNode("c", inZone)
+				incoming := mother.Pod("default", "web",
+					mother.PodLabels(map[string]string{"app": "web"}))
+
+				// The scheduler refuses c on account of what is in byNode, since
+				// the term's domain covers it. binpack is asked with c's own
+				// residents, which is all UnsupportedDestination takes, so the
+				// pod on b never reaches the question and c is approved.
+				return fit.UnsupportedDestination(incoming, c, byNode[c])
 			},
 		},
 	},
@@ -484,6 +518,13 @@ var exempt = map[string][]exemption{
 // Anything else fails, naming the plugin. That is the whole point: the next
 // release that adds a Filter plugin has to be classified by somebody, rather
 // than quietly joining the set of things nobody has thought about.
+//
+// Accounted for is not the same as sound, and this test is careful not to be
+// read as saying so. An exemption whose refusal is narrower than the plugin it
+// stands in for carries a gap: an input binpack accepts and the plugin rejects,
+// asserted here to be still open and logged on every green run. InterPodAffinity
+// has one today. Green means every default Filter plugin has been looked at and
+// its status written down — not that binpack agrees with all of them.
 func TestOracleCoversEveryDefaultFilterPlugin(t *testing.T) {
 	cfg, err := latest.Default()
 	if err != nil {
@@ -545,6 +586,22 @@ func TestOracleCoversEveryDefaultFilterPlugin(t *testing.T) {
 							"other reason does not stand in for a plugin it never runs.",
 							name, e.why, reason.Code)
 					}
+
+					if e.gap == nil {
+						continue
+					}
+					if closed := e.gap(); !closed.Empty() {
+						t.Errorf("%s records a gap internal/fit now closes (%s: %s).\n"+
+							"Delete the gap and narrow the exemption's reason — the "+
+							"record has done its job and is now a false statement.",
+							name, closed.Code, closed.Message)
+						continue
+					}
+					// Passing here is not the same as being covered, and the
+					// difference is worth printing: CI runs this package with
+					// -v, so the open gap is in the log of every green run.
+					t.Logf("%s is exempt with a gap still open: binpack accepts an "+
+						"input this plugin refuses. Not a limitation, a defect.", name)
 				}
 				return
 			}

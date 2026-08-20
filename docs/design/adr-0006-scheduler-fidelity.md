@@ -314,9 +314,17 @@ the allowlist refusing a whole class of pod — every pod with a volume, with re
 a hard spread constraint. The seventh, InterPodAffinity, rests on two refusals, and only the
 first is of that kind: a pod declaring required affinity terms of its own is refused outright,
 while the symmetric direction — a resident's term rejecting the pod arriving beside it — is
-checked node by node where the plugin counts across a whole topology domain. That one is written
-out at length rather than summarised, because an exemption narrower than the plugin it stands in
-for is a limitation somebody has to be able to read.
+checked node by node where the plugin counts across a whole topology domain. A term keyed on the
+zone therefore rejects nodes that hold no matching pod of their own, and binpack approves them.
+
+That shortfall is carried in the map as an input, not as a sentence, because a sentence cannot
+stop a green test from reading as coverage. The exemption names the pod-and-node arrangement
+binpack accepts and the plugin refuses, the test asserts it is still accepted, and the run logs it
+on every pass. Two things follow, and both are the point: a gap cannot be declared where none
+exists, and the day the refusal is widened to the topology domain the assertion fails and the
+record has to be deleted rather than left behind as a false statement about a package that has
+moved on. An exemption narrower than its plugin is a defect with a name, not a limitation
+somebody has decided to live with.
 
 ## Consequences
 
