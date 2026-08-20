@@ -53,7 +53,12 @@ everyone who wrote a config file.
 ## Consequences
 
 - Installing binpack requires no CRD. `helm install` creates a Deployment, a ServiceAccount, an
-  RBAC role and a ConfigMap. Uninstalling leaves nothing behind.
+  RBAC role and a ConfigMap, and uninstalling removes all four: no schema stays registered in
+  the API server, and no object of a kind binpack invented is left for someone to find. What can
+  outlive the release is state on nodes binpack has drained — the drain label and annotations,
+  written when a drain starts and cleared when it ends. That is state on objects the cluster
+  already owns rather than a kind of binpack's own, so it is a node to uncordon rather than a
+  resource to garbage-collect.
 - The CLI (`explain`, `diagnose`) deliberately does **not** start a manager. Starting informers
   and waiting for cache sync to answer one question would be slow and surprising. The CLI makes
   one-shot `List` calls against the user's kubeconfig instead. Both paths feed the same decision

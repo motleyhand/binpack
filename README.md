@@ -14,8 +14,9 @@ were drained, would its workload fit on the remaining nodes without triggering a
 drains it only when the arithmetic says yes. The autoscaler then reaps the node as it normally
 would.
 
-> **Status: pre-release.** The design is settled and documented below; the implementation is in
-> progress. Nothing is installable yet.
+> **Status: 0.x.** binpack decides and reports, and drains nodes once acting is switched on. It
+> stays at 0.x until it has done that on somebody else's cluster — see
+> [versioning](docs/reference/versioning.md) for what the number covers and what it does not.
 
 ## Is this for you?
 
@@ -42,6 +43,19 @@ capacity than binpack can, because they remove *permanent* blocks rather than op
 them — a `PodDisruptionBudget` with `minAvailable: 1` on a single-replica Deployment permits
 *zero* voluntary disruptions, forever, and will pin a node in place no matter what tooling you
 add. If those fixes solve it, you might not need this.
+
+If they do not, the chart installs from a registry and defaults to deciding without acting:
+
+```bash
+helm install binpack oci://ghcr.io/motleyhand/charts/binpack \
+  --namespace binpack-system --create-namespace
+```
+
+`binpack diagnose` and `binpack explain` need nothing installed at all. They run against your own
+kubeconfig from the [release binaries](https://github.com/motleyhand/binpack/releases), need no
+in-cluster identity, and are the recommended way to decide whether the controller is worth
+installing. [Install binpack](docs/how-to/install-binpack.md) covers the chart's defaults, what to
+watch, and how to uninstall it without stranding a node.
 
 ## Documentation
 
@@ -94,8 +108,6 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0007](docs/design/adr-0007-drain-progress-not-deadlines.md) | Why drains are bounded by progress rather than deadlines, and why failures back off |
 | [ADR-0008](docs/design/adr-0008-engine-uses-api-types.md) | Why the engine uses Kubernetes API types directly, and what the purity rule was really protecting |
 | [ADR-0009](docs/design/adr-0009-revalidation-asks-soundness-not-preference.md) | Revalidation re-asks soundness, not preference |
-
-Configuration and metrics references are written as the implementation lands.
 
 ## Design principles
 

@@ -1,8 +1,8 @@
 # RBAC reference
 
-> **Status: the read and report permissions are what `binpack run` uses today.** The mutating
-> rules are marked as such and are not yet needed — nothing in this build cordons or evicts. The
-> authoritative manifests ship with the Helm chart.
+> **The authoritative manifests ship with the Helm chart** —
+> [charts/binpack/templates/rbac.yaml](../../charts/binpack/templates/rbac.yaml). This page says
+> what each rule is for, and is the one to write a role from if you manage RBAC yourself.
 
 binpack needs **no cloud provider credentials** on any platform. A Kubernetes role in the
 cluster it runs in is its entire permission surface — see
@@ -14,7 +14,7 @@ Permissions come in three groups, and it is worth granting only the ones you are
 |---|---|---|
 | Read | `explain`, `diagnose`, `run` | nothing |
 | Report | `run` | Events, and the leader-election Lease |
-| Act | `run` with `dryRun: false` | nodes (cordon and annotations), pod evictions |
+| Act | `run` with `dryRun: false` | nodes (cordon, the drain label and annotations), pod evictions |
 
 ## Read
 
@@ -104,6 +104,12 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch]
+
+  # Leader election announces itself on the Lease through the *core* events
+  # API, not the one binpack reports decisions through. Both are needed.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
 ```
 
 **Both events APIs are in use, for different reasons.** binpack writes its own decisions through
@@ -129,13 +135,14 @@ cannot create resource \"events\" in API group \"\""
 a single replica and accept that a rolling update briefly has two. With `--once` they are never
 used at all.
 
-## Act — not yet used
+## Act — required when `dryRun` is false
 
-Nothing in this build cordons a node or evicts a pod. These are the permissions the executor
-will need, listed so the shape of the final role is not a surprise:
+With `dryRun: false`, binpack cordons the node it has chosen, marks it, evicts its pods one at a
+time through the eviction API, and uncordons it again if the drain ends without the node being
+removed. Two rules cover all of it:
 
 ```yaml
-  # Cordon, uncordon, and the drain marker annotations.
+  # Cordon, uncordon, the drain label, and the drain marker annotations.
   - apiGroups: [""]
     resources: [nodes]
     verbs: [patch]
@@ -147,14 +154,26 @@ will need, listed so the shape of the final role is not a surprise:
 ```
 
 **`nodes: patch` is the only mutating verb on cluster state.** It covers cordoning, uncordoning,
-and writing the drain marker annotations. binpack never deletes a node — that is the
-cluster-autoscaler's job, and the division is deliberate: binpack makes a node removable and
-something else decides to remove it.
+writing the `binpack.motleyhand.com/draining` label, and writing the drain marker annotations.
+All four are the same verb on the same resource, so there is no narrower grant that covers some
+of them and not the rest. binpack never deletes a node: that is the cluster-autoscaler's job, and
+the division is deliberate — binpack makes a node removable and something else decides to remove
+it.
 
 **`pods/eviction: create`** is how the Eviction API works. It is a create on a subresource, and
 it respects PodDisruptionBudgets — unlike `pods: delete`, which does not. binpack does not
 request `pods: delete`, and should not be granted it. That distinction is the difference between
 draining a node and simply killing things on it.
+
+**The chart refuses `config.dryRun: false` without `rbac.allowDraining: true`**, in either RBAC
+mode, because a binpack that decides to drain and is then refused looks healthy from outside: it
+holds its lease, serves its metrics, publishes its decisions, and fails every drain on its first
+node patch.
+
+What the flag *does*, though, depends on the other one. With `rbac.create: true` it adds the two
+rules above to the role the chart writes. With `rbac.create: false` it adds nothing and asserts
+something — that you have granted them wherever you manage RBAC — and nothing on either side
+checks that you have. So if you are writing the role by hand, this is the group to write with it.
 
 ## Read-only evaluation
 
@@ -162,8 +181,9 @@ draining a node and simply killing things on it.
 own kubeconfig they need no in-cluster identity at all.
 
 This is the recommended way to evaluate binpack: read the arithmetic before granting anything
-that can act. `binpack run` with the Read and Report groups is the next step — it decides on an
-interval and reports on nodes, and still changes nothing.
+that can act. `binpack run` with the Read and Report groups is the same decision on an interval,
+reported on the nodes themselves — and without the Act group it holds no verb that can cordon a
+node or evict a pod, whatever its configuration says.
 
 ## What binpack is never granted
 

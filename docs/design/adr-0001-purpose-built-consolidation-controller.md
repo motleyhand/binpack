@@ -116,8 +116,12 @@ performs implicitly and a cron job would not.
   types, or replace the cluster-autoscaler. It nudges an autoscaler that is already working
   into a state where its own scale-down logic can fire.
 - Because it cooperates with the existing autoscaler rather than replacing node lifecycle
-  management, adoption risk is low: uninstalling it returns the cluster to exactly its previous
-  behaviour.
+  management, adoption risk is low: binpack provisions nothing and owns no part of the node
+  lifecycle, so removing it hands the cluster back to the autoscaler that was already running
+  it. The exception is a node binpack is draining at that moment, which is left cordoned and
+  marked with nothing running to release it — accepted deliberately, and the marker is what
+  makes the state self-describing rather than mysterious — see
+  [the architecture](2026-08-15-architecture.md) on recovery state outliving the process.
 - The value proposition depends entirely on the feasibility check being *correct*. A tool that
   drains a node whose workload does not fit elsewhere is worse than no tool, because it causes
   churn and an immediate scale-up. This is why the decision engine is a pure, exhaustively
