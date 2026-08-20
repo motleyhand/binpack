@@ -39,6 +39,15 @@ means the soft variants of constraints — `whenUnsatisfiable: ScheduleAnyway`,
 `preferredDuringSchedulingIgnoredDuringExecution` — can be ignored outright, because they only
 affect scoring.
 
+That is a claim about scoring, and it holds. It is not a claim that the framework has two halves.
+The 1.36 default profile also enables `SchedulingGates`, a PreEnqueue plugin: a gated pod never
+enters the scheduling queue, so no Filter runs on it and no Filter refuses it. `GangScheduling`,
+off by default at this release, is PreEnqueue and Permit, and can hold a pod that every Filter
+accepted. A replacement blocked at either point never binds, while a simulation that asks only
+whether a destination filters cleanly sees nothing wrong. Refusing those pods is the allowlist's
+job rather than the fit predicate's — `internal/fit` refuses a pod carrying `spec.schedulingGates`,
+which covers the gate a workload declares in its own template.
+
 **An unmodelled constraint is a bounded limitation, not a bug** — provided its *presence* is
 detected and causes a refusal. "We do not model hard topology spread" is acceptable. "We
 silently ignore hard topology spread" is not.
@@ -277,6 +286,46 @@ The test asserts the asymmetry rather than equality:
 The converse is explicitly permitted. This is a far easier property to hold than matching the
 scheduler decision for decision, and it is exactly the property the tool's correctness rests on.
 
+What was built is not the `envtest` harness described above, and the difference is worth stating.
+The oracle runs the scheduler's own Filter plugins in-process against API objects, rather than
+standing up an API server with the real `kube-scheduler` binary beside it. In-process
+plugins are what make three thousand generated scenarios affordable on every pull request. They
+are also what turns the plugin *set* into a decision somebody has to make, where the binary would
+have made it by construction.
+
+That decision was made badly at first, and recording the correction matters more than recording
+the choice, because it is the mistake above one level up. The oracle instantiated four plugins
+from a list somebody typed, while the release's default profile enables fourteen that filter. A
+plugin the oracle does not run cannot produce a disagreement: the placement is accepted on both
+sides, and the harness reports agreement about a question it never asked. Unlike a wrong feature
+gate, which announced itself with 171 loud and wrong reports, this failure prints nothing at all.
+
+So the set is derived. `pkg/scheduler/apis/config/latest.Default()` gives the release's own
+default profile under the release's own gates, and `plugins.NewInTreeRegistry()` gives the
+factories under the same names; every enabled plugin that implements `Filter` must be either
+built into the oracle or carry a written exemption naming the `internal/fit` refusal that keeps
+binpack away from its input. The exemption is executed, not merely read, so it stops being true
+if the refusal it rests on is deleted. A release that adds a Filter plugin now fails CI with that
+plugin's name rather than passing quietly.
+
+The exemptions are the honest reading of "an unmodelled constraint is a bounded limitation": each
+one is a limitation, written down, somewhere a test can contradict it. Six of the seven rest on
+the allowlist refusing a whole class of pod — every pod with a volume, with resource claims, with
+a hard spread constraint. The seventh, InterPodAffinity, rests on two refusals, and only the
+first is of that kind: a pod declaring required affinity terms of its own is refused outright,
+while the symmetric direction — a resident's term rejecting the pod arriving beside it — is
+checked node by node where the plugin counts across a whole topology domain. A term keyed on the
+zone therefore rejects nodes that hold no matching pod of their own, and binpack approves them.
+
+That shortfall is carried in the map as an input, not as a sentence, because a sentence cannot
+stop a green test from reading as coverage. The exemption names the pod-and-node arrangement
+binpack accepts and the plugin refuses, the test asserts it is still accepted, and the run logs it
+on every pass. Two things follow, and both are the point: a gap cannot be declared where none
+exists, and the day the refusal is widened to the topology domain the assertion fails and the
+record has to be deleted rather than left behind as a false statement about a package that has
+moved on. An exemption narrower than its plugin is a defect with a name, not a limitation
+somebody has decided to live with.
+
 ## Consequences
 
 - `internal/collect` and `internal/fit` are the project's highest-risk packages, not the boring
@@ -288,6 +337,9 @@ scheduler decision for decision, and it is exactly the property the tool's corre
   `explain`, and it is measured so the decision to escalate can be made on data.
 - The Kubernetes version binpack is built against becomes semantically relevant: scheduler
   behaviour changes between releases. The differential test is what will catch that, and it
-  should run against more than one Kubernetes version in CI once there is reason to.
+  should run against more than one Kubernetes version in CI once there is reason to. It catches it
+  only for plugins the oracle actually runs, which is why that set is derived from the release
+  rather than listed, and why a plugin it does not run has to carry an exemption a test can
+  falsify.
 - `explain` must surface the refusal reason, not just the verdict. "Skipped: pod X has required
   anti-affinity, which binpack does not model" is a useful answer. "Skipped" alone is not.
