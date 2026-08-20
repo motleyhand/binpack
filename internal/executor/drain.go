@@ -234,6 +234,17 @@ func Advance(
 			if assessment.Action == drain.Abandon {
 				return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
 			}
+			// Recorded like every other wait, and here it is what makes the
+			// bound above reachable rather than decorative. record runs before
+			// the eviction it accompanies, so the count on the node is one
+			// higher than what the next evaluation finds: that evaluation sees
+			// fewer pods and calls it progress, correctly, once. Returning
+			// without lowering the count leaves the same departure being read
+			// as fresh progress every interval afterwards, and a stall clock
+			// that restarts every interval never runs out.
+			if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
+				return Step{}, err
+			}
 			return Step{Code: StepWaiting,
 				Reason: "waiting for the replacement pod to be scheduled"}, nil
 		}

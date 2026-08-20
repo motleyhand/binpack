@@ -579,6 +579,57 @@ func TestADrainWaitingForAReplacementThatNeverArrivesIsAbandoned(t *testing.T) {
 	}
 }
 
+func TestAWaitForAReplacementCannotBeExtendedForEver(t *testing.T) {
+	// The single-shot case above only reaches the stall bound because its
+	// recorded count already matches the node's. A real drain never looks like
+	// that: record runs before the eviction it accompanies, so the count on the
+	// node is one higher than what the next evaluation finds. That evaluation
+	// reads the departure as progress — rightly, once — and if the wait then
+	// returns without lowering the count, every later evaluation reads the same
+	// departure again. A stall clock that restarts every interval is not a
+	// bound, and the node is wedged exactly as it was before.
+	n := awaitingNode("a", "web-rs", time.Minute)
+	n.Annotations[engine.AnnotationDrainPodsRemaining] = "2"
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{n, node("b")}, pods)
+	c := clientFor(s)
+
+	// One evaluation a minute for twice the stall timeout, each against the
+	// node as the last one left it.
+	const rounds = 20
+	for i := 0; i <= rounds; i++ {
+		round := s
+		round.Now = at.Add(time.Duration(i) * time.Minute)
+		round.Nodes = []*corev1.Node{nodeFrom(t, c, "a"), node("b")}
+		round.Autoscaler.LastProbe = round.Now.Add(-10 * time.Second)
+
+		step, err := executor.Advance(
+			context.Background(), c, round, "a", engineConfig(), drainPolicy())
+		if err != nil {
+			t.Fatalf("Advance at +%dm: %v", i, err)
+		}
+		if step.Failed && step.Code == drain.AbandonStalled {
+			// At the eleventh minute, not the first: the pod that left at +0
+			// was real progress, so the stall clock runs from there rather
+			// than from the eviction that started the wait. Bounding the
+			// absence of progress is the whole of ADR-0007, and a bound that
+			// fired at +1 would be a wall-clock deadline wearing its name.
+			if i != 11 {
+				t.Errorf("abandoned at +%dm; expected +11m, one minute past the "+
+					"stall timeout measured from the last real progress", i)
+			}
+			return
+		}
+		if step.Code != executor.StepWaiting {
+			t.Fatalf("at +%dm: expected the drain to wait or to end, got %+v", i, step)
+		}
+	}
+
+	t.Errorf("%d evaluations over twice the stall timeout and the drain is still waiting; "+
+		"the replacement never arrived and nothing ended it", rounds+1)
+}
+
 func TestACompletedPodIsNotAnInFlightEviction(t *testing.T) {
 	// A Succeeded pod held by a finalizer is not occupying the node, so the
 	// assessment does not count it. Treating it as in flight would wait on it
