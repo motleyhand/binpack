@@ -161,7 +161,13 @@ binpack's only state outside the release is on the nodes it has drained: the
 and cleared when it ends. `helm uninstall` does not touch them, and a drain ends only when
 binpack next looks at the node — which is exactly what uninstalling stops.
 
-So ask first whether one is in flight:
+Asking whether a drain is in flight is only worth doing once nothing can start one. A binpack
+that is still running decides again every interval, so a check that comes back empty says nothing
+about the moment a second later when `helm uninstall` removes the pod. Stop it first:
+
+```bash
+kubectl -n binpack-system scale deployment/binpack --replicas=0
+```
 
 ```bash
 kubectl get nodes -l binpack.motleyhand.com/draining=true
@@ -171,9 +177,12 @@ kubectl get nodes -l binpack.motleyhand.com/draining=true
 helm uninstall binpack --namespace binpack-system
 ```
 
-A node listed by that command when the release goes is left cordoned and marked, with nothing
-running to release it. Either wait for the drain to end, or repair it by hand afterwards: the
-three commands — clear the annotations, remove the label, uncordon — are in the
+Scaling to zero freezes a drain that is already under way rather than ending it — the node stays
+cordoned and marked, because releasing it is itself an action and there is nothing left running to
+take it. So if the middle command lists a node, choose before you uninstall. Scaling back up hands
+the drain to a binpack that will finish it or abandon it and uncordon; leaving it at zero means
+repairing by hand. The three commands for that — clear the annotations, remove the label, uncordon
+— are in the
 [annotations reference](../reference/annotations.md#if-a-node-is-stuck-cordoned). `binpack
 diagnose` reports the same node as an abandoned drain and prints what to clear; it runs against
 your own kubeconfig, so it still answers with nothing installed in the cluster.

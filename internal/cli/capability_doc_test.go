@@ -105,6 +105,46 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 	}
 }
 
+// TestTheRBACReferenceIsACompleteRoleSpecification holds the page to what its
+// own banner promises: that it is the page to write a role from.
+//
+// Codex found the gap this closes. The reference showed the leader-election
+// Role as leases alone, while the chart also grants core `events` there —
+// client-go's leader-election recorder writes to the *core* group, unlike the
+// decision events. The page explained that in prose four paragraphs below the
+// YAML block that omitted it, so a role copied from the block logged an
+// authorization failure the same page had already predicted.
+//
+// The pairs carry their API group for that reason. Keyed on the resource
+// alone, `events` from `events.k8s.io` and `events` from the core group are
+// the same string, and this test would have been blind to the one gap it
+// exists to catch.
+func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
+	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+	data, err := os.ReadFile("../../docs/reference/rbac.md")
+	if err != nil {
+		t.Fatalf("reading the RBAC reference: %v", err)
+	}
+
+	// Every rule the chart holds, gated or not: the page documents the whole
+	// role, and an operator managing RBAC themselves needs all of it.
+	granted := rulePairs(string(chart))
+	if len(granted) == 0 {
+		t.Fatal("no rules found in the chart; this test would assert nothing")
+	}
+
+	documented := rulePairs(grantedSections(string(data)))
+	for pair := range granted {
+		if !documented[pair] {
+			t.Errorf("the chart grants %q and the RBAC reference does not list it; "+
+				"a role written from this page would be missing it", pair)
+		}
+	}
+}
+
 // grantedSections drops the sections of a document whose heading says the
 // permissions in them are not granted or not needed, so what remains is what
 // the page tells an operator to grant.
@@ -122,26 +162,40 @@ func grantedSections(doc string) string {
 
 var notGranted = regexp.MustCompile(`(?i)not yet|unused|not needed|never granted`)
 
-// rulePairs pulls `resource: verb` pairs out of the RBAC rule blocks in a
-// document. Both the chart and the reference write a rule as adjacent lines:
+// rulePairs pulls `group/resource: verb` pairs out of the RBAC rule blocks in
+// a document. Both the chart and the reference write a rule as three adjacent
+// lines, so the template directives around them are simply not matched:
 //
-//	resources: [nodes]
-//	verbs: [patch]
+//   - apiGroups: [""]
+//     resources: [nodes]
+//     verbs: [patch]
+//
+// The core group is rendered as "core" rather than the empty string, so a
+// failure message names something a reader can find in a role.
 func rulePairs(doc string) map[string]bool {
 	pairs := map[string]bool{}
-	var resources []string
+	var groups, resources []string
 	for _, line := range strings.Split(doc, "\n") {
 		line = strings.TrimSpace(line)
+		line = strings.TrimPrefix(line, "- ")
 		switch {
+		case strings.HasPrefix(line, "apiGroups:"):
+			groups = bracketed(line)
 		case strings.HasPrefix(line, "resources:"):
 			resources = bracketed(line)
 		case strings.HasPrefix(line, "verbs:"):
-			for _, resource := range resources {
-				for _, verb := range bracketed(line) {
-					pairs[resource+": "+verb] = true
+			for _, group := range groups {
+				group = strings.Trim(group, `"`)
+				if group == "" {
+					group = "core"
+				}
+				for _, resource := range resources {
+					for _, verb := range bracketed(line) {
+						pairs[group+"/"+resource+": "+verb] = true
+					}
 				}
 			}
-			resources = nil
+			groups, resources = nil, nil
 		}
 	}
 	return pairs

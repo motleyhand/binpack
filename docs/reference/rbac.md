@@ -104,6 +104,12 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch]
+
+  # Leader election announces itself on the Lease through the *core* events
+  # API, not the one binpack reports decisions through. Both are needed.
+  - apiGroups: [""]
+    resources: [events]
+    verbs: [create, patch]
 ```
 
 **Both events APIs are in use, for different reasons.** binpack writes its own decisions through
