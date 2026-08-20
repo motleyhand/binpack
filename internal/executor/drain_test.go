@@ -253,6 +253,31 @@ func TestAMarkedNodeThatIsNotCordonedIsRepaired(t *testing.T) {
 	}
 }
 
+func TestAMarkedNodeNobodyLetsBinpackCordonIsStillBounded(t *testing.T) {
+	// The repair is right for the case it was written for — a process that
+	// stopped between Begin's two writes — but it is not a resting place. A
+	// controller that owns spec.unschedulable, or an operator answering an
+	// unexpected SchedulingDisabled with kubectl uncordon, puts the drain back
+	// here every interval, and the repair on its own never consults a bound.
+	nodes := []*corev1.Node{marked("a", 6*time.Hour, 6*time.Hour, "1"), node("b")}
+	nodes[0].Spec.Unschedulable = false
+	pods := []*corev1.Pod{mother.Pod("default", "idle", mother.OnNode("a"))}
+	s := snapshot(nodes, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Failed || step.Code != drain.AbandonStalled {
+		t.Errorf("expected the repair to consult the stall bound, got %+v", step)
+	}
+	if nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainStarted] != "" {
+		t.Error("the drain marker survived, so the next interval repairs the node again")
+	}
+}
+
 func TestAVanishedNodeIsSuccess(t *testing.T) {
 	// The cluster-autoscaler removing the node is the outcome a drain works
 	// towards, so finding it gone is completion rather than an error.
@@ -527,6 +552,30 @@ func TestSomebodyElsesUnschedulablePodDoesNotEndTheDrain(t *testing.T) {
 	}
 	if step.Failed {
 		t.Errorf("an unrelated workload ended the drain: %+v", step)
+	}
+}
+
+func TestADrainWaitingForAReplacementThatNeverArrivesIsAbandoned(t *testing.T) {
+	// Having a controller does not guarantee the controller produces a bound
+	// pod carrying that same UID. A rollout or a scale-down supersedes the
+	// ReplicaSet, so every later pod is owned by a different one; a Job at its
+	// backoffLimit creates nothing at all. The wait then has nothing to end it
+	// unless the drain assessment gets to run, and while it lasts binpack
+	// evaluates no other node in the cluster.
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", 30*time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Failed || step.Code != drain.AbandonStalled {
+		t.Errorf("expected the stall bound to end the wait, got %+v", step)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node was left cordoned waiting for a pod that will never arrive")
 	}
 }
 

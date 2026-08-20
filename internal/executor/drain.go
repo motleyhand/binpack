@@ -81,6 +81,12 @@ func Begin(ctx context.Context, w Writer, node *corev1.Node, now time.Time) erro
 // Every path through this function ends with the node removed, still being
 // drained, or uncordoned. A cordoned node nothing will finish is capacity that
 // is paid for and cannot be used.
+//
+// "Still being drained" is the answer that needs watching, because it is the
+// one that can be given for ever. It is only safe while every path that
+// returns it has first consulted the drain assessment, which is why the
+// assessment is computed above all of them rather than beside the branch that
+// happened to need it.
 func Advance(
 	ctx context.Context, w Writer,
 	s engine.Snapshot, name string, cfg engine.Config, policy drain.Policy,
@@ -128,14 +134,54 @@ func Advance(
 		}
 		return Step{Code: StepHandedOver,
 			Reason: "the cluster-autoscaler is removing this node"}, nil
+	}
 
+	// The bound, computed before any branch that would otherwise return
+	// without one.
+	//
+	// It used to sit fifty lines below, under the repair and under the wait
+	// for a replacement, and both of those returned above it — so on those two
+	// paths stallTimeout, removalTimeout and the stuck detector were not
+	// merely unmet, they were never evaluated. That is the closure property
+	// failing in the one place it is load-bearing: a node nothing will finish
+	// stays cordoned, and because the controller short-circuits every
+	// evaluation to this function while a drain is marked, binpack stops
+	// consolidating anywhere in the cluster.
+	//
+	// Assessing here costs nothing that returning early saved: it reads the
+	// snapshot and writes nothing.
+	pods := podsOn(s, name)
+
+	assessment := drain.Assess(
+		drain.State{Node: a.Node, Pods: pods, Now: s.Now}, policy)
+
+	switch {
 	case a.SkipCode == engine.SkipUncordoned:
 		// Marked but schedulable, so a previous evaluation stopped between
-		// the two writes. Repaired rather than abandoned — nothing has been
-		// evicted on the strength of a bad snapshot, because revalidation
-		// refuses to look at an uncordoned node at all. The next evaluation
-		// re-asks against a snapshot taken after this cordon.
+		// the two writes — or something else keeps clearing the flag: a
+		// controller that owns spec.unschedulable, or an operator answering an
+		// unexpected SchedulingDisabled with kubectl uncordon. Repaired rather
+		// than abandoned on that account alone: nothing has been evicted on
+		// the strength of a bad snapshot, because revalidation refuses to look
+		// at an uncordoned node at all.
+		//
+		// The cordon still comes first, even when the drain is about to end,
+		// because a node accepting pods must stop accepting them before
+		// anything else is decided. Abandon then hands it back, which is the
+		// same field written again in the other direction.
 		if err := Cordon(ctx, w, a.Node); err != nil {
+			return Step{}, err
+		}
+		if assessment.Action == drain.Abandon {
+			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+		}
+		// Recorded rather than asserted: record writes only when the
+		// assessment saw progress of its own, so the repair leaves a mark when
+		// the cluster moved and stays silent when it did not. Repairing a
+		// cordon is not itself progress, and a path that claimed otherwise
+		// would hold the stall clock at zero for as long as the repair kept
+		// being needed — which is the same wedge in a different disguise.
+		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
 			return Step{}, err
 		}
 		return Step{Code: StepCordoned,
@@ -150,6 +196,11 @@ func Advance(
 		// infeasible or blocked carries no skip code at all — and publishing
 		// an empty label would put a value outside the documented vocabulary
 		// into the metric, on the two outcomes most worth telling apart.
+		//
+		// Ahead of the assessment's own abandonment, because it names what
+		// changed. "The remaining pods no longer fit" tells an operator where
+		// to look; a node that has also been quiet for eleven minutes is the
+		// same node with the reason filed off.
 		return Abandon(ctx, w, a.Node, revalidationCode(a), revalidationReason(a), s.Now)
 	}
 
@@ -171,17 +222,24 @@ func Advance(
 				pod.Namespace, pod.Name), s.Now)
 
 		case awaited:
+			// Bounded, because having a controller does not mean the
+			// controller will produce a bound pod carrying that same UID. A
+			// rollout or a scale-down supersedes the ReplicaSet and every
+			// later pod is owned by a different one; a Job at its backoffLimit
+			// creates nothing at all; an admission-attached scheduling gate
+			// leaves the replacement neither placed nor refused. None of those
+			// is distinguishable from a replacement that is merely slow, and
+			// all of them show up as an absence of progress — which is the
+			// question the assessment already answers.
+			if assessment.Action == drain.Abandon {
+				return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+			}
 			return Step{Code: StepWaiting,
 				Reason: "waiting for the replacement pod to be scheduled"}, nil
 		}
 		// landed: the next eviction overwrites this marker, so there is
 		// nothing to clear.
 	}
-
-	pods := podsOn(s, name)
-
-	assessment := drain.Assess(
-		drain.State{Node: a.Node, Pods: pods, Now: s.Now}, policy)
 
 	switch assessment.Action {
 	case drain.Abandon:
