@@ -27,6 +27,15 @@
 // Only the predicates binpack actually models. Everything else it refuses
 // outright, and a refusal is sound by definition — so an unmodelled constraint
 // needs no oracle, only the assurance that binpack keeps refusing it.
+//
+// That assurance used to be this paragraph and nothing else, which is not an
+// assurance. The plugin list was four literal constructor calls, so a release
+// that added a Filter plugin widened what binpack was blind to without
+// widening what the harness looked at, and every generated case still passed.
+// TestOracleCoversEveryDefaultFilterPlugin now derives the release's default
+// Filter set and fails on any member the oracle neither runs nor exempts —
+// and an exemption has to name the internal/fit refusal that keeps binpack
+// away from the plugin's input, and that refusal is run.
 package differential
 
 import (
@@ -40,6 +49,9 @@ import (
 	"k8s.io/kubernetes/pkg/scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/feature"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeaffinity"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodedeclaredfeatures"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodename"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeports"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/noderesources"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/nodeunschedulable"
 	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/tainttoleration"
@@ -73,8 +85,18 @@ type Oracle struct {
 }
 
 // NewOracle builds the Filter plugins corresponding to the predicates binpack
-// models: NodeUnschedulable, TaintToleration, NodeAffinity and
-// NodeResourcesFit.
+// models: NodeUnschedulable, NodeName, TaintToleration, NodeAffinity,
+// NodePorts, NodeResourcesFit and NodeDeclaredFeatures, in the order the
+// release's default profile runs them — so the plugin a Verdict names is the
+// one the scheduler would have reported first.
+//
+// Which plugins belong here is not a judgement this constructor is trusted to
+// make alone. TestOracleCoversEveryDefaultFilterPlugin derives the default
+// Filter set from the pinned release and fails on any member built neither
+// here nor into its exemption map. The seven built here are the ones that
+// decide from the pod and the node alone; the rest want a scheduler Handle, a
+// snapshot of the whole cluster, or a DRA manager, and are exempted there
+// against the internal/fit refusal that keeps binpack away from their inputs.
 //
 // Feature gates come from the same place the real scheduler gets them:
 // NewSchedulerFeaturesFromGates over the release's DefaultFeatureGate. They
@@ -129,6 +151,14 @@ func NewOracle() (*Oracle, error) {
 		return nil, err
 	}
 
+	// NodeName is inert for anything binpack would relocate — a pod naming a
+	// node bypasses the scheduler, and fit refuses those outright — so it
+	// costs nothing and makes that refusal falsifiable rather than assumed.
+	p, err = nodename.New(ctx, nil, nil, features)
+	if err := add(nodename.Name, p, err); err != nil {
+		return nil, err
+	}
+
 	p, err = tainttoleration.New(ctx, nil, nil, features)
 	if err := add(tainttoleration.Name, p, err); err != nil {
 		return nil, err
@@ -139,10 +169,23 @@ func NewOracle() (*Oracle, error) {
 		return nil, err
 	}
 
+	p, err = nodeports.New(ctx, nil, nil, features)
+	if err := add(nodeports.Name, p, err); err != nil {
+		return nil, err
+	}
+
 	p, err = noderesources.NewFit(ctx, &config.NodeResourcesFitArgs{
 		ScoringStrategy: &config.ScoringStrategy{Type: config.LeastAllocated},
 	}, nil, features)
 	if err := add(noderesources.Name, p, err); err != nil {
+		return nil, err
+	}
+
+	// Beta and on by default since 1.36. It rejects a node whose kubelet has
+	// not declared a feature the pod's spec implies — new at this release,
+	// and so the demonstration of why the set is derived rather than typed.
+	p, err = nodedeclaredfeatures.New(ctx, nil, nil, features)
+	if err := add(nodedeclaredfeatures.Name, p, err); err != nil {
 		return nil, err
 	}
 
@@ -180,4 +223,14 @@ func (o *Oracle) Accepts(pod *corev1.Pod, node *corev1.Node, residents []*corev1
 	}
 
 	return Verdict{Accepted: true}, nil
+}
+
+// Modelled returns the names of the Filter plugins this oracle runs, in the
+// order it runs them.
+func (o *Oracle) Modelled() []string {
+	names := make([]string, 0, len(o.plugins))
+	for _, p := range o.plugins {
+		names = append(names, p.name)
+	}
+	return names
 }

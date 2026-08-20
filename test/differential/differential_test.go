@@ -3,10 +3,20 @@ package differential_test
 import (
 	"fmt"
 	"math/rand"
+	"slices"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
+	apiruntime "k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/client-go/informers"
+	"k8s.io/client-go/kubernetes/fake"
+	fwk "k8s.io/kube-scheduler/framework"
+	"k8s.io/kubernetes/pkg/scheduler/apis/config/latest"
+	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins"
+	"k8s.io/kubernetes/pkg/scheduler/framework/plugins/names"
+	frameworkruntime "k8s.io/kubernetes/pkg/scheduler/framework/runtime"
 
 	"github.com/motleyhand/binpack/internal/fit"
 	"github.com/motleyhand/binpack/internal/mother"
@@ -332,4 +342,253 @@ func TestPodSlotsAreEnforced(t *testing.T) {
 	}
 
 	check(t, o, "pod slots exhausted", pod, node, residents)
+}
+
+// exemption is one internal/fit refusal that keeps binpack away from the
+// inputs a Filter plugin judges, and so justifies the oracle not running it.
+type exemption struct {
+	// why names the predicate and says what it refuses. Prose, because the
+	// interesting half of an exemption is the half no compiler can check:
+	// what the plugin decides, and why binpack never puts it in a position
+	// to decide it.
+	why string
+	// refused is that predicate, applied to an input the plugin would judge.
+	// The test runs it, so the exemption holds only while the refusal it
+	// claims is still there — delete the check in internal/fit and this map
+	// stops agreeing rather than staying reassuring.
+	//
+	// A witness, not a proof of closure. It shows the refusal exists, not
+	// that it covers every input the plugin sees; where the coverage is known
+	// to be narrower than the plugin's, why says so.
+	refused func() fit.Reason
+}
+
+// exempt records, for each default Filter plugin the oracle does not run, the
+// internal/fit refusals it rests on.
+//
+// This map is the dangerous half of the coverage test below. Prose alone would
+// make it the place to put any plugin that is inconvenient to construct, and
+// an exemption nobody can falsify turns the allowlist into a denylist — the
+// one shape ADR-0006 says binpack's must never take. So each entry carries a
+// predicate and an input the test runs, and each entry is a limitation of
+// binpack. Read a new one as if you were adding one, because you are.
+var exempt = map[string][]exemption{
+	names.VolumeRestrictions: {{
+		why: "fit.UnsupportedPod refuses any pod carrying a volume it cannot prove " +
+			"node-independent, and volumes are the whole of what this plugin filters " +
+			"on: it rejects a node where a resident already holds the incoming pod's " +
+			"read-write-once volume.",
+		refused: func() fit.Reason {
+			return fit.UnsupportedPod(mother.Pod("default", "web", mother.WithPVC("data")))
+		},
+	}},
+	names.NodeVolumeLimits: {{
+		why: "fit.UnsupportedPod refuses any pod carrying a volume it cannot prove " +
+			"node-independent, which is every volume that could count against a CSI " +
+			"driver's per-node attachment limit.",
+		refused: func() fit.Reason {
+			return fit.UnsupportedPod(mother.Pod("default", "web",
+				mother.WithInlineCSIVolume("data", "csi.example.com")))
+		},
+	}},
+	names.VolumeBinding: {{
+		why: "fit.UnsupportedPod refuses any pod carrying a volume it cannot prove " +
+			"node-independent, so binpack never asks whether a claim could bind to a " +
+			"volume this node can reach.",
+		refused: func() fit.Reason {
+			return fit.UnsupportedPod(mother.Pod("default", "web", mother.WithPVC("data")))
+		},
+	}},
+	names.VolumeZone: {{
+		why: "fit.UnsupportedPod refuses any pod carrying a volume it cannot prove " +
+			"node-independent, so binpack never asks whether the node's zone matches " +
+			"the zone affinity of a volume already bound to one.",
+		refused: func() fit.Reason {
+			return fit.UnsupportedPod(mother.Pod("default", "web", mother.WithPVC("data")))
+		},
+	}},
+	names.PodTopologySpread: {{
+		why: "fit.UnsupportedPod refuses any pod declaring a DoNotSchedule spread " +
+			"constraint, which is the only kind this plugin's Filter can reject on. " +
+			"The ScheduleAnyway variant — including both constraints the release's " +
+			"SystemDefaulting supplies to a pod that declares none — reaches Score " +
+			"and never Filter, so it cannot make a placement fail.",
+		refused: func() fit.Reason {
+			return fit.UnsupportedPod(mother.Pod("default", "web",
+				mother.WithHardTopologySpread(corev1.LabelTopologyZone)))
+		},
+	}},
+	names.InterPodAffinity: {
+		{
+			why: "fit.UnsupportedPod refuses any pod declaring required pod affinity " +
+				"or anti-affinity of its own.",
+			refused: func() fit.Reason {
+				return fit.UnsupportedPod(mother.Pod("default", "web",
+					mother.WithRequiredAntiAffinity("app", "web")))
+			},
+		},
+		{
+			// The one exemption here that is narrower than the plugin it stands
+			// in for, which is why it is written out rather than summarised.
+			why: "fit.UnsupportedDestination refuses a node whose residents declare " +
+				"required anti-affinity that could match the incoming pod — the " +
+				"symmetric direction, which checking the incoming pod alone would " +
+				"miss. It is narrower than the plugin: it compares the incoming pod " +
+				"against the residents of the one candidate node, while upstream " +
+				"counts matching pods across the term's whole topology domain, so a " +
+				"term keyed on anything but the hostname is not covered by it. " +
+				"Accepts takes a single node and could not adjudicate that " +
+				"difference even if this plugin were built here.",
+			refused: func() fit.Reason {
+				return fit.UnsupportedDestination(
+					mother.Pod("default", "web", mother.PodLabels(map[string]string{"app": "web"})),
+					mother.SmallNode("n"),
+					[]*corev1.Pod{mother.Pod("default", "sitting",
+						mother.OnNode("n"), mother.WithRequiredAntiAffinity("app", "web"))},
+				)
+			},
+		},
+	},
+	names.DynamicResources: {{
+		why: "fit.UnsupportedPod refuses any pod carrying resource claims, which are " +
+			"the only pods this plugin filters on. The oracle also clears the DRA " +
+			"gates, since the plugin reads device availability through a Handle it " +
+			"has no manager for.",
+		refused: func() fit.Reason {
+			return fit.UnsupportedPod(mother.Pod("default", "web", mother.WithResourceClaim("gpu")))
+		},
+	}},
+}
+
+// TestOracleCoversEveryDefaultFilterPlugin derives the Filter plugins the
+// pinned release enables by default, and asserts the oracle accounts for every
+// one of them.
+//
+// The set the oracle builds used to be four literal constructor calls, which
+// is the practice this package's own doc comment argues against one level
+// down. For feature gates a hand-written list produced 171 confident, wrong
+// reports — and that is the benign failure, because it was loud. A
+// hand-written plugin list fails the other way round: a placement the
+// scheduler refuses through a plugin the oracle never runs is accepted on both
+// sides, so check's only failing condition cannot fire, and the harness reads
+// green exactly where it is blind. Neither vacuity guard in TestGeneratedStates
+// can see it either, since the modelled plugins refuse thousands of scenarios
+// on their own.
+//
+// Accounted for means one of two things:
+//
+//   - the oracle constructs it, so the scheduler's own code answers; or
+//   - exempt names the internal/fit refusals that keep binpack away from the
+//     inputs it judges, and this test runs them.
+//
+// Anything else fails, naming the plugin. That is the whole point: the next
+// release that adds a Filter plugin has to be classified by somebody, rather
+// than quietly joining the set of things nobody has thought about.
+func TestOracleCoversEveryDefaultFilterPlugin(t *testing.T) {
+	cfg, err := latest.Default()
+	if err != nil {
+		t.Fatalf("reading the release's default scheduler configuration: %v", err)
+	}
+	if len(cfg.Profiles) != 1 {
+		t.Fatalf("expected exactly one default profile, got %d", len(cfg.Profiles))
+	}
+	profile := cfg.Profiles[0]
+
+	// Defaulted args, from the same source as the plugin names. Passing
+	// hand-written args would reintroduce the problem one field down.
+	args := make(map[string]apiruntime.Object, len(profile.PluginConfig))
+	for _, pc := range profile.PluginConfig {
+		args[pc.Name] = pc.Args
+	}
+
+	enabled := make([]string, 0, len(profile.Plugins.MultiPoint.Enabled))
+	for _, entry := range profile.Plugins.MultiPoint.Enabled {
+		enabled = append(enabled, entry.Name)
+	}
+
+	registry := plugins.NewInTreeRegistry()
+	modelled := newOracle(t).Modelled()
+
+	// An exemption that no longer describes anything reads as coverage, so
+	// both ways of going stale are failures rather than untidiness.
+	for name := range exempt {
+		switch {
+		case !slices.Contains(enabled, name):
+			t.Errorf("exempt names %s, which this release's default profile does not "+
+				"enable — drop the exemption", name)
+		case slices.Contains(modelled, name):
+			t.Errorf("exempt names %s, which the oracle now runs — drop the exemption", name)
+		case len(exempt[name]) == 0:
+			t.Errorf("exempt names %s with no refusal behind it, which is not an exemption", name)
+		}
+	}
+
+	for _, name := range enabled {
+		t.Run(name, func(t *testing.T) {
+			if slices.Contains(modelled, name) {
+				return
+			}
+
+			if reasons, ok := exempt[name]; ok {
+				for _, e := range reasons {
+					reason := e.refused()
+					switch {
+					case reason.Empty():
+						t.Errorf("%s is exempt because:\n  %s\n"+
+							"but that predicate accepted the input it names, so the "+
+							"exemption rests on a refusal that is no longer there.",
+							name, e.why)
+					case reason.Code != fit.ReasonUnsupportedPod && reason.Code != fit.ReasonUnsupportedNode:
+						t.Errorf("%s is exempt because:\n  %s\n"+
+							"but that predicate answered %s rather than declining to "+
+							"model the input, and a refusal binpack makes for some "+
+							"other reason does not stand in for a plugin it never runs.",
+							name, e.why, reason.Code)
+					}
+				}
+				return
+			}
+
+			// Neither modelled nor exempt. Build it to find out whether it
+			// filters at all: most of the default profile does not, and a
+			// plugin nobody can construct is a plugin nobody has classified,
+			// which is the state this test exists to end.
+			factory, ok := registry[name]
+			if !ok {
+				t.Fatalf("%s is enabled by default but absent from the in-tree registry", name)
+			}
+			p, err := factory(t.Context(), args[name], schedulerHandle(t))
+			if err != nil {
+				t.Fatalf("cannot classify %s: constructing it failed: %v\n"+
+					"Build it in NewOracle, or exempt it naming the internal/fit "+
+					"refusal that keeps binpack away from its input.", name, err)
+			}
+			if _, filters := p.(fwk.FilterPlugin); !filters {
+				return
+			}
+			t.Errorf("%s filters placements and the oracle neither runs it nor exempts "+
+				"it, so the harness cannot disagree with the scheduler about anything "+
+				"it decides.\nBuild it in NewOracle, or exempt it naming the "+
+				"internal/fit refusal that keeps binpack away from its input.", name)
+		})
+	}
+}
+
+// schedulerHandle builds the least a default plugin needs to construct: a
+// snapshot lister, an informer factory and a client. Nothing here is asked a
+// question — the handle exists so that a plugin the oracle does not run can
+// still be classified, rather than being exempted because it panicked.
+func schedulerHandle(t *testing.T) fwk.Handle {
+	t.Helper()
+
+	client := fake.NewClientset()
+	h, err := frameworkruntime.NewFramework(t.Context(), nil, nil,
+		frameworkruntime.WithSnapshotSharedLister(cache.NewEmptySnapshot()),
+		frameworkruntime.WithInformerFactory(informers.NewSharedInformerFactory(client, 0)),
+		frameworkruntime.WithClientSet(client),
+	)
+	if err != nil {
+		t.Fatalf("building a scheduler handle: %v", err)
+	}
+	return h
 }

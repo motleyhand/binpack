@@ -695,6 +695,17 @@ func ScheduledBy(name string) PodOption {
 	return func(p *corev1.Pod) { p.Spec.SchedulerName = name }
 }
 
+// WithResourceClaim requests a device through dynamic resource allocation,
+// whose availability is tracked outside the node object.
+func WithResourceClaim(name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.ResourceClaims = append(p.Spec.ResourceClaims, corev1.PodResourceClaim{
+			Name:              name,
+			ResourceClaimName: ptr(name),
+		})
+	}
+}
+
 // Gated adds a scheduling gate, which holds the pod unschedulable until
 // something removes it.
 func Gated(name string) PodOption {
