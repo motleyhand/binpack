@@ -238,7 +238,7 @@ func randomScenario(rng *rand.Rand, i int) (*corev1.Node, *corev1.Pod, []*corev1
 	name := fmt.Sprintf("n%d", i)
 
 	var nodeOpts []mother.NodeOption
-	switch rng.Intn(6) {
+	switch rng.Intn(7) {
 	case 0:
 		nodeOpts = append(nodeOpts, mother.Cordoned())
 	case 1:
@@ -249,6 +249,9 @@ func randomScenario(rng *rand.Rand, i int) (*corev1.Node, *corev1.Pod, []*corev1
 		nodeOpts = append(nodeOpts, mother.Tainted("spot", "true", corev1.TaintEffectPreferNoSchedule))
 	case 4:
 		nodeOpts = append(nodeOpts, mother.NodeLabels(map[string]string{"disk": "ssd"}))
+	case 5:
+		// Numeric, so a Gt toleration has something to compare against.
+		nodeOpts = append(nodeOpts, mother.Tainted("shard", "5", corev1.TaintEffectNoSchedule))
 	}
 
 	var node *corev1.Node
@@ -267,7 +270,7 @@ func randomScenario(rng *rand.Rand, i int) (*corev1.Node, *corev1.Pod, []*corev1
 			fmt.Sprintf("%dMi", 32+rng.Intn(3000)),
 		),
 	}
-	switch rng.Intn(7) {
+	switch rng.Intn(8) {
 	case 0:
 		podOpts = append(podOpts, mother.Tolerating("dedicated", corev1.TaintEffectNoSchedule))
 	case 1:
@@ -282,6 +285,8 @@ func randomScenario(rng *rand.Rand, i int) (*corev1.Node, *corev1.Pod, []*corev1
 		podOpts = append(podOpts, mother.WithOverhead("25m", fmt.Sprintf("%dMi", 32+rng.Intn(256))))
 	case 5:
 		podOpts = append(podOpts, mother.Requesting("nvidia.com/gpu", fmt.Sprintf("%d", 1+rng.Intn(2))))
+	case 6:
+		podOpts = append(podOpts, mother.ToleratingGt("shard", "3"))
 	}
 
 	pod := mother.Pod("default", fmt.Sprintf("p%d", i), podOpts...)
