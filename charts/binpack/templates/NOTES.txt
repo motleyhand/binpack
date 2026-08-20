@@ -35,6 +35,9 @@ Before trusting it, ask what is stopping this cluster shrinking today:
 That works without binpack installed at all, and usually finds something the
 autoscaler is blocked on too.
 {{ if not .Values.rbac.allowDraining }}
-RBAC currently grants read and report only. rbac.allowDraining=true adds the
-cordon and eviction verbs, and is not needed until a build that can act.
+RBAC grants read and report only. rbac.allowDraining=true adds the cordon and
+eviction verbs; set it together with config.dryRun=false to let binpack act.
+The chart refuses one without the other.
+
+  docs/how-to/let-binpack-drain-nodes.md
 {{- end }}

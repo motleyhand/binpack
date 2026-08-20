@@ -1,9 +1,5 @@
 # Configuration reference
 
-> **Status: the format is implemented; the behaviour it configures is not yet.**
-> Fields are validated and resolved today, and `binpack config validate` will tell you exactly
-> what a document means. Nothing acts on it until the controller lands.
-
 binpack is configured by a YAML document mounted from a ConfigMap. **Every field is optional.**
 An empty document is valid and produces a working, safe configuration, because node pools and
 their bounds are discovered from the cluster-autoscaler rather than declared here.

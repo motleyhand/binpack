@@ -1,8 +1,8 @@
 # Install binpack
 
-> **Status: pre-release.** binpack decides and reports; it does not yet act. The chart defaults
-> to dry run and grants no permission that could change anything, which is the state to install
-> and leave running for a while.
+> **Start in dry run.** The chart defaults to deciding without acting, and to a role holding no
+> permission that could change anything — which is the state to install and leave running for a
+> while. [Let binpack drain nodes](let-binpack-drain-nodes.md) is the step after it.
 
 ## Before installing anything
 
@@ -156,11 +156,31 @@ The [RBAC reference](../reference/rbac.md) lists every permission and what each 
 
 ## Uninstall
 
+binpack's only state outside the release is on the nodes it has drained: the
+`binpack.motleyhand.com/draining` label and the drain annotations, written when a drain starts
+and cleared when it ends. `helm uninstall` does not touch them, and a drain ends only when
+binpack next looks at the node — which is exactly what uninstalling stops.
+
+So ask first whether one is in flight:
+
+```bash
+kubectl get nodes -l binpack.motleyhand.com/draining=true
+```
+
 ```bash
 helm uninstall binpack --namespace binpack-system
 ```
 
-binpack holds no state of its own beyond annotations on nodes it has drained, and this build
-never writes those. If a future version leaves a node cordoned with a
-`binpack.motleyhand.com/drain-started` annotation, `binpack diagnose` reports it as an abandoned
-drain and tells you what to clear.
+A node listed by that command when the release goes is left cordoned and marked, with nothing
+running to release it. Either wait for the drain to end, or repair it by hand afterwards: the
+three commands — clear the annotations, remove the label, uncordon — are in the
+[annotations reference](../reference/annotations.md#if-a-node-is-stuck-cordoned). `binpack
+diagnose` reports the same node as an abandoned drain and prints what to clear; it runs against
+your own kubeconfig, so it still answers with nothing installed in the cluster.
+
+Reinstalling also resolves it, if the reinstall can act. Recovery asks the cluster rather than
+its own memory — a pod still terminating within its grace period says the drain is alive, and a
+node holding fewer pods than the marker records says it moved while binpack was away — so a
+binpack with `dryRun: false` resumes a drain that is still going and uncordons the node when it
+is not. A binpack in dry run leaves the node exactly as it is and says so in its logs, because
+uncordoning would itself be a change.
