@@ -102,6 +102,7 @@ this use case.
 | Effective pod requests: init-container peaks, native sidecars, `spec.overhead`, pod-level resources | `resource.PodRequests` |
 | Required node affinity and node selectors | `nodeaffinity.GetRequiredNodeAffinity` |
 | Taints and tolerations | `corev1.FindMatchingUntoleratedTaint` |
+| Node capabilities a pod's spec implies, and whether a node declares them | `nodedeclaredfeatures.DefaultFramework` |
 
 Resource fit against `status.allocatable` is implemented directly, since the rules are now
 understood and the inputs come from upstream.
@@ -127,8 +128,8 @@ knows how to reason about**, and any relocatable pod using a feature outside tha
 node an invalid candidate, with the specific feature named as the reason.
 
 Stage 1 models the constraints corresponding to these scheduler Filter plugins:
-`NodeUnschedulable`, `NodeName`, `NodeAffinity` (including `nodeSelector`), `NodeResourcesFit`
-and `TaintToleration`.
+`NodeUnschedulable`, `NodeName`, `NodeAffinity` (including `nodeSelector`), `NodeResourcesFit`,
+`TaintToleration` and `NodeDeclaredFeatures`.
 
 Everything else triggers a refusal. That includes, non-exhaustively: `hostPort` (`NodePorts`);
 any persistent volume claim, since deciding whether a volume can follow the pod means modelling
@@ -138,6 +139,29 @@ non-default `schedulerName`; scheduling gates; and dynamic resource allocation c
 
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
+
+That was the intent, and for a while it was not what the code did. `firstConstrainingVolume` is
+a `switch` whose `default` refuses, so an unknown volume source really does refuse; the pod-field
+checks were a sequence of `if`s ending in "no objection", so an unknown *field* was accepted.
+Kubernetes 1.36 supplied the demonstration: `spec.schedulingGroup` holds a pod at the scheduler's
+`Permit` phase until its whole gang can be placed, and it fell straight through. The inversion
+cannot be written into the control flow — there is no `default` branch over a struct's fields —
+so it is enforced from outside instead. `TestPodSpecFieldsAreAccountedFor` reflects over
+`corev1.PodSpec` and requires every field to be named either as one `internal/fit` accounts for
+or as one no Filter plugin reads, with the reason. A field the next release adds fails CI naming
+itself, which is what makes the paragraph above true rather than aspirational.
+
+**A requirement can be about the destination, and then it must be derived, not recognised.**
+`NodeDeclaredFeatures`, on by default since 1.36, refuses a node whose kubelet has not published
+a capability the pod's spec implies — today, a container carrying a `RestartAllContainers`
+restart rule. That is a question about the *pair*, so it is asked in `UnsupportedDestination`
+rather than `UnsupportedPod`, and it is asked by running upstream's own inference and node match
+(`k8s.io/component-helpers/nodedeclaredfeatures`) rather than by recognising the one shape that
+is live today. The reasoning is the same as for the differential harness's feature gates, and the
+stakes are worse: a hand-written list that upstream has moved past does not fail, it accepts. The
+one number the derivation still needs — the version requirements are inferred at — is pinned to
+the release this module depends on, and is held by a test to a value that drops no registered
+feature, because dropping one is the accepting direction.
 
 #### Closed: the running pod was a proxy for the replacement
 

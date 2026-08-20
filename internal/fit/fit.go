@@ -16,6 +16,12 @@
 // detected and refused, never ignored. A list of exceptions we remembered
 // could not stay complete as Kubernetes grows; refusing by default can.
 //
+// Go has no default branch over a struct's fields, so the second rule is held
+// from outside the code that implements it: TestPodSpecFieldsAreAccountedFor
+// reflects over corev1.PodSpec and requires every field to be named as one
+// this package accounts for or as one no scheduler Filter plugin reads. A
+// field the next release adds fails CI naming itself.
+//
 // This package holds no clients and performs no I/O. It takes API objects as
 // data.
 package fit

@@ -3,14 +3,39 @@ package fit
 import (
 	"fmt"
 	"slices"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
+	"k8s.io/apimachinery/pkg/util/version"
+	"k8s.io/component-helpers/nodedeclaredfeatures"
 )
 
 // defaultSchedulerName is the only scheduler whose behaviour binpack models.
 const defaultSchedulerName = "default-scheduler"
+
+// schedulingTargetVersion is the Kubernetes version binpack infers node
+// feature requirements at. It matches the k8s.io release this module pins,
+// which is the choice kube-scheduler makes too — its plugin passes its own
+// binary's version.
+//
+// The parameter only ever *removes* requirements: InferForPodScheduling drops
+// any feature whose MaxVersion the target has passed, on the grounds that
+// every kubelet still within the version skew implements it unconditionally
+// and has stopped declaring it. So a value that is too low costs a
+// consolidation and a value that is too high accepts a node the scheduler
+// refuses, and only one of those is a direction this package may err in. Left
+// behind on a dependency bump, it errs the safe way.
+//
+// TestTheSchedulingTargetVersionDropsNoFeature holds it to that: every
+// registered feature is unbounded today, and the release that bounds one fails
+// there rather than quietly widening what binpack accepts.
+var schedulingTargetVersion = version.MajorMinor(1, 36)
+
+// SchedulingTargetVersion returns that version, so a test can run upstream's
+// inference at exactly the version this package runs it at.
+func SchedulingTargetVersion() *version.Version { return schedulingTargetVersion }
 
 // UnsupportedPod reports why binpack cannot reason about where this pod could
 // go, or the zero Reason if it can.
@@ -77,6 +102,19 @@ func UnsupportedPod(pod *corev1.Pod) Reason {
 		return unsupportedPod(pod, "uses dynamic resource allocation claims")
 	}
 
+	// GangScheduling. A pod naming a scheduling group is not an independently
+	// schedulable object: its group's policy decides when it may enter the
+	// queue at all, and it is then held at Permit until the whole group can be
+	// placed together. A single-pod placement proved for it is not a claim
+	// that its replacement will run.
+	if group := pod.Spec.SchedulingGroup; group != nil {
+		named := "a scheduling group"
+		if group.PodGroupName != nil {
+			named = "scheduling group " + *group.PodGroupName
+		}
+		return unsupportedPod(pod, "belongs to "+named)
+	}
+
 	// An in-flight in-place resize means the pod's requests are changing
 	// underneath us, so any answer computed from them is about to be stale.
 	//
@@ -134,10 +172,17 @@ func resizeInFlight(pod *corev1.Pod) string {
 //   - A resident's topology spread constraints are not evaluated for an
 //     incoming pod either; only the incoming pod's own constraints are, and
 //     those are handled by UnsupportedPod.
+//   - A pod can require a capability of the destination's *kubelet*, which is
+//     a property of the pair rather than of either side, so UnsupportedPod
+//     cannot decide it at all.
 //
-// Checking only the incoming pod would let the first case through and leave
-// the replacement Pending.
+// Checking only the incoming pod would let the first and last cases through
+// and leave the replacement Pending.
 func UnsupportedDestination(pod *corev1.Pod, node *corev1.Node, residents []*corev1.Pod) Reason {
+	if r := undeclaredFeatures(pod, node); !r.Empty() {
+		return r
+	}
+
 	for _, resident := range residents {
 		if antiAffinityCouldReject(resident, pod) {
 			return Reason{ReasonUnsupportedNode,
@@ -146,6 +191,64 @@ func UnsupportedDestination(pod *corev1.Pod, node *corev1.Node, residents []*cor
 		}
 	}
 	return Reason{}
+}
+
+// undeclaredFeatures reports whether node lacks a capability pod's spec
+// implies, which is what the scheduler's NodeDeclaredFeatures Filter decides.
+//
+// Both halves are upstream's, deliberately. The requirement is inferred by
+// k8s.io/component-helpers' registry and matched against
+// node.status.declaredFeatures by the same code the plugin calls, so the
+// question binpack asks tracks the pinned release rather than a list somebody
+// wrote down. Recognising the one live shape by hand — a container carrying a
+// RestartAllContainers restart rule — would be right today and stale the day
+// upstream registers a sixth feature or gives an inert one a scheduling
+// meaning. That failure would be silent and it would be in the accepting
+// direction, which is the same object as the hand-written feature-gate list
+// the differential harness had to stop keeping.
+//
+// Deriving also buys a better answer than a blanket refusal could. binpack has
+// the destination in hand here, so a pod using container restart rules is
+// refused exactly the nodes whose kubelets have not declared the feature —
+// none at all on a homogeneous cluster — where refusing in UnsupportedPod
+// would make every such workload permanently unrelocatable everywhere.
+//
+// The pod's spec goes to upstream by pointer, without a copy. Nothing on this
+// path writes to it, and the scheduler's own plugin does the same with pods
+// straight out of an informer cache.
+func undeclaredFeatures(pod *corev1.Pod, node *corev1.Node) Reason {
+	framework := nodedeclaredfeatures.DefaultFramework
+
+	required, err := framework.InferForPodScheduling(
+		&nodedeclaredfeatures.PodInfo{Spec: &pod.Spec}, schedulingTargetVersion)
+	if err != nil {
+		return Reason{ReasonUnsupportedNode,
+			"the node features " + podRef(pod) + " needs could not be inferred: " + err.Error()}
+	}
+	// The plugin skips its own Filter when a pod requires nothing, which is
+	// almost every pod: the inference returns an empty set unless the spec
+	// names one of the handful of registered features.
+	if required.IsEmpty() {
+		return Reason{}
+	}
+
+	match, err := framework.MatchNode(required, node)
+	if err != nil {
+		return Reason{ReasonUnsupportedNode,
+			"node " + node.Name + " could not be matched against the features " +
+				podRef(pod) + " needs: " + err.Error()}
+	}
+	if match.IsMatch {
+		return Reason{}
+	}
+
+	// A node that has published no declared features at all lands here too,
+	// and correctly: an older kubelet, or one with the gate off, publishes an
+	// empty list and the scheduler refuses it for the same reason.
+	return Reason{ReasonUnsupportedNode,
+		"node " + node.Name + " has not declared " +
+			strings.Join(match.UnsatisfiedRequirements, ", ") + ", which " +
+			podRef(pod) + " requires"}
 }
 
 // antiAffinityCouldReject reports whether a resident's required anti-affinity
