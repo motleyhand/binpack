@@ -35,17 +35,23 @@ shows you, and because a drain that has gone wrong is explained by them.
 |---|---|
 | `drain-started` | When this drain began, RFC 3339 |
 | `drain-progress` | When binpack last observed the drain moving |
-| `drain-pods-remaining` | How many pods were still to leave when it last looked |
+| `drain-pods-remaining` | How many pods were still to leave when it last saw the drain move |
 | `drain-awaiting` | The controller owing a replacement pod, as `<owner UID>@<RFC 3339>` |
 
 `drain-started` is also the marker: while it is present, binpack advances *this* drain and makes
 no new decision anywhere in the cluster. One node at a time.
 
-`drain-progress` is what the stall bound measures against, and it moves only when something
-actually happened — a pod left, a pod is shutting down inside its grace period, or an eviction
-was accepted. A drain with a long `terminationGracePeriodSeconds` can sit here for a long time
-and be perfectly healthy; see
+`drain-progress` is what the stall bound measures against, and it moves only when the node's
+state changed — a pod left, or a pod is shutting down inside its grace period. Accepting an
+eviction is not itself progress: it is something binpack did rather than something that happened
+to the node, and a workload tolerating the cordon can be evicted and rescheduled straight back
+onto the node it was evicted from. A drain with a long `terminationGracePeriodSeconds` can sit
+here for a long time and be perfectly healthy; see
 [ADR-0007](../design/adr-0007-drain-progress-not-deadlines.md).
+
+`drain-pods-remaining` is the baseline that comparison is made against, so it appears as soon as
+binpack looks at a drain and then follows the progress marker. A later count being lower than it
+is what tells binpack a pod left while it was not watching.
 
 `drain-awaiting` is why evictions are sequential. binpack waits for the replacement pod to be
 *bound to a node*, not merely created, before evicting the next one.

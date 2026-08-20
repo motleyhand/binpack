@@ -470,6 +470,27 @@ func ToleratingGt(key, value string) PodOption {
 	}
 }
 
+// ToleratingEverything tolerates every taint, the way a chart's "run anywhere"
+// values do.
+//
+// The blanket form specifically, because it is the only one that changes what a
+// drain means. Per k8s.io/api core/v1 Toleration.ToleratesTaint, a toleration
+// matches the node.kubernetes.io/unschedulable:NoSchedule taint a cordon
+// carries only when its key is empty — which the API requires to pair with
+// operator Exists, i.e. tolerate everything — or is literally that key. A
+// key-scoped Exists, `{key: nvidia.com/gpu, operator: Exists}`, which is what
+// most spot and GPU-pool workloads actually carry, does not match it.
+//
+// So this is the fixture for a pod the scheduler is free to place back onto the
+// node binpack is draining.
+func ToleratingEverything() PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Tolerations = append(p.Spec.Tolerations, corev1.Toleration{
+			Operator: corev1.TolerationOpExists,
+		})
+	}
+}
+
 // PDB builds a PodDisruptionBudget selecting pods by label, with the given
 // number of disruptions currently allowed.
 //

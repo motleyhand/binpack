@@ -175,12 +175,12 @@ func Advance(
 		if assessment.Action == drain.Abandon {
 			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
 		}
-		// Recorded rather than asserted: record writes only when the
-		// assessment saw progress of its own, so the repair leaves a mark when
-		// the cluster moved and stays silent when it did not. Repairing a
-		// cordon is not itself progress, and a path that claimed otherwise
-		// would hold the stall clock at zero for as long as the repair kept
-		// being needed — which is the same wedge in a different disguise.
+		// Recorded rather than asserted: record moves the progress marker only
+		// when the assessment saw progress of its own, so the repair leaves a
+		// mark when the cluster moved and stays silent when it did not.
+		// Repairing a cordon is not itself progress, and a path that claimed
+		// otherwise would hold the stall clock at zero for as long as the
+		// repair kept being needed — the same wedge in a different disguise.
 		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
 			return Step{}, err
 		}
@@ -211,7 +211,7 @@ func Advance(
 	// in flight is the whole of what binpack can do about that, and it only
 	// works if "in flight" means bound rather than merely gone from here.
 	if owner, since, ok := awaiting(a.Node); ok {
-		switch state, pod := replacementFor(s, owner, since); state {
+		switch state, pod := replacementFor(s, name, owner, since); state {
 		case refused:
 			// The scheduler said so itself — PodScheduled=False, reason
 			// Unschedulable — so this is detected rather than inferred from a
@@ -290,10 +290,19 @@ func Advance(
 		return Step{}, err
 	}
 
-	// An accepted eviction is itself progress, and the only progress signal
-	// that is an event rather than a state — nothing in the next snapshot
-	// distinguishes "just evicted" from "never touched".
-	assessment.Progressed = true
+	// Recorded on the assessment's terms, not on the eviction's. An accepted
+	// eviction feels like progress and is not: it is an event, and a bound
+	// defined over the *absence* of progress cannot be kept alive by something
+	// that can be emitted every interval for ever. A node whose population
+	// never falls is not being emptied however many evictions it has accepted
+	// — which is the state a workload tolerating the cordon produces, since
+	// every pod evicted off the node is placed straight back onto it.
+	//
+	// Nothing is lost by not asserting it. record writes the count as it was
+	// *before* this eviction, so the next evaluation finds one fewer pod than
+	// the node records and reads the departure as progress — from the state,
+	// where it can be checked, rather than from an event only this process
+	// remembers.
 	if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
 		return Step{}, err
 	}
@@ -348,20 +357,47 @@ func Abandon(
 	return Step{Code: code, Reason: reason, Done: true, Failed: true}, nil
 }
 
-// record refreshes the progress markers, and only when there is progress to
-// record: ADR-0007 asks for at most one such write per evaluation, and writing
-// an unchanged timestamp every interval would reset the stall clock forever.
+// record refreshes the drain markers, at most once per evaluation as ADR-0007
+// asks, and only where there is something new to say.
+//
+// The progress timestamp moves only when there was progress: it is a claim
+// about the cluster, and refreshing it on an evaluation that saw none would
+// push the stall deadline out by an interval every interval, which is a
+// deadline that never arrives.
+//
+// The count is not a claim but the baseline the claim is measured against —
+// [drain.Assess] reports progress when the live count is below it — so it is
+// also written when the node carries no readable one. Writing it only
+// alongside progress is circular, and the circle closes on the first eviction
+// of every drain, because a node comes out of [Begin] with no count at all:
+// nothing seeds it, so nothing can ever be fewer than it, so no departure is
+// ever progress. A node holding more pods than the stall timeout has intervals
+// is then abandoned mid-drain as stalled, having relocated every pod it was
+// asked to and reported "no progress" about each one.
+//
+// Seeded, rather than refreshed on every evaluation. A count that followed the
+// live population would let one that rose and fell back — a tolerating
+// workload arriving on the cordoned node and leaving again — read as a fall
+// every other interval, which is the same clock reset in a different disguise.
 func record(
 	ctx context.Context, w Writer,
 	node *corev1.Node, a drain.Assessment, now time.Time,
 ) error {
-	if !a.Progressed {
+	markers := map[string]string{}
+	if a.Progressed {
+		markers[engine.AnnotationDrainProgress] = now.UTC().Format(time.RFC3339)
+	}
+
+	_, err := strconv.Atoi(node.Annotations[engine.AnnotationDrainPodsRemaining])
+	unseeded := err != nil
+	if a.Progressed || unseeded {
+		markers[engine.AnnotationDrainPodsRemaining] = strconv.Itoa(a.Remaining)
+	}
+
+	if len(markers) == 0 {
 		return nil
 	}
-	return Annotate(ctx, w, node, map[string]string{
-		engine.AnnotationDrainProgress:      now.UTC().Format(time.RFC3339),
-		engine.AnnotationDrainPodsRemaining: strconv.Itoa(a.Remaining),
-	})
+	return Annotate(ctx, w, node, markers)
 }
 
 func podsOn(s engine.Snapshot, name string) []*corev1.Pod {
@@ -453,7 +489,9 @@ func awaiting(node *corev1.Node) (types.UID, time.Time, bool) {
 // node. Created-after matters too: a Deployment with replicas elsewhere
 // already has bound pods, and one of those would answer "landed" before the
 // replacement existed.
-func replacementFor(s engine.Snapshot, owner types.UID, since time.Time) (replacement, *corev1.Pod) {
+func replacementFor(
+	s engine.Snapshot, node string, owner types.UID, since time.Time,
+) (replacement, *corev1.Pod) {
 	// Every candidate is examined rather than the first match returned. A
 	// controller can have several pods newer than the eviction — a rollout, a
 	// scale-up — and returning on whichever the snapshot happened to list
@@ -464,6 +502,23 @@ func replacementFor(s engine.Snapshot, owner types.UID, since time.Time) (replac
 	for _, pod := range s.Pods {
 		ref := metav1.GetControllerOf(pod)
 		if ref == nil || ref.UID != owner || pod.CreationTimestamp.Before(&metav1.Time{Time: since}) {
+			continue
+		}
+		// Bound to the node under drain is not relocated, however bound it
+		// looks. kube-scheduler admits a pod onto a cordoned node when the pod
+		// tolerates node.kubernetes.io/unschedulable:NoSchedule — a blanket
+		// `{operator: Exists}`, which "run anywhere" chart values set — so a
+		// replacement can be placed straight back where its predecessor came
+		// from. Reading that as a landed replacement counts a pod that never
+		// left as a successful relocation and evicts the next one on the
+		// strength of it; that one's replacement comes back too, and the node
+		// is churned for as long as binpack is running.
+		//
+		// Skipped rather than reported, because it is neither: nothing has
+		// relocated, so the drain goes on waiting, and what ends the wait is
+		// the same bound that ends any other — the node's population is not
+		// falling, and an absence of progress is what the assessment measures.
+		if pod.Spec.NodeName == node {
 			continue
 		}
 		if pod.Spec.NodeName != "" {
