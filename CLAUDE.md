@@ -137,7 +137,12 @@ computing the answer per node. See [ADR-0006](docs/design/adr-0006-scheduler-fid
 
 **Every drain branch must end with the node deleted or uncordoned**, and the recovery state
 lives in node annotations rather than process memory. The failure an in-memory timer guards
-against and the failure that destroys it are the same class of event.
+against and the failure that destroys it are the same class of event. "Still being drained" is
+the answer that needs watching, because it is the one a branch can give for ever — and the branch
+that waits on another component is the easiest place to forget, since waiting is what it is
+*for*. Every such wait needs a bound drawn from that component's own reported state, never from
+elapsed time: only a live cluster-autoscaler ever clears its own deletion taint, so a wait for a
+dead one is a wait for nothing.
 
 **A partially drained node is *more* attractive to the next evaluation, not less.** It has fewer
 pods, and candidates are ordered least-loaded-first — so without per-node backoff, binpack

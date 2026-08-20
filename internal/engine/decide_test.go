@@ -695,6 +695,14 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 		{"cordoned", func() engine.Snapshot {
 			return cluster([]*corev1.Node{inPool("a", mother.Cordoned()), inPool("b")}, nil)
 		}, config(), engine.SkipCordoned},
+
+		{"the autoscaler is already deleting this node", func() engine.Snapshot {
+			return cluster([]*corev1.Node{
+				inPool("a", mother.Tainted(
+					engine.TaintToBeDeleted, "1786971071", corev1.TaintEffectNoSchedule)),
+				inPool("b"),
+			}, nil)
+		}, config(), engine.SkipBeingRemoved},
 	}
 
 	seen := map[string]bool{}
@@ -724,7 +732,7 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 		engine.SkipNotAutoscaled, engine.SkipScaleUpInProgress,
 		engine.SkipCooldownAfterScaleUp, engine.SkipCooldownAfterDrain,
 		engine.SkipPoolAtMinimum, engine.SkipAnnotated, engine.SkipDrainInProgress,
-		engine.SkipBackoff, engine.SkipCordoned,
+		engine.SkipBackoff, engine.SkipCordoned, engine.SkipBeingRemoved,
 	} {
 		if !seen[code] {
 			t.Errorf("no case reaches %q", code)
@@ -767,5 +775,32 @@ func TestEveryDecisionCarriesACode(t *testing.T) {
 				t.Errorf("code = %q, want %q (reason: %s)", d.Code, tc.want, d.Reason)
 			}
 		})
+	}
+}
+
+// TestAnOrdinaryTaintIsNotTheAutoscalers is the negative half, and it is the
+// one the suite could not fail.
+//
+// BeingRemoved scans the whole taint list for a single key, so it can be wrong
+// in two directions and neither is loud. Not recognising the autoscaler's taint
+// has binpack evicting alongside a deletion already under way. Recognising
+// everything else has every dedicated, spot or GPU pool reported as
+// being-removed — and, on a node binpack is draining, handed to a wait for an
+// autoscaler that was never coming.
+func TestAnOrdinaryTaintIsNotTheAutoscalers(t *testing.T) {
+	s := cluster([]*corev1.Node{
+		inPool("a", mother.Tainted("dedicated", "db", corev1.TaintEffectNoSchedule)),
+		inPool("b"),
+	}, nil)
+
+	a := assessmentFor(engine.Decide(s, config()), "a")
+	if a == nil {
+		t.Fatal("every node must be accounted for; a was not")
+	}
+	if a.SkipCode == engine.SkipBeingRemoved {
+		t.Errorf("a taint that is not the autoscaler's was read as one: %s", a.SkipReason)
+	}
+	if a.Skipped {
+		t.Errorf("an ordinary taint is not a reason to skip a node: %s", a.SkipReason)
 	}
 }
