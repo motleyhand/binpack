@@ -1067,3 +1067,36 @@ func TestTheReserveStillNeedsATemplateToSizeAgainst(t *testing.T) {
 		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
 	}
 }
+
+// TestANodeTheAutoscalerIsRemovingIsNotADestination is the destination-side
+// half of the question the candidate side already answers.
+//
+// The autoscaler taints; it does not necessarily cordon. Its
+// --cordon-node-before-terminating flag defaulted to false through
+// cluster-autoscaler 1.33 and only became true at 1.34, and operators set it
+// either way — so spec.unschedulable is false on a node that is minutes from
+// deletion, and the cordon check in fit does not see it. What kept binpack
+// away from such a node was only that the taint is NoSchedule and the pod
+// happened not to tolerate it, which is a property of the workload rather than
+// a decision binpack made.
+func TestANodeTheAutoscalerIsRemovingIsNotADestination(t *testing.T) {
+	candidate := sized("candidate", "4Gi")
+	doomed := sized("doomed", "4Gi",
+		mother.Tainted(engine.TaintToBeDeleted, "1786971071", corev1.TaintEffectNoSchedule))
+
+	// Tolerating everything is the blanket `operator: Exists` a chart's
+	// "run anywhere" values produce. It is what makes the doomed node look
+	// like capacity.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web", mother.OnNode("candidate"),
+			mother.Requests("100m", "1Gi"), mother.ToleratingEverything()),
+	}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, doomed}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatalf("a node the autoscaler is deleting is not capacity; %s/%s was placed on %s",
+			sim.Relocated[0].Pod.Namespace, sim.Relocated[0].Pod.Name, sim.Relocated[0].Node.Name)
+	}
+}

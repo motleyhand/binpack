@@ -135,6 +135,11 @@ annotating the node. So can `infeasible` and `blocked`, for the two outcomes tha
 code: the remaining pods stopped fitting elsewhere, and a disruption budget stopped allowing
 their eviction.
 
+`not-autoscaled` is worth reading carefully in this position. On `binpack_nodes_skipped` it means
+what the table says; as an abandonment it also covers the cluster-autoscaler's status having gone
+stale mid-drain, including while binpack was waiting for the autoscaler to remove a node it had
+tainted itself. The note on the `DrainAbandoned` event says which.
+
 Every one of these has a series from startup, at zero. A counter that only appears once it has
 fired makes a `rate()` alert silently useless until the first occurrence.
 

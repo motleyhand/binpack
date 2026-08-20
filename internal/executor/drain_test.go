@@ -3,6 +3,7 @@ package executor_test
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -173,6 +174,20 @@ func TestEveryEndingHandsTheNodeBack(t *testing.T) {
 			name: "nothing has moved for longer than the stall timeout",
 			code: drain.AbandonStalled,
 			pods: []*corev1.Pod{mother.Pod("default", "idle", mother.OnNode("a"))},
+		},
+		{
+			// The hand-over is the one ending that used to have no bound at
+			// all: binpack waits for the autoscaler to take the node away, and
+			// only a live autoscaler ever clears the taint that says it is
+			// trying.
+			name: "the autoscaler stopped without finishing the deletion it began",
+			code: engine.SkipNotAutoscaled,
+			pods: []*corev1.Pod{mother.Pod("default", "left", mother.OnNode("a"))},
+			to: func(s *engine.Snapshot) {
+				s.Nodes[0].Spec.Taints = append(s.Nodes[0].Spec.Taints, corev1.Taint{
+					Key: engine.TaintToBeDeleted, Effect: corev1.TaintEffectNoSchedule})
+				s.Autoscaler.LastProbe = at.Add(-30 * time.Minute)
+			},
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1215,8 +1230,6 @@ func TestTheHandoverSurvivesEveryOtherReasonToStop(t *testing.T) {
 			func(s *engine.Snapshot) {
 				s.Nodes[0].Annotations[engine.AnnotationSkip] = "true"
 			}},
-		{"the autoscaler's status went stale",
-			func(s *engine.Snapshot) { s.Autoscaler.LastProbe = at.Add(-time.Hour) }},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			n := marked("a", time.Hour, time.Hour, "1")
@@ -1241,5 +1254,130 @@ func TestTheHandoverSurvivesEveryOtherReasonToStop(t *testing.T) {
 				t.Error("binpack uncordoned a node the autoscaler is deleting")
 			}
 		})
+	}
+}
+
+func TestAdvanceAbandonsAHandOverTheAutoscalerNeverFinishes(t *testing.T) {
+	// The taint is only ever cleared by a live autoscaler — on a failed
+	// scale-down, on the batch rollback, or by cleanUpIfRequired at process
+	// start. So an autoscaler that stops between tainting the node and
+	// deleting it leaves a taint nothing in the cluster will remove, and
+	// binpack refreshing the progress marker against it for ever leaves the
+	// node cordoned and stops consolidation everywhere else.
+	n := marked("a", 2*time.Hour, 2*time.Hour, "1")
+	// Valued as the autoscaler values it: the Unix second at which it
+	// committed to the deletion.
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{
+		Key:    engine.TaintToBeDeleted,
+		Value:  strconv.FormatInt(at.Add(-2*time.Hour).Unix(), 10),
+		Effect: corev1.TaintEffectNoSchedule,
+	})
+
+	s := snapshot([]*corev1.Node{n, node("b")},
+		[]*corev1.Pod{mother.Pod("default", "left", mother.OnNode("a"))})
+	// Still claiming to be running — a status ConfigMap outlives the process
+	// that wrote it — but thirty minutes since it last completed a scan,
+	// against a five-minute MaxStatusAge.
+	s.Autoscaler.LastProbe = at.Add(-30 * time.Minute)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Done || !step.Failed {
+		t.Errorf("got %+v, want the hand-over ended and recorded as a failure", step)
+	}
+	// The reason revalidation already computed, rather than a code invented
+	// here: what ended this drain is that nothing would remove the node, which
+	// is the same fact under the same name whether a drain was in flight or
+	// not.
+	if step.Code != engine.SkipNotAutoscaled {
+		t.Errorf("abandon code = %q, want %q", step.Code, engine.SkipNotAutoscaled)
+	}
+
+	after := nodeFrom(t, c, "a")
+	if after.Spec.Unschedulable {
+		t.Error("the node is still cordoned, so the capacity is still paid for and unusable")
+	}
+	if after.Annotations[engine.AnnotationDrainStarted] != "" {
+		t.Error("the drain markers survived, so binpack will short-circuit to this node again")
+	}
+	if after.Annotations[engine.AnnotationBackoffUntil] == "" {
+		t.Error("no backoff was recorded, so the node is the emptiest candidate again immediately")
+	}
+}
+
+func TestALiveHandOverIsWaitedForHoweverLongItTakes(t *testing.T) {
+	// The other side of the bound, and it needs a loop: a hand-over is
+	// refreshed once an interval, and a clock that is reset once an interval
+	// looks exactly like a clock that is running if you only ever look once.
+	// A bound that read the taint's age, or any other elapsed time, would end
+	// this drain part-way through — and uncordoning a node the autoscaler is
+	// genuinely mid-delete is the one thing the hand-over exists to prevent.
+	n := marked("a", time.Hour, time.Hour, "1")
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{
+		Key:    engine.TaintToBeDeleted,
+		Value:  strconv.FormatInt(at.Add(-time.Hour).Unix(), 10),
+		Effect: corev1.TaintEffectNoSchedule,
+	})
+
+	s := snapshot([]*corev1.Node{n, node("b")},
+		[]*corev1.Pod{mother.Pod("default", "left", mother.OnNode("a"))})
+	c := clientFor(s)
+
+	// Well past both the stall and the removal timeout, with the autoscaler
+	// reporting in throughout.
+	round, step := drainRounds(t, c, 40, func(pod string, _ time.Time) {
+		t.Errorf("binpack evicted %s alongside the autoscaler", pod)
+	})
+	if round != -1 {
+		t.Fatalf("the drain ended at +%dm with %+v; a live autoscaler is waited for", round, step)
+	}
+
+	after := nodeFrom(t, c, "a")
+	if !after.Spec.Unschedulable {
+		t.Error("binpack uncordoned a node the autoscaler is deleting")
+	}
+	if after.Annotations[engine.AnnotationBackoffUntil] != "" {
+		t.Error("a hand-over in progress was recorded as a failed drain")
+	}
+}
+
+func TestAHandOverForAPoolTheAutoscalerNoLongerManagesIsEnded(t *testing.T) {
+	// The other way a hand-over is never finished, and this one survives a
+	// restart: the autoscaler's start-up clean-up only visits nodes in the
+	// groups it currently manages, so a node whose pool has left that set —
+	// deleted, dropped by auto-discovery, or failing a provider lookup — keeps
+	// its taint however healthy the autoscaler is. Its status is fresh
+	// throughout, which is why the bound cannot be freshness alone.
+	n := marked("a", time.Hour, time.Hour, "1")
+	n.Spec.Taints = append(n.Spec.Taints, corev1.Taint{
+		Key:    engine.TaintToBeDeleted,
+		Value:  strconv.FormatInt(at.Add(-time.Hour).Unix(), 10),
+		Effect: corev1.TaintEffectNoSchedule,
+	})
+
+	s := snapshot([]*corev1.Node{n, node("b")},
+		[]*corev1.Pod{mother.Pod("default", "left", mother.OnNode("a"))})
+	s.Autoscaler.Groups = []engine.NodeGroup{
+		{ID: "a-pool-that-is-not-this-one", MinSize: 1, MaxSize: 10, Ready: 2},
+	}
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Done || !step.Failed {
+		t.Errorf("got %+v, want the hand-over ended and recorded as a failure", step)
+	}
+	if step.Code != engine.SkipNotAutoscaled {
+		t.Errorf("abandon code = %q, want %q", step.Code, engine.SkipNotAutoscaled)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node is still cordoned, waiting on an autoscaler that does not manage it")
 	}
 }

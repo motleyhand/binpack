@@ -135,6 +135,23 @@ func Simulate(
 		if node.Name == candidate.Name {
 			continue
 		}
+		// A node the autoscaler has committed to deleting is not capacity: it
+		// is going away, and a replacement sent there is evicted again minutes
+		// later with the candidate now cordoned behind it — which is the
+		// scale-up binpack exists to prevent, arrived at through a drain that
+		// reported success.
+		//
+		// Asked as a predicate rather than left to the taint, because the
+		// taint only repels a pod that does not tolerate it, and the cordon
+		// that would catch the rest need not be there:
+		// --cordon-node-before-terminating defaulted to false through
+		// cluster-autoscaler 1.33 and operators set it either way. Soundness
+		// resting on how narrow a workload's tolerations happen to be is not
+		// soundness. The cost is a consolidation missed on a node that is
+		// about to disappear anyway, which ADR-0006 accepts.
+		if BeingRemoved(node) {
+			continue
+		}
 		destinations = append(destinations, node)
 
 		free := fit.Allocatable(node)

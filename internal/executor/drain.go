@@ -100,9 +100,9 @@ func Advance(
 		return Step{Code: StepRemoved, Done: true,
 			Reason: "the cluster-autoscaler removed the node"}, nil
 
-	case engine.BeingRemoved(a.Node):
-		// Asked of the node directly rather than read from the skip code,
-		// because eligibility reports one reason and a node can satisfy
+	case engine.BeingRemoved(a.Node) && a.SkipCode != engine.SkipNotAutoscaled:
+		// The taint asked of the node directly rather than read from the skip
+		// code, because eligibility reports one reason and a node can satisfy
 		// several. The likeliest overlap is the one this must survive: the
 		// autoscaler deleting a node is frequently *what brings the pool to
 		// its minimum*, so pool-at-minimum would be reported instead, this
@@ -110,6 +110,27 @@ func Advance(
 		// node mid-deletion, which is the single thing the branch exists to
 		// prevent. A scale-up elsewhere, or an operator annotating the node,
 		// reach it the same way.
+		//
+		// Conditioned, though, on there still being an autoscaler that could
+		// finish what it started. Only a live one ever clears this taint — on
+		// a failed scale-down, on the batch rollback, or from its start-up
+		// clean-up, which is itself filtered to the node groups it currently
+		// manages, so a pool that left that set keeps its taint across a full
+		// restart. An autoscaler that stopped in between leaves a hand-over
+		// nothing will ever complete, and a branch with no bound waits for it
+		// for ever: the node stays cordoned, and because the controller
+		// short-circuits every evaluation to this function while a drain is
+		// marked, binpack stops consolidating anywhere in the cluster.
+		//
+		// SkipNotAutoscaled is that question already answered, in the place
+		// that answers it for everything else: revalidation sets it when the
+		// status is too stale to vouch for the process, eligibility when the
+		// node's pool is not one the autoscaler manages. Both are readings of
+		// the autoscaler's own published status. What is deliberately not read
+		// is the taint's value, which is the Unix second it was applied:
+		// elapsed time cannot tell a dead autoscaler from a slow deletion, and
+		// guessing wrong uncordons a node mid-delete. Falling through hands
+		// the node back under the reason revalidation already computed.
 		//
 		// The autoscaler owns the node now. Not abandoned — abandoning
 		// uncordons, and uncordoning a node another component is deleting is

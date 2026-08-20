@@ -78,6 +78,22 @@ at that point would be two controllers disagreeing about whether a node accepts 
 `DeletionCandidateOfClusterAutoscaler` is only an opinion that the node is unneeded, and does not
 stop a drain.
 
+That wait is bounded, but not by a clock. Only a running cluster-autoscaler ever removes that
+taint, so a wait for one that has stopped is a wait for nothing — the node would stay cordoned,
+and binpack would keep returning to it instead of considering anywhere else. binpack ends the
+wait and uncordons when the autoscaler's own status says it could not finish: either the status
+is more than five minutes stale, or the node's pool is no longer one the status lists. Elapsed
+time on its own is not a signal, because a node can be under deletion for as long as the
+autoscaler's `--max-graceful-termination-sec` allows.
+
+The taint itself is left alone — it is the autoscaler's, and binpack writes no taints. So a node
+handed back this way is uncordoned but still repelling pods until an autoscaler returns to clear
+it, or you do:
+
+```bash
+kubectl taint nodes <node> ToBeDeletedByClusterAutoscaler-
+```
+
 ## After
 
 binpack writes three events per drain, on the node itself:

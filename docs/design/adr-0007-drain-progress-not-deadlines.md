@@ -81,13 +81,41 @@ Slack is a fixed two minutes — enough for SIGKILL and the API server to catch 
 that a genuinely stuck pod is not mistaken for a slow one. It is deliberately not configurable:
 it describes how Kubernetes behaves, not a preference.
 
-### Two bounds, because they measure different things
+### Three bounds, because they measure different things
 
 - `drain.stallTimeout` — no progress during eviction.
 - `drain.removalTimeout` — the node is empty; how long to wait for the autoscaler to delete it.
+- The hand-over — the autoscaler has taken the node over; how long to go on waiting for it.
 
 The second is a genuinely different question with a genuinely different answer, and conflating
 them is what hid the missing bound in the first place.
+
+The third was added afterwards, and it is not a duration at all. Once a node carries
+`ToBeDeletedByClusterAutoscaler` the autoscaler has committed to deleting it and is draining it
+itself, so binpack stops evicting and waits — abandoning would uncordon a node another controller
+is part-way through removing. That branch had no bound of any kind, which is the worst place to
+lack one: the taint is only ever cleared by a live autoscaler, on a failed scale-down, on the
+batch rollback of a tainting pass, or by its start-up clean-up, and that last visits only the node
+groups the autoscaler currently manages. An autoscaler that stopped between tainting a node and
+deleting it therefore leaves a taint nothing in the cluster will remove — as does a pool that
+leaves the managed set, which survives even a full restart. binpack refreshed the progress marker
+against it once an interval indefinitely, and since evaluation short-circuits to a drain in
+flight, one such node stopped consolidation everywhere.
+
+The bound is a fact about the autoscaler rather than a clock. binpack ends the wait when the
+autoscaler's own published status cannot vouch for the deletion: the status is more than
+`MaxStatusAge` old, or the node's pool is no longer among the groups it lists. Both are already
+the engine's single answer to whether anything would ever remove this node, so the abandonment
+carries the reason revalidation had computed anyway rather than inventing a code for the occasion.
+
+What is deliberately *not* read is the taint's own value, which is the Unix second the autoscaler
+applied it. Elapsed time cannot separate a dead autoscaler from a slow deletion — a node under
+deletion may legitimately take as long as the autoscaler's `--max-graceful-termination-sec`
+allows — and the failure mode of guessing wrong is uncordoning a node mid-delete, the single thing
+the hand-over exists to prevent. It remains available as a fallback signal should a case need one.
+This is the same argument as the section above, arrived at from the other side: there, elapsed
+time could not tell a long shutdown from a wedged one; here it cannot tell a long deletion from an
+abandoned one.
 
 ### Per-node exponential backoff
 
@@ -169,3 +197,9 @@ free to select a second node. "One node per run" quietly assumed a run was short
   visible without reading logs.
 - `cooldown.afterDrain` remains, and is now clearly distinct: it is cluster-wide and applies
   after a *successful* drain, while backoff is per-node and applies after a failed one.
+- A hand-over binpack ends leaves the node uncordoned but still tainted. The taint is the
+  autoscaler's and binpack writes no taints, so the node repels everything that does not tolerate
+  it until an autoscaler returns to clear it or an operator does. Ending the wait recovers
+  binpack — it stops short-circuiting to a node nothing is finishing — before it recovers the
+  node, and that ordering is the honest one: the taint is somebody else's statement about the
+  node, and binpack removing it would be binpack claiming the deletion was cancelled.
