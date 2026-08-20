@@ -90,8 +90,17 @@ func CanFit(pod *corev1.Pod, node *corev1.Node, remaining corev1.ResourceList, r
 	// no-op sink: this package must do no I/O, and klog itself is a logging
 	// implementation that could, so it is deliberately not imported —
 	// klog.Logger is only an alias for logr.Logger anyway.
+	//
+	// The final parameter is enableComparisonOperators, and false is what the
+	// scheduler computes: it passes the TaintTolerationComparisonOperators gate,
+	// which is alpha and off by default, so a Gt or Lt toleration does not match
+	// there. Honouring one here would accept a destination the scheduler
+	// refuses, and the pod would go Pending after binpack had already evicted it.
+	// The error direction of false is the safe one — on a cluster that has
+	// turned the gate on, binpack under-tolerates and misses a destination,
+	// which costs a consolidation rather than a wrong answer.
 	if taint, untolerated := schedcorev1.FindMatchingUntoleratedTaint(
-		logr.Discard(), node.Spec.Taints, pod.Spec.Tolerations, schedulingTaint, true,
+		logr.Discard(), node.Spec.Taints, pod.Spec.Tolerations, schedulingTaint, false,
 	); untolerated {
 		return false, Reason{ReasonUntoleratedTaint,
 			"node " + node.Name + " has untolerated taint " + taint.Key + "=" + taint.Value + ":" + string(taint.Effect)}

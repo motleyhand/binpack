@@ -47,6 +47,17 @@ func TestCanFit(t *testing.T) {
 			wantCode: fit.ReasonUntoleratedTaint,
 		},
 		{
+			// The scheduler matches Gt and Lt only when
+			// TaintTolerationComparisonOperators is on, and it is alpha and
+			// off by default. Honouring one the scheduler would not is the
+			// unsound direction: binpack would approve a destination the
+			// scheduler refuses.
+			name:     "a greater-than toleration does not tolerate the taint",
+			pod:      mother.Pod("default", "web", mother.ToleratingGt("shard", "3")),
+			node:     mother.SmallNode("node-a", mother.Tainted("shard", "5", corev1.TaintEffectNoSchedule)),
+			wantCode: fit.ReasonUntoleratedTaint,
+		},
+		{
 			name:    "tolerated taint is fine",
 			pod:     mother.Pod("default", "web", mother.Tolerating("dedicated", corev1.TaintEffectNoSchedule)),
 			node:    mother.SmallNode("node-a", mother.Tainted("dedicated", "db", corev1.TaintEffectNoSchedule)),

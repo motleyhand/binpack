@@ -453,6 +453,23 @@ func Tolerating(key string, effect corev1.TaintEffect) PodOption {
 	}
 }
 
+// ToleratingGt tolerates a numeric taint whose value is greater than value.
+//
+// Gt and Lt tolerations are gated: the scheduler only honours them when
+// TaintTolerationComparisonOperators is on, and it is alpha and off by default.
+// A fixture exists for that reason — the interesting case is a toleration the
+// API server accepts and the scheduler declines to match.
+func ToleratingGt(key, value string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Tolerations = append(p.Spec.Tolerations, corev1.Toleration{
+			Key:      key,
+			Operator: corev1.TolerationOpGt,
+			Value:    value,
+			Effect:   corev1.TaintEffectNoSchedule,
+		})
+	}
+}
+
 // PDB builds a PodDisruptionBudget selecting pods by label, with the given
 // number of disruptions currently allowed.
 //

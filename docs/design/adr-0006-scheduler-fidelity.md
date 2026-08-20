@@ -97,6 +97,14 @@ this use case.
 Resource fit against `status.allocatable` is implemented directly, since the rules are now
 understood and the inputs come from upstream.
 
+Borrowing a function is not the same as borrowing its configuration. `FindMatchingUntoleratedTaint`
+takes an `enableComparisonOperators` flag, and the scheduler passes the
+`TaintTolerationComparisonOperators` gate rather than a constant — alpha and off by default, so
+`Gt` and `Lt` tolerations do not match there. binpack passes `false` for the same reason it derives
+the differential harness's feature gates from the release rather than listing them: what the
+cluster actually does is the only fidelity that counts. Where the answer is version-dependent,
+binpack takes the value that under-tolerates, which costs a consolidation rather than a wrong one.
+
 #### What is modelled is a closed allowlist, not an open denylist
 
 An earlier draft named two constraints as unmodelled and implied the rest were covered. That
