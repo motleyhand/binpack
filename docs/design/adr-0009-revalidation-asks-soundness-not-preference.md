@@ -2,9 +2,13 @@
 
 ## Status
 
-Accepted. Narrows the property recorded in
-[ADR-0006](adr-0006-scheduler-fidelity.md)'s implementation and in the revalidation work that
-followed it.
+Accepted, and **superseded in part by
+[ADR-0010](adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md)**: "has a scale-up started"
+has moved from the soundness list below to the preference list. The split itself, its criterion
+and everything else in both lists stand.
+
+Narrows the property recorded in [ADR-0006](adr-0006-scheduler-fidelity.md)'s implementation and
+in the revalidation work that followed it.
 
 ## Context
 
@@ -46,6 +50,13 @@ Split the checks by what a wrong answer costs, and re-ask only the ones that mak
 
 - `feasibility.reserveForLargestPod`
 - `drain.maxPodsPerDrain`
+
+> **"Has a scale-up started" has since moved to the preference list.** By the criterion stated
+> immediately below, it answers "was this a good idea" — and re-asking it abandoned drains that
+> had already relocated pods, on growth anywhere in the cluster and on a cluster-autoscaler
+> restart with no growth at all. See
+> [ADR-0010](adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md), which also records why
+> "is the pool above its minimum" did not move with it.
 
 Both of these answer "was this a good idea", not "is this safe". A drain that violates them
 after the fact has already violated them; re-asking does not undo the eviction that caused it.

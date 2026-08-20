@@ -520,14 +520,9 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 		return a
 	}
 
-	// Committed once the drain has evicted something, which the node records
-	// itself: the marker naming the replacement it is waiting for is written
-	// with the first eviction and cleared only when the drain ends. Read here
-	// rather than passed in, so a caller cannot disagree with the node about
-	// what has already happened.
-	committed := node.Annotations[AnnotationDrainAwaiting] != ""
-
-	drainable(s, &a, cfg.PolicyFor(a.Group, a.Pool), committed)
+	// The same question eligibility asked above, through the same reading, so
+	// the two halves of the drain cannot disagree about whether it has begun.
+	drainable(s, &a, cfg.PolicyFor(a.Group, a.Pool), committedDrain(node))
 	return a
 }
 
@@ -542,6 +537,17 @@ func outcomeCode(assessments []NodeAssessment) string {
 		}
 	}
 	return CodeNoCandidates
+}
+
+// committedDrain reports whether the drain on this node has already evicted
+// something.
+//
+// Read from the node rather than passed in, so nothing can disagree with the
+// node about what has already happened: the marker names the replacement the
+// drain is waiting for, is written with the first eviction, and is cleared only
+// when the drain ends. See ADR-0009.
+func committedDrain(node *corev1.Node) bool {
+	return node.Annotations[AnnotationDrainAwaiting] != ""
 }
 
 // cooling reports whether recent activity means this node should be left
@@ -614,11 +620,23 @@ func groupsByID(s Snapshot) map[string]NodeGroup {
 // eligibility rules a node in or out before any simulation runs.
 //
 // resuming is set when the caller is binpack revisiting a drain it started
-// itself, and suppresses exactly the two checks binpack is the cause of: its
-// own drain marker, and the cordon it applied. Every other check still
-// applies, and that is the point of re-running them — a scale-up that began
-// after the cordon, a pool that has since reached its minimum, or an operator
-// annotating the node mid-drain all mean the drain should stop.
+// itself, and suppresses the two checks binpack is the cause of: its own drain
+// marker, and the cordon it applied.
+//
+// Once that drain has evicted something, the cooldowns are suppressed too —
+// a different rule, for a different reason. The marker and the cordon are
+// binpack's own answers read back, so re-asking them is wrong at any point in
+// a drain. A cooldown is a real observation about the cluster; it is just an
+// observation about whether a drain should *start*, and this one has started.
+// Re-asking it afterwards cannot undo the evictions it disapproves of. What it
+// does is hand back a half-drained node, leaving the pods that already moved
+// where they went and billing the node thirty minutes of backoff for a
+// cluster-wide event it had no part in. See ADR-0010.
+//
+// Every other check still applies, and that is the point of re-running them: a
+// pool that has since reached its minimum, an operator annotating the node
+// mid-drain, or an autoscaler that has stopped managing the pool all mean the
+// drain should stop, however much of it is already done.
 func eligibility(
 	s Snapshot, cfg Config,
 	groups map[string]NodeGroup, protected map[string]string,
@@ -634,6 +652,14 @@ func eligibility(
 	group, managed := groups[a.Group]
 	coolCode, cooldown, cooling := cooling(s, policy)
 
+	// Committedness is binpack resuming its own drain, not a property of the
+	// node that every caller should honour. Selection rules a node with a
+	// drain in flight out further down this same switch, and without the
+	// resuming half it would reach that case instead — reporting a different
+	// question's answer to explain and diagnose, by an accident of case order
+	// rather than a decision.
+	committed := resuming && committedDrain(node)
+
 	switch {
 	case !managed:
 		// Absent from the autoscaler's status means it does not manage
@@ -643,7 +669,7 @@ func eligibility(
 	case !policy.Enabled:
 		a.Skipped, a.SkipCode, a.SkipReason = true, SkipPoolDisabled, "binpack is disabled for this pool"
 
-	case cooling:
+	case cooling && !committed:
 		a.Skipped, a.SkipCode, a.SkipReason = true, coolCode, cooldown
 
 	case group.Size() <= group.MinSize:

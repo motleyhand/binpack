@@ -213,6 +213,126 @@ func TestTheReserveStopsApplyingOncePodsHaveLeft(t *testing.T) {
 	}
 }
 
+// midDrain is a cluster whose node "a" is being drained and has already evicted
+// something: cordoned, marked, and carrying the marker naming the replacement
+// it is waiting for. A cooldown is configured so the window exists to fall
+// inside; nothing else stands in the drain's way.
+func midDrain() (engine.Snapshot, engine.Config) {
+	s := cluster([]*corev1.Node{inPool("a", draining()...), inPool("b"), inPool("c")}, nil)
+	s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = "some-uid@2026-08-15T12:00:00Z"
+
+	cfg := config()
+	cfg.Default.CooldownAfterScaleUp = 10 * time.Minute
+	return s, cfg
+}
+
+// growing is the two ways the cluster says it has grown. Worth telling apart:
+// one is the autoscaler adding capacity right now, the other is binpack's own
+// quiet period after it finished doing so.
+var growing = []struct {
+	name string
+	code string
+	to   func(*engine.Snapshot)
+}{
+	{"the cluster is growing right now", engine.SkipScaleUpInProgress,
+		func(s *engine.Snapshot) { s.Autoscaler.ScaleUpInProgress = true }},
+	{"the cluster grew a minute ago", engine.SkipCooldownAfterScaleUp,
+		func(s *engine.Snapshot) { s.Autoscaler.LastScaleUp = now.Add(-time.Minute) }},
+}
+
+func TestAScaleUpStopsApplyingOncePodsHaveLeft(t *testing.T) {
+	// A scale-up adds nodes. It cannot make the pods still on this node fit
+	// less well, so it cannot make a drain that has already evicted something
+	// unsound — and the questions that can are all asked elsewhere and are
+	// untouched: Simulate re-answers fit against the current node set,
+	// CheckEvictable re-answers the budgets, and Autoscaler.Live re-answers
+	// whether anything will ever remove the node.
+	//
+	// What abandoning does instead is discard relocations that already
+	// happened, and bill the node thirty minutes of backoff for a cluster-wide
+	// event it had no part in. See ADR-0010.
+	for _, tc := range growing {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cfg := midDrain()
+			tc.to(&s)
+
+			if got := engine.Revalidate(s, "a", cfg); got.Verdict() != engine.VerdictDrainable {
+				t.Errorf("a committed drain was abandoned by a preference: %q (%s)",
+					got.Verdict(), revalidationDetail(got))
+			}
+		})
+	}
+}
+
+func TestAScaleUpStillRefusesADrainThatHasNotStarted(t *testing.T) {
+	// The other half of the pair above: without this, that test would pass
+	// against a cluster where the scale-up checks never applied at all.
+	//
+	// It is also the behaviour ADR-0009 chose and ADR-0010 keeps. The first
+	// revalidation, immediately after the cordon, has nothing to lose by
+	// stopping — and stopping there is what keeps binpack from draining into a
+	// cluster that is simultaneously growing.
+	for _, tc := range growing {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cfg := midDrain()
+			s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = ""
+			tc.to(&s)
+
+			got := engine.Revalidate(s, "a", cfg)
+
+			if !got.Skipped || got.SkipCode != tc.code {
+				t.Errorf("got skipped=%v code=%q (%s), want %q",
+					got.Skipped, got.SkipCode, got.SkipReason, tc.code)
+			}
+		})
+	}
+}
+
+func TestSelectionStillReportsACooldownOnANodeAlreadyBeingDrained(t *testing.T) {
+	// "Committed" is a fact about binpack resuming a drain it started, not a
+	// property of the node that every caller should honour. Selection reads
+	// the same annotation on the same node and must go on reporting the
+	// cooldown, because explain and diagnose run selection against a live
+	// cluster and a drain in flight is exactly the state an operator asks them
+	// about.
+	//
+	// Without the resuming half of the test, this node reports
+	// drain-in-progress instead — a different answer to a different question,
+	// arrived at by an accident of case ordering rather than a decision.
+	s, cfg := midDrain()
+	s.Autoscaler.LastScaleUp = now.Add(-time.Minute)
+
+	got := assessmentFor(engine.Decide(s, cfg), "a")
+	if got == nil {
+		t.Fatal("node a was not assessed at all")
+	}
+	if !got.Skipped || got.SkipCode != engine.SkipCooldownAfterScaleUp {
+		t.Errorf("got skipped=%v code=%q (%s), want %q",
+			got.Skipped, got.SkipCode, got.SkipReason, engine.SkipCooldownAfterScaleUp)
+	}
+}
+
+func TestPoolAtMinimumStillStopsACommittedDrain(t *testing.T) {
+	// The arm that must not move with the scale-up checks, however alike they
+	// look from inside eligibility.
+	//
+	// At the floor the autoscaler will never remove this node, so carrying the
+	// drain to completion strands an empty cordoned node until removalTimeout
+	// abandons it anyway — with more pods bounced, not fewer. "Is the pool
+	// above its minimum" is a soundness question by ADR-0009's own criterion:
+	// a wrong answer does not merely cost churn, it produces a drain that
+	// cannot succeed.
+	s, cfg := midDrain()
+	s.Autoscaler.Groups[0].MinSize = 3
+
+	got := engine.Revalidate(s, "a", cfg)
+
+	if !got.Skipped || got.SkipCode != engine.SkipPoolAtMinimum {
+		t.Errorf("got skipped=%v code=%q (%s), want %q",
+			got.Skipped, got.SkipCode, got.SkipReason, engine.SkipPoolAtMinimum)
+	}
+}
+
 func TestSoundnessIsStillReAskedAfterPodsHaveLeft(t *testing.T) {
 	// The distinction is preference versus soundness, not "checks before" and
 	// "no checks after". A drain whose remaining pods no longer fit anywhere

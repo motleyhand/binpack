@@ -211,7 +211,10 @@ func Advance(
 	case a.Verdict() != engine.VerdictDrainable:
 		// The cluster moved underneath the drain. Nothing here distinguishes
 		// a drain that has evicted nothing from one that is half done: both
-		// end the same way, with the node handed back.
+		// end the same way, with the node handed back. What differs is which
+		// conditions get this far — revalidation stops asking the preferences
+		// once pods have left — and that is decided where the questions are
+		// asked, by something that knows which of them are about safety.
 		//
 		// The verdict rather than the skip code, because a node that became
 		// infeasible or blocked carries no skip code at all — and publishing

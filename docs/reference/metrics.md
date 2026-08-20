@@ -130,8 +130,8 @@ investigation use one vocabulary.
 | `unaccounted-pods` | Pods remained that the simulation had not accounted for |
 
 Any of the skip codes above can also appear, when the cluster changed underneath a drain and
-revalidation stopped it — a scale-up beginning, a pool reaching its minimum, an operator
-annotating the node. So can `infeasible` and `blocked`, for the two outcomes that carry no skip
+revalidation stopped it — a pool reaching its minimum, an operator annotating the node, the
+cluster growing before anything had moved. So can `infeasible` and `blocked`, for the two outcomes that carry no skip
 code: the remaining pods stopped fitting elsewhere, and a disruption budget stopped allowing
 their eviction.
 
@@ -139,6 +139,15 @@ their eviction.
 what the table says; as an abandonment it also covers the cluster-autoscaler's status having gone
 stale mid-drain, including while binpack was waiting for the autoscaler to remove a node it had
 tainted itself. The note on the `DrainAbandoned` event says which.
+
+`scale-up-in-progress` and `cooldown-after-scale-up` are narrower here than the table above
+suggests. As an abandonment, either means the cluster grew **between the cordon and the first
+eviction** — the window in which stopping costs nothing, because nothing has moved yet. Once a
+drain has relocated a pod, growth elsewhere in the cluster no longer ends it: abandoning would
+leave those pods where they went and buy nothing, while the questions that could make the drain
+unsound are re-asked directly on every evaluation.
+[ADR-0010](../design/adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md) has the
+reasoning. On `binpack_nodes_skipped` both codes are unchanged.
 
 Every one of these has a series from startup, at zero. A counter that only appears once it has
 fired makes a `rate()` alert silently useless until the first occurrence.
