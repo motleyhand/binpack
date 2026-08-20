@@ -253,6 +253,31 @@ func TestAMarkedNodeThatIsNotCordonedIsRepaired(t *testing.T) {
 	}
 }
 
+func TestAMarkedNodeNobodyLetsBinpackCordonIsStillBounded(t *testing.T) {
+	// The repair is right for the case it was written for — a process that
+	// stopped between Begin's two writes — but it is not a resting place. A
+	// controller that owns spec.unschedulable, or an operator answering an
+	// unexpected SchedulingDisabled with kubectl uncordon, puts the drain back
+	// here every interval, and the repair on its own never consults a bound.
+	nodes := []*corev1.Node{marked("a", 6*time.Hour, 6*time.Hour, "1"), node("b")}
+	nodes[0].Spec.Unschedulable = false
+	pods := []*corev1.Pod{mother.Pod("default", "idle", mother.OnNode("a"))}
+	s := snapshot(nodes, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Failed || step.Code != drain.AbandonStalled {
+		t.Errorf("expected the repair to consult the stall bound, got %+v", step)
+	}
+	if nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainStarted] != "" {
+		t.Error("the drain marker survived, so the next interval repairs the node again")
+	}
+}
+
 func TestAVanishedNodeIsSuccess(t *testing.T) {
 	// The cluster-autoscaler removing the node is the outcome a drain works
 	// towards, so finding it gone is completion rather than an error.
@@ -528,6 +553,81 @@ func TestSomebodyElsesUnschedulablePodDoesNotEndTheDrain(t *testing.T) {
 	if step.Failed {
 		t.Errorf("an unrelated workload ended the drain: %+v", step)
 	}
+}
+
+func TestADrainWaitingForAReplacementThatNeverArrivesIsAbandoned(t *testing.T) {
+	// Having a controller does not guarantee the controller produces a bound
+	// pod carrying that same UID. A rollout or a scale-down supersedes the
+	// ReplicaSet, so every later pod is owned by a different one; a Job at its
+	// backoffLimit creates nothing at all. The wait then has nothing to end it
+	// unless the drain assessment gets to run, and while it lasts binpack
+	// evaluates no other node in the cluster.
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", 30*time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Failed || step.Code != drain.AbandonStalled {
+		t.Errorf("expected the stall bound to end the wait, got %+v", step)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node was left cordoned waiting for a pod that will never arrive")
+	}
+}
+
+func TestAWaitForAReplacementCannotBeExtendedForEver(t *testing.T) {
+	// The single-shot case above only reaches the stall bound because its
+	// recorded count already matches the node's. A real drain never looks like
+	// that: record runs before the eviction it accompanies, so the count on the
+	// node is one higher than what the next evaluation finds. That evaluation
+	// reads the departure as progress — rightly, once — and if the wait then
+	// returns without lowering the count, every later evaluation reads the same
+	// departure again. A stall clock that restarts every interval is not a
+	// bound, and the node is wedged exactly as it was before.
+	n := awaitingNode("a", "web-rs", time.Minute)
+	n.Annotations[engine.AnnotationDrainPodsRemaining] = "2"
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{n, node("b")}, pods)
+	c := clientFor(s)
+
+	// One evaluation a minute for twice the stall timeout, each against the
+	// node as the last one left it.
+	const rounds = 20
+	for i := 0; i <= rounds; i++ {
+		round := s
+		round.Now = at.Add(time.Duration(i) * time.Minute)
+		round.Nodes = []*corev1.Node{nodeFrom(t, c, "a"), node("b")}
+		round.Autoscaler.LastProbe = round.Now.Add(-10 * time.Second)
+
+		step, err := executor.Advance(
+			context.Background(), c, round, "a", engineConfig(), drainPolicy())
+		if err != nil {
+			t.Fatalf("Advance at +%dm: %v", i, err)
+		}
+		if step.Failed && step.Code == drain.AbandonStalled {
+			// At the eleventh minute, not the first: the pod that left at +0
+			// was real progress, so the stall clock runs from there rather
+			// than from the eviction that started the wait. Bounding the
+			// absence of progress is the whole of ADR-0007, and a bound that
+			// fired at +1 would be a wall-clock deadline wearing its name.
+			if i != 11 {
+				t.Errorf("abandoned at +%dm; expected +11m, one minute past the "+
+					"stall timeout measured from the last real progress", i)
+			}
+			return
+		}
+		if step.Code != executor.StepWaiting {
+			t.Fatalf("at +%dm: expected the drain to wait or to end, got %+v", i, step)
+		}
+	}
+
+	t.Errorf("%d evaluations over twice the stall timeout and the drain is still waiting; "+
+		"the replacement never arrived and nothing ended it", rounds+1)
 }
 
 func TestACompletedPodIsNotAnInFlightEviction(t *testing.T) {
