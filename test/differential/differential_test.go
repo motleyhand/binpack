@@ -39,7 +39,8 @@ func check(t *testing.T, o *differential.Oracle, name string, pod *corev1.Pod, n
 		fit.Subtract(remaining, fit.EffectiveRequests(r))
 	}
 
-	binpackFits, reason := fit.CanFit(pod, node, remaining, residents)
+	binpackFits, reason := fit.CanFit(pod, node, remaining, residents,
+		fit.NewAntiAffinityDomains([]*corev1.Node{node}, residents))
 
 	verdict, err := o.Accepts(pod, node, residents)
 	if err != nil {
@@ -237,7 +238,8 @@ func TestGeneratedStates(t *testing.T) {
 		for _, r := range residents {
 			fit.Subtract(remaining, fit.EffectiveRequests(r))
 		}
-		if ok, _ := fit.CanFit(pod, node, remaining, residents); ok {
+		if ok, _ := fit.CanFit(pod, node, remaining, residents,
+			fit.NewAntiAffinityDomains([]*corev1.Node{node}, residents)); ok {
 			accepted++
 		} else {
 			refused++
@@ -463,47 +465,49 @@ var exempt = map[string][]exemption{
 			},
 		},
 		{
-			// This exemption does not hold all the way, and gap below is where
-			// it stops holding. Upstream rejects every node in the term's
-			// topology domain; binpack looks only at the candidate node's own
-			// residents, so a zone-keyed term on a neighbouring node is
-			// invisible to it and the destination is approved.
-			why: "fit.UnsupportedDestination refuses a node whose residents declare " +
+			why: "fit.UnsupportedDestination refuses a node whose own residents declare " +
 				"required anti-affinity that could match the incoming pod — the " +
 				"symmetric direction, which checking the incoming pod alone would " +
-				"miss. It does not cover the plugin: upstream counts matching pods " +
-				"across the term's whole topology domain, so a term keyed on " +
-				"anything wider than the hostname rejects nodes that hold no " +
-				"matching pod of their own, and binpack accepts them. Building the " +
-				"plugin here would not settle it either, because Accepts models a " +
-				"single node and the disagreement is between nodes.",
+				"miss. Asked without any wider view, which is the single-node " +
+				"shape this harness has.",
 			refused: func() fit.Reason {
 				return fit.UnsupportedDestination(
 					mother.Pod("default", "web", mother.PodLabels(map[string]string{"app": "web"})),
 					mother.SmallNode("n"),
 					[]*corev1.Pod{mother.Pod("default", "sitting",
 						mother.OnNode("n"), mother.WithRequiredAntiAffinity("app", "web"))},
+					nil,
 				)
 			},
-			gap: func() fit.Reason {
+		},
+		{
+			// The half this exemption used to record as an open gap. Upstream
+			// counts matching pods across the term's whole topology domain, so
+			// a term keyed on anything wider than the hostname rejects nodes
+			// holding no matching pod of their own. binpack now indexes the
+			// cluster the same way and checks the candidate node's labels
+			// against it, which is what the witness below exercises.
+			why: "fit.NewAntiAffinityDomains indexes every required anti-affinity term " +
+				"in the cluster by the topology domain it covers, and " +
+				"fit.UnsupportedDestination refuses a candidate node whose labels put " +
+				"it in one of those domains — the case the node's own residents cannot " +
+				"answer. The oracle still could not adjudicate this one: Accepts " +
+				"models a single node, and a domain-scoped disagreement is between " +
+				"nodes.",
+			refused: func() fit.Reason {
 				const zone = corev1.LabelTopologyZone
 				inZone := mother.NodeLabels(map[string]string{zone: "z1"})
 
 				// Node b hosts the pod whose anti-affinity spans the zone.
 				// Node c is in the same zone and holds nothing at all.
-				byNode := map[*corev1.Node][]*corev1.Pod{
-					mother.SmallNode("b", inZone): {mother.Pod("default", "sitting",
-						mother.OnNode("b"), mother.WithRequiredAntiAffinityAt(zone, "app", "web"))},
-				}
-				c := mother.SmallNode("c", inZone)
+				b, c := mother.SmallNode("b", inZone), mother.SmallNode("c", inZone)
+				declaring := mother.Pod("default", "sitting",
+					mother.OnNode("b"), mother.WithRequiredAntiAffinityAt(zone, "app", "web"))
 				incoming := mother.Pod("default", "web",
 					mother.PodLabels(map[string]string{"app": "web"}))
 
-				// The scheduler refuses c on account of what is in byNode, since
-				// the term's domain covers it. binpack is asked with c's own
-				// residents, which is all UnsupportedDestination takes, so the
-				// pod on b never reaches the question and c is approved.
-				return fit.UnsupportedDestination(incoming, c, byNode[c])
+				return fit.UnsupportedDestination(incoming, c, nil,
+					fit.NewAntiAffinityDomains([]*corev1.Node{b, c}, []*corev1.Pod{declaring}))
 			},
 		},
 	},
@@ -546,8 +550,10 @@ var exempt = map[string][]exemption{
 // Accounted for is not the same as sound, and this test is careful not to be
 // read as saying so. An exemption whose refusal is narrower than the plugin it
 // stands in for carries a gap: an input binpack accepts and the plugin rejects,
-// asserted here to be still open and logged on every green run. InterPodAffinity
-// has one today. Green means every default Filter plugin has been looked at and
+// asserted here to be still open and logged on every green run. None does
+// today — InterPodAffinity's was closed by the topology-domain index, and the
+// field is kept because the next narrow exemption should not have to rebuild
+// the mechanism. Green means every default Filter plugin has been looked at and
 // its status written down — not that binpack agrees with all of them.
 func TestOracleCoversEveryDefaultFilterPlugin(t *testing.T) {
 	cfg, err := latest.Default()

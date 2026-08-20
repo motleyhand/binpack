@@ -160,15 +160,18 @@ func resizeInFlight(pod *corev1.Pod) string {
 }
 
 // UnsupportedDestination reports why node cannot be considered as a
-// destination, including reasons that come from the pods already on it.
+// destination, including reasons that come from pods other than the one being
+// placed.
 //
 // The allowlist applies in both directions, but not symmetrically, because the
 // scheduler's filters are not symmetric:
 //
-//   - A resident's required *anti*-affinity can reject an incoming pod, so it
-//     disqualifies the node.
-//   - A resident's required *affinity* is not re-evaluated when another pod
-//     arrives, so it does not.
+//   - Another pod's required *anti*-affinity can reject an incoming pod, so it
+//     disqualifies every node in the domain that term covers. Only for a term
+//     keyed on kubernetes.io/hostname is that domain the declaring pod's own
+//     node; see AntiAffinityDomains.
+//   - Another pod's required *affinity* is not re-evaluated when a pod
+//     arrives, so it disqualifies nothing.
 //   - A resident's topology spread constraints are not evaluated for an
 //     incoming pod either; only the incoming pod's own constraints are, and
 //     those are handled by UnsupportedPod.
@@ -178,7 +181,18 @@ func resizeInFlight(pod *corev1.Pod) string {
 //
 // Checking only the incoming pod would let the first and last cases through
 // and leave the replacement Pending.
-func UnsupportedDestination(pod *corev1.Pod, node *corev1.Node, residents []*corev1.Pod) Reason {
+//
+// domains carries the first case beyond the node in front of it and may be
+// empty, which says the caller holds no wider view; residents is then all the
+// anti-affinity binpack can see. Both are asked, because they fail in
+// different places: a hostname-keyed term is caught by residents whether or
+// not the node is labelled into any domain at all.
+func UnsupportedDestination(
+	pod *corev1.Pod,
+	node *corev1.Node,
+	residents []*corev1.Pod,
+	domains AntiAffinityDomains,
+) Reason {
 	if r := undeclaredFeatures(pod, node); !r.Empty() {
 		return r
 	}
@@ -190,7 +204,99 @@ func UnsupportedDestination(pod *corev1.Pod, node *corev1.Node, residents []*cor
 					", whose required pod anti-affinity could reject " + podRef(pod)}
 		}
 	}
+
+	if declarer, domain, rejected := domains.rejects(pod, node); rejected {
+		return Reason{ReasonUnsupportedNode,
+			"node " + node.Name + " is in " + domain + " with " + podRef(declarer) +
+				", whose required pod anti-affinity could reject " + podRef(pod)}
+	}
 	return Reason{}
+}
+
+// AntiAffinityDomains records where the cluster's required pod anti-affinity
+// applies, keyed the way the scheduler keys it: by the topology domain a term
+// covers, rather than by the node the pod declaring it happens to sit on.
+//
+// The two coincide only at kubernetes.io/hostname, where the domain is one
+// node. A term keyed on the zone rejects every node in that zone — including
+// nodes hosting no matching pod of their own — so asking each candidate node
+// about its own residents asks a narrower question than the scheduler's, and
+// gets it wrong in the accepting direction: binpack approves a destination
+// that will refuse the replacement, and the eviction has already happened.
+// That is why this is built once from the whole cluster and handed down to the
+// per-node question rather than computed inside it.
+//
+// The scheduler builds the same index, over every node hosting a pod with
+// required anti-affinity, and then checks the candidate node's own labels
+// against it (interpodaffinity's getExistingAntiAffinityCounts and
+// satisfyExistingPodsAntiAffinity). This is that, kept to the same shape.
+//
+// The pods are held by pointer and never written to; they come from a shared
+// informer cache upstream of here.
+type AntiAffinityDomains []antiAffinityDomain
+
+// antiAffinityDomain is one required anti-affinity term, with the topology
+// domain the declaring pod's node places it in.
+type antiAffinityDomain struct {
+	declarer *corev1.Pod
+	term     corev1.PodAffinityTerm
+	value    string
+}
+
+// NewAntiAffinityDomains indexes every required anti-affinity term in the
+// cluster by the domain it covers.
+//
+// Pods are located by spec.nodeName, so one that is not scheduled yet
+// contributes nothing: it is in no domain. A term whose topologyKey the
+// declaring pod's node does not carry contributes nothing either, which is
+// what upstream does — a domain a node is not labelled into is one it is not
+// in, and inventing an empty-string domain would make every unlabelled node
+// share it.
+//
+// Everything else contributes, terminating and completed pods included. They
+// are in the scheduler's snapshot until they are gone, and a term that counts
+// slightly too long costs a consolidation where one dropped too early costs a
+// Pending pod.
+func NewAntiAffinityDomains(nodes []*corev1.Node, pods []*corev1.Pod) AntiAffinityDomains {
+	byName := make(map[string]*corev1.Node, len(nodes))
+	for _, node := range nodes {
+		byName[node.Name] = node
+	}
+
+	var domains AntiAffinityDomains
+	for _, pod := range pods {
+		affinity := pod.Spec.Affinity
+		if affinity == nil || affinity.PodAntiAffinity == nil {
+			continue
+		}
+		node, ok := byName[pod.Spec.NodeName]
+		if !ok {
+			continue
+		}
+		for _, term := range affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
+			value, ok := node.Labels[term.TopologyKey]
+			if !ok {
+				continue
+			}
+			domains = append(domains, antiAffinityDomain{declarer: pod, term: term, value: value})
+		}
+	}
+	return domains
+}
+
+// rejects reports whether node sits in a domain holding anti-affinity that
+// could reject pod, naming the pod that declared it and the domain.
+func (d AntiAffinityDomains) rejects(pod *corev1.Pod, node *corev1.Node) (*corev1.Pod, string, bool) {
+	for _, domain := range d {
+		value, ok := node.Labels[domain.term.TopologyKey]
+		if !ok || value != domain.value {
+			continue
+		}
+		if termCouldReject(domain.term, domain.declarer, pod) {
+			return domain.declarer, domain.term.TopologyKey + "=" + value, true
+		}
+	}
+	return nil, "", false
 }
 
 // undeclaredFeatures reports whether node lacks a capability pod's spec
@@ -272,31 +378,42 @@ func antiAffinityCouldReject(resident, incoming *corev1.Pod) bool {
 	}
 
 	for _, term := range affinity.PodAntiAffinity.RequiredDuringSchedulingIgnoredDuringExecution {
-		// A namespace selector would need the Namespace objects to evaluate,
-		// which this package does not have.
-		if term.NamespaceSelector != nil {
-			return true
-		}
-
-		// An empty Namespaces list means the resident's own namespace.
-		scope := term.Namespaces
-		if len(scope) == 0 {
-			scope = []string{resident.Namespace}
-		}
-		if !slices.Contains(scope, incoming.Namespace) {
-			continue
-		}
-
-		selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
-		if err != nil {
-			return true
-		}
-		if selector.Matches(labels.Set(incoming.Labels)) {
+		if termCouldReject(term, resident, incoming) {
 			return true
 		}
 	}
 
 	return false
+}
+
+// termCouldReject applies one term, declared by declarer, to incoming.
+//
+// Shared with the domain index deliberately: the two paths ask about the same
+// term from different distances, and a term that resolves to "cannot tell,
+// so refuse" on one of them has to resolve the same way on the other. Written
+// twice, they would drift, and the drift would be silent in the accepting
+// direction on whichever copy was left behind.
+func termCouldReject(term corev1.PodAffinityTerm, declarer, incoming *corev1.Pod) bool {
+	// A namespace selector would need the Namespace objects to evaluate,
+	// which this package does not have.
+	if term.NamespaceSelector != nil {
+		return true
+	}
+
+	// An empty Namespaces list means the declaring pod's own namespace.
+	scope := term.Namespaces
+	if len(scope) == 0 {
+		scope = []string{declarer.Namespace}
+	}
+	if !slices.Contains(scope, incoming.Namespace) {
+		return false
+	}
+
+	selector, err := metav1.LabelSelectorAsSelector(term.LabelSelector)
+	if err != nil {
+		return true
+	}
+	return selector.Matches(labels.Set(incoming.Labels))
 }
 
 func firstHostPort(pod *corev1.Pod) (int32, bool) {

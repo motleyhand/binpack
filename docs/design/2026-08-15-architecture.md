@@ -214,14 +214,26 @@ constraints are the exception, ignored rather than refused, because they affect 
 can never cause a placement to fail.
 
 **The allowlist applies in both directions.** It is not enough to inspect the pods being
-relocated; the pods already resident on each prospective destination must be inspected too.
-Inter-pod affinity is symmetric — the scheduler's filter rejects an incoming pod if an existing
-pod on that node declares required anti-affinity matching it. A relocating pod using nothing but
-allowlisted features can still be refused by a destination it knows nothing about.
+relocated; the pods that could object to their arrival must be inspected too. Inter-pod affinity
+is symmetric — the scheduler's filter rejects an incoming pod when another pod declares required
+anti-affinity matching it and sits in the same topology domain. A relocating pod using nothing
+but allowlisted features can still be refused by a destination it knows nothing about.
 
-So a destination is disqualified if any pod on it uses a feature outside the allowlist, exactly
-as a relocating pod is. Checking only one side would let precisely this case through and leave
-the replacement Pending.
+That does not make the two directions the same check. A destination is disqualified by required
+*anti-affinity* that could match the incoming pod, because that is the filter which reads pods
+other than the one being placed. A resident's required *affinity* is not re-evaluated when
+another pod arrives, and nor are its topology spread constraints — only the incoming pod's own
+are, and those are decided on the relocating side. Applying the whole allowlist symmetrically
+would not be fidelity to the scheduler but arbitrary refusal, and it would refuse everything:
+every ordinary cluster runs a `hostNetwork` DaemonSet on every node, and `hostNetwork` is
+outside the allowlist.
+
+Nor are "the pods already on the node" the right set to read. The scheduler counts matching pods
+across the whole topology domain the term names, so a term keyed on
+`topology.kubernetes.io/zone` rejects every node in that zone, including nodes hosting no
+matching pod of their own. Only at `kubernetes.io/hostname` is the domain a single node. binpack
+therefore indexes the cluster's required anti-affinity by the domain each term covers and checks
+each candidate node's labels against that index, which is the question the scheduler asks.
 
 There is a second kind of both-directions constraint, and it belongs to neither side alone: a
 pod can require a *capability of the destination's kubelet*. Since 1.36 the scheduler refuses

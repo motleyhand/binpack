@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/component-helpers/nodedeclaredfeatures"
 	"k8s.io/component-helpers/nodedeclaredfeatures/features"
 	"k8s.io/component-helpers/nodedeclaredfeatures/features/restartallcontainers"
@@ -137,7 +138,22 @@ func TestSoftConstraintsAreIgnoredNotRefused(t *testing.T) {
 		TopologyKey:       corev1.LabelHostname,
 		WhenUnsatisfiable: corev1.ScheduleAnyway,
 	}}
+	// Both halves, because they are two checks. A preferred-only PodAffinity
+	// is what a pod asking to sit near a cache or a shard carries, and a
+	// service mesh may inject one; reading it as a required term would make
+	// that pod permanently unrelocatable without anything going red.
 	pod.Spec.Affinity = &corev1.Affinity{
+		PodAffinity: &corev1.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+				Weight: 100,
+				PodAffinityTerm: corev1.PodAffinityTerm{
+					TopologyKey: corev1.LabelHostname,
+					LabelSelector: &metav1.LabelSelector{
+						MatchLabels: map[string]string{"app": "cache"},
+					},
+				},
+			}},
+		},
 		PodAntiAffinity: &corev1.PodAntiAffinity{
 			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
 				Weight:          100,
@@ -166,7 +182,7 @@ func TestUnsupportedDestination(t *testing.T) {
 	node := mother.SmallNode("node-a")
 
 	t.Run("no residents", func(t *testing.T) {
-		if r := fit.UnsupportedDestination(mother.Pod("default", "incoming"), node, nil); !r.Empty() {
+		if r := fit.UnsupportedDestination(mother.Pod("default", "incoming"), node, nil, nil); !r.Empty() {
 			t.Errorf("expected support, got: %s", r.Message)
 		}
 	})
@@ -178,7 +194,7 @@ func TestUnsupportedDestination(t *testing.T) {
 			mother.Pod("shard", "ordinary"),
 			mother.Pod("shard", "member", mother.WithRequiredAntiAffinity("app", "member")),
 		}
-		r := fit.UnsupportedDestination(incoming, node, residents)
+		r := fit.UnsupportedDestination(incoming, node, residents, nil)
 
 		if r.Empty() {
 			t.Fatal("an anti-affinity term that could match must disqualify the node")
@@ -195,8 +211,50 @@ func TestUnsupportedDestination(t *testing.T) {
 		residents := []*corev1.Pod{
 			mother.Pod("shard", "member", mother.WithRequiredAntiAffinity("app", "member")),
 		}
-		if r := fit.UnsupportedDestination(incoming, node, residents); !r.Empty() {
+		if r := fit.UnsupportedDestination(incoming, node, residents, nil); !r.Empty() {
 			t.Errorf("a term scoped to another namespace must not disqualify, got: %s", r.Message)
+		}
+	})
+
+	t.Run("a term whose selector does not match leaves the node usable", func(t *testing.T) {
+		// The selector has to be evaluated, not merely detected. Almost every
+		// node in a real cluster hosts some pod with required anti-affinity to
+		// its own kind; treating that as disqualifying would leave binpack no
+		// destination anywhere, and nothing would go red saying so.
+		incoming := mother.Pod("default", "web", mother.PodLabels(map[string]string{"app": "web"}))
+		residents := []*corev1.Pod{
+			mother.Pod("default", "db-0", mother.PodLabels(map[string]string{"app": "db"}),
+				mother.WithRequiredAntiAffinity("app", "db")),
+		}
+		if r := fit.UnsupportedDestination(incoming, node, residents, nil); !r.Empty() {
+			t.Errorf("a term that cannot select the incoming pod must not disqualify, got: %s", r.Message)
+		}
+	})
+
+	t.Run("resident anti-affinity at zone topology", func(t *testing.T) {
+		// Two nodes in one zone. The pod on b keys its anti-affinity on the
+		// zone rather than the hostname, so the scheduler refuses every node
+		// in z1 — c included, though c holds nothing at all.
+		const zone = corev1.LabelTopologyZone
+		inZone := mother.NodeLabels(map[string]string{zone: "z1"})
+		nodeB, nodeC := mother.SmallNode("b", inZone), mother.SmallNode("c", inZone)
+		residentsOfB := []*corev1.Pod{mother.Pod("default", "sitting",
+			mother.OnNode("b"), mother.WithRequiredAntiAffinityAt(zone, "app", "web"))}
+		var residentsOfC []*corev1.Pod
+		incoming := mother.Pod("default", "web", mother.PodLabels(map[string]string{"app": "web"}))
+		domains := fit.NewAntiAffinityDomains([]*corev1.Node{nodeB, nodeC}, residentsOfB)
+
+		if r := fit.UnsupportedDestination(incoming, nodeB, residentsOfB, domains); r.Empty() {
+			t.Error("the node hosting the declaring pod must be disqualified")
+		}
+		// The one that was accepted: c holds nothing, so every question asked
+		// of c's own residents answers yes.
+		r := fit.UnsupportedDestination(incoming, nodeC, residentsOfC, domains)
+		if r.Empty() {
+			t.Fatal("a node sharing the term's topology domain must be disqualified too")
+		}
+		if !strings.Contains(r.Message, zone+"=z1") || !strings.Contains(r.Message, "default/sitting") {
+			t.Errorf("message should name the domain and the pod that declared the term, got: %s", r.Message)
 		}
 	})
 
@@ -208,7 +266,7 @@ func TestUnsupportedDestination(t *testing.T) {
 			mother.Pod("default", "ingress", mother.WithHostPort(80)),
 			mother.Pod("default", "db", mother.WithPVC("data")),
 		}
-		if r := fit.UnsupportedDestination(mother.Pod("default", "incoming", mother.PodLabels(map[string]string{"app": "member"})), node, residents); !r.Empty() {
+		if r := fit.UnsupportedDestination(mother.Pod("default", "incoming", mother.PodLabels(map[string]string{"app": "member"})), node, residents, nil); !r.Empty() {
 			t.Errorf("asymmetric features on residents must not disqualify a node, got: %s", r.Message)
 		}
 	})
@@ -240,7 +298,7 @@ func TestDeclaredFeaturesAreDerivedNotListed(t *testing.T) {
 
 	declaring := mother.SmallNode("declaring",
 		mother.DeclaringFeature(restartallcontainers.RestartAllContainersOnContainerExits))
-	if ok, r := fit.CanFit(pod, declaring, fit.Allocatable(declaring), nil); !ok {
+	if ok, r := fit.CanFit(pod, declaring, fit.Allocatable(declaring), nil, nil); !ok {
 		t.Errorf("a node declaring the feature must be accepted, got: %s", r)
 	}
 
@@ -249,7 +307,7 @@ func TestDeclaredFeaturesAreDerivedNotListed(t *testing.T) {
 	// accepting it drains a node whose replacement is then refused by every
 	// node whose kubelet is too old — and the autoscaler adds one back.
 	silent := mother.SmallNode("silent")
-	ok, r := fit.CanFit(pod, silent, fit.Allocatable(silent), nil)
+	ok, r := fit.CanFit(pod, silent, fit.Allocatable(silent), nil, nil)
 	if ok {
 		t.Fatal("a node that has not declared the feature must be refused; the scheduler refuses it")
 	}
@@ -298,7 +356,7 @@ var modelled = map[string]string{
 	"NodeName":                  "UnsupportedPod refuses a template that pins one, since such a pod bypasses the scheduler",
 	"HostNetwork":               "UnsupportedPod refuses it: container ports become host ports with none written down",
 	"HostUsers":                 "with hostNetwork it implies a declared node feature, and hostNetwork itself is already refused",
-	"Affinity":                  "UnsupportedPod refuses required pod (anti-)affinity; CanFit evaluates required node affinity",
+	"Affinity":                  "UnsupportedPod refuses required pod (anti-)affinity; UnsupportedDestination reads other pods' required anti-affinity, by topology domain; CanFit evaluates required node affinity",
 	"SchedulerName":             "UnsupportedPod refuses any scheduler but the default, whose rules are the only ones binpack models",
 	"Tolerations":               "CanFit matches them against the node's taints, at the scheduler's own gate setting",
 	"Overhead":                  "EffectiveRequests includes it, as the scheduler reserves it",

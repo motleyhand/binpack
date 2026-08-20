@@ -85,6 +85,12 @@ func Simulate(
 ) Simulation {
 	byNode := indexPodsByNode(pods)
 
+	// Built from the whole cluster, once. A required anti-affinity term keyed
+	// on anything wider than the hostname rejects every node in its domain,
+	// and the node that holds the pod declaring it need not be one binpack is
+	// looking at — so the per-node question cannot compute this for itself.
+	domains := fit.NewAntiAffinityDomains(nodes, pods)
+
 	var sim Simulation
 	var toPlace []*corev1.Pod
 	// The running pod each replacement stands in for, so a report names an
@@ -148,7 +154,7 @@ func Simulate(
 	})
 
 	for _, pod := range toPlace {
-		placedOn, perNode := place(pod, destinations, remaining, residents)
+		placedOn, perNode := place(pod, destinations, remaining, residents, domains)
 		if placedOn == nil {
 			was := running[pod]
 			sim.Blocked = &Blocked{
@@ -186,6 +192,7 @@ func place(
 	destinations []*corev1.Node,
 	remaining map[string]corev1.ResourceList,
 	residents map[string][]*corev1.Pod,
+	domains fit.AntiAffinityDomains,
 ) (*corev1.Node, map[string]string) {
 	ordered := make([]*corev1.Node, len(destinations))
 	copy(ordered, destinations)
@@ -195,7 +202,7 @@ func place(
 
 	refusals := make(map[string]string, len(ordered))
 	for _, node := range ordered {
-		ok, reason := fit.CanFit(pod, node, remaining[node.Name], residents[node.Name])
+		ok, reason := fit.CanFit(pod, node, remaining[node.Name], residents[node.Name], domains)
 		if ok {
 			return node, nil
 		}
@@ -272,9 +279,17 @@ func checkHeadroom(
 	// unplaceable are dropped.
 	probe := sizeProbe(largest)
 
+	// No anti-affinity index, and that is the point of the parameter being
+	// absent rather than nil at the call site. sizeProbe rebuilds the spec to
+	// hold only size but copies ObjectMeta wholesale, so the probe still
+	// carries the largest workload's labels and namespace — and an index keyed
+	// on those reads it as that workload. One zone-scoped term matching the
+	// biggest thing in the cluster would then veto the margin on every node in
+	// the zone and report it as "no room", which is the failure this whole
+	// function's probe exists to avoid.
 	refusals := make(map[string]string, len(destinations))
 	for _, node := range destinations {
-		if ok, _ := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name]); ok {
+		if ok, _ := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name], nil); ok {
 			return nil
 		}
 		refusals[node.Name] = "no room for a pod the size of the largest relocatable one"
