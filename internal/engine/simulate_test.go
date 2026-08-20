@@ -498,6 +498,54 @@ func TestTheReserveDoesNotRefuseAClusterWithObviousRoom(t *testing.T) {
 	}
 }
 
+func TestTheReserveAsksAboutSizeNotAboutIdentity(t *testing.T) {
+	// The reserve is a margin — "leave room for something as big as your
+	// biggest workload" — and never a claim that one specific pod must be
+	// placeable. sizeProbe rebuilds the spec field by field to say so, but it
+	// copies ObjectMeta wholesale, so the probe still carries the largest
+	// workload's labels and namespace. Anything that matches on those reads
+	// the probe as that workload and answers a question the reserve is not
+	// asking.
+	//
+	// A cluster-wide anti-affinity index is exactly such a thing, and it fails
+	// far wider than a node-local check can: one zone-scoped term matching the
+	// biggest workload would veto the margin on every node in the zone and
+	// stop consolidation there, reported as "no room" on a cluster with 7Gi
+	// free.
+	const zone = corev1.LabelTopologyZone
+	inZone := mother.NodeLabels(map[string]string{zone: "z1"})
+	candidate := sized("candidate", "4Gi", inZone)
+	destination := sized("destination", "8Gi", inZone)
+	neighbour := sized("neighbour", "8Gi", inZone)
+
+	// The largest relocatable pod in the cluster, and so the shape the reserve
+	// probes with. It declares nothing itself; it is only labelled.
+	big := mother.Pod("default", "big", mother.OnNode("destination"),
+		mother.PodLabels(map[string]string{"app": "web"}), mother.Requests("100m", "512Mi"))
+	// The term covering the whole zone, declared by something else and — the
+	// point of the third node — sitting nowhere the destination's own resident
+	// list would reveal it. Only a cluster-wide index reaches it, so only the
+	// cluster-wide index can be what refuses.
+	db := mother.Pod("default", "db", mother.OnNode("neighbour"),
+		mother.Requests("100m", "128Mi"), mother.WithRequiredAntiAffinityAt(zone, "app", "web"))
+	// The pod actually being relocated, which the term cannot select.
+	small := mother.Pod("default", "small", mother.OnNode("candidate"),
+		mother.Requests("100m", "128Mi"))
+	pods := []*corev1.Pod{big, db, small}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination, neighbour}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if !sim.Feasible {
+		t.Errorf("the reserve refused a drain with ~7Gi free, because the probe "+
+			"inherited the labels of a workload something else has anti-affinity to: %s",
+			sim.Blocked.Summary)
+	}
+}
+
 func TestAdmissionInjectedContainersAreCarriedOntoTheReplacement(t *testing.T) {
 	// The template understates whenever admission mutates a pod on creation —
 	// a service-mesh sidecar from a webhook, requests filled in by a

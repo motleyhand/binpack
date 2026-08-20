@@ -171,7 +171,7 @@ func Simulate(
 	}
 
 	if cfg.ReserveForLargestPod {
-		if blocked := checkHeadroom(pods, templates, destinations, remaining, residents, domains, cfg); blocked != nil {
+		if blocked := checkHeadroom(pods, templates, destinations, remaining, residents, cfg); blocked != nil {
 			sim.Blocked = blocked
 			return sim
 		}
@@ -225,7 +225,6 @@ func checkHeadroom(
 	destinations []*corev1.Node,
 	remaining map[string]corev1.ResourceList,
 	residents map[string][]*corev1.Pod,
-	domains fit.AntiAffinityDomains,
 	cfg SimConfig,
 ) *Blocked {
 	// Sized as replacements, like every other placement question: this asks
@@ -280,9 +279,17 @@ func checkHeadroom(
 	// unplaceable are dropped.
 	probe := sizeProbe(largest)
 
+	// No anti-affinity index, and that is the point of the parameter being
+	// absent rather than nil at the call site. sizeProbe rebuilds the spec to
+	// hold only size but copies ObjectMeta wholesale, so the probe still
+	// carries the largest workload's labels and namespace — and an index keyed
+	// on those reads it as that workload. One zone-scoped term matching the
+	// biggest thing in the cluster would then veto the margin on every node in
+	// the zone and report it as "no room", which is the failure this whole
+	// function's probe exists to avoid.
 	refusals := make(map[string]string, len(destinations))
 	for _, node := range destinations {
-		if ok, _ := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name], domains); ok {
+		if ok, _ := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name], nil); ok {
 			return nil
 		}
 		refusals[node.Name] = "no room for a pod the size of the largest relocatable one"
