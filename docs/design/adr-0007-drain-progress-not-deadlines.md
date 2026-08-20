@@ -35,18 +35,37 @@ loop that resembles progress.
 A drain is abandoned when it stops making progress, not when a clock runs out. Any of these
 keeps it alive:
 
-1. An eviction request was accepted.
-2. The count of relocatable pods on the node decreased.
-3. A pod on the node acquired a `deletionTimestamp`.
-4. A pod on the node is terminating and still **within** its
+1. The count of relocatable pods on the node decreased.
+2. A pod on the node acquired a `deletionTimestamp`.
+3. A pod on the node is terminating and still **within** its
    `deletionTimestamp + terminationGracePeriodSeconds + slack`.
 
-The fourth is the important one, and it is a *state* rather than an event: while a pod is
+The third is the important one, and it is a *state* rather than an event: while a pod is
 legitimately shutting down, the stall clock does not run. A pod with an hour-long grace period
 therefore needs no configuration and no derived budget — it is visibly, checkably in the middle
 of doing what it was told to do.
 
-`stallTimeout` (default 10 minutes) governs only the absence of all four.
+`stallTimeout` (default 10 minutes) governs only the absence of all three.
+
+A fourth signal was listed here and has been withdrawn: *an eviction request was accepted*. It
+was the only one binpack produced rather than observed, and that is what disqualifies it. A
+keep-alive the controller emits itself can be emitted every interval for ever, so a bound resting
+on its absence is not a bound. The case that demonstrates it is a workload tolerating
+`node.kubernetes.io/unschedulable:NoSchedule`: the scheduler admits such a pod onto a cordoned
+node, so each replacement is placed back onto the node being drained, the population never falls,
+and the eviction stream restamps the marker for as long as the process runs. Nothing is lost by
+withdrawing it, because an eviction that achieves anything shows up as signal 1 or 3 on the next
+evaluation — and an eviction that achieves nothing is exactly what must not keep the drain alive.
+
+Signal 1 is measured against `drain-pods-remaining`, which makes that count a baseline rather
+than a report. It is therefore written the first time binpack looks at a drain as well as
+whenever progress is observed: a node comes out of the marking step carrying no count at all, and
+nothing can be fewer than a count that was never recorded. Gating the baseline on progress is
+circular, and the circle closes on the first eviction of every drain — leaving a node with more
+pods on it than `stallTimeout` has intervals to be abandoned mid-flight as stalled, having
+relocated every pod it was asked to. For the same reason the count follows progress rather than
+the live population: one that tracked every evaluation would read a population that rose and fell
+back as a fresh departure, which is the same clock reset arrived at more slowly.
 
 ### Stuck is detected, not inferred
 
@@ -101,7 +120,8 @@ binpack.motleyhand.com/drain-progress:       "2026-08-15T09:31:02Z"
 binpack.motleyhand.com/drain-pods-remaining: "4"
 ```
 
-`drain-progress` and `drain-pods-remaining` are updated whenever a progress signal is observed.
+`drain-progress` and `drain-pods-remaining` are updated whenever a progress signal is observed,
+and `drain-pods-remaining` is seeded on first sight of the drain, for the reason above.
 
 **Recovery reads live pod state first, and the annotation only as a fallback.** The annotation
 records when *binpack* last looked, not whether the cluster is making progress — and those come

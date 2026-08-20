@@ -409,7 +409,6 @@ the second.
 
 So `stallTimeout` bounds the **absence of progress**. Any of these keeps a drain alive:
 
-- an eviction request was accepted
 - the count of relocatable pods on the node decreased
 - a pod acquired a `deletionTimestamp`
 - a pod is terminating and still within `deletionTimestamp + terminationGracePeriodSeconds`
@@ -417,6 +416,12 @@ So `stallTimeout` bounds the **absence of progress**. Any of these keeps a drain
 
 The last is a state rather than an event, which is what makes long grace periods work without
 configuration: while a pod is legitimately shutting down, the stall clock does not run.
+
+Every one of them is something binpack observes about the node, rather than something binpack
+did. An accepted eviction was once on this list and is not any more: a keep-alive the controller
+emits itself can be emitted every interval for ever, so a bound resting on its absence does not
+bind — and a pod tolerating the cordon can be evicted straight back onto the node it was evicted
+from, which is that failure made real. See [ADR-0007](adr-0007-drain-progress-not-deadlines.md).
 
 Being stuck is then **detected**, not inferred. A pod still present past its termination
 deadline plus slack is not slow — the kubelet should have sent SIGKILL — so something is wrong:

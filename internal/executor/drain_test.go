@@ -2,6 +2,7 @@ package executor_test
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -432,6 +433,47 @@ func TestABoundReplacementLetsTheDrainProceed(t *testing.T) {
 	}
 }
 
+func TestAReplacementRescheduledOntoTheDrainingNodeIsNotLanded(t *testing.T) {
+	// Bound is not the same question as moved, and binpack was asking the
+	// wrong one. kube-scheduler admits a pod onto a cordoned node when the pod
+	// tolerates node.kubernetes.io/unschedulable:NoSchedule, so a workload
+	// carrying a blanket toleration can be evicted and placed straight back
+	// where it came from. Counting that as a landed replacement reads a pod
+	// that never left as a successful relocation, and evicts the next one on
+	// the strength of it — for ever, since the same thing happens to that one.
+	//
+	// The assertion is that nothing was evicted rather than that any
+	// particular step was returned: more than one answer is defensible here,
+	// and today it is the bounded wait the assessment already governs.
+	returned := mother.Pod("default", "returned",
+		mother.OnNode("a"),
+		mother.ControlledBy("ReplicaSet", "web-rs"),
+		mother.ToleratingEverything())
+	returned.CreationTimestamp.Time = at.Add(-30 * time.Second)
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), returned}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code == executor.StepEvicted {
+		t.Errorf("a replacement that came back to the draining node counted as a relocation: %+v",
+			step)
+	}
+
+	var left corev1.PodList
+	if err := c.List(context.Background(), &left); err != nil {
+		t.Fatalf("listing pods: %v", err)
+	}
+	if len(left.Items) != 2 {
+		t.Errorf("a second pod was evicted for a replacement that never left the node: "+
+			"%d of 2 remain", len(left.Items))
+	}
+}
+
 func TestAnEvictionRecordsWhatItIsWaitingFor(t *testing.T) {
 	pods := []*corev1.Pod{mother.Pod("default", "one", mother.OnNode("a"))}
 	s := snapshot([]*corev1.Node{marked("a", time.Minute, time.Minute, "1"), node("b")}, pods)
@@ -628,6 +670,265 @@ func TestAWaitForAReplacementCannotBeExtendedForEver(t *testing.T) {
 
 	t.Errorf("%d evaluations over twice the stall timeout and the drain is still waiting; "+
 		"the replacement never arrived and nothing ended it", rounds+1)
+}
+
+// returning builds a pod of a workload that tolerates every taint, the cordon's
+// included — so the scheduler is free to put its replacement straight back onto
+// the node being drained.
+func returning(name, owner string, created time.Time) *corev1.Pod {
+	p := mother.Pod("default", name,
+		mother.OnNode("a"),
+		mother.ControlledBy("ReplicaSet", owner),
+		mother.ToleratingEverything())
+	p.CreationTimestamp.Time = created
+	return p
+}
+
+// cluster rebuilds the snapshot from the cluster as the previous round left it,
+// so each evaluation reads what the last one actually wrote rather than a
+// fixture frozen before the drain started.
+func cluster(t *testing.T, c client.Client, now time.Time) engine.Snapshot {
+	t.Helper()
+	var nodes corev1.NodeList
+	if err := c.List(context.Background(), &nodes); err != nil {
+		t.Fatalf("listing nodes: %v", err)
+	}
+	var pods corev1.PodList
+	if err := c.List(context.Background(), &pods); err != nil {
+		t.Fatalf("listing pods: %v", err)
+	}
+
+	ns := make([]*corev1.Node, 0, len(nodes.Items))
+	for i := range nodes.Items {
+		ns = append(ns, &nodes.Items[i])
+	}
+	ps := make([]*corev1.Pod, 0, len(pods.Items))
+	for i := range pods.Items {
+		ps = append(ps, &pods.Items[i])
+	}
+
+	s := snapshot(ns, ps)
+	s.Now = now
+	s.Autoscaler.LastProbe = now.Add(-10 * time.Second)
+	return s
+}
+
+// drainRounds runs one evaluation a minute for as long as it takes, calling
+// left for each pod that goes so the caller can say what the cluster does about
+// it. It returns the round the drain reached an answer on and the step that
+// gave it, or -1 if it never did.
+//
+// A loop rather than a call, and this is not stylistic. Every question about a
+// bound is a question about a clock, and a clock that is reset once an interval
+// looks exactly like a clock that is running if you only ever look at it once.
+// The bound this file is about was shipped reachable and inert for that reason.
+func drainRounds(
+	t *testing.T, c client.Client, rounds int, left func(pod string, now time.Time),
+) (int, executor.Step) {
+	t.Helper()
+	for i := 0; i <= rounds; i++ {
+		round := cluster(t, c, at.Add(time.Duration(i)*time.Minute))
+		before := map[string]bool{}
+		for _, p := range round.Pods {
+			before[p.Name] = true
+		}
+
+		step, err := executor.Advance(
+			context.Background(), c, round, "a", engineConfig(), drainPolicy())
+		if err != nil {
+			t.Fatalf("Advance at +%dm: %v", i, err)
+		}
+		if step.Done || step.Code == executor.StepAwaitRemoval {
+			return i, step
+		}
+
+		var after corev1.PodList
+		if err := c.List(context.Background(), &after); err != nil {
+			t.Fatalf("listing pods at +%dm: %v", i, err)
+		}
+		for _, p := range after.Items {
+			delete(before, p.Name)
+		}
+		for name := range before {
+			left(name, round.Now)
+		}
+	}
+	return -1, executor.Step{}
+}
+
+func TestADrainWhosePodsKeepReturningIsEventuallyAbandoned(t *testing.T) {
+	// The case above says one returning pod is not a relocation. This says what
+	// has to happen when they keep returning: the node's population never
+	// falls, so the drain is achieving nothing and must end.
+	//
+	// It did not. Every round read the returned pod as a landed replacement,
+	// evicted another on the strength of it, and stamped progress on the way
+	// out — so the stall clock restarted every interval and one workload's
+	// lineage was evicted indefinitely, its neighbour never touched. The cost
+	// is not confined to this node either: the controller short-circuits every
+	// evaluation to a drain in flight, so a cluster with one wedged node
+	// consolidates nowhere.
+	owners := map[string]string{"w1": "w1-rs", "w2": "w2-rs"}
+	pods := []*corev1.Pod{
+		returning("w1", "w1-rs", at.Add(-time.Hour)),
+		returning("w2", "w2-rs", at.Add(-time.Hour)),
+	}
+	// Three recorded against two live, because record writes the count before
+	// the eviction it accompanies. That is the state every drain is in after
+	// its first eviction, and a fixture where the two agree is a state no drain
+	// is ever in.
+	s := snapshot([]*corev1.Node{marked("a", 20*time.Minute, time.Minute, "3"), node("b")}, pods)
+	c := clientFor(s)
+
+	round, step := drainRounds(t, c, 20, func(pod string, now time.Time) {
+		// The controller replaces the pod it lost, and the scheduler — which
+		// admits a pod tolerating the cordon onto a cordoned node — puts the
+		// replacement back where it came from.
+		owner := owners[pod]
+		back := returning(fmt.Sprintf("%s-%s", owner, now.Sub(at)), owner, now)
+		owners[back.Name] = owner
+		if err := c.Create(context.Background(), back); err != nil {
+			t.Fatalf("replacing %s: %v", pod, err)
+		}
+	})
+
+	// At +11m: one minute past the stall timeout, measured from the last time
+	// the node's population actually fell — round zero, where three recorded
+	// became two observed. Nothing after it moves a pod off the node, so the
+	// clock runs from there uninterrupted. A bound that fired earlier would be
+	// counting evictions rather than progress; one that never fires is the
+	// defect this test exists for.
+	if round != 11 || step.Code != drain.AbandonStalled {
+		t.Errorf("ended at +%dm with %+v; expected the stall bound at +11m", round, step)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the drain ended but left the node cordoned")
+	}
+}
+
+func TestANodeThatNeverGetsEmptierEndsTheDrain(t *testing.T) {
+	// The other way a node's population fails to fall, and the one the fix
+	// above does not cover: every replacement does relocate, so the drain is
+	// entitled to proceed to the next eviction — and pods of some other
+	// tolerating workload keep arriving to take their place.
+	//
+	// An accepted eviction was progress in its own right, which makes the stall
+	// bound unreachable here however correct it is: the eviction is an event,
+	// it happens every round, and it restamps the marker every round. Progress
+	// has to be read from the node's state, because state is the only kind of
+	// progress that cannot be manufactured by trying.
+	relocate := func(t *testing.T, c client.Client, gone string, now time.Time) {
+		t.Helper()
+		moved := mother.Pod("default", gone+"-r", mother.OnNode("b"),
+			mother.ControlledBy("ReplicaSet", gone+"-rs"))
+		moved.CreationTimestamp.Time = now
+		if err := c.Create(context.Background(), moved); err != nil {
+			t.Fatalf("relocating %s: %v", gone, err)
+		}
+	}
+	arrive := func(t *testing.T, c client.Client, now time.Time, n int) {
+		t.Helper()
+		for k := range n {
+			name := fmt.Sprintf("arrival-%d-%d", int(now.Sub(at).Minutes()), k)
+			if err := c.Create(context.Background(), returning(name, name+"-rs", now)); err != nil {
+				t.Fatalf("scheduling %s onto the draining node: %v", name, err)
+			}
+		}
+	}
+
+	for _, tc := range []struct {
+		name string
+		fill func(t *testing.T, c client.Client, gone string, now time.Time)
+	}{
+		{
+			// The population holds exactly still.
+			name: "one arrives for each that leaves",
+			fill: func(t *testing.T, c client.Client, gone string, now time.Time) {
+				relocate(t, c, gone, now)
+				arrive(t, c, now, 1)
+			},
+		},
+		{
+			// The same thing less tidily, and worth its own case because it
+			// defeats the obvious repair. A count that simply followed the live
+			// population would read every fall back to two as a fresh
+			// departure, and refresh the stall clock on it — half as often as
+			// an eviction did, and just as endlessly.
+			name: "they arrive in pairs and leave again",
+			fill: func(t *testing.T, c client.Client, gone string, now time.Time) {
+				relocate(t, c, gone, now)
+				if int(now.Sub(at).Minutes())%2 == 0 {
+					arrive(t, c, now, 2)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pods := []*corev1.Pod{
+				returning("w1", "w1-rs", at.Add(-time.Hour)),
+				returning("w2", "w2-rs", at.Add(-time.Hour)),
+			}
+			s := snapshot(
+				[]*corev1.Node{marked("a", 20*time.Minute, time.Minute, "3"), node("b")}, pods)
+			c := clientFor(s)
+
+			round, step := drainRounds(t, c, 20, func(gone string, now time.Time) {
+				tc.fill(t, c, gone, now)
+			})
+
+			if round != 11 || step.Code != drain.AbandonStalled {
+				t.Errorf("ended at +%dm with %+v; expected the stall bound at +11m, since the "+
+					"node has emptied by not one pod in that time", round, step)
+			}
+		})
+	}
+}
+
+func TestADrainLongerThanTheStallTimeoutIsNotAbandonedWhileItIsWorking(t *testing.T) {
+	// The other half of the bound, and the half that is easy to break while
+	// tightening the first. A node with more pods on it than the stall timeout
+	// has intervals takes longer than the stall timeout to drain — and must not
+	// be abandoned for that, because it is working the whole time.
+	//
+	// What makes it work is the recorded population, and that is a baseline
+	// rather than a claim: `fewer` is the live count measured against it, so a
+	// drain that never records one can never detect the fall it is waiting for.
+	// Recording it only once progress has been seen is circular, and the circle
+	// closes on the first eviction of every drain, since a node comes out of
+	// Begin carrying no count at all. This drain relocates a pod a minute and
+	// every replacement lands elsewhere; nothing about it is stalled.
+	var pods []*corev1.Pod
+	for i := range 15 {
+		pods = append(pods, mother.Pod("default", fmt.Sprintf("p%02d", i), mother.OnNode("a")))
+	}
+	// No pods-remaining marker, because Begin writes none: it records when the
+	// drain started and that it is progressing, and the count arrives with the
+	// first evaluation that looks at the node.
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, 0, ""), node("b")}, pods)
+	c := clientFor(s)
+
+	round, step := drainRounds(t, c, 3*len(pods), func(pod string, now time.Time) {
+		// Scheduled somewhere else, which is what a relocation is, and gone
+		// from this node inside the interval — the ordinary case, since
+		// terminationGracePeriodSeconds defaults to well under a minute.
+		moved := mother.Pod("default", pod+"-r", mother.OnNode("b"),
+			mother.ControlledBy("ReplicaSet", pod+"-rs"))
+		moved.CreationTimestamp.Time = now
+		if err := c.Create(context.Background(), moved); err != nil {
+			t.Fatalf("relocating %s: %v", pod, err)
+		}
+	})
+
+	if step.Failed {
+		t.Fatalf("a drain that had relocated a pod a minute was abandoned at +%dm: %+v",
+			round, step)
+	}
+	// One pod an evaluation, so the fifteenth evaluation is the one that finds
+	// the node empty.
+	if round != len(pods) || step.Code != executor.StepAwaitRemoval {
+		t.Errorf("ended at +%dm with %+v; expected an empty node at +%dm",
+			round, step, len(pods))
+	}
 }
 
 func TestACompletedPodIsNotAnInFlightEviction(t *testing.T) {
