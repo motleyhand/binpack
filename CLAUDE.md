@@ -126,9 +126,14 @@ and adds RuntimeClass `spec.overhead`. Use `k8s.io/component-helpers/resource.Po
 matched by *two* PDBs can never be evicted at all — the eviction subresource returns HTTP 500,
 not a retryable 429.
 
-**What binpack understands is an allowlist, never a denylist** — and it applies to pods on
-*destination* nodes too, not just relocating pods, because inter-pod affinity is symmetric. See
-[ADR-0006](docs/design/adr-0006-scheduler-fidelity.md).
+**What binpack understands is an allowlist, never a denylist** — and it applies to pods other
+than the one being placed, not just relocating pods, because inter-pod affinity is symmetric.
+**That symmetric direction is not node-local.** The scheduler counts matching anti-affinity
+across the whole topology domain a term names, so a zone-keyed term rejects every node in the
+zone, not only the one hosting the pod that declared it. Reading a candidate's own residents is
+the `kubernetes.io/hostname` special case mistaken for the general rule, and it errs by
+accepting — which is why `fit` is handed an index of the cluster's terms by domain rather than
+computing the answer per node. See [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md).
 
 **Every drain branch must end with the node deleted or uncordoned**, and the recovery state
 lives in node annotations rather than process memory. The failure an in-memory timer guards

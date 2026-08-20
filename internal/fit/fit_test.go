@@ -156,7 +156,7 @@ func TestCanFit(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			ok, reason := fit.CanFit(tc.pod, tc.node, free(tc.node), tc.residents)
+			ok, reason := fit.CanFit(tc.pod, tc.node, free(tc.node), tc.residents, nil)
 
 			if ok != tc.wantFit {
 				t.Fatalf("CanFit = %t (%s), want %t", ok, reason.Message, tc.wantFit)
@@ -184,7 +184,7 @@ func TestBoundPodCanBePlacedElsewhere(t *testing.T) {
 	pod := mother.Pod("default", "web")
 	destination := mother.SmallNode("node-b")
 
-	ok, reason := fit.CanFit(pod, destination, free(destination), nil)
+	ok, reason := fit.CanFit(pod, destination, free(destination), nil, nil)
 	if !ok {
 		t.Fatalf("a bound pod must be placeable on another node, got refusal: %s", reason.Message)
 	}
@@ -199,7 +199,7 @@ func TestPodCountIsAResource(t *testing.T) {
 	remaining[corev1.ResourcePods] = *resource.NewQuantity(0, resource.DecimalSI)
 
 	pod := mother.Pod("default", "web")
-	ok, reason := fit.CanFit(pod, node, remaining, nil)
+	ok, reason := fit.CanFit(pod, node, remaining, nil, nil)
 
 	if ok {
 		t.Fatal("a node with no pod slots left must refuse, however much CPU and memory it has")
@@ -267,7 +267,7 @@ func TestSubtractMatchesCanFit(t *testing.T) {
 
 	placed := 0
 	for {
-		ok, _ := fit.CanFit(pod, node, remaining, nil)
+		ok, _ := fit.CanFit(pod, node, remaining, nil, nil)
 		if !ok {
 			break
 		}

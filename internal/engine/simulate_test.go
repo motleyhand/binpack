@@ -846,6 +846,18 @@ func TestPreferencesAreNotConstraints(t *testing.T) {
 	candidate, destination := mother.LargeNode("candidate"), mother.LargeNode("destination")
 	pod := mother.Pod("default", "web", mother.OnNode("candidate"))
 	pod.Spec.Affinity = &corev1.Affinity{
+		// Both halves. A preferred-only PodAffinity is what a pod asking to
+		// sit near a cache carries, and reading it as a required term would
+		// make that pod permanently unrelocatable with nothing going red.
+		PodAffinity: &corev1.PodAffinity{
+			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
+				Weight: 100,
+				PodAffinityTerm: corev1.PodAffinityTerm{
+					TopologyKey:   corev1.LabelHostname,
+					LabelSelector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "cache"}},
+				},
+			}},
+		},
 		PodAntiAffinity: &corev1.PodAntiAffinity{
 			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.WeightedPodAffinityTerm{{
 				Weight: 100,
@@ -870,6 +882,40 @@ func TestPreferencesAreNotConstraints(t *testing.T) {
 
 	if !sim.Feasible {
 		t.Errorf("refused over a preference that cannot filter: %s", sim.Blocked.Summary)
+	}
+}
+
+func TestAZoneAntiAffinityRefusesEveryNodeInTheZone(t *testing.T) {
+	// The scheduler counts the pods declaring required anti-affinity across
+	// the whole domain a term names, so a zone-keyed term rejects every node
+	// in that zone — one holding no matching pod included. Asking each
+	// candidate about its own residents asks a narrower question and gets it
+	// wrong in the accepting direction, which is the direction that costs:
+	// binpack evicts, and the replacement goes Pending in the zone it was
+	// sent to.
+	//
+	// The domain view is built in Simulate and handed down, so this is also
+	// what fails if a later refactor stops passing it: internal/fit's own
+	// tests would stay green while the simulation went back to being blind.
+	const zone = corev1.LabelTopologyZone
+	inZone := mother.NodeLabels(map[string]string{zone: "z1"})
+	candidate := mother.LargeNode("candidate")
+	guarded, bare := mother.LargeNode("guarded", inZone), mother.LargeNode("bare", inZone)
+
+	web := mother.Pod("default", "web", mother.OnNode("candidate"),
+		mother.PodLabels(map[string]string{"app": "web"}))
+	db := mother.Pod("default", "db", mother.OnNode("guarded"),
+		mother.WithRequiredAntiAffinityAt(zone, "app", "web"))
+	pods := []*corev1.Pod{web, db}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, guarded, bare}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("accepted a destination in a zone whose anti-affinity rejects the replacement")
+	}
+	if got := sim.Blocked.PerNode["bare"]; !strings.Contains(got, zone+"=z1") {
+		t.Errorf("the empty node in the zone should be refused for the domain it is in, got: %q", got)
 	}
 }
 

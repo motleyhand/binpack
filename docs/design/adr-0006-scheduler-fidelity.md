@@ -269,9 +269,34 @@ template is the only answer.
 
 The allowlist is applied to **both** the pods being relocated and the pods already resident on
 each prospective destination. Inter-pod affinity is symmetric: the scheduler rejects an incoming
-pod if a pod already on that node declares required anti-affinity matching it. A relocating pod
-using nothing but allowlisted features can therefore still be refused by a destination, and
-checking only the relocating side would let exactly that case through.
+pod when another pod declares required anti-affinity matching it and sits in the same topology
+domain. A relocating pod using nothing but allowlisted features can therefore still be refused by
+a destination, and checking only the relocating side would let exactly that case through.
+
+**The domain is the node only at `kubernetes.io/hostname`.** This paragraph originally read "a pod
+already on that node", which is that special case stated as the general rule. What upstream does
+is build a cluster-wide (topologyKey, topologyValue) → count map over every node hosting a pod
+with required anti-affinity, and then check the candidate node's own labels against it
+(`interpodaffinity`'s `getExistingAntiAffinityCounts` and `satisfyExistingPodsAntiAffinity`). A
+term keyed on `topology.kubernetes.io/zone` — the ordinary way to keep replicas of one workload
+in separate zones, on a label every managed provider sets — therefore rejects every node in that
+zone, including nodes hosting no matching pod of their own. Asking each candidate node about its
+own residents asks a narrower question and gets it wrong in the accepting direction: binpack
+approves a destination that will refuse the replacement, and the eviction has already happened.
+
+So `internal/fit` indexes those terms the way the scheduler indexes them.
+`NewAntiAffinityDomains` is built once per simulation from the nodes and pods the engine already
+holds, and passed down to `CanFit`. It has to be, because the question cannot be answered from
+one node: the pod declaring the term need not be on any node the current placement is looking at.
+The blunt alternative — refuse every destination whose domain binpack cannot survey — is sound
+and useless, since every node in a cloud cluster carries a zone label and consolidation would
+stop everywhere.
+
+Widening what `CanFit` takes is a deliberate move and it stays inside ADR-0008's rule: the index
+is built from Kubernetes API objects passed as data, holds no client, does no I/O, and can be
+written in a test literal. An empty index is a legitimate value meaning the caller has no view
+wider than the node in front of it — which is what the differential harness, whose oracle also
+models a single node, necessarily passes.
 
 The soft counterparts of these constraints — `preferredDuringSchedulingIgnoredDuringExecution`,
 `whenUnsatisfiable: ScheduleAnyway` — are ignored rather than refused, because they affect only

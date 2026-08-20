@@ -75,11 +75,22 @@ const (
 // residents are the pods already on node. They matter because inter-pod
 // anti-affinity is symmetric: a pod that is already there can reject an
 // incoming one.
-func CanFit(pod *corev1.Pod, node *corev1.Node, remaining corev1.ResourceList, residents []*corev1.Pod) (bool, Reason) {
+//
+// domains carries that same symmetry the rest of the way, since a term keyed
+// on anything wider than the hostname rejects nodes that host no matching pod
+// at all. Build it with [NewAntiAffinityDomains] from the cluster the caller
+// holds. An empty one is honest but blind — see [UnsupportedDestination].
+func CanFit(
+	pod *corev1.Pod,
+	node *corev1.Node,
+	remaining corev1.ResourceList,
+	residents []*corev1.Pod,
+	domains AntiAffinityDomains,
+) (bool, Reason) {
 	if r := UnsupportedPod(pod); !r.Empty() {
 		return false, r
 	}
-	if r := UnsupportedDestination(pod, node, residents); !r.Empty() {
+	if r := UnsupportedDestination(pod, node, residents, domains); !r.Empty() {
 		return false, r
 	}
 
