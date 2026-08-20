@@ -202,10 +202,11 @@ and affinity, `corev1` for taints — and called directly by the engine. Hand-ro
 the defects above arose in the first place.
 
 What binpack understands is a **closed allowlist**, never a list of known exceptions. Stage 1
-models `NodeUnschedulable`, `NodeName`, `NodeAffinity` and `nodeSelector`, `NodeResourcesFit`
-and `TaintToleration`. Anything outside that set — a `hostPort`, a persistent volume claim,
-required inter-pod affinity, hard topology spread, a custom scheduler — makes the node an
-invalid candidate, with the specific feature named as the reason.
+models `NodeUnschedulable`, `NodeName`, `NodeAffinity` and `nodeSelector`, `NodeResourcesFit`,
+`TaintToleration` and `NodeDeclaredFeatures`. Anything outside that set — a `hostPort`, a
+persistent volume claim, required inter-pod affinity, hard topology spread, a custom scheduler,
+a scheduling group — makes the node an invalid candidate, with the specific feature named as the
+reason.
 
 The direction matters: a denylist of constraints we remembered can never be complete, and every
 Kubernetes release lengthens it. An unrecognised feature must refuse by default. Soft
@@ -221,6 +222,13 @@ allowlisted features can still be refused by a destination it knows nothing abou
 So a destination is disqualified if any pod on it uses a feature outside the allowlist, exactly
 as a relocating pod is. Checking only one side would let precisely this case through and leave
 the replacement Pending.
+
+There is a second kind of both-directions constraint, and it belongs to neither side alone: a
+pod can require a *capability of the destination's kubelet*. Since 1.36 the scheduler refuses
+any node that has not published, in `status.declaredFeatures`, a feature the pod's spec implies.
+binpack asks the same question of the same library the scheduler asks it of, rather than
+recognising the shapes that imply a feature today — a list of those is a list that goes stale in
+the accepting direction.
 
 Every gap in the model must fail towards refusing to drain, and `internal/fit` is tested
 against a real `kube-scheduler` with a one-directional property: if binpack says a pod fits, the

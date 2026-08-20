@@ -12,6 +12,7 @@
 package mother
 
 import (
+	"slices"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -147,6 +148,21 @@ func InPool(name, id string) NodeOption {
 		"doks.digitalocean.com/node-pool":    name,
 		"doks.digitalocean.com/node-pool-id": id,
 	})
+}
+
+// DeclaringFeature publishes a feature in the node's status.declaredFeatures,
+// as a kubelet does for each feature it implements.
+//
+// The list is kept sorted, because that is what the kubelet writes and what
+// upstream's reader assumes: MatchNode merge-joins the node's list against its
+// registry, so an out-of-order entry is silently dropped rather than rejected.
+// A fixture that skipped the sort would model a node no kubelet produces, and
+// would quietly answer "feature absent" for a feature it had just declared.
+func DeclaringFeature(name string) NodeOption {
+	return func(n *corev1.Node) {
+		n.Status.DeclaredFeatures = append(n.Status.DeclaredFeatures, name)
+		slices.Sort(n.Status.DeclaredFeatures)
+	}
 }
 
 // Pod is the base archetype: an ordinary Deployment-owned workload with modest
@@ -724,6 +740,44 @@ func Gated(name string) PodOption {
 	return func(p *corev1.Pod) {
 		p.Spec.SchedulingGates = append(p.Spec.SchedulingGates,
 			corev1.PodSchedulingGate{Name: name})
+	}
+}
+
+// WithRestartAllContainersRule gives the pod's first container a rule that
+// restarts every container in the pod when that one exits.
+//
+// This is the shape that makes a pod's placement depend on what its node can
+// do rather than on what it asks for: the scheduler requires the destination
+// kubelet to have declared RestartAllContainersOnContainerExits before it will
+// place such a pod there.
+//
+// The two companions of the action are set because the API server requires
+// them — a container carrying rules must state its own restartPolicy, and
+// every rule must name the exit codes it applies to. A fixture missing either
+// is a pod no cluster ever accepted, and one binpack would never meet.
+func WithRestartAllContainersRule() PodOption {
+	return func(p *corev1.Pod) {
+		c := &p.Spec.Containers[0]
+		c.RestartPolicy = ptr(corev1.ContainerRestartPolicyOnFailure)
+		c.RestartPolicyRules = append(c.RestartPolicyRules, corev1.ContainerRestartRule{
+			Action: corev1.ContainerRestartRuleActionRestartAllContainers,
+			ExitCodes: &corev1.ContainerRestartRuleOnExitCodes{
+				Operator: corev1.ContainerRestartRuleOnExitCodesOpIn,
+				Values:   []int32{42},
+			},
+		})
+	}
+}
+
+// InSchedulingGroup puts the pod in a gang, whose group policy decides when
+// the whole group may be admitted.
+//
+// Such a pod is not an independently schedulable object: it waits at the
+// scheduler's Permit phase until its group can be placed together, so a
+// single-pod placement proved for it means nothing.
+func InSchedulingGroup(name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.SchedulingGroup = &corev1.PodSchedulingGroup{PodGroupName: ptr(name)}
 	}
 }
 

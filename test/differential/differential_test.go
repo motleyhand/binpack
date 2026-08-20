@@ -11,6 +11,7 @@ import (
 	apiruntime "k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes/fake"
+	"k8s.io/component-helpers/nodedeclaredfeatures/features/restartallcontainers"
 	fwk "k8s.io/kube-scheduler/framework"
 	"k8s.io/kubernetes/pkg/scheduler/apis/config/latest"
 	"k8s.io/kubernetes/pkg/scheduler/backend/cache"
@@ -170,6 +171,29 @@ func TestMirrorsUnitCases(t *testing.T) {
 				mother.WithOverhead("50m", "256Mi")),
 			mother.SmallNode("n"),
 			nil, false,
+		},
+		{
+			// The pod requires something of the node's kubelet rather than of
+			// its capacity: a RestartAllContainers restart rule needs the
+			// destination to have published RestartAllContainersOnContainerExits
+			// in status.declaredFeatures. An ordinary node fixture declares
+			// nothing, which is what a node running an older kubelet — or one
+			// with the gate off — looks like.
+			"undeclared node feature",
+			mother.Pod("default", "web", mother.WithRestartAllContainersRule()),
+			mother.SmallNode("n"),
+			nil, false,
+		},
+		{
+			// The same pod on a node that has declared it. Paired with the row
+			// above so the refusal is shown to be about the feature and not
+			// about restart rules in general — a blanket refusal would satisfy
+			// the first row and cost every such workload its relocations.
+			"declared node feature",
+			mother.Pod("default", "web", mother.WithRestartAllContainersRule()),
+			mother.SmallNode("n", mother.DeclaringFeature(
+				restartallcontainers.RestartAllContainersOnContainerExits)),
+			nil, true,
 		},
 		{
 			// 1360Mi node, 1000Mi resident, 600Mi candidate.
