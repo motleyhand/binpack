@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -208,6 +209,57 @@ func Advance(
 		return Step{Code: StepCordoned,
 			Reason: "the node carried a drain marker but was not cordoned"}, nil
 
+	case pausable(a.Blockers):
+		// A refusal that will lift on its own, so the drain waits for it
+		// instead of ending over it.
+		//
+		// The blockers are right, and they are right at selection too: a
+		// candidate whose pods cannot be evicted is not a candidate. What
+		// differs here is the price of agreeing. Refusing a candidate costs
+		// nothing — there are other nodes, and the next evaluation is sixty
+		// seconds away. Ending a drain that has already relocated pods keeps
+		// every one of those relocations, buys nothing with them, files thirty
+		// minutes of backoff against a node that did nothing wrong, and leaves
+		// on it an explanation that has stopped being true. A budget waiting
+		// for its own controller resolves in one disruption-controller sync;
+		// nothing about it survives to the interval that would have retried.
+		//
+		// A replacement the scheduler has already refused outranks the pause,
+		// and it is the one thing that does. Every other non-drainable verdict
+		// uncordons, so before this branch existed a refused replacement got
+		// its node back whatever else was wrong with the drain; pausing is the
+		// first verdict that keeps the cordon, and the cordon is precisely
+		// what that pod is waiting for — uncordoning is its repair, as the
+		// awaiting block below says. Holding it down until a budget catches up
+		// trades a Pending workload for a consolidation, which is the wrong
+		// way round, and the trade lasts until the stall timeout if the thing
+		// that is broken is the disruption controller itself.
+		//
+		// Ahead of the assessment's abandonment for the reason the assessment
+		// is always ranked behind a named cause: "the replacement could not be
+		// scheduled" tells an operator where to look, and "nothing has moved
+		// for eleven minutes" is the same node with the reason filed off. The
+		// awaiting block orders these two the same way.
+		if pod, ok := refusedReplacement(s, name, a.Node); ok {
+			return Abandon(ctx, w, a.Node,
+				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now)
+		}
+		// Bounded by the same thing every other wait is bounded by, and
+		// checked before the wait rather than after it, because a pause that
+		// nothing ends is the failure this branch can introduce. If the
+		// blocker turns out to be durable after all, the node stops getting
+		// emptier, the assessment says so, and the drain ends as stalled.
+		if assessment.Action == drain.Abandon {
+			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+		}
+		// Recorded like every other wait: record moves the progress marker
+		// only where the assessment saw progress, so pausing cannot hold the
+		// stall clock at zero for as long as the pause lasts.
+		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
+			return Step{}, err
+		}
+		return Step{Code: StepWaiting, Reason: a.Blockers[0].Message}, nil
+
 	case a.Verdict() != engine.VerdictDrainable:
 		// The cluster moved underneath the drain. Nothing here distinguishes
 		// a drain that has evicted nothing from one that is half done: both
@@ -241,9 +293,8 @@ func Advance(
 			// Unschedulable — so this is detected rather than inferred from a
 			// timeout, and it names the pod. Uncordoning is also the repair:
 			// this node is where that pod can go.
-			return Abandon(ctx, w, a.Node, drain.AbandonUnschedulable, fmt.Sprintf(
-				"pod %s/%s could not be scheduled after moving off this node",
-				pod.Namespace, pod.Name), s.Now)
+			return Abandon(ctx, w, a.Node,
+				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now)
 
 		case awaited:
 			// Bounded, because having a controller does not mean the
@@ -370,6 +421,30 @@ func Advance(
 	}
 
 	if err := Evict(ctx, w, next); err != nil {
+		// A refusal nothing can lift, which today means one pod covered by two
+		// disruption budgets: the eviction subresource declines to arbitrate
+		// between them and answers 500 rather than a retryable 429. No amount
+		// of waiting changes that, and binpack cannot fix it either — the
+		// budgets are somebody else's objects.
+		//
+		// Reached only as a race, because CheckEvictable refuses such a
+		// candidate before anything is cordoned; the second budget has to
+		// appear between the assessment and the eviction. Returning the error
+		// instead ends the evaluation — every write failure here does, today —
+		// and leaves a cordoned node carrying no record of why, until a later
+		// evaluation reaches this same answer through revalidation. The node
+		// recovers either way. What it costs is the recorded reason, which is
+		// the only thing on the node that tells an operator what happened.
+		//
+		// Under that same later route's code, deliberately. A drain stopped by
+		// a blocker reports the verdict, since a blocked node carries no skip
+		// code, and reaching the conclusion an interval earlier should not
+		// move which series counts it.
+		if errors.Is(err, ErrEvictionImpossible) {
+			return Abandon(ctx, w, a.Node, engine.VerdictBlocked, fmt.Sprintf(
+				"the eviction API refuses %s/%s outright, and will refuse it again on every retry",
+				next.Namespace, next.Name), s.Now)
+		}
 		return Step{}, err
 	}
 
@@ -481,6 +556,26 @@ func record(
 		return nil
 	}
 	return Annotate(ctx, w, node, markers)
+}
+
+// pausable reports whether every reason this drain cannot proceed is one that
+// lifts without anybody acting, so waiting is the right answer rather than
+// handing the node back.
+//
+// Every one, not any: a single durable blocker means the drain is over
+// whatever else is true, and a node held cordoned waiting for a condition that
+// has already resolved alongside one that never will is the worst of both.
+//
+// An empty list is not pausable. It is not a pause at all — it is a drainable
+// node, or one stopped for a reason that is not a blocker — and answering true
+// here would put this branch in front of the verdict it does not speak for.
+func pausable(blockers []engine.EvictionBlocker) bool {
+	for _, b := range blockers {
+		if !b.Transient {
+			return false
+		}
+	}
+	return len(blockers) > 0
 }
 
 func podsOn(s engine.Snapshot, name string) []*corev1.Pod {
@@ -655,6 +750,33 @@ func replacementFor(
 		return landed, landedPod
 	}
 	return awaited, pendingPod
+}
+
+// refusedReplacement reports the pod this drain awaits when the scheduler has
+// definitively refused it, and nothing otherwise.
+//
+// A narrow reading of the awaiting block below, for the one caller that has to
+// ask the question before that block is reached. Kept to the refused state on
+// purpose: "awaited" and "landed" both mean the drain should carry on doing
+// whatever it was doing, and only a refusal is a fact that outranks another
+// branch's answer.
+func refusedReplacement(s engine.Snapshot, name string, node *corev1.Node) (*corev1.Pod, bool) {
+	owner, since, ok := awaiting(node)
+	if !ok {
+		return nil, false
+	}
+	if state, pod := replacementFor(s, name, owner, since); state == refused {
+		return pod, true
+	}
+	return nil, false
+}
+
+// unschedulableReason renders a refused replacement, in one place because two
+// branches now report it and a drain's recorded failure is what an operator
+// reads to find out what happened.
+func unschedulableReason(pod *corev1.Pod) string {
+	return fmt.Sprintf("pod %s/%s could not be scheduled after moving off this node",
+		pod.Namespace, pod.Name)
 }
 
 // awaitingMarker records which controller owes this drain a pod, so the next

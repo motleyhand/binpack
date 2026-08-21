@@ -149,6 +149,18 @@ unsound are re-asked directly on every evaluation.
 [ADR-0010](../design/adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md) has the
 reasoning. On `binpack_nodes_skipped` both codes are unchanged.
 
+`blocked` moves in both directions here, and the two halves are worth reading apart. It no
+longer fires for a budget whose controller has not caught up with its spec — `observedGeneration`
+behind `generation`, which the eviction API refuses outright whatever the recorded allowance
+says. The disruption controller resyncs on the very write that bumped the generation, so that
+condition lasts one sync; a drain in flight now waits for it instead of ending over it, bounded
+by `stallTimeout` like every other wait. It does now fire for the eviction API refusing a pod
+outright at the moment of eviction — a pod covered by two budgets, created between the
+assessment and the eviction. That case previously ended the evaluation instead, leaving a
+cordoned node with no recorded reason until a later evaluation reached this same code through
+revalidation. On `binpack_nodes{verdict="blocked"}` nothing changes:
+at selection a blocker of any kind still rules a candidate out, where refusing costs nothing.
+
 Every one of these has a series from startup, at zero. A counter that only appears once it has
 fired makes a `rate()` alert silently useless until the first occurrence.
 

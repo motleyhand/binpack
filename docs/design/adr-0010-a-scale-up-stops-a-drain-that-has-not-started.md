@@ -2,7 +2,10 @@
 
 - **Status:** accepted. Supersedes the soundness list in
   [ADR-0009](adr-0009-revalidation-asks-soundness-not-preference.md): "has a scale-up started"
-  moves from Soundness to Preference. Everything else in ADR-0009 stands.
+  moves from Soundness to Preference. Everything else in ADR-0009 stands. Amended since, not
+  superseded: the soundness list below is qualified by
+  [a blocker that has not been computed yet is not an answer](#a-blocker-that-has-not-been-computed-yet-is-not-an-answer),
+  which says what stopping means for a refusal that lifts on its own.
 - **Date:** 2026-08-21
 
 ## Context
@@ -89,6 +92,42 @@ remaining pods fit" against the current node set, the evictability check re-answ
 disruption budgets, and the autoscaler's own published status re-answers whether anything will
 ever remove this node. Abandoning on a scale-up added no safety on top of those. It only threw
 away work.
+
+### A blocker that has not been computed yet is not an answer
+
+Amended after the fact, and it qualifies the soundness list above rather than moving anything
+out of it. "Are they still evictable" stays a soundness question, re-asked before every eviction,
+and a drain whose remaining pods cannot be evicted still stops. What the list did not say is what
+*stopping* should mean, and the answer is not the same for every blocker.
+
+A PodDisruptionBudget whose `status.observedGeneration` is behind its `metadata.generation` has
+not been recomputed by the disruption controller yet. The eviction subresource refuses outright
+in that state, whatever `disruptionsAllowed` says, so binpack refuses too — but the refusal is
+"binpack is looking at this budget between the write and the recomputation", not "this
+application cannot spare a replica". The controller resyncs on the very update that bumped the
+generation, so the condition lasts one sync, while the response to it lasted thirty minutes of
+backoff on a node that had already relocated pods. That is the same trade ADR-0009 draws for
+preferences, arrived at from the other side: the check is right, and destroying a committed drain
+is the wrong thing to do with the answer.
+
+So a blocker that lifts without anybody acting **pauses** the drain — no eviction this evaluation,
+and the drain assessment decides what happens next. Nothing new bounds it: if the blocker turns
+out to be durable the node stops getting emptier, and `stallTimeout` ends the drain exactly as it
+ends any other absence of progress.
+
+The set is one member wide and the asymmetry is why. Waiting for a blocker that really does lift
+costs one evaluation. Classing a durable blocker transient converts an abandonment that is
+immediate and names its cause into a cordoned node that ends eleven minutes later reporting "no
+progress" — the same outcome, later, described worse. `pdb-insufficient` is therefore *not*
+transient, though it often resolves: a budget at `minAvailable: 100%` never has slack, and
+nothing in the object distinguishes the two.
+
+The mirror holds too, and it was the same reasoning run backwards. A refusal nothing can lift —
+the eviction API's HTTP 500 for a pod covered by two budgets, which it returns because it will
+not arbitrate between them — now ends the drain at the eviction, rather than travelling out of the
+executor as an error and leaving a cordoned node carrying no record of why until a later
+evaluation reaches the same conclusion through revalidation. It ends under that same later
+route's reason code, so arriving sooner does not move which series counts it.
 
 ### Why `pool-at-minimum` does not move with it
 
