@@ -34,7 +34,7 @@ const (
 	// drain is waiting to see bound, as "<owner UID>@<RFC3339>". Evicting the
 	// next pod before this one has landed would put two replacements in
 	// flight against a simulation that assumed one. Or AwaitingSettled, when
-	// the drain has evicted something and is owed no replacement for it.
+	// the drain has committed to an eviction and is owed no replacement for it.
 	AnnotationDrainAwaiting = "binpack.motleyhand.com/drain-awaiting"
 
 	// Backoff markers, recorded when a drain is abandoned.
@@ -43,9 +43,17 @@ const (
 	AnnotationLastFailure   = "binpack.motleyhand.com/last-failure"
 )
 
-// AwaitingSettled is what [AnnotationDrainAwaiting] carries when a drain has
-// evicted a pod and is owed no replacement for it: the replacement has already
-// landed, or the pod was expendable and the simulation never placed one.
+// AwaitingSettled is what [AnnotationDrainAwaiting] carries when a drain owes
+// itself no replacement: the previous one has already landed, the pod evicted
+// was expendable and the simulation never placed one, or the eviction that will
+// owe one has been committed to but not yet attempted.
+//
+// That last is why the sentinel is written before the eviction rather than
+// after it. A marker written afterwards is lost by exactly the failures it
+// exists to survive, and the eviction is not lost with it; a marker naming a
+// controller cannot go first, because it claims a replacement is owed and an
+// eviction refused after the write would leave the drain waiting out its stall
+// timeout for a pod nobody was going to create.
 //
 // A third state in what began as a two-state annotation, because the two
 // obvious spellings of "nothing owed" are both wrong. Absent means the drain
@@ -557,15 +565,21 @@ func outcomeCode(assessments []NodeAssessment) string {
 	return CodeNoCandidates
 }
 
-// committedDrain reports whether the drain on this node has already evicted
-// something.
+// committedDrain reports whether the drain on this node has begun disrupting
+// workload.
 //
 // Read from the node rather than passed in, so nothing can disagree with the
-// node about what has already happened: the marker is written with the first
-// eviction and cleared only when the drain ends, naming the replacement being
-// waited for or, as [AwaitingSettled], recording that none is owed. Its
-// presence is the signal and its value is not, which is why "nothing owed" has
-// a spelling of its own. See ADR-0009.
+// node about what has already happened: the marker is written immediately
+// before the first eviction and cleared only when the drain ends, naming the
+// replacement being waited for or, as [AwaitingSettled], recording that none is
+// owed. Its presence is the signal and its value is not, which is why "nothing
+// owed" has a spelling of its own. See ADR-0009.
+//
+// Before rather than after, so a drain whose first eviction was refused reads
+// as committed having disrupted nothing. That is the direction to be wrong in:
+// it withdraws two preferences and leaves every question of soundness asked,
+// where the other direction hands back a node that has already been half
+// emptied.
 func committedDrain(node *corev1.Node) bool {
 	return node.Annotations[AnnotationDrainAwaiting] != ""
 }

@@ -1,5 +1,5 @@
 // Package executor performs the only changes binpack makes to a cluster:
-// cordoning a node, annotating it, uncordoning it, and evicting a pod.
+// cordoning a node, annotating it, handing it back, and evicting a pod.
 //
 // It holds no policy. Whether a node should be drained is [engine.Decide]'s
 // answer and the order things happen in is the drain protocol's; what lives
@@ -44,14 +44,28 @@ func Cordon(ctx context.Context, w Writer, node *corev1.Node) error {
 	return patchNode(ctx, w, node, `{"spec":{"unschedulable":true}}`)
 }
 
-// Uncordon makes a node schedulable again.
+// HandBack makes a node schedulable again and records why, in one patch.
 //
 // Every branch of a drain ends here or with the node deleted. A cordoned node
 // the autoscaler never removes is capacity that is paid for and cannot be
 // used, so this is the call that must work even when everything else has
 // failed.
-func Uncordon(ctx context.Context, w Writer, node *corev1.Node) error {
-	return patchNode(ctx, w, node, `{"spec":{"unschedulable":false}}`)
+//
+// One patch rather than an uncordon followed by a record, because the state
+// between them cannot be read. A node that is schedulable and still marked is
+// byte-identical to one left by a Begin that stopped between its own two
+// writes, and that state's repair is to cordon and carry on — the opposite of
+// what the call that produced it wanted. A merge patch carries spec and
+// metadata together, so there is no reason to leave a state whose two readings
+// call for opposite corrections.
+func HandBack(
+	ctx context.Context, w Writer, node *corev1.Node, labels, annotations map[string]string,
+) error {
+	patch := map[string]any{"spec": map[string]any{"unschedulable": false}}
+	if meta := metadataPatch(labels, annotations); len(meta) > 0 {
+		patch["metadata"] = meta
+	}
+	return marshalAndPatch(ctx, w, node, patch)
 }
 
 // Annotate sets annotations on a node, and removes those given an empty value.
@@ -73,10 +87,16 @@ func Annotate(ctx context.Context, w Writer, node *corev1.Node, annotations map[
 func patchMeta(
 	ctx context.Context, w Writer, node *corev1.Node, labels, annotations map[string]string,
 ) error {
-	if len(labels) == 0 && len(annotations) == 0 {
+	meta := metadataPatch(labels, annotations)
+	if len(meta) == 0 {
 		return nil
 	}
+	return marshalAndPatch(ctx, w, node, map[string]any{"metadata": meta})
+}
 
+// metadataPatch renders labels and annotations as the metadata half of a merge
+// patch, empty for nothing to say.
+func metadataPatch(labels, annotations map[string]string) map[string]any {
 	// Marshalled rather than concatenated: an annotation value is arbitrary
 	// text, and a drain's recorded failure reason is a message from the API
 	// server. Building this by hand would put unescaped quotes into a patch.
@@ -102,12 +122,16 @@ func patchMeta(
 	if len(annotations) > 0 {
 		meta["annotations"] = nullable(annotations)
 	}
+	return meta
+}
 
-	patch, err := json.Marshal(map[string]any{"metadata": meta})
+func marshalAndPatch(
+	ctx context.Context, w Writer, node *corev1.Node, document map[string]any,
+) error {
+	patch, err := json.Marshal(document)
 	if err != nil {
-		return fmt.Errorf("building the metadata patch for %s: %w", node.Name, err)
+		return fmt.Errorf("building the patch for %s: %w", node.Name, err)
 	}
-
 	return patchNode(ctx, w, node, string(patch))
 }
 

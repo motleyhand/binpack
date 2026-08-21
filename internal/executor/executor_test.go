@@ -32,7 +32,7 @@ func reread(t *testing.T, c client.Client, name string) *corev1.Node {
 	return &node
 }
 
-func TestCordonAndUncordon(t *testing.T) {
+func TestCordonAndHandBack(t *testing.T) {
 	node := mother.SmallNode("a")
 	c := withNode(t, node)
 
@@ -43,11 +43,22 @@ func TestCordonAndUncordon(t *testing.T) {
 		t.Error("the node is still schedulable after a cordon")
 	}
 
-	if err := executor.Uncordon(ctx(), c, node); err != nil {
-		t.Fatalf("Uncordon: %v", err)
+	// The cordon and the record travel together, so the hand-back is asserted
+	// on both halves: a node that came back schedulable but kept its marker is
+	// the half-state the single patch exists to make unreachable.
+	err := executor.HandBack(ctx(), c, node,
+		map[string]string{"binpack.motleyhand.com/draining": ""},
+		map[string]string{"binpack.motleyhand.com/last-failure": "because"})
+	if err != nil {
+		t.Fatalf("HandBack: %v", err)
 	}
-	if reread(t, c, "a").Spec.Unschedulable {
-		t.Error("the node is still cordoned after an uncordon")
+
+	after := reread(t, c, "a")
+	if after.Spec.Unschedulable {
+		t.Error("the node is still cordoned after a hand-back")
+	}
+	if after.Annotations["binpack.motleyhand.com/last-failure"] != "because" {
+		t.Errorf("the hand-back recorded nothing: %v", after.Annotations)
 	}
 }
 
@@ -62,7 +73,7 @@ func TestTheCachedObjectIsNeverWrittenThrough(t *testing.T) {
 
 	for name, call := range map[string]func() error{
 		"Cordon":   func() error { return executor.Cordon(ctx(), c, node) },
-		"Uncordon": func() error { return executor.Uncordon(ctx(), c, node) },
+		"HandBack": func() error { return executor.HandBack(ctx(), c, node, nil, nil) },
 		"Annotate": func() error {
 			return executor.Annotate(ctx(), c, node, map[string]string{"binpack.motleyhand.com/skip": "true"})
 		},

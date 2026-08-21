@@ -179,12 +179,13 @@ instrument.
 - **Selection is untouched.** `explain` and `diagnose` never resume a drain, so both still apply
   the full set of checks and still report a cooldown as the reason a node was ruled out — even a
   node that a drain is already under way on. ADR-0009 asserted that in prose; it is now a test.
-- **Committedness is only as durable as the annotation, and the annotation is written after the
-  eviction it records.** `Advance` evicts, then patches the node. If that patch fails, a pod has
-  been disrupted and the node carries no marker — a state indistinguishable from a drain that has
-  cordoned and evicted nothing, because it is the same node. The next evaluation therefore reads
-  the drain as uncommitted, and inside a cooldown window abandons it: the outcome this ADR is
-  about, through a door it does not close.
+- **Committedness is only as durable as the annotation, and the annotation was written after the
+  eviction it records.** *Closed since this was written; the paragraphs below record why the
+  obvious fix is the wrong one, which is still worth knowing.* `Advance` evicted, then patched the
+  node. If that patch failed, a pod had been disrupted and the node carried no marker — a state
+  indistinguishable from a drain that has cordoned and evicted nothing, because it is the same
+  node. The next evaluation therefore read the drain as uncommitted, and inside a cooldown window
+  abandoned it: the outcome this ADR is about, through a door it did not close.
 
   This window is not opened here. The marker has been the sole committedness signal since
   [ADR-0009](adr-0009-revalidation-asks-soundness-not-preference.md), and the same partial write
@@ -202,6 +203,16 @@ instrument.
   upgraded to the controller's identity after it. That value is being introduced for its own
   reasons by the work that gives `drain-awaiting` a settled state, and it belongs there rather
   than here.
+
+  **That is what now happens.** The settled sentinel goes on the node immediately before the
+  eviction, in the same patch as the progress markers, and is upgraded to the controller's
+  identity once the eviction is accepted. Losing the second write costs the wait for one
+  replacement rather than the drain. The trade is that a drain whose eviction is then refused
+  reads as committed having disrupted nothing, which withdraws `reserveForLargestPod`, the pod cap
+  and the cooldowns from a drain that has moved no pods — every one of them a preference, and none
+  of them a question of soundness. `Abandon` took the same view of its own pair of writes at the
+  same time: the cordon lifts and the failure is recorded in one patch, because the state between
+  them is byte-identical to a half-finished `Begin` and calls for the opposite repair.
 - One fewer reason for a node to accumulate backoff it did not earn. Candidates are ordered
   least-loaded-first, so the same node was chosen and abandoned each cycle, and seven cluster-wide
   events could put binpack's best candidate on a daily retry without it ever having had a

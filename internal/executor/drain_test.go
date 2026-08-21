@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/resource"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -1987,5 +1988,563 @@ func TestAPermanentEvictionRefusalAbandonsRatherThanRetries(t *testing.T) {
 	}
 	if nodeFrom(t, c, "a").Spec.Unschedulable {
 		t.Error("the drain ended but left the node cordoned")
+	}
+}
+
+// sized is a pool member with its memory stated outright. The fixtures below
+// turn on how much room is left in the cluster rather than on how many pods
+// there are, so the archetype's "large enough that resources are never the
+// reason" is the wrong default for them.
+func sized(name, memory string, opts ...mother.NodeOption) *corev1.Node {
+	return node(name, append([]mother.NodeOption{
+		mother.Allocatable(corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("4"),
+			corev1.ResourceMemory: resource.MustParse(memory),
+			corev1.ResourcePods:   resource.MustParse("110"),
+		}),
+	}, opts...)...)
+}
+
+// journal records every write in the order it was made, patches and evictions
+// together.
+//
+// Ordering is not visible in the state a successful call leaves behind: the
+// same annotations are on the node either way. It is only visible in what
+// survives an interruption, so it is asserted directly.
+type journal struct {
+	executor.Writer
+	writes []string
+}
+
+func (j *journal) Patch(
+	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption,
+) error {
+	data, err := patch.Data(obj)
+	if err != nil {
+		return err
+	}
+	j.writes = append(j.writes, "patch "+string(data))
+	return j.Writer.Patch(ctx, obj, patch, opts...)
+}
+
+func (j *journal) SubResource(name string) client.SubResourceClient {
+	return evictions{SubResourceClient: j.Writer.SubResource(name), journal: j}
+}
+
+type evictions struct {
+	client.SubResourceClient
+	journal *journal
+}
+
+func (e evictions) Create(
+	ctx context.Context, obj client.Object, sub client.Object, opts ...client.SubResourceCreateOption,
+) error {
+	e.journal.writes = append(e.journal.writes, "evict "+obj.GetName())
+	return e.SubResourceClient.Create(ctx, obj, sub, opts...)
+}
+
+// interrupted stops answering after keep node patches, which is what a lost
+// lease, an OOM kill or an API server that has started refusing looks like from
+// inside one evaluation. Counted rather than matched on content, so it puts the
+// break at a position in the sequence rather than at a particular annotation.
+type interrupted struct {
+	executor.Writer
+	keep int
+	seen int
+}
+
+func (i *interrupted) Patch(
+	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption,
+) error {
+	i.seen++
+	if i.seen > i.keep {
+		return apierrors.NewInternalError(errors.New("simulated API-server failure"))
+	}
+	return i.Writer.Patch(ctx, obj, patch, opts...)
+}
+
+// commitment is a drain one eviction from finishing whose cluster tightens
+// underneath it: a big workload is deployed while the drain is in flight, and
+// the reserve — which asks that a pod the size of the largest one in the
+// cluster could still be placed — stops being satisfiable.
+//
+// That is the shape the reserve is dangerous in. It is a preference, so
+// ADR-0009 stops asking it once pods have moved; a drain that has forgotten it
+// evicted anything is asked it again, and abandons a node it had half emptied.
+func commitment() (engine.Snapshot, engine.Config) {
+	pods := []*corev1.Pod{
+		mother.Pod("default", "one", mother.OnNode("a"), mother.Requests("100m", "1Gi")),
+		mother.Pod("default", "two", mother.OnNode("a"), mother.Requests("100m", "512Mi")),
+	}
+	s := snapshot([]*corev1.Node{
+		marked("a", 20*time.Minute, 5*time.Minute, "3"),
+		sized("b", "2048Mi"), sized("c", "2048Mi"), sized("d", "4352Mi"),
+	}, pods)
+
+	cfg := engineConfig()
+	cfg.Default.Sim.ReserveForLargestPod = true
+	return s, cfg
+}
+
+// tightens deploys the workload that makes the reserve unsatisfiable, and puts
+// the replacement for the evicted pod where the scheduler would have put it.
+func tightens(t *testing.T, c client.Client) {
+	t.Helper()
+	back := mother.Pod("default", "one-back", mother.OnNode("c"),
+		mother.ControlledBy("ReplicaSet", "one-rs"), mother.Requests("100m", "1Gi"))
+	back.CreationTimestamp.Time = at.Add(30 * time.Second)
+
+	for _, pod := range []*corev1.Pod{
+		back,
+		mother.Pod("default", "big", mother.OnNode("d"), mother.Requests("100m", "4Gi")),
+	} {
+		if err := c.Create(context.Background(), pod); err != nil {
+			t.Fatalf("creating %s: %v", pod.Name, err)
+		}
+	}
+}
+
+func TestTheDrainCommitsBeforeItEvicts(t *testing.T) {
+	// The commitment marker is the only record that a drain has disrupted
+	// anything, and it was written afterwards, in a patch of its own. Between
+	// the accepted eviction and that write the node is indistinguishable from
+	// one that has evicted nothing — and the window is entered once per
+	// eviction, so a busy drain enters it dozens of times.
+	//
+	// Written first instead, and in the same patch as the progress markers,
+	// because there is no useful state between those two either: a node
+	// carrying fresh progress and no commitment says both that an eviction has
+	// just happened and that none ever has.
+	//
+	// Both arms because the write that follows the eviction is conditional,
+	// and a condition nothing exercises on its false side is a condition
+	// nothing holds to.
+	for _, tc := range []struct {
+		name   string
+		pods   []*corev1.Pod
+		cfg    engine.Config
+		writes int
+	}{
+		{
+			// The marker is upgraded afterwards to name the controller that
+			// owes the replacement, which is a fact only the accepted eviction
+			// establishes.
+			name:   "the eviction owes a replacement",
+			pods:   []*corev1.Pod{mother.Pod("default", "one", mother.OnNode("a"))},
+			cfg:    engineConfig(),
+			writes: 3,
+		},
+		{
+			// Nothing is owed for an expendable pod, so the commitment already
+			// says everything there is to say and the second write would
+			// repeat it.
+			name:   "the eviction owes nothing",
+			pods:   []*corev1.Pod{expendable("filler")},
+			cfg:    consolidating(),
+			writes: 2,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := snapshot([]*corev1.Node{
+				marked("a", 20*time.Minute, 5*time.Minute, "2"), node("b")}, tc.pods)
+			w := &journal{Writer: clientFor(s)}
+
+			step, err := executor.Advance(
+				context.Background(), w, s, "a", tc.cfg, drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if step.Code != executor.StepEvicted {
+				t.Fatalf("expected an eviction, got %+v", step)
+			}
+
+			if len(w.writes) != tc.writes {
+				t.Fatalf("expected %d writes, got %d: %v", tc.writes, len(w.writes), w.writes)
+			}
+			for _, key := range []string{
+				engine.AnnotationDrainAwaiting,
+				engine.AnnotationDrainProgress,
+				engine.AnnotationDrainPodsRemaining,
+			} {
+				if !strings.Contains(w.writes[0], key) {
+					t.Errorf("the drain's first write did not carry %s: %s", key, w.writes[0])
+				}
+			}
+			if !strings.HasPrefix(w.writes[1], "evict ") {
+				t.Errorf("the eviction did not follow the commitment: %v", w.writes)
+			}
+		})
+	}
+}
+
+func TestACommittedDrainStaysCommittedWhenTheMarkerWriteFails(t *testing.T) {
+	// The eviction is irreversible and the write that records it is not
+	// retried, so one failed patch used to leave a disrupted pod on a node
+	// carrying no marker. Since the commitment gates which questions
+	// revalidation re-asks, that is not a re-applied preference any more: the
+	// reserve comes back, and the pod that just left has consumed the room it
+	// wants, so the next evaluation abandons a drain that was working.
+	//
+	// Every place the evaluation can stop, not only the last one. The invariant
+	// is that no interruption leaves a pod gone from a node that reads as
+	// untouched, and an evaluation that stops before the eviction satisfies it
+	// by having disrupted nothing — which is the arm that fails if the
+	// commitment travels with the markers but still follows the eviction.
+	for _, keep := range []int{0, 1, 2} {
+		t.Run(fmt.Sprintf("%d writes reach the API server", keep), func(t *testing.T) {
+			s, reserving := commitment()
+			c := clientFor(s)
+
+			_, _ = executor.Advance(context.Background(),
+				&interrupted{Writer: c, keep: keep}, s, "a", engineConfig(), drainPolicy())
+
+			var left corev1.PodList
+			if err := c.List(context.Background(), &left); err != nil {
+				t.Fatalf("listing pods: %v", err)
+			}
+			evicted := len(left.Items) < len(s.Pods)
+			committed := nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainAwaiting] != ""
+
+			if evicted && !committed {
+				t.Fatal("a drain that has evicted a pod is carrying no record of it")
+			}
+			if !evicted {
+				return
+			}
+
+			tightens(t, c)
+			step, err := executor.Advance(context.Background(), c,
+				cluster(t, c, at.Add(time.Minute)), "a", reserving, drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if step.Failed {
+				t.Errorf("a preference abandoned a drain that had already evicted: %+v", step)
+			}
+		})
+	}
+}
+
+func TestARefusedEvictionLeavesTheDrainOwingNoReplacement(t *testing.T) {
+	// The other half of writing the marker first, and the reason the value
+	// written is the settled sentinel rather than the controller's identity.
+	//
+	// A disruption budget refusing the eviction is the routine failure here,
+	// and it lands *after* the commitment. A marker naming a controller would
+	// then claim a replacement is owed for a pod that never left, and nothing
+	// creates one — so the drain waits, makes no progress, and ends at the
+	// stall bound having relocated everything it was asked to. The sentinel
+	// owes nothing, so the next evaluation simply tries the eviction again.
+	//
+	// Run to its ending rather than checked once, because "waits this round"
+	// and "waits for ever" look identical from a single call, and it is the
+	// ending that differs.
+	s, _ := commitment()
+	c := clientFor(s)
+
+	budget := refusingEvictions{Writer: c, err: apierrors.NewTooManyRequests("nope", 1)}
+	if _, err := executor.Advance(
+		context.Background(), budget, s, "a", engineConfig(), drainPolicy()); err == nil {
+		t.Fatal("expected the refused eviction to end the evaluation")
+	}
+
+	round, step := drainRounds(t, c, 20, func(pod string, now time.Time) {
+		back := mother.Pod("default", pod+"-back", mother.OnNode("d"),
+			mother.ControlledBy("ReplicaSet", pod+"-rs"), mother.Requests("100m", "128Mi"))
+		back.CreationTimestamp.Time = now
+		if err := c.Create(context.Background(), back); err != nil {
+			t.Fatalf("replacing %s: %v", pod, err)
+		}
+	})
+
+	if step.Code != executor.StepAwaitRemoval {
+		t.Errorf("the drain ended at +%dm with %+v; expected it to finish", round, step)
+	}
+}
+
+func TestALostReplacementWaitCostsTheWaitAndNotTheDrain(t *testing.T) {
+	// What the residual window actually costs, measured rather than argued.
+	//
+	// The commitment survives a failed marker write; the wait for the
+	// replacement does not, because the value naming the controller is the one
+	// written after the eviction. So the next evaluation evicts again with a
+	// replacement still unbound — and an unbound pod sits on no node, so the
+	// simulation approving that eviction has reserved nothing for it. Two
+	// replacements against room proved for one is the risk sequential eviction
+	// exists to remove, and it is why this window is worth stating rather than
+	// waving at.
+	//
+	// It is bounded, though, and narrower than the window it replaces, where
+	// the same failed patch lost the commitment as well. Both halves are
+	// asserted: neither follows from the other, and the second is the reason
+	// the first is acceptable.
+	s, _ := commitment()
+	c := clientFor(s)
+
+	if _, err := executor.Advance(context.Background(),
+		&interrupted{Writer: c, keep: 1}, s, "a", engineConfig(), drainPolicy()); err == nil {
+		t.Fatal("expected the lost marker write to end the evaluation")
+	}
+
+	// Unbound, which is precisely the state the lost wait would have waited
+	// for, and which the simulation cannot see.
+	unbound := pending("one-back", "one-rs", at.Add(30*time.Second), false)
+	if err := c.Create(context.Background(), unbound); err != nil {
+		t.Fatalf("creating the replacement: %v", err)
+	}
+
+	next, err := executor.Advance(context.Background(), c,
+		cluster(t, c, at.Add(time.Minute)), "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if next.Code != executor.StepEvicted {
+		t.Errorf("the lost write should cost the wait, not the eviction: %+v", next)
+	}
+
+	// The second eviction's own marker was written, so its replacement is
+	// waited for as usual. Bind it and let the drain reach its ending: a lost
+	// wait must not leave the node cordoned with nothing to finish it.
+	landed := pending("two-back", "two-rs", at.Add(90*time.Second), false)
+	landed.Spec.NodeName = "d"
+	if err := c.Create(context.Background(), landed); err != nil {
+		t.Fatalf("binding the second replacement: %v", err)
+	}
+
+	last, err := executor.Advance(context.Background(), c,
+		cluster(t, c, at.Add(2*time.Minute)), "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if last.Code != executor.StepAwaitRemoval {
+		t.Errorf("a drain that lost a replacement wait was left unfinished: %+v", last)
+	}
+}
+
+func TestALostAwaitingMarkerDoesNotReapplyTheReserve(t *testing.T) {
+	// The same thing asked of the engine rather than of the annotation, and
+	// asked of both outcomes of the write. Whether the patch that carries the
+	// marker reaches the API server is not something a drain can control; what
+	// it can control is whether the answer to "has this drain evicted
+	// anything" depends on it.
+	for _, tc := range []struct {
+		name string
+		keep int
+	}{
+		{"the marker write landed", 99},
+		{"the marker write was lost", 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, reserving := commitment()
+			c := clientFor(s)
+
+			_, _ = executor.Advance(context.Background(),
+				&interrupted{Writer: c, keep: tc.keep}, s, "a", engineConfig(), drainPolicy())
+
+			tightens(t, c)
+			got := engine.Revalidate(cluster(t, c, at.Add(time.Minute)), "a", reserving)
+
+			if got.Verdict() != engine.VerdictDrainable {
+				t.Errorf("the reserve re-armed on a drain that had already evicted: %q",
+					got.Verdict())
+			}
+		})
+	}
+}
+
+func TestBeginDoesNotCommitTheDrain(t *testing.T) {
+	// The cheap version of the fix, and the trap in it. Committing in Begin
+	// leaves every test green while reversing what ADR-0009 chose: a node that
+	// has cordoned and evicted nothing would read as committed, and the
+	// preferences that decide whether a drain should *start* would never be
+	// asked of it.
+	//
+	// Asserted against a node Begin actually wrote, because the fixtures that
+	// pin the uncommitted side elsewhere build their nodes by hand and would
+	// go on passing.
+	s, reserving := commitment()
+	fresh := node("a")
+	s.Nodes[0] = fresh
+	c := clientFor(s)
+
+	if err := executor.Begin(context.Background(), c, fresh, at); err != nil {
+		t.Fatalf("Begin: %v", err)
+	}
+
+	after := nodeFrom(t, c, "a")
+	if got := after.Annotations[engine.AnnotationDrainAwaiting]; got != "" {
+		t.Errorf("a drain that has evicted nothing recorded a commitment: %q", got)
+	}
+
+	tightens(t, c)
+	if got := engine.Revalidate(cluster(t, c, at.Add(time.Minute)), "a", reserving); got.Verdict() ==
+		engine.VerdictDrainable {
+		t.Error("the reserve should still refuse a drain that has evicted nothing")
+	}
+}
+
+func TestMaxPodsPerDrainStopsApplyingOnceTheDrainHasCommitted(t *testing.T) {
+	// The boundary the commitment moves, stated rather than discovered. A cap
+	// on how many pods one drain may relocate is a question about whether the
+	// drain should start, so it stops being asked once the drain has committed
+	// — and the drain now commits when it attempts an eviction rather than when
+	// one is accepted. A budget refusing the first eviction therefore takes the
+	// cap out of force an evaluation earlier than it used to.
+	//
+	// The conservative direction of the same trade the reserve gets: a drain
+	// that has disrupted nothing reads as committed, which disables two
+	// preferences and nothing else. The other direction is a drain that has
+	// disrupted something reading as untouched, and that ends it.
+	//
+	// Both arms, because the cap moving one evaluation earlier and the cap
+	// never applying at all look identical from the second arm alone — and the
+	// second is what writing the marker in Begin would produce.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "one", mother.OnNode("a")),
+		mother.Pod("default", "two", mother.OnNode("a")),
+	}
+	s := snapshot([]*corev1.Node{marked("a", 20*time.Minute, 5*time.Minute, "3"), node("b")}, pods)
+	cfg := engineConfig()
+	cfg.Default.MaxPodsPerDrain = 2
+
+	for _, tc := range []struct {
+		name      string
+		attempted bool
+		capped    bool
+	}{
+		{"before the first eviction is attempted", false, true},
+		{"after a budget refused the first eviction", true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := clientFor(s)
+			if tc.attempted {
+				budget := refusingEvictions{
+					Writer: c, err: apierrors.NewTooManyRequests("nope", 1)}
+				if _, err := executor.Advance(
+					context.Background(), budget, s, "a", cfg, drainPolicy()); err == nil {
+					t.Fatal("expected the refused eviction to end the evaluation")
+				}
+			}
+
+			// A workload that tolerates the cordon lands on the node, which is
+			// the only way a drain's relocatable set grows once it is under
+			// way. Without it the cap answers the same at every evaluation and
+			// the arms cannot differ.
+			if err := c.Create(context.Background(),
+				returning("late", "late-rs", at.Add(30*time.Second))); err != nil {
+				t.Fatalf("creating the arrival: %v", err)
+			}
+
+			step, err := executor.Advance(context.Background(), c,
+				cluster(t, c, at.Add(time.Minute)), "a", cfg, drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if step.Failed != tc.capped {
+				t.Errorf("cap applied = %t, want %t: %+v", step.Failed, tc.capped, step)
+			}
+		})
+	}
+}
+
+// refusingMetadata answers every patch carrying metadata with err, so a test
+// can stop a hand-back at the point where it records why it happened. A bare
+// spec patch still goes through, which is what makes the two orderings of an
+// abandon distinguishable.
+type refusingMetadata struct {
+	executor.Writer
+	err error
+}
+
+func (r refusingMetadata) Patch(
+	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption,
+) error {
+	data, err := patch.Data(obj)
+	if err != nil {
+		return err
+	}
+	if strings.Contains(string(data), "metadata") {
+		return r.err
+	}
+	return r.Writer.Patch(ctx, obj, patch, opts...)
+}
+
+// stuck is a drain the cluster has overtaken: the pod left on the node no
+// longer fits anywhere, so revalidation ends it.
+func stuck() engine.Snapshot {
+	pods := []*corev1.Pod{
+		mother.Pod("default", "stuck", mother.OnNode("a"), mother.Requests("100m", "3Gi")),
+		mother.Pod("default", "big", mother.OnNode("b"), mother.Requests("100m", "3Gi")),
+	}
+	return snapshot([]*corev1.Node{
+		marked("a", 20*time.Minute, time.Minute, "1"), sized("b", "4096Mi"),
+	}, pods)
+}
+
+func TestAnAbandonThatCannotRecordItselfDoesNotResume(t *testing.T) {
+	// A hand-back that uncordons and then fails to record itself leaves the
+	// node in the state Begin leaves between its own two writes — marked and
+	// schedulable — and that state has a repair, which is to cordon and carry
+	// on. So the drain the cluster had just decided to abandon resumes, and
+	// the diagnosis goes with it: no reason on the node, no backoff, and
+	// nothing to stop the same node being chosen again immediately.
+	//
+	// The two halves have no useful intermediate, so they travel together.
+	s := stuck()
+	c := clientFor(s)
+	w := refusingMetadata{Writer: c, err: apierrors.NewInternalError(
+		errors.New("simulated API-server failure"))}
+
+	if _, err := executor.Advance(
+		context.Background(), w, s, "a", engineConfig(), drainPolicy()); err == nil {
+		t.Fatal("expected the refused patch to end the evaluation")
+	}
+
+	step, err := executor.Advance(context.Background(), c,
+		cluster(t, c, at.Add(time.Minute)), "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code == executor.StepCordoned {
+		t.Errorf("the abandoned drain resumed: %+v", step)
+	}
+
+	after := nodeFrom(t, c, "a")
+	if after.Spec.Unschedulable {
+		t.Error("the drain ended but left the node cordoned")
+	}
+	for _, key := range []string{
+		engine.AnnotationBackoffUntil,
+		engine.AnnotationLastFailure,
+		engine.AnnotationDrainAttempts,
+	} {
+		if after.Annotations[key] == "" {
+			t.Errorf("the abandonment left no %s behind: %v", key, after.Annotations)
+		}
+	}
+}
+
+func TestTheHandBackAndItsRecordMoveInOneWrite(t *testing.T) {
+	// Separately would let the node be schedulable-but-marked for as long as
+	// it takes the second write to land, or forever if it fails — and that is
+	// the one half-state binpack cannot read, because it is byte-identical to
+	// the one a half-finished Begin leaves and calls for the opposite repair.
+	// A merge patch carries spec and metadata together, so there is no reason
+	// to take that risk.
+	s := stuck()
+	c := clientFor(s)
+	rec := &recorder{Writer: c}
+
+	if _, err := executor.Abandon(context.Background(), rec,
+		s.Nodes[0], "test", "because", at); err != nil {
+		t.Fatalf("Abandon: %v", err)
+	}
+
+	if len(rec.patches) != 1 {
+		t.Fatalf("expected one patch, got %d: %v", len(rec.patches), rec.patches)
+	}
+	if !strings.Contains(rec.patches[0], "unschedulable") ||
+		!strings.Contains(rec.patches[0], engine.AnnotationBackoffUntil) {
+		t.Errorf("the hand-back and its record were not written together: %s", rec.patches[0])
 	}
 }
