@@ -54,7 +54,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 				return err
 			}
 
-			decision := engine.Decide(snapshot, engineConfig(cfg))
+			decision := explainDecision(snapshot, engineConfig(cfg))
 			opts.configSource = source
 			return renderExplain(opts, snapshot, decision)
 		},
@@ -65,6 +65,41 @@ func newExplainCommand(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&kubecontext, "context", "", "kubeconfig context to use")
 
 	return cmd
+}
+
+// explainDecision is the decision explain renders.
+//
+// [engine.Decide] answers the headline: during a drain it declines to choose a
+// second node, so explain and the controller now reach that conclusion through
+// the same function rather than one of them having a rule the other lacks.
+//
+// What Decide cannot answer is the marked node's own row. It is assessed there
+// as a node binpack might newly select, so it reports "a drain is already in
+// progress on this node" — which is true, and tells an operator watching a
+// cordoned node nothing whatsoever. The question that actually governs it is
+// whether the drain survives another step, and [engine.Revalidate] is what asks
+// that: the same call the executor makes before every eviction, with binpack's
+// own marker and cordon ignored and the reserve suppressed once pods have
+// moved. So its answer replaces the row.
+//
+// Substituted here rather than inside Decide, deliberately. Those assessments
+// are also what the metrics count, and `drain-in-progress` is a published
+// binpack_nodes_skipped code: swapping the row in the engine would leave that
+// code unreachable whenever there is a single marker, which is the ordinary
+// case, and would count a node already being drained towards
+// binpack_drainable_nodes.
+func explainDecision(s engine.Snapshot, cfg engine.Config) engine.Decision {
+	d := engine.Decide(s, cfg)
+	if d.Code != engine.CodeDraining || d.Node == nil {
+		return d
+	}
+
+	for i := range d.Assessments {
+		if d.Assessments[i].Node.Name == d.Node.Name {
+			d.Assessments[i] = engine.Revalidate(s, d.Node.Name, cfg)
+		}
+	}
+	return d
 }
 
 // restConfigFor resolves a connection from the usual kubeconfig rules, so the
@@ -214,10 +249,14 @@ type explainView struct {
 }
 
 type nodeReport struct {
-	Name    string `json:"name"`
-	Pool    string `json:"pool,omitempty"`
-	Chosen  bool   `json:"chosen,omitempty"`
-	Verdict string `json:"verdict"`
+	Name   string `json:"name"`
+	Pool   string `json:"pool,omitempty"`
+	Chosen bool   `json:"chosen,omitempty"`
+	// Draining marks the node binpack is part-way through emptying. Its
+	// verdict is the one revalidation reached, not the one selection would —
+	// they are different questions and this says which was asked.
+	Draining bool   `json:"draining,omitempty"`
+	Verdict  string `json:"verdict"`
 	// Code names why a node was skipped, from the engine's bounded set. The
 	// detail says it in prose; this is what a consumer can branch on without
 	// matching a sentence that may be reworded.
@@ -266,18 +305,19 @@ func buildView(s engine.Snapshot, d engine.Decision) explainView {
 	}
 
 	for _, a := range d.Assessments {
-		v.Nodes = append(v.Nodes, reportFor(a))
+		v.Nodes = append(v.Nodes, reportFor(a, d))
 	}
 	return v
 }
 
-func reportFor(a engine.NodeAssessment) nodeReport {
+func reportFor(a engine.NodeAssessment, d engine.Decision) nodeReport {
 	// The verdict comes from the engine rather than being recomputed here.
 	// Two implementations of "what happened to this node" is one more than
 	// can be kept in step, and the metrics read the same one.
 	r := nodeReport{
 		Name: a.Node.Name, Pool: a.Pool, Chosen: a.Chosen,
 		Verdict: a.Verdict(), Code: a.SkipCode,
+		Draining: d.Code == engine.CodeDraining && d.Node != nil && a.Node.Name == d.Node.Name,
 	}
 
 	switch r.Verdict {
@@ -294,7 +334,15 @@ func reportFor(a engine.NodeAssessment) nodeReport {
 			r.Refusals = a.Simulation.Blocked.PerNode
 		}
 	default:
-		if !a.Chosen {
+		// Why this node is not being drained, which during a drain is a
+		// different sentence: nothing was chosen, so "another node was chosen
+		// first" would name a choice that was never made.
+		switch {
+		case r.Draining:
+			r.Detail = "binpack is draining this node, and it is still drainable"
+		case d.Code == engine.CodeDraining:
+			r.Detail = "it could be drained, but a drain is already in progress"
+		case !a.Chosen:
 			r.Detail = "another node was chosen first"
 		}
 		if a.Simulation != nil {
@@ -347,8 +395,11 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 	p("\nnodes\n")
 	for _, r := range v.Nodes {
 		marker := " "
-		if r.Chosen {
+		switch {
+		case r.Chosen:
 			marker = "*"
+		case r.Draining:
+			marker = ">"
 		}
 		name := r.Name
 		if r.Pool != "" {
@@ -364,10 +415,22 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 	}
 
 	p("\n")
-	if d.Action == engine.Drain {
+	switch {
+	case d.Action == engine.Drain:
 		p("would drain %s\n", d.Node.Name)
 		p("(dry run: explain never changes anything)\n")
-	} else {
+
+	case d.Code == engine.CodeDraining && d.Node != nil:
+		// Narrowed rather than lost. What binpack will do next is advance this
+		// drain, and the honest answer to "which node would you pick" is that
+		// it is not picking one — so the preview that remains is the node table
+		// above, and the row that matters is the one being emptied.
+		p("a drain is in progress on %s, marked > above\n", d.Node.Name)
+		p("binpack advances that drain rather than choosing another node. That row is\n")
+		p("re-checked the way each drain step re-checks it, so its verdict is what\n")
+		p("decides whether the drain continues.\n")
+
+	default:
 		p("nothing to do: %s\n", d.Reason)
 	}
 

@@ -11,6 +11,7 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
+	dto "github.com/prometheus/client_model/go"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
@@ -1341,6 +1342,26 @@ func evaluationErrors(t *testing.T) float64 {
 	return 0
 }
 
+// evaluationsWithCode is binpack_evaluations_total for one outcome code.
+func evaluationsWithCode(t *testing.T, code string) float64 {
+	t.Helper()
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "binpack_evaluations_total" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			if hasLabel(m.GetLabel(), "code", code) {
+				return m.GetCounter().GetValue()
+			}
+		}
+	}
+	return 0
+}
+
 func TestATransientEvictionRefusalDoesNotStopTheController(t *testing.T) {
 	var log captured
 	pod, rs := relocatable("a", "web")
@@ -1502,6 +1523,13 @@ func TestShutdownHandsTheLeaseOverRatherThanWaitingItOut(t *testing.T) {
 // last evaluation actually assessed.
 func nodesReported(t *testing.T) float64 {
 	t.Helper()
+	return nodesWithVerdict(t, "")
+}
+
+// nodesWithVerdict is binpack_nodes for one verdict, or all of them when the
+// verdict is empty.
+func nodesWithVerdict(t *testing.T, verdict string) float64 {
+	t.Helper()
 	families, err := ctrlmetrics.Registry.Gather()
 	if err != nil {
 		t.Fatalf("gathering metrics: %v", err)
@@ -1512,10 +1540,22 @@ func nodesReported(t *testing.T) float64 {
 			continue
 		}
 		for _, m := range f.GetMetric() {
+			if verdict != "" && !hasLabel(m.GetLabel(), "verdict", verdict) {
+				continue
+			}
 			total += m.GetGauge().GetValue()
 		}
 	}
 	return total
+}
+
+func hasLabel(labels []*dto.LabelPair, name, value string) bool {
+	for _, l := range labels {
+		if l.GetName() == name && l.GetValue() == value {
+			return true
+		}
+	}
+	return false
 }
 
 func TestDryRunStillReportsOnTheRestOfTheCluster(t *testing.T) {
@@ -1524,25 +1564,29 @@ func TestDryRunStillReportsOnTheRestOfTheCluster(t *testing.T) {
 	ev := newEvaluator(t, &log, rec,
 		drainingNode("a"), inPool("b"), inPool("c"), statusConfigMap())
 
+	drainingBefore := evaluationsWithCode(t, engine.CodeDraining)
+
 	if err := ev.evaluate(context.Background()); err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	var elsewhere, stranded bool
+	// Counted as what it was. Before the drain-in-progress gate moved into the
+	// engine this evaluation ended in a decision to drain a second node, so it
+	// was counted `drain` — an outcome nothing acted on, in the mode whose
+	// whole purpose is saying what would happen.
+	if got := evaluationsWithCode(t, engine.CodeDraining) - drainingBefore; got != 1 {
+		t.Errorf("binpack_evaluations_total{code=draining} moved by %v, want 1", got)
+	}
+
+	var stranded bool
 	for _, e := range rec.events {
 		n, ok := e.object.(*corev1.Node)
 		if !ok {
 			continue
 		}
-		if n.Name != "a" {
-			elsewhere = true
-		}
 		if n.Name == "a" && e.reason == ReasonWouldAdvanceDrain {
 			stranded = true
 		}
-	}
-	if !elsewhere {
-		t.Error("dry run reported on nothing but the node it was told to leave alone")
 	}
 	if !stranded {
 		t.Errorf("nothing said what would happen to the drain binpack is not advancing: %+v",
@@ -1550,6 +1594,14 @@ func TestDryRunStillReportsOnTheRestOfTheCluster(t *testing.T) {
 	}
 	if got := nodesReported(t); got != 3 {
 		t.Errorf("binpack_nodes covers %v nodes, want all 3", got)
+	}
+	// Assessed, not merely counted. A drain in progress stops binpack choosing
+	// a second node, so nothing here names b or c any more — but the whole of
+	// what dry run is for is that the rest of the cluster is still evaluated,
+	// and three nodes counted would be satisfied by three skips. Reaching
+	// drainable means the simulation ran for both.
+	if got := nodesWithVerdict(t, engine.VerdictDrainable); got != 2 {
+		t.Errorf("binpack_nodes{verdict=drainable} = %v, want b and c both assessed", got)
 	}
 
 	var nodes corev1.NodeList

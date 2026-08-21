@@ -12,7 +12,6 @@ import (
 	"fmt"
 	"maps"
 	"slices"
-	"sort"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -692,9 +691,14 @@ func (e *evaluator) attempt(ctx context.Context) error {
 
 // drainInProgress names the node binpack is part-way through draining.
 //
-// It also remembers the last one, because a successful drain is exactly the
-// case where the evidence disappears: the autoscaler removes the node and the
-// markers go with it. Without this the completion is unobservable — the
+// The marker is read by [engine.Marked], which is also what makes
+// [engine.Decide] decline to choose a second node — so this short-circuit and
+// the decision function cannot disagree about whether a drain is running.
+//
+// What is added here is the half the engine cannot see: a drain whose node has
+// gone. It remembers the last one, because a successful drain is exactly the
+// case where the evidence disappears — the autoscaler removes the node and the
+// markers go with it. Without this the completion is unobservable, and the
 // completed-drain counter would only ever increment for drains that failed to
 // finish, which is the opposite of useful.
 //
@@ -702,7 +706,7 @@ func (e *evaluator) attempt(ctx context.Context) error {
 // because it is only a metric. Everything a *recovery* needs still lives on
 // the nodes; the worst a restart costs is one uncounted drain.
 func (e *evaluator) drainInProgress(s engine.Snapshot) string {
-	if name := marked(s); name != "" {
+	if name := engine.Marked(s); name != "" {
 		e.active = name
 		return name
 	}
@@ -720,26 +724,6 @@ func (e *evaluator) drainInProgress(s engine.Snapshot) string {
 	// marked.
 	e.active = ""
 	return ""
-}
-
-// marked names the node carrying a drain marker.
-//
-// Sorted, so two markers left by some earlier confusion produce the same
-// answer every evaluation rather than whichever the cache listed first. One
-// drain at a time is the invariant; picking deterministically means the second
-// marker is resolved rather than alternated with.
-func marked(s engine.Snapshot) string {
-	var names []string
-	for _, node := range s.Nodes {
-		if node.Annotations[engine.AnnotationDrainStarted] != "" {
-			names = append(names, node.Name)
-		}
-	}
-	sort.Strings(names)
-	if len(names) == 0 {
-		return ""
-	}
-	return names[0]
 }
 
 func present(s engine.Snapshot, name string) bool {

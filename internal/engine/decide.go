@@ -439,6 +439,30 @@ func Decide(s Snapshot, cfg Config) Decision {
 		assessments = append(assessments, *a)
 	}
 
+	// Step 0 of the drain protocol: a drain already under way pre-empts a new
+	// decision, however good the candidate below it looks.
+	//
+	// Below the assessments rather than above them, and the difference is the
+	// whole value of the branch. Returning at the top of this function is the
+	// cheap way to write "one node per run" and it would hand `binpack explain`
+	// an empty node table — losing the arithmetic the command exists to show,
+	// in precisely the window that made the gate necessary. So every node is
+	// still assessed and still reported; what a drain in progress takes away is
+	// the choice, not the reasoning.
+	//
+	// The marked node's own row is the one this cannot answer: it is assessed
+	// here as a node binpack might select, and what governs it is whether the
+	// drain already under way survives another step. That question is
+	// [Revalidate]'s, and it is asked with the drain's own flags.
+	if name := Marked(s); name != "" {
+		return Decision{
+			Code:        CodeDraining,
+			Node:        nodeNamed(s, name),
+			Reason:      "a drain is in progress on " + name,
+			Assessments: assessments,
+		}
+	}
+
 	if chosen >= 0 {
 		assessments[chosen].Chosen = true
 		return Decision{
@@ -515,13 +539,7 @@ func drainable(s Snapshot, a *NodeAssessment, policy Policy, committed bool) boo
 // A node absent from the snapshot returns skipped rather than an error: the
 // cluster-autoscaler removing it is the outcome a drain is working towards.
 func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
-	var node *corev1.Node
-	for _, n := range s.Nodes {
-		if n.Name == name {
-			node = n
-			break
-		}
-	}
+	node := nodeNamed(s, name)
 	if node == nil {
 		return NodeAssessment{
 			Node:       &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}},
@@ -563,6 +581,42 @@ func outcomeCode(assessments []NodeAssessment) string {
 		}
 	}
 	return CodeNoCandidates
+}
+
+// Marked names the node binpack is part-way through draining, or "" for none.
+//
+// "One node per run" is the whole of the drain protocol's step 0, and it used
+// to live above this package, in the controller's loop — so the other caller of
+// [Decide], `binpack explain`, did not have it and went on choosing a second
+// node while the first was still being emptied. A rule enforced above a shared
+// function is a rule only one of its callers obeys.
+//
+// Sorted, so two markers left by some earlier confusion produce the same answer
+// every evaluation rather than whichever the cache listed first. One drain at a
+// time is the invariant; picking deterministically means the second marker is
+// resolved rather than alternated with.
+func Marked(s Snapshot) string {
+	var names []string
+	for _, node := range s.Nodes {
+		if node.Annotations[AnnotationDrainStarted] != "" {
+			names = append(names, node.Name)
+		}
+	}
+	sort.Strings(names)
+	if len(names) == 0 {
+		return ""
+	}
+	return names[0]
+}
+
+// nodeNamed finds one node in a snapshot, or nil.
+func nodeNamed(s Snapshot, name string) *corev1.Node {
+	for _, node := range s.Nodes {
+		if node.Name == name {
+			return node
+		}
+	}
+	return nil
 }
 
 // committedDrain reports whether the drain on this node has begun disrupting

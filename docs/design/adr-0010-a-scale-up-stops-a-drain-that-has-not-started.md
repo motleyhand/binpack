@@ -176,9 +176,13 @@ instrument.
 - **A drain can now run to completion while the cluster is growing.** Deliberate, and the point.
   It is still bounded, by everything ADR-0007 governs: the stall timeout, the removal timeout and
   the positive detection of a pod past its termination deadline. None of those changes here.
-- **Selection is untouched.** `explain` and `diagnose` never resume a drain, so both still apply
-  the full set of checks and still report a cooldown as the reason a node was ruled out — even a
-  node that a drain is already under way on. ADR-0009 asserted that in prose; it is now a test.
+- **Selection is untouched.** Selection never resumes a drain, so it still applies the full set
+  of checks and still reports a cooldown as the reason a node was ruled out — even a node that a
+  drain is already under way on. ADR-0009 asserted that in prose; it is now a test.
+  `explain` has since gained one exception, recorded in ADR-0009's consequences: it substitutes
+  `Revalidate`'s answer for the marked node's row, and marks the row, because that is the
+  question being asked about the node being emptied. The assessment selection produced is what
+  the metrics still count.
 - **Committedness is only as durable as the annotation, and the annotation was written after the
   eviction it records.** *Closed since this was written; the paragraphs below record why the
   obvious fix is the wrong one, which is still worth knowing.* `Advance` evicted, then patched the

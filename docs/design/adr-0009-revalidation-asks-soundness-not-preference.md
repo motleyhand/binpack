@@ -84,8 +84,14 @@ catches pods the scheduler bound to the node between the decision and the cordon
 - A drain can now complete having left the cluster with less headroom than the reserve wanted.
   That was already true of any drain that finished before the reserve was re-checked; it is now
   true predictably rather than depending on eviction order.
-- `explain` and `diagnose` are unaffected. Neither runs against a drain in progress, so both
-  always see the full set of checks.
+- `diagnose` is unaffected. It never resumes a drain, so it always sees the full set of checks.
+  `explain` was too when this was written, and is no longer, in exactly one row and deliberately.
+  Selection is untouched: every check is still asked of every node, a node carrying a drain
+  marker included, so the assessments `Decide` returns and the metrics counting them are the
+  same as before. But the row `explain` prints for the node being drained is `Revalidate`'s
+  answer rather than selection's, because the question an operator is asking about that node is
+  whether the drain survives another step — and that question is the one this document narrowed.
+  The row is marked as such in both renderings, so the two are not read as one.
 
 ## Alternatives considered
 

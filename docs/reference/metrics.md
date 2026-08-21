@@ -71,7 +71,7 @@ alerts rather than being folded into this one:
 | `no-autoscaler` | No live cluster-autoscaler; binpack will not act |
 | `no-candidates` | Every node was ruled out before any simulation ran |
 | `none-feasible` | Nodes were simulated and none could be emptied |
-| `draining` | A drain was already under way, so this evaluation advanced it rather than deciding afresh |
+| `draining` | A drain was already under way, so no new node was chosen: binpack advanced that drain, or — under `dryRun: true` — reported it and carried on |
 
 The last two are worth telling apart: `no-candidates` is a configuration answer, `none-feasible`
 is a capacity one.
@@ -88,6 +88,10 @@ is a capacity one.
 `verdict` is one of `skipped`, `infeasible`, `blocked`, `drainable`. All four are always
 published, reporting zero rather than disappearing — "no drainable nodes" and "binpack is not
 reporting" must not look the same.
+
+These four gauges describe the last evaluation that *assessed* the cluster, which is not always
+the last evaluation: see [During a drain](#during-a-drain) and
+[After a failed evaluation](#after-a-failed-evaluation).
 
 `code` on `binpack_nodes_skipped` is one of:
 
@@ -264,6 +268,34 @@ a cluster having a bad minute from a deployment that will never work again — a
 has been narrowed, an admission webhook that denies binpack's patches — where retrying quietly
 for ever would leave binpack reporting healthy while doing nothing at all. A binpack that is
 restarting *and* whose error counter is climbing is telling you which of the two you have.
+
+## During a drain
+
+A drain takes one step per evaluation and can outlast many of them, and each of those
+evaluations advances the drain rather than deciding afresh. They reach no conclusion about any
+node, so **the node gauges are left alone**: `binpack_nodes`, `binpack_nodes_skipped`,
+`binpack_drainable_nodes` and `binpack_nodes_unmodelled` all keep the reading from the last
+evaluation that assessed the cluster.
+
+That reading goes stale for as long as the drain runs, and there is no better option: binpack
+cannot publish an assessment it did not make, and republishing zeroes instead says the cluster
+is empty — which drives `binpack_nodes{verdict="infeasible"}` to zero and so disables the
+conjunctive alert above for the whole of its window.
+
+`binpack_last_evaluation_timestamp_seconds` is how to tell the two apart. It moves on every
+evaluation, a draining one included, so a fresh timestamp beside unchanging node gauges is
+binpack working on a drain, while a stale timestamp is binpack not evaluating at all. The drain
+itself is visible in the outcome counter:
+
+```promql
+increase(binpack_evaluations_total{code="draining"}[5m]) > 0
+```
+
+`binpack_pool_nodes`, `binpack_autoscaler_up` and the backoff gauges are unaffected. They are
+read from the cluster on every evaluation rather than from a decision.
+
+Under `dryRun: true` the node gauges do keep moving during a drain: binpack reports the drain it
+is not advancing, then goes on to assess the rest of the cluster as usual.
 
 ## See also
 

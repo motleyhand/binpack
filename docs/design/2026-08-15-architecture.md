@@ -100,6 +100,14 @@ watch-backed cache. Both produce the same `Snapshot` — Kubernetes objects as r
 translated — so the engine cannot tell them apart, which is what guarantees `explain` describes
 what `run` will do.
 
+The shared `Snapshot` is necessary but not sufficient, and the gap is worth naming because this
+project fell into it. A rule enforced *above* `Decide` is a rule only the caller holding it
+obeys: "one drain at a time" lived in the controller's evaluation loop and nowhere else, so for
+the whole duration of every drain `explain` went on choosing a second node and naming it — in
+precisely the window an operator is most likely to be asking what binpack is doing. Anything
+that decides belongs in the engine. The frontends differ only in how they render what it
+decided.
+
 Objects reaching the engine are **read-only**. The controller path hands out pointers into a
 shared informer cache, and writing to one corrupts it for every other consumer in the process.
 
@@ -406,7 +414,8 @@ elapsed time. The reasoning is in [ADR-0007](adr-0007-drain-progress-not-deadlin
 0. **Resume before deciding.** Each evaluation first checks whether any node carries a drain
    marker. If one does, that drain is advanced and no new decision is made. Without this, a
    forty-minute drain would have forty evaluations running alongside it, each free to start a
-   second one.
+   second one. The check itself is `engine.Marked`, and `Decide` applies it too — reporting the
+   drain in progress instead of choosing — so the answer cannot depend on which command asked.
 1. **Mark, then cordon.** Write the drain annotations, then cordon. Cordoning first and deciding
    afterwards is what makes the next step meaningful: until the node is unschedulable, its pod
    set can still grow.

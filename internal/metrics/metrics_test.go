@@ -1,6 +1,7 @@
 package metrics
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -475,5 +476,145 @@ func TestBackoffDepthOutlivesTheBackoffWindow(t *testing.T) {
 	}
 	if got := testutil.ToFloat64(nodesInBackoff); got != 1 {
 		t.Errorf("nodes_in_backoff = %v, want 1 — only one deadline is still in the future", got)
+	}
+}
+
+// sumNodes is the whole of binpack_nodes, which is what a dashboard panel
+// showing "how many nodes does binpack see" actually plots.
+func sumNodes() float64 {
+	var total float64
+	for _, verdict := range []string{
+		engine.VerdictSkipped, engine.VerdictInfeasible,
+		engine.VerdictBlocked, engine.VerdictDrainable,
+	} {
+		total += testutil.ToFloat64(nodes.WithLabelValues(verdict))
+	}
+	return total
+}
+
+func TestAdvancingADrainDoesNotZeroTheNodeGauges(t *testing.T) {
+	// An evaluation that advances a drain never runs Decide, so it carries no
+	// reading of the cluster's nodes — and reset-then-recount over no
+	// assessments republishes an empty cluster. For the whole duration of
+	// every drain, which is minutes to tens of minutes, the gauges said
+	// binpack could see nothing.
+	//
+	// The same reasoning Failed() already applies: the gauges describe the
+	// last evaluation that reached a conclusion, and an evaluation that
+	// reached none must leave them alone.
+	Observe(snapshot(), engine.Decision{
+		Code: engine.CodeNoneFeasible,
+		Assessments: []engine.NodeAssessment{
+			assess(engine.VerdictSkipped, engine.SkipCordoned),
+			assess(engine.VerdictInfeasible, ""),
+			assess(engine.VerdictBlocked, ""),
+		},
+	}, config(), 0.01)
+
+	before := sumNodes()
+	if before != 3 {
+		t.Fatalf("binpack_nodes summed to %v after assessing three nodes, want 3", before)
+	}
+
+	Observe(snapshot(), engine.Decision{
+		Code:   engine.CodeDraining,
+		Reason: "a drain is in progress on node-a",
+	}, config(), 0.01)
+
+	if got := sumNodes(); got != before {
+		t.Errorf("binpack_nodes summed to %v after a draining tick, want it unchanged at %v",
+			got, before)
+	}
+	if got := testutil.ToFloat64(skipped.WithLabelValues(engine.SkipCordoned)); got != 1 {
+		t.Errorf("binpack_nodes_skipped{code=cordoned} = %v after a draining tick, want 1", got)
+	}
+	if got := testutil.ToFloat64(evaluations.WithLabelValues(engine.CodeDraining)); got < 1 {
+		t.Error("the draining tick was not counted as an evaluation")
+	}
+}
+
+// TestADrainingTickStillSeedsTheVerdicts covers the leader that restarts
+// mid-drain, whose first evaluation is a draining tick.
+//
+// Leaving the gauges alone opens the gate without ever having written them, so
+// binpack_nodes would be served with no children at all — absent rather than
+// zero, which is the reading the gate itself exists to prevent.
+func TestADrainingTickStillSeedsTheVerdicts(t *testing.T) {
+	// Reset stands in for the fresh process: a GaugeVec that has never counted
+	// anything has no children at all.
+	nodes.Reset()
+
+	Observe(snapshot(), engine.Decision{
+		Code:   engine.CodeDraining,
+		Reason: "a drain is in progress on node-a",
+	}, config(), 0.01)
+
+	scrape := gather(t)
+	for _, verdict := range []string{
+		engine.VerdictSkipped, engine.VerdictInfeasible,
+		engine.VerdictBlocked, engine.VerdictDrainable,
+	} {
+		series := fmt.Sprintf("binpack_nodes{verdict=%q} 0", verdict)
+		if !strings.Contains(scrape, series) {
+			t.Errorf("%s is missing from the scrape:\n%s", series, scrape)
+		}
+	}
+}
+
+// TestADryRunDrainStillPublishesTheClusterItAssessed is the other half of the
+// condition, and it is the half a narrower guard would take away.
+//
+// In dry run a drain in progress is reported and then decided past, so the
+// decision carries the draining code *and* a full set of assessments. Keying
+// only on the code would republish an empty cluster for as long as dryRun
+// stood — which, since the marker is never cleared, is for ever.
+func TestADryRunDrainStillPublishesTheClusterItAssessed(t *testing.T) {
+	Observe(snapshot(), engine.Decision{
+		Code: engine.CodeDraining,
+		Assessments: []engine.NodeAssessment{
+			assess(engine.VerdictSkipped, engine.SkipDrainInProgress),
+			assess(engine.VerdictDrainable, ""),
+			assess(engine.VerdictDrainable, ""),
+		},
+	}, config(), 0.01)
+
+	if got := sumNodes(); got != 3 {
+		t.Errorf("binpack_nodes summed to %v, want the 3 nodes the dry run assessed", got)
+	}
+	if got := testutil.ToFloat64(skipped.WithLabelValues(engine.SkipDrainInProgress)); got != 1 {
+		t.Errorf("binpack_nodes_skipped{code=drain-in-progress} = %v, want 1", got)
+	}
+}
+
+// TestNoAutoscalerStillZeroesTheNodeGauges is the widening direction.
+//
+// That decision also carries no assessments, and there the zeroes are the
+// answer rather than the absence of one: binpack has refused to assess
+// anything, binpack_autoscaler_up says so in the same scrape, and the metrics
+// reference gives that state its own alert. A guard that keyed on emptiness
+// alone would freeze the last healthy reading over a cluster whose autoscaler
+// has gone.
+func TestNoAutoscalerStillZeroesTheNodeGauges(t *testing.T) {
+	Observe(snapshot(), engine.Decision{
+		Code: engine.CodeNoneFeasible,
+		Assessments: []engine.NodeAssessment{
+			assess(engine.VerdictDrainable, ""),
+			assess(engine.VerdictDrainable, ""),
+		},
+	}, config(), 0.01)
+
+	if got := sumNodes(); got != 2 {
+		t.Fatalf("binpack_nodes summed to %v before the autoscaler went, want 2", got)
+	}
+
+	dead := snapshot()
+	dead.Autoscaler = engine.Autoscaler{}
+	Observe(dead, engine.Decision{
+		Code:   engine.CodeNoAutoscaler,
+		Reason: "no cluster-autoscaler status was found",
+	}, config(), 0.01)
+
+	if got := sumNodes(); got != 0 {
+		t.Errorf("binpack_nodes summed to %v with no autoscaler, want 0", got)
 	}
 }
