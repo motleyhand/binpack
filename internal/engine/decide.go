@@ -33,7 +33,8 @@ const (
 	// AnnotationDrainAwaiting names the controller whose replacement pod the
 	// drain is waiting to see bound, as "<owner UID>@<RFC3339>". Evicting the
 	// next pod before this one has landed would put two replacements in
-	// flight against a simulation that assumed one.
+	// flight against a simulation that assumed one. Or AwaitingSettled, when
+	// the drain has evicted something and is owed no replacement for it.
 	AnnotationDrainAwaiting = "binpack.motleyhand.com/drain-awaiting"
 
 	// Backoff markers, recorded when a drain is abandoned.
@@ -41,6 +42,23 @@ const (
 	AnnotationBackoffUntil  = "binpack.motleyhand.com/backoff-until"
 	AnnotationLastFailure   = "binpack.motleyhand.com/last-failure"
 )
+
+// AwaitingSettled is what [AnnotationDrainAwaiting] carries when a drain has
+// evicted a pod and is owed no replacement for it: the replacement has already
+// landed, or the pod was expendable and the simulation never placed one.
+//
+// A third state in what began as a two-state annotation, because the two
+// obvious spellings of "nothing owed" are both wrong. Absent means the drain
+// has evicted nothing — [committedDrain] reads this key's presence and nothing
+// else — so clearing it re-arms the preferences ADR-0009 stops asking once pods
+// have moved, and since ADR-0010 the scale-up cooldown with them. Leaving the
+// previous eviction's marker standing is the other way to say nothing, and it
+// says something false: the drain goes on waiting for a replacement it is not
+// owed, and any later pod of that controller the scheduler refuses ends it.
+//
+// Deliberately not of the form "<uid>@<RFC3339>". A reader parses the marker to
+// find the controller it names, and a sentinel that parsed would name one.
+const AwaitingSettled = "settled"
 
 // Taints the cluster-autoscaler puts on nodes it is removing. Its constants,
 // not binpack's — from cluster-autoscaler/utils/taints/taints.go — so they are
@@ -543,9 +561,11 @@ func outcomeCode(assessments []NodeAssessment) string {
 // something.
 //
 // Read from the node rather than passed in, so nothing can disagree with the
-// node about what has already happened: the marker names the replacement the
-// drain is waiting for, is written with the first eviction, and is cleared only
-// when the drain ends. See ADR-0009.
+// node about what has already happened: the marker is written with the first
+// eviction and cleared only when the drain ends, naming the replacement being
+// waited for or, as [AwaitingSettled], recording that none is owed. Its
+// presence is the signal and its value is not, which is why "nothing owed" has
+// a spelling of its own. See ADR-0009.
 func committedDrain(node *corev1.Node) bool {
 	return node.Annotations[AnnotationDrainAwaiting] != ""
 }

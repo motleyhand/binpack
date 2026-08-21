@@ -1548,3 +1548,140 @@ func TestAHandOverForAPoolTheAutoscalerNoLongerManagesIsEnded(t *testing.T) {
 		t.Error("the node is still cordoned, waiting on an autoscaler that does not manage it")
 	}
 }
+
+// expendable is a pod the autoscaler would terminate without ceremony, and
+// which binpack therefore simulates no destination for. Its controller is the
+// load-bearing part: a bare pod is refused before anything is evicted, so the
+// only expendable pod that reaches an eviction is one something will recreate.
+func expendable(name string) *corev1.Pod {
+	return mother.Pod("default", name, mother.OnNode("a"), mother.Priority(-100))
+}
+
+// consolidating is engineConfig with the autoscaler's own expendable cutoff
+// stated rather than left at the zero value, so the fixtures below say which
+// rule they are testing.
+func consolidating() engine.Config {
+	cfg := engineConfig()
+	cfg.Default.Sim.ExpendablePriorityCutoff = -10
+	return cfg
+}
+
+func TestAnExpendablePodsEvictionRecordsNoReplacementWait(t *testing.T) {
+	// An expendable pod needs no destination — that is the whole of what the
+	// class means, and Simulate places none for it. Recording a wait for its
+	// replacement adds exactly the thing the contract says binpack adds
+	// nothing of: the drain now requires a pod that was deliberately never
+	// placed to be placeable, and the autoscaler will not scale up for a
+	// sub-cutoff pod, so nothing ever resolves it.
+	pods := []*corev1.Pod{expendable("filler")}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, time.Minute, "1"), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", consolidating(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code != executor.StepEvicted {
+		t.Fatalf("expected the expendable pod evicted, got %+v", step)
+	}
+
+	// Settled, not absent. The marker's presence is the only record that this
+	// drain has begun, so omitting the write leaves the previous eviction's
+	// marker standing and clearing it re-arms the preferences ADR-0009 stops
+	// asking once pods have moved.
+	got := nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainAwaiting]
+	if got != engine.AwaitingSettled {
+		t.Errorf("the drain recorded a wait for a pod it never placed: %q", got)
+	}
+}
+
+func TestAnUnschedulableExpendableReplacementDoesNotEndTheDrain(t *testing.T) {
+	// The harm in full, and it lands at the worst possible moment. nextToEvict
+	// takes the relocatable pods first, so the expendable one is the last
+	// eviction of the drain — by which point every pod that needed a
+	// destination has already been given one. Its replacement then comes back
+	// Unschedulable, which is an ordinary outcome in a cluster binpack has
+	// just tightened by a node's worth of pods, and binpack throws away a
+	// drain that had finished: node uncordoned, thirty minutes of backoff, and
+	// a replacement-unschedulable abandonment counted against an operation
+	// that succeeded.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web", mother.OnNode("a")),
+		expendable("filler"),
+	}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, 0, ""), node("b")}, pods)
+	c := clientFor(s)
+
+	round, step := drainRounds(t, c, 6, func(pod string, now time.Time) {
+		// The relocatable pod's replacement lands where the simulation said it
+		// would; the expendable one's cannot be placed, because nothing
+		// reserved it room and nothing will make any.
+		replacement := pending(pod+"-2", pod+"-rs", now, pod == "filler")
+		if pod != "filler" {
+			replacement.Spec.NodeName = "b"
+		}
+		if err := c.Create(context.Background(), replacement); err != nil {
+			t.Fatalf("replacing %s: %v", pod, err)
+		}
+	})
+
+	if step.Failed {
+		t.Fatalf("a finished drain was abandoned at +%dm: %+v", round, step)
+	}
+	if step.Code != executor.StepAwaitRemoval {
+		t.Errorf("ended at +%dm with %+v; expected the emptied node awaiting removal", round, step)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node was uncordoned, so the cluster-autoscaler will not remove it")
+	}
+}
+
+func TestAnUnrelatedUnschedulablePodDoesNotAbandonAnEmptiedNode(t *testing.T) {
+	// The marker means "this drain owes one replacement", but its lifetime was
+	// "until the next eviction" — and on an emptied node there is no next
+	// eviction. So it stays live, and every later evaluation re-asks the same
+	// question of the whole pod list. Any new pod of that ReplicaSet the
+	// scheduler cannot place then abandons the drain and uncordons a node the
+	// autoscaler was about to reap, recording a failure that names a pod which
+	// never ran there.
+	//
+	// Reached in three rounds rather than built by hand, because the defect is
+	// in what the second round leaves behind: a fixture that wrote the marker
+	// itself would be asserting the test's own idea of the state.
+	pods := []*corev1.Pod{mother.Pod("default", "web", mother.OnNode("a"))}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, 0, ""), node("b")}, pods)
+	c := clientFor(s)
+
+	round, step := drainRounds(t, c, 6, func(pod string, now time.Time) {
+		moved := pending(pod+"-2", pod+"-rs", now, false)
+		moved.Spec.NodeName = "b"
+		if err := c.Create(context.Background(), moved); err != nil {
+			t.Fatalf("relocating %s: %v", pod, err)
+		}
+	})
+	if step.Code != executor.StepAwaitRemoval {
+		t.Fatalf("the drain did not reach an emptied node: +%dm %+v", round, step)
+	}
+
+	// An HPA scale-up, a rollout, a replica recreated after a node failure —
+	// during a period when the cluster is by construction near-full. Nothing
+	// to do with this drain, and not on this node.
+	if err := c.Create(context.Background(),
+		pending("scaled-up", "web-rs", at.Add(time.Duration(round+1)*time.Minute), true)); err != nil {
+		t.Fatalf("scaling up: %v", err)
+	}
+
+	after := cluster(t, c, at.Add(time.Duration(round+1)*time.Minute))
+	step, err := executor.Advance(
+		context.Background(), c, after, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Failed || step.Code != executor.StepAwaitRemoval {
+		t.Errorf("an unrelated pod ended a drain that had emptied its node: %+v", step)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node was uncordoned while the cluster-autoscaler was removing it")
+	}
+}

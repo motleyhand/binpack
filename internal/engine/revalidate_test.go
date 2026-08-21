@@ -288,6 +288,45 @@ func TestAScaleUpStillRefusesADrainThatHasNotStarted(t *testing.T) {
 	}
 }
 
+func TestASettledReplacementStillReadsAsACommittedDrain(t *testing.T) {
+	// The invariant that makes a settled marker safe to write. Committedness
+	// is derived from this annotation and nothing else, so the value that says
+	// "no replacement owed" has to be a value, not the absence of one — and
+	// both readings of it, the reserve here and the cooldown below, must agree.
+	//
+	// The pair for this is TestTheReserveRefusesADrainThatHasNotStarted, which
+	// builds the same cluster with the marker cleared and asserts the opposite.
+	// Without it this test would pass against a reserve that never applied.
+	s, cfg := reserving(t, draining()...)
+	s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = engine.AwaitingSettled
+
+	if got := engine.Revalidate(s, "a", cfg); got.Verdict() != engine.VerdictDrainable {
+		t.Errorf("a preference re-armed on a drain whose replacement had settled: %q (%s)",
+			got.Verdict(), revalidationDetail(got))
+	}
+}
+
+func TestASettledReplacementStillSurvivesAScaleUp(t *testing.T) {
+	// The second reading of the same annotation, added by ADR-0010: a marker
+	// that reads as uncommitted no longer merely re-applies the reserve, it
+	// puts the scale-up cooldown back in force and ends the drain. So a drain
+	// that settled its marker rather than clearing it must survive both, and
+	// it is worth asserting separately because the two are asked in different
+	// places — one below eligibility, one inside it.
+	for _, tc := range growing {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cfg := midDrain()
+			s.Nodes[0].Annotations[engine.AnnotationDrainAwaiting] = engine.AwaitingSettled
+			tc.to(&s)
+
+			if got := engine.Revalidate(s, "a", cfg); got.Verdict() != engine.VerdictDrainable {
+				t.Errorf("a drain whose replacement had settled was abandoned: %q (%s)",
+					got.Verdict(), revalidationDetail(got))
+			}
+		})
+	}
+}
+
 func TestSelectionStillReportsACooldownOnANodeAlreadyBeingDrained(t *testing.T) {
 	// "Committed" is a fact about binpack resuming a drain it started, not a
 	// property of the node that every caller should honour. Selection reads

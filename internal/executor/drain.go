@@ -272,8 +272,26 @@ func Advance(
 			return Step{Code: StepWaiting,
 				Reason: "waiting for the replacement pod to be scheduled"}, nil
 		}
-		// landed: the next eviction overwrites this marker, so there is
-		// nothing to clear.
+		// landed. The marker is replaced rather than left standing, because
+		// the next eviction is not guaranteed to overwrite it: an emptied node
+		// has no next eviction at all, and a wait for a pod still terminating
+		// can run for a whole termination grace period. Through both windows
+		// the marker goes on asking replacementFor the same question of the
+		// whole pod list, and any later pod of that controller the scheduler
+		// cannot place answers "refused" — ending a drain that a rollout or an
+		// HPA scale-up merely happened alongside, and naming in the failure a
+		// pod that never ran on the node.
+		//
+		// Settled rather than cleared. This drain has evicted something, and
+		// the marker's presence is the only record of that.
+		//
+		// One extra write per eviction, not per evaluation: a settled marker
+		// names no controller, so every later evaluation skips this block.
+		if err := Annotate(ctx, w, a.Node, map[string]string{
+			engine.AnnotationDrainAwaiting: engine.AwaitingSettled,
+		}); err != nil {
+			return Step{}, err
+		}
 	}
 
 	switch assessment.Action {
@@ -301,7 +319,7 @@ func Advance(
 			inFlight.Namespace, inFlight.Name)}, nil
 	}
 
-	next := nextToEvict(a.Simulation, pods)
+	next, placed := nextToEvict(a.Simulation, pods)
 	if next == nil {
 		// Pods remain that the simulation did not name. Rather than guess at
 		// them, hand the node back: acting on a set binpack cannot account for
@@ -331,7 +349,7 @@ func Advance(
 		return Step{}, err
 	}
 	if err := Annotate(ctx, w, a.Node, map[string]string{
-		engine.AnnotationDrainAwaiting: awaitingMarker(next, s.Now),
+		engine.AnnotationDrainAwaiting: awaitingMarker(next, placed, s.Now),
 	}); err != nil {
 		return Step{}, err
 	}
@@ -450,14 +468,21 @@ func terminating(pods []*corev1.Pod) *corev1.Pod {
 	return nil
 }
 
-// nextToEvict picks the pod to evict, in the order the simulation placed them.
+// nextToEvict picks the pod to evict, in the order the simulation placed them,
+// and reports whether it placed this one at all.
 //
 // Largest first, which is the order the packing found a home for them in. The
 // hardest pod to place goes first, so a prediction that was wrong costs one
 // eviction rather than all of them.
-func nextToEvict(sim *engine.Simulation, on []*corev1.Pod) *corev1.Pod {
+//
+// The expendable pods come after every relocatable one, and which list this pod
+// came from is the caller's business rather than a detail of the ordering: the
+// simulation reserved nothing for an expendable pod, so no replacement is owed
+// for it. Reported here rather than re-derived from the cutoff at the call
+// site, so the two answers cannot drift apart.
+func nextToEvict(sim *engine.Simulation, on []*corev1.Pod) (*corev1.Pod, bool) {
 	if sim == nil {
-		return nil
+		return nil, false
 	}
 	present := make(map[string]bool, len(on))
 	for _, pod := range on {
@@ -466,15 +491,15 @@ func nextToEvict(sim *engine.Simulation, on []*corev1.Pod) *corev1.Pod {
 
 	for _, p := range sim.Relocated {
 		if present[p.Pod.Namespace+"/"+p.Pod.Name] {
-			return p.Pod
+			return p.Pod, true
 		}
 	}
 	for _, pod := range sim.Evicted {
 		if present[pod.Namespace+"/"+pod.Name] {
-			return pod
+			return pod, false
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // replacement reports what has become of the pod a controller owes this drain.
@@ -492,6 +517,12 @@ const (
 )
 
 // awaiting reads the controller this drain is waiting on, and since when.
+//
+// Not found is the answer for both states that name no controller: a drain that
+// has evicted nothing, and one whose marker has settled. Neither parses, and
+// that is a property of [engine.AwaitingSettled]'s shape rather than a case
+// tested for here — a sentinel that parsed would name a controller that does
+// not exist, and the drain would wait out its stall timeout for its pod.
 func awaiting(node *corev1.Node) (types.UID, time.Time, bool) {
 	owner, stamp, found := strings.Cut(node.Annotations[engine.AnnotationDrainAwaiting], "@")
 	if !found || owner == "" {
@@ -565,15 +596,27 @@ func replacementFor(
 }
 
 // awaitingMarker records which controller owes this drain a pod, so the next
-// evaluation can tell whether it landed.
+// evaluation can tell whether it landed — or [engine.AwaitingSettled] when the
+// eviction owes nothing.
 //
-// The nil case guards a dereference rather than describing a reachable state:
-// a pod with no readable controller template makes the node infeasible, so the
-// engine refuses the drain long before anything is evicted.
-func awaitingMarker(pod *corev1.Pod, now time.Time) string {
+// placed is what the simulation did with the pod. An expendable one is evicted
+// without a destination being reserved for it, which is the whole of what the
+// class means; waiting for its replacement demands of that pod precisely the
+// property the class excuses it from, and since the cluster-autoscaler ignores
+// sub-cutoff pods for scale-up too, nothing would ever supply it. The wait ends
+// in a drain abandoned for a replacement nobody was owed — and because the
+// expendable pods are evicted last, it ends one that had already finished.
+//
+// The controller-less case still guards a dereference rather than describing a
+// reachable state: a pod with no readable controller template makes the node
+// infeasible, so the engine refuses the drain long before anything is evicted.
+// It settles rather than returning "", all the same. The empty string deletes
+// the annotation, and the annotation's presence is what records that this drain
+// has evicted something — so the write is one the caller can always make.
+func awaitingMarker(pod *corev1.Pod, placed bool, now time.Time) string {
 	ref := metav1.GetControllerOf(pod)
-	if ref == nil {
-		return ""
+	if !placed || ref == nil {
+		return engine.AwaitingSettled
 	}
 	return string(ref.UID) + "@" + now.UTC().Format(time.RFC3339)
 }
