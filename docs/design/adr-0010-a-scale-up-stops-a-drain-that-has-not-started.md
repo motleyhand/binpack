@@ -140,6 +140,29 @@ instrument.
 - **Selection is untouched.** `explain` and `diagnose` never resume a drain, so both still apply
   the full set of checks and still report a cooldown as the reason a node was ruled out — even a
   node that a drain is already under way on. ADR-0009 asserted that in prose; it is now a test.
+- **Committedness is only as durable as the annotation, and the annotation is written after the
+  eviction it records.** `Advance` evicts, then patches the node. If that patch fails, a pod has
+  been disrupted and the node carries no marker — a state indistinguishable from a drain that has
+  cordoned and evicted nothing, because it is the same node. The next evaluation therefore reads
+  the drain as uncommitted, and inside a cooldown window abandons it: the outcome this ADR is
+  about, through a door it does not close.
+
+  This window is not opened here. The marker has been the sole committedness signal since
+  [ADR-0009](adr-0009-revalidation-asks-soundness-not-preference.md), and the same partial write
+  already re-armed `reserveForLargestPod` and `maxPodsPerDrain` —
+  `TestTheReserveRefusesADrainThatHasNotStarted` builds exactly that node and asserts exactly that
+  refusal. What changes is the cost of falling into it, which is now a drain abandoned rather than
+  a preference re-applied.
+
+  Closing it is not simply a matter of writing the marker first. The marker's value names the
+  controller whose replacement the drain is waiting for, so writing it before the eviction claims
+  a replacement is owed — and an eviction refused after that claim (a `429` from a disruption
+  budget, the routine failure on this path) leaves the drain waiting for a pod that was never
+  evicted, until the stall bound ends it eleven minutes later. Measured, not assumed. What is
+  wanted is a value meaning "committed, and no replacement owed", written before the eviction and
+  upgraded to the controller's identity after it. That value is being introduced for its own
+  reasons by the work that gives `drain-awaiting` a settled state, and it belongs there rather
+  than here.
 - One fewer reason for a node to accumulate backoff it did not earn. Candidates are ordered
   least-loaded-first, so the same node was chosen and abandoned each cycle, and seven cluster-wide
   events could put binpack's best candidate on a daily retry without it ever having had a
