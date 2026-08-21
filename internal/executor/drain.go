@@ -272,8 +272,26 @@ func Advance(
 			return Step{Code: StepWaiting,
 				Reason: "waiting for the replacement pod to be scheduled"}, nil
 		}
-		// landed: the next eviction overwrites this marker, so there is
-		// nothing to clear.
+		// landed. The marker is replaced rather than left standing, because
+		// the next eviction is not guaranteed to overwrite it: an emptied node
+		// has no next eviction at all, and a wait for a pod still terminating
+		// can run for a whole termination grace period. Through both windows
+		// the marker goes on asking replacementFor the same question of the
+		// whole pod list, and any later pod of that controller the scheduler
+		// cannot place answers "refused" — ending a drain that a rollout or an
+		// HPA scale-up merely happened alongside, and naming in the failure a
+		// pod that never ran on the node.
+		//
+		// Settled rather than cleared. This drain has evicted something, and
+		// the marker's presence is the only record of that.
+		//
+		// One extra write per eviction, not per evaluation: a settled marker
+		// names no controller, so every later evaluation skips this block.
+		if err := Annotate(ctx, w, a.Node, map[string]string{
+			engine.AnnotationDrainAwaiting: engine.AwaitingSettled,
+		}); err != nil {
+			return Step{}, err
+		}
 	}
 
 	switch assessment.Action {
@@ -301,13 +319,54 @@ func Advance(
 			inFlight.Namespace, inFlight.Name)}, nil
 	}
 
-	next := nextToEvict(a.Simulation, pods)
-	if next == nil {
+	// A pod that arrived after the cordon is not a candidate. The scheduler
+	// puts a pod on a cordoned node only when the pod tolerates
+	// node.kubernetes.io/unschedulable:NoSchedule, so evicting one is an
+	// experiment whose answer is already on the node: it comes straight back,
+	// and on a workload that restarts quickly it comes back once an interval
+	// for as long as the drain lasts.
+	//
+	// The relocatable evictions never needed this, which is why it was not
+	// here. Their marker names a controller, and replacementFor already
+	// declines to read a pod bound to this node as a landed replacement, so
+	// the drain waits instead of evicting again. It is the evictions that owe
+	// no replacement — an expendable pod, and the step after a replacement has
+	// landed — that reach here with nothing holding the line.
+	//
+	// Measured against drain-started rather than the cordon itself, which is
+	// not timestamped. Begin marks before it cordons, so a pod created in
+	// between may have been placed on a node that was still schedulable; it is
+	// left alone anyway, because the cost of that is one evaluation's delay
+	// and the cost of the other direction is the churn above.
+	staying := residentSince(pods, a.Node)
+
+	next, placed := nextToEvict(a.Simulation, staying)
+	switch {
+	case next != nil:
+		// The ordinary case: a pod to evict.
+
+	case len(staying) > 0:
 		// Pods remain that the simulation did not name. Rather than guess at
 		// them, hand the node back: acting on a set binpack cannot account for
-		// is exactly what the allowlist exists to prevent.
+		// is exactly what the allowlist exists to prevent. Asked of the
+		// residents rather than of everything on the node, because an arrival
+		// is accounted for — binpack simply declines to evict it.
 		return Abandon(ctx, w, a.Node, drain.AbandonUnaccounted, fmt.Sprintf(
-			"%d pods remain that the simulation did not account for", len(pods)), s.Now)
+			"%d pods remain that the simulation did not account for", len(staying)), s.Now)
+
+	default:
+		// Nothing is left but pods that came back after the cordon. None of
+		// them can be moved, so the drain is achieving nothing — which is the
+		// question the assessment answers, and it has already had its say
+		// above. Waiting rather than abandoning here, because a workload that
+		// keeps returning may simply stop, and because an ending that reports
+		// "no progress" describes this node better than one that reports pods
+		// binpack could not account for.
+		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
+			return Step{}, err
+		}
+		return Step{Code: StepWaiting, Reason: fmt.Sprintf(
+			"%d pods came back to the node after it was cordoned", len(pods))}, nil
 	}
 
 	if err := Evict(ctx, w, next); err != nil {
@@ -331,7 +390,7 @@ func Advance(
 		return Step{}, err
 	}
 	if err := Annotate(ctx, w, a.Node, map[string]string{
-		engine.AnnotationDrainAwaiting: awaitingMarker(next, s.Now),
+		engine.AnnotationDrainAwaiting: awaitingMarker(next, placed, s.Now),
 	}); err != nil {
 		return Step{}, err
 	}
@@ -450,14 +509,42 @@ func terminating(pods []*corev1.Pod) *corev1.Pod {
 	return nil
 }
 
-// nextToEvict picks the pod to evict, in the order the simulation placed them.
+// residentSince drops the pods that arrived on the node after the drain began,
+// leaving the ones it was started to move.
+//
+// An unreadable drain-started marker keeps every pod, rather than none: the
+// annotation is the drain's own recovery state, and a drain that cannot read it
+// must not conclude that everything on the node is untouchable.
+func residentSince(pods []*corev1.Pod, node *corev1.Node) []*corev1.Pod {
+	started, err := time.Parse(time.RFC3339, node.Annotations[engine.AnnotationDrainStarted])
+	if err != nil {
+		return pods
+	}
+
+	resident := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if !pod.CreationTimestamp.After(started) {
+			resident = append(resident, pod)
+		}
+	}
+	return resident
+}
+
+// nextToEvict picks the pod to evict, in the order the simulation placed them,
+// and reports whether it placed this one at all.
 //
 // Largest first, which is the order the packing found a home for them in. The
 // hardest pod to place goes first, so a prediction that was wrong costs one
 // eviction rather than all of them.
-func nextToEvict(sim *engine.Simulation, on []*corev1.Pod) *corev1.Pod {
+//
+// The expendable pods come after every relocatable one, and which list this pod
+// came from is the caller's business rather than a detail of the ordering: the
+// simulation reserved nothing for an expendable pod, so no replacement is owed
+// for it. Reported here rather than re-derived from the cutoff at the call
+// site, so the two answers cannot drift apart.
+func nextToEvict(sim *engine.Simulation, on []*corev1.Pod) (*corev1.Pod, bool) {
 	if sim == nil {
-		return nil
+		return nil, false
 	}
 	present := make(map[string]bool, len(on))
 	for _, pod := range on {
@@ -466,15 +553,15 @@ func nextToEvict(sim *engine.Simulation, on []*corev1.Pod) *corev1.Pod {
 
 	for _, p := range sim.Relocated {
 		if present[p.Pod.Namespace+"/"+p.Pod.Name] {
-			return p.Pod
+			return p.Pod, true
 		}
 	}
 	for _, pod := range sim.Evicted {
 		if present[pod.Namespace+"/"+pod.Name] {
-			return pod
+			return pod, false
 		}
 	}
-	return nil
+	return nil, false
 }
 
 // replacement reports what has become of the pod a controller owes this drain.
@@ -492,6 +579,12 @@ const (
 )
 
 // awaiting reads the controller this drain is waiting on, and since when.
+//
+// Not found is the answer for both states that name no controller: a drain that
+// has evicted nothing, and one whose marker has settled. Neither parses, and
+// that is a property of [engine.AwaitingSettled]'s shape rather than a case
+// tested for here — a sentinel that parsed would name a controller that does
+// not exist, and the drain would wait out its stall timeout for its pod.
 func awaiting(node *corev1.Node) (types.UID, time.Time, bool) {
 	owner, stamp, found := strings.Cut(node.Annotations[engine.AnnotationDrainAwaiting], "@")
 	if !found || owner == "" {
@@ -565,15 +658,27 @@ func replacementFor(
 }
 
 // awaitingMarker records which controller owes this drain a pod, so the next
-// evaluation can tell whether it landed.
+// evaluation can tell whether it landed — or [engine.AwaitingSettled] when the
+// eviction owes nothing.
 //
-// The nil case guards a dereference rather than describing a reachable state:
-// a pod with no readable controller template makes the node infeasible, so the
-// engine refuses the drain long before anything is evicted.
-func awaitingMarker(pod *corev1.Pod, now time.Time) string {
+// placed is what the simulation did with the pod. An expendable one is evicted
+// without a destination being reserved for it, which is the whole of what the
+// class means; waiting for its replacement demands of that pod precisely the
+// property the class excuses it from, and since the cluster-autoscaler ignores
+// sub-cutoff pods for scale-up too, nothing would ever supply it. The wait ends
+// in a drain abandoned for a replacement nobody was owed — and because the
+// expendable pods are evicted last, it ends one that had already finished.
+//
+// The controller-less case still guards a dereference rather than describing a
+// reachable state: a pod with no readable controller template makes the node
+// infeasible, so the engine refuses the drain long before anything is evicted.
+// It settles rather than returning "", all the same. The empty string deletes
+// the annotation, and the annotation's presence is what records that this drain
+// has evicted something — so the write is one the caller can always make.
+func awaitingMarker(pod *corev1.Pod, placed bool, now time.Time) string {
 	ref := metav1.GetControllerOf(pod)
-	if ref == nil {
-		return ""
+	if !placed || ref == nil {
+		return engine.AwaitingSettled
 	}
 	return string(ref.UID) + "@" + now.UTC().Format(time.RFC3339)
 }

@@ -36,10 +36,12 @@ shows you, and because a drain that has gone wrong is explained by them.
 | `drain-started` | When this drain began, RFC 3339 |
 | `drain-progress` | When binpack last observed the drain moving |
 | `drain-pods-remaining` | How many pods were still to leave when it last saw the drain move |
-| `drain-awaiting` | The controller owing a replacement pod, as `<owner UID>@<RFC 3339>` |
+| `drain-awaiting` | The controller owing a replacement pod, as `<owner UID>@<RFC 3339>`, or `settled` when none is owed |
 
 `drain-started` is also the marker: while it is present, binpack advances *this* drain and makes
-no new decision anywhere in the cluster. One node at a time.
+no new decision anywhere in the cluster. One node at a time. It also fixes the set of pods the
+drain will move — a pod created after it arrived on a node that was already cordoned, so it
+tolerates the cordon, and evicting it would put it straight back.
 
 `drain-progress` is what the stall bound measures against, and it moves only when the node's
 state changed — a pod left, or a pod is shutting down inside its grace period. Accepting an
@@ -55,6 +57,17 @@ is what tells binpack a pod left while it was not watching.
 
 `drain-awaiting` is why evictions are sequential. binpack waits for the replacement pod to be
 *bound to a node*, not merely created, before evicting the next one.
+
+It carries `settled` when no replacement is owed, which happens two ways: the replacement has
+landed, or the pod that left was
+[expendable](../explanation/overprovisioning-and-expendable-pods.md) and binpack reserved it no
+destination in the first place. The distinction between `settled` and the annotation being absent
+is load-bearing rather than cosmetic — absent means this drain has evicted nothing at all, and
+binpack asks a drain that has moved pods a narrower set of questions than one that has not
+([ADR-0009](../design/adr-0009-revalidation-asks-soundness-not-preference.md),
+[ADR-0010](../design/adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md)). If you are
+clearing these by hand, clear them all together — the command under [If a node is stuck
+cordoned](#if-a-node-is-stuck-cordoned) does.
 
 ### After a drain has failed
 
