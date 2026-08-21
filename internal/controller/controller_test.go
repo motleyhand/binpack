@@ -1631,3 +1631,55 @@ func TestWhatAFrozenDrainIsToldAboutItself(t *testing.T) {
 		})
 	}
 }
+
+func TestALostFrozenDrainEventFailsAOneShotRunAndOnlyAOneShotRun(t *testing.T) {
+	// A frozen drain's event is the whole output of that evaluation: nothing is
+	// written, nothing is advanced, and the note on the node is the only thing
+	// that says a cordoned node is being left cordoned deliberately. In --once
+	// that makes it the only durable record there is — the process is exiting
+	// and its logs go with it — and the decision that follows writes nothing at
+	// all when there is nothing to drain, so the run would exit 0 having
+	// reported none of it.
+	//
+	// The same rule the decision's own report has drawn since it was written,
+	// and both directions matter: a controller must not crash-loop over one
+	// lost event, because on a cluster where events are the only reachable
+	// surface that takes the logs away too.
+	for _, tc := range []struct {
+		name string
+		once bool
+		want bool
+	}{
+		{"a one-shot run", true, true},
+		{"a controller", false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// The marked node and nothing else, which is the half of this
+			// the decision cannot cover for. With another candidate present
+			// the decision that follows writes its own event and fails on
+			// that, so the frozen drain's lost event is invisible; with none,
+			// report logs "nothing to do", writes nothing, and returns nil.
+			var log captured
+			ev := newEvaluator(t, &log, &fakeRecorder{},
+				drainingNode("a"), statusConfigMap())
+			ev.reporter = failingReporter{}
+			ev.opts.Once = tc.once
+
+			err := ev.evaluate(context.Background())
+			if tc.want && err == nil {
+				t.Fatal("a one-shot run reported nothing about the drain it left alone " +
+					"and called it success")
+			}
+			if !tc.want && err != nil {
+				t.Fatalf("a controller stopped over one lost event: %v", err)
+			}
+			if tc.want && !strings.Contains(err.Error(), "the drain of a") {
+				t.Errorf("the error does not say what was lost: %v", err)
+			}
+			if !tc.want && !log.contains("could not record what would happen") {
+				t.Errorf("the lost event was swallowed entirely:\n%s",
+					strings.Join(log.lines, "\n"))
+			}
+		})
+	}
+}

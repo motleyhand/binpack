@@ -634,7 +634,22 @@ func (e *evaluator) attempt(ctx context.Context) error {
 		// Nothing is written on the way through. Deciding costs a simulation
 		// and the gate below stops before the executor, as it does on every
 		// other dry-run pass.
-		e.frozen(ctx, snapshot, node)
+		if err := e.frozen(ctx, snapshot, node); err != nil {
+			if e.opts.Once {
+				// Nothing will retry, and unlike the decision below there is
+				// no second chance within this run either: a frozen drain
+				// writes nothing and advances nothing, so that event is the
+				// whole of what the evaluation had to say. Where the decision
+				// that follows finds nothing to drain it writes nothing at
+				// all, and the run would exit 0 having reported none of it.
+				return err
+			}
+			// The next tick re-reports, and the recorder aggregates it into
+			// the same event. Same call as the decision's, for the same
+			// reason: on a cluster where events are the only reachable
+			// surface, a crash loop takes the logs away too.
+			e.log.Error(err, "could not record what would happen to the drain", "node", node)
+		}
 	}
 
 	// Filled in by the controller rather than read from the cluster: it is the
@@ -749,7 +764,12 @@ func present(s engine.Snapshot, name string) bool {
 // state a drain can be left in indefinitely. Every other ending is bounded by
 // the assessment; this one is bounded by an operator noticing, and on a managed
 // control plane `kubectl describe node` is where they will be looking.
-func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) {
+//
+// Which is also why losing that event is worth reporting rather than logging.
+// Nothing here writes or advances anything, so the event is the whole output of
+// the evaluation — and in a one-shot run it is the only durable record there
+// is, since the logs go with the process.
+func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) error {
 	a := engine.Revalidate(s, name, e.opts.Engine)
 	if a.SkipCode == engine.SkipGone {
 		// The autoscaler finished a drain that started before dry run was
@@ -757,7 +777,7 @@ func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) 
 		// stops every later evaluation reporting on one that is not there.
 		e.log.Info("the node a drain was in progress on has gone", "node", name)
 		e.active = ""
-		return
+		return nil
 	}
 
 	would := wouldHappen(a, drain.Assess(
@@ -766,11 +786,15 @@ func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) 
 	e.log.Info("a drain is in progress but dryRun is set; leaving it alone",
 		"node", name, "wouldHappen", would)
 
+	// Returned rather than logged here, like the decision's own report and for
+	// the same reason: whether a lost event is fatal depends on whether
+	// anything will try again, which the caller knows and this does not.
 	if err := e.reporter.emit(ctx, a.Node, ReasonWouldAdvanceDrain, ActionConsolidate,
 		"binpack is in dry run, so it is not advancing the drain in progress on this node: "+
 			"it stays cordoned and marked until dryRun is set to false. "+would); err != nil {
-		e.log.Error(err, "could not record what would happen to the drain", "node", name)
+		return fmt.Errorf("recording what would happen to the drain of %s: %w", name, err)
 	}
+	return nil
 }
 
 // wouldHappen describes a frozen drain in one sentence.
