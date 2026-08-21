@@ -729,3 +729,70 @@ func TestDiagnoseReportsAPodWhoseTemplateCannotBeRead(t *testing.T) {
 		mother.Pod("default", "orphan", mother.OnNode("a"), mother.Bare()),
 	}), engine.FindingNoTemplate)
 }
+
+func TestACordonBinpackLeftBehindIsReportedEvenWithoutItsMarkers(t *testing.T) {
+	// The half-cleaned state: the annotations are gone and the cordon is not.
+	// It is what the documented hand-back leaves behind between its first
+	// command and its last, and nothing else in binpack can see it — the
+	// engine skips it as `cordoned`, which is the same bucket as a node a
+	// human cordoned. The label is the only thing left that says whose it is.
+	labelled := inPool("a", mother.Cordoned(),
+		mother.NodeLabels(map[string]string{engine.LabelDraining: "true"}))
+
+	f := only(t, diagnose([]*corev1.Node{labelled, inPool("b"), inPool("c")}, nil),
+		engine.FindingAbandonedDrain)
+	if f.Subject != "a" {
+		t.Errorf("subject = %q, want the node", f.Subject)
+	}
+
+	// A labelled node that is *not* cordoned is the other half-state, left by
+	// a hand-back that got as far as uncordoning. That one has a reader
+	// already: the next evaluation cordons it and resumes.
+	schedulable := inPool("a", mother.NodeLabels(map[string]string{engine.LabelDraining: "true"}))
+	none(t, diagnose([]*corev1.Node{schedulable, inPool("b"), inPool("c")}, nil),
+		engine.FindingAbandonedDrain)
+}
+
+func TestADrainInFlightIsReportedOnceAndAsItself(t *testing.T) {
+	// Begin writes the label and the markers in one patch, so every drain in
+	// flight carries both keys the check now reads. Ungated, the label arm
+	// fires on all of them — a second copy of a finding that is already noise
+	// on a healthy cluster. Gated on the absence of the marker, it names only
+	// the state nothing else can see.
+	//
+	// Both directions are asserted here: exactly one finding rather than two,
+	// and the one that fired is the marker arm, which is the arm that can say
+	// when the drain began.
+	started := now.Add(-2 * time.Hour).Format(time.RFC3339)
+	inFlight := inPool("a", mother.Cordoned(),
+		mother.NodeLabels(map[string]string{engine.LabelDraining: "true"}),
+		mother.NodeAnnotations(map[string]string{engine.AnnotationDrainStarted: started}))
+
+	f := only(t, diagnose([]*corev1.Node{inFlight, inPool("b"), inPool("c")}, nil),
+		engine.FindingAbandonedDrain)
+	if !strings.Contains(f.Detail, started) {
+		t.Errorf("detail = %q, want the marker arm's, naming when the drain began", f.Detail)
+	}
+}
+
+func TestTheAbandonedDrainFixNamesEveryMarkerBinpackWrote(t *testing.T) {
+	// The fix is the one instruction reached by an operator who uninstalled
+	// binpack mid-drain, and it is followed literally. `kubectl annotate` does
+	// not remove a label, so a fix naming only the annotations leaves the node
+	// back in service still advertising a drain that ended — which is what the
+	// label was added to make impossible.
+	var fix string
+	for _, d := range engine.Diagnoses() {
+		if d.Code == engine.FindingAbandonedDrain {
+			fix = d.Fix
+		}
+	}
+	if fix == "" {
+		t.Fatalf("no %s diagnosis in the catalogue", engine.FindingAbandonedDrain)
+	}
+	for _, key := range []string{"binpack.motleyhand.com/", engine.LabelDraining} {
+		if !strings.Contains(fix, key) {
+			t.Errorf("the fix does not name %s, so following it exactly leaves it behind: %s", key, fix)
+		}
+	}
+}

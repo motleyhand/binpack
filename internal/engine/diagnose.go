@@ -224,10 +224,13 @@ var diagnoses = map[string]Diagnosis{
 	},
 	FindingAbandonedDrain: {
 		Severity: Warning,
-		Summary:  "this node is cordoned and still carries a binpack drain marker",
+		Summary:  "this node is cordoned and still says binpack is draining it",
 		Fix: "if binpack is running it will finish or abandon the drain by itself. If it is " +
-			"not — uninstalled mid-drain, most likely — uncordon the node and remove its " +
-			"binpack.motleyhand.com/ annotations, or it stays cordoned and billed.",
+			"not — uninstalled mid-drain, most likely — uncordon the node first, then remove " +
+			"its binpack.motleyhand.com/ annotations and its " +
+			"binpack.motleyhand.com/draining label. That order, because a node left cordoned " +
+			"with its markers cleared reads as somebody else's cordon: binpack skips it, this " +
+			"check stops naming it, and it stays cordoned and billed with nothing left to say why.",
 	},
 	FindingNodeInBackoff: {
 		Severity: Info,
@@ -666,12 +669,36 @@ func diagnoseNodes(s Snapshot) []Finding {
 	var findings []Finding
 
 	for _, node := range s.Nodes {
+		if !node.Spec.Unschedulable {
+			continue
+		}
 		// A cordoned node still carrying a drain marker. Naming it is the whole
 		// value: without the marker this is a mysteriously cordoned node that
 		// nobody dares uncordon.
-		if started := node.Annotations[AnnotationDrainStarted]; started != "" && node.Spec.Unschedulable {
+		if started := node.Annotations[AnnotationDrainStarted]; started != "" {
 			findings = append(findings, finding(FindingAbandonedDrain, node.Name,
 				"drain started "+started))
+			continue
+		}
+		// The marker gone and the cordon still there is the worse half of the
+		// same state, and until now the only one nothing could see. It is what
+		// a hand-back leaves between clearing the markers and uncordoning, and
+		// what a policy controller stripping binpack.motleyhand.com/
+		// annotations leaves for good: [eligibility] then skips the node as
+		// SkipCordoned, which is the bucket for a node somebody else cordoned,
+		// and every surface that could name it has gone quiet.
+		//
+		// The label is a sound second key because Begin and Abandon write and
+		// clear it in the same patch as the markers, so it is never left
+		// behind by binpack itself — only by a repair that stopped halfway.
+		// Reading it here is also the only reader it has ever had.
+		//
+		// Gated on the marker's absence rather than added beside it, because
+		// every drain in flight carries both: ungated this would report each
+		// of them twice, and the finding is already noise on a busy cluster.
+		if node.Labels[LabelDraining] == "true" {
+			findings = append(findings, finding(FindingAbandonedDrain, node.Name,
+				"cordoned by binpack, drain markers removed"))
 		}
 	}
 

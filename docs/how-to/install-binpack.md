@@ -181,11 +181,12 @@ Scaling to zero freezes a drain that is already under way rather than ending it 
 cordoned and marked, because releasing it is itself an action and there is nothing left running to
 take it. So if the middle command lists a node, choose before you uninstall. Scaling back up hands
 the drain to a binpack that will finish it or abandon it and uncordon; leaving it at zero means
-repairing by hand. The three commands for that — clear the annotations, remove the label, uncordon
-— are in the
-[annotations reference](../reference/annotations.md#if-a-node-is-stuck-cordoned). `binpack
-diagnose` reports the same node as an abandoned drain and prints what to clear; it runs against
-your own kubeconfig, so it still answers with nothing installed in the cluster.
+repairing by hand. The three commands for that — **uncordon, then clear the annotations, then
+remove the label** — are in the
+[annotations reference](../reference/annotations.md#if-a-node-is-stuck-cordoned), with the reason
+that order is not arbitrary. `binpack diagnose` reports the same node as an abandoned drain and
+prints what to clear; it runs against your own kubeconfig, so it still answers with nothing
+installed in the cluster.
 
 Reinstalling also resolves it, if the reinstall can act. Recovery asks the cluster rather than
 its own memory — a pod still terminating within its grace period says the drain is alive, and a

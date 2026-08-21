@@ -287,13 +287,18 @@ nothing to do.
 
 ### `abandoned-drain` — warning
 
-The node is cordoned and still carries a binpack drain marker.
+The node is cordoned and still says binpack is draining it. Two ways it can say so: it carries a
+drain marker, or the markers have been cleared and the `binpack.motleyhand.com/draining` label is
+all that is left. The second is a hand-back that stopped halfway, and that label is the only
+thing left to recognise it by.
 
 **Fix.** If binpack is running it will finish or abandon the drain by itself. If it is not —
-uninstalled mid-drain, most likely — uncordon the node and remove its
-`binpack.motleyhand.com/` annotations, or it stays cordoned and billed. The marker exists
-precisely so this is a self-describing state rather than a mysteriously cordoned node nobody
-dares touch.
+uninstalled mid-drain, most likely — uncordon the node first, then remove its
+`binpack.motleyhand.com/` annotations and its `binpack.motleyhand.com/draining` label. That
+order, because a node left cordoned with its markers cleared reads as somebody else's cordon:
+binpack skips it, this check stops naming it, and it stays cordoned and billed with nothing left
+to say why. The markings exist precisely so this is a self-describing state rather than a
+mysteriously cordoned node nobody dares touch.
 
 ### `node-in-backoff` — info
 

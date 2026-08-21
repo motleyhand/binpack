@@ -26,13 +26,27 @@ Fixed, and treated as public API from the first release:
 | API group | `binpack.motleyhand.com` |
 | Config `apiVersion` | `binpack.motleyhand.com/v1alpha1` |
 | Node opt-out annotation | `binpack.motleyhand.com/skip: "true"` |
-| Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-progress`, `binpack.motleyhand.com/drain-pods-remaining` |
+| Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-progress`, `binpack.motleyhand.com/drain-pods-remaining`, `binpack.motleyhand.com/drain-awaiting` |
 | Backoff markers on a node | `binpack.motleyhand.com/drain-attempts`, `binpack.motleyhand.com/backoff-until`, `binpack.motleyhand.com/last-failure` |
+| Drain label on a node | `binpack.motleyhand.com/draining: "true"` |
 | Metric prefix | `binpack_` |
 
 The opt-out annotation key is **not configurable**. A fixed key means one thing to document,
 one thing to search for, and no possibility of two clusters disagreeing about what protects a
 node.
+
+The list is exhaustive and a test keeps it that way: `TestEveryNodeKeyBinpackWritesIsInTheConventions`
+parses the constant block in `internal/engine/decide.go` and fails if a key binpack writes is
+missing from the table above. It parses rather than enumerating by hand because the commit that
+adds a key and forgets this document is the same commit that would forget a hand-written list. It
+reads the table itself rather than the file, because several of these keys are named again in the
+prose below — and a check satisfied by a passing mention is one that stays green when a row is
+deleted, which is the only edit it exists to catch.
+
+The label is here rather than only in the reference because operators are told to select on it —
+`kubectl get nodes -l binpack.motleyhand.com/draining=true` is the pre-uninstall check — and a
+selector that is documented is a selector somebody has scripted. Renaming it is a breaking change
+on the same terms as renaming a metric.
 
 ## Components
 
@@ -415,6 +429,16 @@ lost schedulable capacity, and if the pool is at its maximum, pods can stay Pend
 while a healthy node sits idle. binpack must leave the cluster working without human
 intervention, including — especially — when its own prediction was wrong.
 
+A person handing a node back by hand is taking over one of those branches, and owes the same
+ending in the same order: **uncordon first, then clear the markers and the label.** The two
+orders fail differently, and only one of them fails recoverably. Stopping partway through the
+order above leaves a node that is schedulable and still marked — which a running binpack repairs
+by cordoning and resuming, and which a binpack that is gone has left doing useful work. Stopping
+partway through the other leaves a node that is cordoned and unmarked: `eligibility` skips it as
+`cordoned`, the same bucket as a node somebody else cordoned, and nothing distinguishes it or
+offers to repair it. The `diagnose` check reads the `draining` label precisely so that state has
+one reader left, but the label is the last thing to go and the cordon is the first.
+
 Sequential eviction makes drains slow. That is acceptable: binpack drains one node at a time,
 and trading minutes for the ability to abort at any point is the right side of that trade for a
 tool that deletes capacity.
@@ -502,9 +526,17 @@ So the drain marker is written **on the node itself**, before the cordon:
 binpack.motleyhand.com/drain-started:        2026-08-15T09:15:37Z
 binpack.motleyhand.com/drain-progress:       2026-08-15T09:31:02Z
 binpack.motleyhand.com/drain-pods-remaining: 4
+binpack.motleyhand.com/drain-awaiting:       settled
 ```
 
 These record how the drain is doing rather than when someone once decided it should be over.
+`drain-awaiting` names the controller whose replacement pod the drain is waiting to see bound, or
+`settled` when it is owed none — the one piece of the state that says whether another eviction is
+allowed yet.
+
+A `binpack.motleyhand.com/draining: "true"` label goes on in the same patch. It is a signal
+rather than state: `kubectl get nodes` says only `SchedulingDisabled`, which does not say who did
+it, and a label is the only part of this that a selector can reach.
 
 The node is the right home for it. It survives any process failure, it needs no CRD, ConfigMap
 or Lease, it requires no permission binpack does not already hold for cordoning, and it is

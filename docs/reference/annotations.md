@@ -1,6 +1,6 @@
 # Annotations and labels
 
-binpack reads one annotation you set, and writes six of its own, plus one label. All are on
+binpack reads one annotation you set, and writes seven of its own, plus one label. All are on
 **nodes**; it annotates and labels no other kind of object.
 
 The keys are fixed rather than configurable: one thing to document, one thing to grep for, and
@@ -108,7 +108,11 @@ node in backoff was skipped.
 
 Every branch of a drain ends with the node either removed or uncordoned, so this should not
 happen. If it does — binpack was killed at exactly the wrong moment, or its RBAC was removed
-mid-drain — the repair is to clear the markers and uncordon:
+mid-drain — the repair is to uncordon and then clear the markers, in that order:
+
+```bash
+kubectl uncordon NODE
+```
 
 ```bash
 kubectl annotate node NODE binpack.motleyhand.com/drain-started- binpack.motleyhand.com/drain-progress- binpack.motleyhand.com/drain-pods-remaining- binpack.motleyhand.com/drain-awaiting-
@@ -118,16 +122,26 @@ kubectl annotate node NODE binpack.motleyhand.com/drain-started- binpack.motleyh
 kubectl label node NODE binpack.motleyhand.com/draining-
 ```
 
-```bash
-kubectl uncordon NODE
-```
+**Uncordon first**, and the reason is what each order leaves behind if you stop partway. binpack
+itself has a third option — it hands a node back in a single merge patch, so there is no partway
+— but three `kubectl` commands are three chances to be interrupted by a dead shell, a denied
+patch or a runbook that stops.
 
-The label goes too. binpack never reads it, so nothing clears it for you — and a node still
-reporting `draining=true` after the drain has ended makes the label worth nothing.
+Clearing the markers first leaves a node that is cordoned and carries nothing. binpack skips it
+as `cordoned`, the same bucket as a node you cordoned yourself, and will not touch it again; the
+capacity stays paid for and nothing left on the node says why. That state has no repair that
+anything will start on its own.
 
-binpack itself repairs the commoner half of this: a node carrying `drain-started` that is *not*
-cordoned is one where the process stopped between the two writes, and the next evaluation
-cordons it and re-checks rather than acting on a stale view.
+Uncordoning first leaves the opposite half-state, and that one is recoverable either way. A node
+carrying `drain-started` that is *not* cordoned is one where a write did not land, so a running
+binpack cordons it on the next evaluation and re-checks rather than acting on a stale view — and
+if binpack is not running, the node is back in service, which is where you wanted it.
+
+The label goes too. Nothing clears it for you once binpack has stopped looking, and a node still
+reporting `draining=true` after the drain has ended makes the label worth nothing. Its one reader
+inside binpack is `binpack diagnose`, which reports a cordoned node carrying the label but no
+markers as an abandoned drain — that is the half-cleaned state above, and naming it is the only
+thing standing between it and being forgotten.
 
 ## See also
 
@@ -156,5 +170,7 @@ field the cluster-autoscaler is editing on these same nodes during a scale-down.
 write binpack makes is a merge patch built from a bare object precisely so it can never clobber
 a concurrent change, and a label keeps that property because it is a map key.
 
-The label is a signal, not state. binpack never reads it, and nothing changes if you remove it
-by hand; the annotations are what a drain is recovered from.
+The label is a signal, not state: the annotations are what a drain is recovered from, and
+removing the label by hand changes nothing about a drain in flight. Its one reader is
+`binpack diagnose`, above — a diagnostic rather than a decision, which is why removing it costs
+you the report and not the drain.
