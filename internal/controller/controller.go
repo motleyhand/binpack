@@ -8,6 +8,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"maps"
 	"slices"
@@ -68,6 +69,46 @@ const (
 	DefaultRenewDeadline = 40 * time.Second
 	DefaultRetryPeriod   = 10 * time.Second
 )
+
+// DefaultGracefulShutdown is how long the manager waits for the evaluator to
+// return before giving up on it, once a signal has cancelled its context.
+//
+// Set rather than left to controller-runtime's own default, because the chart's
+// terminationGracePeriodSeconds has to be longer than it — the lease is released
+// after the runnables have stopped, so a pod killed inside this window is killed
+// at the moment of the handover — and a number binpack does not name is one the
+// chart could only guess at. That is exactly the shape of guess this codebase
+// keeps getting wrong about other people's defaults.
+//
+// Short, because the evaluator returns as soon as its context is cancelled and
+// the calls it has in flight fail with it. This is a bound on an API call that
+// hangs, not a wait binpack expects to use.
+const DefaultGracefulShutdown = 15 * time.Second
+
+// maxConsecutiveFailures is how many evaluations may fail in a row before
+// binpack stops rather than going on retrying.
+//
+// The bound is the other half of not exiting on a failed write. Swallowing one
+// is right for a bad minute and wrong for a deployment that will never work
+// again — a narrowed nodes/patch grant, an admission webhook that denies
+// binpack's patches — where a quiet retry every interval leaves a controller
+// reporting healthy while doing nothing at all. That reading is exactly what
+// returning the error used to protect against, and it is worth keeping.
+//
+// Five, which at the default interval is five minutes: long enough to ride out
+// a control-plane upgrade or a disruption budget that is only briefly
+// exhausted, short enough that something permanent shows up as a restarting
+// pod. The error counter moves from the first failure either way, so a cluster
+// with monitoring sees it immediately and does not depend on this number.
+const maxConsecutiveFailures = 5
+
+// unretryable marks a failure that will still be there on the next tick, so it
+// leaves the evaluator rather than being counted and retried.
+//
+// One member today: a configuration naming a pool that is not in the cluster.
+// Waiting does not fix a typo, and carrying on would silently apply the
+// default policy to a pool an operator believes they switched off.
+type unretryable struct{ error }
 
 // Options configures a run.
 type Options struct {
@@ -232,6 +273,13 @@ func managerOptions(opts Options) manager.Options {
 	// binpacks draining at once — is worst exactly during a deploy, when both
 	// the old and new pods are alive.
 	out.LeaderElectionReleaseOnCancel = true
+
+	// Not tunable, unlike the lease timings beside it: the chart's
+	// terminationGracePeriodSeconds is checked against this constant, and a
+	// flag would let the pod's deadline and the shutdown it is waiting for
+	// disagree without anything noticing.
+	graceful := DefaultGracefulShutdown
+	out.GracefulShutdownTimeout = &graceful
 
 	out.LeaseDuration = orDefault(opts.LeaseDuration, DefaultLeaseDuration)
 	out.RenewDeadline = orDefault(opts.RenewDeadline, DefaultRenewDeadline)
@@ -416,6 +464,10 @@ type evaluator struct {
 	// one cooldown window.
 	lastDrain time.Time
 
+	// consecutiveFailures counts evaluations that failed back to back, and is
+	// reset by any that does not. See [evaluator.failed].
+	consecutiveFailures int
+
 	// err carries a one-shot run's outcome back to [Run]. See Start.
 	err error
 }
@@ -465,17 +517,87 @@ func (e *evaluator) Start(ctx context.Context) error {
 	}
 }
 
-// evaluate reads the cluster once and reports what binpack would do.
+// evaluate runs one pass and decides whether its failure, if it failed, is the
+// process's failure too.
+//
+// Almost never, and it used to be always. Every write binpack makes — a cordon,
+// an annotation, an eviction the API server answered 429 because a disruption
+// budget's allowance had been drawn on since the snapshot — returned its error
+// from here, which returned it from [evaluator.Start], which stops the manager
+// and exits the process. On a managed control plane those failures are ordinary
+// rather than exceptional, and they cluster during a control-plane upgrade,
+// which is when binpack is likeliest to be mid-drain. The 429 in particular is
+// documented in the executor as retryable and was the one nothing retried.
+//
+// Nothing is lost by carrying on. A drain's recovery state is on the node it is
+// draining precisely so that the next evaluation can pick it up (ADR-0007), so
+// re-reading and re-deciding a minute later is both cheaper and safer than a
+// restart — and it is already what a failed report does two functions below.
 func (e *evaluator) evaluate(ctx context.Context) error {
+	if err := e.attempt(ctx); err != nil {
+		return e.failed(ctx, err)
+	}
+	e.consecutiveFailures = 0
+	return nil
+}
+
+// failed records an evaluation that could not be completed.
+func (e *evaluator) failed(ctx context.Context, err error) error {
+	// Shutting down is not a failure. Cancelling the manager's context cancels
+	// every call an evaluation has left, so without this a SIGTERM landing
+	// mid-drain would move the counter that exists to report a broken cluster
+	// and spend one of the retries meant for one — on every rolling update.
+	if shuttingDown(ctx) {
+		e.log.Info("shutting down; this evaluation was interrupted", "reason", err.Error())
+		return nil
+	}
+
+	metrics.Failed()
+
+	var permanent unretryable
+	switch {
+	case errors.As(err, &permanent):
+		// Unwrapped, so what reaches the operator is the sentence the check
+		// wrote rather than a marker they have no way to interpret.
+		return permanent.error
+
+	case e.opts.Once:
+		// Nothing will retry: this process is about to exit, and a CronJob
+		// that exits 0 having done nothing is indistinguishable from one that
+		// found nothing to do. The report path draws the same line.
+		return err
+	}
+
+	e.consecutiveFailures++
+	if e.consecutiveFailures >= maxConsecutiveFailures {
+		return fmt.Errorf("%d evaluations in a row have failed, the last with: %w",
+			e.consecutiveFailures, err)
+	}
+	e.log.Error(err, "evaluation failed; the next one re-reads the cluster and re-decides",
+		"consecutiveFailures", e.consecutiveFailures)
+	return nil
+}
+
+// shuttingDown reports whether the manager has begun stopping.
+//
+// A named question rather than the cancellation read inline, because the two
+// readings of a cancelled context are opposites here: every call an evaluation
+// makes after this point fails, and none of those failures is a fact about the
+// cluster.
+func shuttingDown(ctx context.Context) bool { return ctx.Err() != nil }
+
+// attempt reads the cluster once and reports what binpack would do.
+func (e *evaluator) attempt(ctx context.Context) error {
 	started := time.Now()
 
 	snapshot, err := collect.Snapshot(ctx, e.reader, started)
 	if err != nil {
-		metrics.Failed()
-		// Returned rather than logged and swallowed. A read that fails every
-		// tick is a broken deployment — bad RBAC, most likely — and a
-		// controller that hides it behind a log line looks healthy while doing
-		// nothing at all.
+		// Counted rather than returned on sight. A read that fails every tick
+		// is a broken deployment — bad RBAC, most likely — and a controller
+		// that hides it behind a log line looks healthy while doing nothing at
+		// all; but a single failed list is an API server having a moment, and
+		// exiting over one made the process's restart backoff, rather than
+		// interval, the clock every drain ran on.
 		return fmt.Errorf("reading the cluster: %w", err)
 	}
 
@@ -485,8 +607,7 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 	// it, so silently applying the default policy to a pool an operator
 	// believes they switched off is the failure that costs something.
 	if err := engine.CheckPools(snapshot, e.opts.Engine); err != nil {
-		metrics.Failed()
-		return err
+		return unretryable{err}
 	}
 
 	// Step 0 of the drain protocol: resume before deciding.
@@ -495,10 +616,25 @@ func (e *evaluator) evaluate(ctx context.Context) error {
 	// one of those intervals would be free to select a second node. "One node
 	// per run" quietly assumed a run was short.
 	if node := e.drainInProgress(snapshot); node != "" {
-		metrics.Observe(snapshot, engine.Decision{Code: engine.CodeDraining,
-			Reason: "a drain is in progress on " + node}, e.opts.Engine,
-			time.Since(started).Seconds())
-		return e.advance(ctx, snapshot, node)
+		if !e.opts.DryRun {
+			metrics.Observe(snapshot, engine.Decision{Code: engine.CodeDraining,
+				Reason: "a drain is in progress on " + node}, e.opts.Engine,
+				time.Since(started).Seconds())
+			return e.advance(ctx, snapshot, node)
+		}
+		// Said, and then carried on past — because in dry run this drain never
+		// moves. Step 0 pre-empts a new decision so that a drain outlasting
+		// many intervals cannot have a second node cordoned underneath it, and
+		// that pre-emption is bounded by the drain ending. Dry run removes the
+		// bound: the marker is never cleared, so returning here made binpack
+		// silent about every other node in the cluster for as long as the
+		// setting stood — no decision, no event, and binpack_nodes publishing
+		// an empty set — which is the whole of what dry run is for.
+		//
+		// Nothing is written on the way through. Deciding costs a simulation
+		// and the gate below stops before the executor, as it does on every
+		// other dry-run pass.
+		e.frozen(ctx, snapshot, node)
 	}
 
 	// Filled in by the controller rather than read from the cluster: it is the
@@ -600,17 +736,89 @@ func present(s engine.Snapshot, name string) bool {
 	return false
 }
 
-// advance moves an in-progress drain on by one step.
-func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string) error {
-	if e.opts.DryRun {
-		// Reachable: dryRun can be switched on while a drain is running. The
-		// node is cordoned and binpack has been told to change nothing, which
-		// leaves saying so as the only honest option — the alternative is
-		// uncordoning, and that is a change.
-		e.log.Info("a drain is in progress but dryRun is set; leaving it alone", "node", name)
-		return nil
+// frozen reports the drain binpack is not advancing, because dryRun is set.
+//
+// Reachable, and reached by the commonest routes there are: dry run is the
+// default and the mode operators are told to return to when unsure, so a helm
+// rollback, a reverted values file or an override lost in a chart upgrade all
+// arrive here with a drain in flight. The node is cordoned and binpack has been
+// told to change nothing, which leaves saying so as the only honest option —
+// the alternative is uncordoning, and that is a change.
+//
+// Saying it on the node rather than only in the log, because this is the one
+// state a drain can be left in indefinitely. Every other ending is bounded by
+// the assessment; this one is bounded by an operator noticing, and on a managed
+// control plane `kubectl describe node` is where they will be looking.
+func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) {
+	a := engine.Revalidate(s, name, e.opts.Engine)
+	if a.SkipCode == engine.SkipGone {
+		// The autoscaler finished a drain that started before dry run was
+		// switched on. Nothing is stranded, and forgetting the node is what
+		// stops every later evaluation reporting on one that is not there.
+		e.log.Info("the node a drain was in progress on has gone", "node", name)
+		e.active = ""
+		return
 	}
 
+	would := wouldHappen(a, drain.Assess(
+		drain.State{Node: a.Node, Pods: podsOn(s, name), Now: s.Now}, e.drainPolicy(name, s)))
+
+	e.log.Info("a drain is in progress but dryRun is set; leaving it alone",
+		"node", name, "wouldHappen", would)
+
+	if err := e.reporter.emit(ctx, a.Node, ReasonWouldAdvanceDrain, ActionConsolidate,
+		"binpack is in dry run, so it is not advancing the drain in progress on this node: "+
+			"it stays cordoned and marked until dryRun is set to false. "+would); err != nil {
+		e.log.Error(err, "could not record what would happen to the drain", "node", name)
+	}
+}
+
+// wouldHappen describes a frozen drain in one sentence.
+//
+// What revalidation and the assessment observed, not a rehearsal of
+// [executor.Advance]. Predicting the ending would mean a second copy of that
+// function's precedence living here, and most of the conditions below do not
+// have one ending: a node the autoscaler is already removing is handed over
+// rather than back, and one marked but uncordoned is repaired. A copy that
+// drifted would tell an operator something confidently wrong about their own
+// cluster, which is worse than telling them less.
+func wouldHappen(a engine.NodeAssessment, assessment drain.Assessment) string {
+	switch {
+	case a.Skipped:
+		return "The cluster has moved underneath it: " + a.SkipReason + "."
+	case len(a.Blockers) > 0:
+		return "A pod on it can no longer be evicted: " + a.Blockers[0].Message + "."
+	case a.Verdict() == engine.VerdictInfeasible:
+		return "The pods still on it no longer fit anywhere else."
+	case assessment.Action == drain.Abandon:
+		return fmt.Sprintf("It has passed its bound and would be handed back: %s (%s).",
+			assessment.Reason, assessment.Code)
+	default:
+		return fmt.Sprintf("It is within its bounds, with %d pods left to move.",
+			assessment.Remaining)
+	}
+}
+
+// podsOn is the pods the drain assessment reads. Terminating ones included: a
+// pod on its way out is still occupying the node.
+//
+// The same filter the executor applies before its own [drain.Assess] call, and
+// it has to stay the same: the sentence this feeds tells an operator what
+// acting would do, so a pod set that differed from the acting path's would make
+// a dry run describe a drain nobody would get.
+func podsOn(s engine.Snapshot, name string) []*corev1.Pod {
+	var on []*corev1.Pod
+	for _, pod := range s.Pods {
+		if pod.Spec.NodeName == name {
+			on = append(on, pod)
+		}
+	}
+	return on
+}
+
+// advance moves an in-progress drain on by one step. Only ever reached when
+// binpack is acting; a dry run reports through [evaluator.frozen] instead.
+func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string) error {
 	step, err := executor.Advance(ctx, e.writer, s, name, e.opts.Engine, e.drainPolicy(name, s))
 	if err != nil {
 		return fmt.Errorf("advancing the drain of %s: %w", name, err)

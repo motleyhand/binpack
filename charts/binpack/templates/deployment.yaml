@@ -32,6 +32,16 @@ spec:
                         (deepCopy (.Values.podLabels | default dict))
                   | toYaml | nindent 8 }}
     spec:
+      # Longer than binpack's own 15s shutdown window and shorter than the 60s
+      # lease. On SIGTERM the manager cancels the evaluator, waits for it to
+      # return, and only then releases the lease — so a pod killed inside that
+      # window is killed at the moment of the handover, and its replacement
+      # waits out the whole lease instead.
+      #
+      # Stated even though it is what Kubernetes would default to anyway. It is
+      # the deadline the handover depends on, and a default that happens to
+      # agree is not the same as a number somebody chose.
+      terminationGracePeriodSeconds: 30
       serviceAccountName: {{ include "binpack.serviceAccountName" . }}
       {{- with .Values.imagePullSecrets }}
       imagePullSecrets: {{- toYaml . | nindent 8 }}

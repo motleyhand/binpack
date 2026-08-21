@@ -59,7 +59,7 @@ alerts rather than being folded into this one:
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `binpack_evaluations_total` | counter | `code` | Evaluations completed, by outcome |
-| `binpack_evaluation_errors_total` | counter | — | Evaluations that could not be completed, usually a failed read |
+| `binpack_evaluation_errors_total` | counter | — | Evaluations that could not be completed: a failed read, or a write the API server refused |
 | `binpack_evaluation_duration_seconds` | histogram | — | Reading the cluster through to reaching a decision |
 | `binpack_last_evaluation_timestamp_seconds` | gauge | — | When the last evaluation completed |
 
@@ -253,6 +253,17 @@ the last evaluation that reached a conclusion.
 Zeroing them would turn a broken permission into what looks like a cluster with nothing left to
 consolidate — the one state binpack most needs to distinguish. Alert on the error counter and
 on the evaluation timestamp; do not infer health from the gauges alone.
+
+One failure does not stop binpack. A read the API server could not answer, an eviction a
+disruption budget refused, a node patch a webhook rejected: the evaluation ends, this counter
+moves, and the next interval re-reads the cluster and decides again. A drain in progress is
+unaffected, because its state is on the node rather than in the process.
+
+**Five consecutive failures do stop it**, and the pod restarts. That bound is what distinguishes
+a cluster having a bad minute from a deployment that will never work again — a permission that
+has been narrowed, an admission webhook that denies binpack's patches — where retrying quietly
+for ever would leave binpack reporting healthy while doing nothing at all. A binpack that is
+restarting *and* whose error counter is climbing is telling you which of the two you have.
 
 ## See also
 

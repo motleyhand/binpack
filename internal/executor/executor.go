@@ -155,8 +155,12 @@ var (
 	// ErrEvictionBlocked is a disruption budget refusing right now. Retryable:
 	// the budget's allowance is recomputed as replicas become healthy, so the
 	// same eviction may well succeed a moment later. Returned to the caller
-	// all the same, and nothing above treats it as the retry it is — the
-	// drain's recovery state is on the node, so it resumes, but not from here.
+	// rather than retried here, because one step per evaluation is the shape of
+	// this whole package: the controller ends the evaluation on it and re-reads
+	// the cluster on the next interval, which is the retry — against a fresh
+	// snapshot rather than the stale one that produced the refusal. It used to
+	// end the process instead, which made the pod's restart backoff, rather
+	// than the interval, the clock every drain ran on.
 	ErrEvictionBlocked = errors.New("a PodDisruptionBudget currently allows no disruption")
 
 	// ErrEvictionImpossible is the API refusing outright, which it does when a

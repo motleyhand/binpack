@@ -10,7 +10,30 @@ import (
 	"io"
 
 	"github.com/spf13/cobra"
+	ctrl "sigs.k8s.io/controller-runtime"
 )
+
+// Execute runs binpack under a context a signal cancels.
+//
+// Here rather than in main because the context is the whole of binpack's
+// graceful shutdown, and main is the one place nothing can test. ADR-0002 chose
+// controller-runtime partly so that a drain in progress is not abandoned
+// mid-eviction, and the manager does deliver that — but only once something
+// cancels the context it was started with. Executing without one left that
+// unreachable rather than merely unused: cobra fills in context.Background,
+// whose Done channel is nil, so the manager's stop procedure can never be
+// selected, LeaderElectionReleaseOnCancel was dead configuration, and every
+// rolling update made the next leader wait out the whole lease rather than take
+// a released one.
+//
+// controller-runtime's handler rather than signal.NotifyContext, for what it
+// does with a second signal: it exits immediately, so an operator whose
+// shutdown is taking longer than they expected can still stop it with a second
+// ^C. NotifyContext would swallow that one too. The read-only commands are
+// unaffected either way — they finish long before a signal matters.
+func Execute(root *cobra.Command) error {
+	return root.ExecuteContext(ctrl.SetupSignalHandler())
+}
 
 // ExitFindings is the status `binpack diagnose` exits with when a report
 // crosses its --fail-on threshold.

@@ -10,7 +10,9 @@ import (
 )
 
 func main() {
-	if err := cli.NewRootCommand(os.Stdout).Execute(); err != nil {
+	// Through cli.Execute, which supplies the context a signal cancels. Calling
+	// the command's own Execute would leave binpack unable to shut down at all.
+	if err := cli.Execute(cli.NewRootCommand(os.Stdout)); err != nil {
 		fmt.Fprintln(os.Stderr, "binpack:", err)
 		// Not every non-nil error is a failure: `diagnose --fail-on` reports
 		// its verdict through the exit status, and a CI job has to be able to

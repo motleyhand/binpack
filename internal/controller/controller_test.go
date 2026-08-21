@@ -15,8 +15,10 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/leaderelection"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -24,6 +26,7 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/motleyhand/binpack/internal/collect"
+	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
 )
@@ -297,19 +300,29 @@ func TestADrainInProgressPreemptsANewDecision(t *testing.T) {
 	// Step 0 of the protocol. A drain can legitimately outlast many intervals,
 	// and without this every one of those intervals would be free to cordon a
 	// second node — "one node per run" quietly assumed a run was short.
+	//
+	// Asked of the acting mode, which is the only mode where it means
+	// anything: what pre-emption prevents is a second node being cordoned, and
+	// a dry run cordons nothing whatever it decides. It used to be asked of a
+	// dry run, where "no event was recorded" passed for the property — and
+	// where the silence it was really observing was binpack reporting on
+	// nothing at all for as long as the marker stood.
 	var log captured
 	rec := &fakeRecorder{}
 	draining := inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
 		engine.AnnotationDrainStarted: time.Now().Add(-time.Minute).Format(time.RFC3339),
 	}))
 	ev := newEvaluator(t, &log, rec, draining, inPool("b"), inPool("c"), statusConfigMap())
+	ev.opts.DryRun = false
 
 	if err := ev.evaluate(context.Background()); err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	if len(rec.events) != 0 {
-		t.Errorf("a new decision was reported while a drain was running: %+v", rec.events)
+	for _, e := range rec.events {
+		if e.reason == ReasonDraining || e.reason == ReasonWouldDrain {
+			t.Errorf("a new drain was decided on while one was already running: %+v", e)
+		}
 	}
 	for _, name := range []string{"b", "c"} {
 		var n corev1.Node
@@ -485,10 +498,16 @@ func TestDryRunLeavesADrainInProgressAlone(t *testing.T) {
 	}
 }
 
-func TestEvaluateReturnsAReadFailureRatherThanHidingIt(t *testing.T) {
+func TestAOneShotRunReturnsAReadFailureRatherThanHidingIt(t *testing.T) {
 	// A read that fails every tick is a broken deployment, bad RBAC most
-	// likely. A controller that logs it and carries on looks healthy while
-	// doing nothing at all.
+	// likely. A run that logs it and carries on looks healthy while doing
+	// nothing at all.
+	//
+	// Immediately here, because --once has no next tick: this process is about
+	// to exit and its logs go with it, and a CronJob that exits 0 having read
+	// nothing is indistinguishable from one that found nothing. A controller
+	// counts the same failure instead and stops on the fifth, which is
+	// TestAFailureThatNeverClearsStillStopsTheController's read row.
 	var log captured
 	ev := newEvaluator(t, &log, &fakeRecorder{},
 		&corev1.ConfigMap{
@@ -498,6 +517,7 @@ func TestEvaluateReturnsAReadFailureRatherThanHidingIt(t *testing.T) {
 			},
 			Data: map[string]string{"status": "\tnot: [valid"},
 		})
+	ev.opts.Once = true
 
 	err := ev.evaluate(context.Background())
 	if err == nil {
@@ -636,20 +656,6 @@ func TestOnceRunsWithoutServersOrLeaderElection(t *testing.T) {
 	}
 }
 
-func TestTheLeaseIsReleasedOnShutdown(t *testing.T) {
-	// The failure leader election guards against — two binpacks draining at
-	// once — is worst during a rolling update, when the old and new pods are
-	// both alive. Holding the lease to expiry makes that window minutes long.
-	opts := managerOptions(Options{LeaderElection: true, MetricsAddress: "0", ProbeAddress: "0"})
-
-	if !opts.LeaderElectionReleaseOnCancel {
-		t.Error("a rolling update would wait out the lease instead of handing over")
-	}
-	if opts.LeaderElectionID != LeaderElectionID {
-		t.Errorf("lease ID = %q, want the documented %q", opts.LeaderElectionID, LeaderElectionID)
-	}
-}
-
 func TestOnceWritesItsEventBeforeTheProcessExits(t *testing.T) {
 	// The defect a live run found and no fake recorder could: the real
 	// recorder returns before it posts, so a --once process was gone before
@@ -767,6 +773,22 @@ func TestEvaluateRefusesAnOverrideNamingAPoolThatIsNotThere(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "poool-4g") {
 		t.Errorf("error does not name the unknown pool: %v", err)
+	}
+
+	// And on the first evaluation, not the fifth. Everything else a failed
+	// evaluation can hit is worth retrying — the cluster may have moved — so
+	// binpack carries on and counts. Waiting does not fix a typo, and the
+	// evaluations spent waiting are ones where the misspelt override is
+	// unreachable and its nodes are taking the default enabled policy.
+	//
+	// Asked of a controller rather than a one-shot run, which is the whole
+	// point of the row: --once returns every failure, so this distinction is
+	// invisible in that mode and the refusal was reachable and inert.
+	ev = newEvaluator(t, &log, &fakeRecorder{}, inPool("a"), statusConfigMap())
+	ev.opts.Engine, ev.opts.Once = cfg, false
+
+	if err := ev.evaluate(context.Background()); err == nil {
+		t.Error("a controller retried a configuration no retry can fix")
 	}
 }
 
@@ -1232,6 +1254,379 @@ func TestWhatBinpackAcceptsClientGoAlsoAccepts(t *testing.T) {
 				if err != nil && strings.Contains(err.Error(), timing) {
 					t.Errorf("binpack accepted timings client-go refuses: %v", err)
 				}
+			}
+		})
+	}
+}
+
+// --- PR 12 scratch tests (to be placed properly) ---
+
+// refusingEvictions answers the eviction subresource with err while letting
+// node patches through, which is what a disruption budget with no allowance
+// looks like from here.
+type refusingEvictions struct {
+	client.Client
+	err error
+}
+
+func (r refusingEvictions) SubResource(string) client.SubResourceClient {
+	return refusedSubResource{r.err}
+}
+
+type refusedSubResource struct{ err error }
+
+func (s refusedSubResource) Create(context.Context, client.Object, client.Object, ...client.SubResourceCreateOption) error {
+	return s.err
+}
+
+func (s refusedSubResource) Get(context.Context, client.Object, client.Object, ...client.SubResourceGetOption) error {
+	return nil
+}
+
+func (s refusedSubResource) Update(context.Context, client.Object, ...client.SubResourceUpdateOption) error {
+	return nil
+}
+
+func (s refusedSubResource) Patch(context.Context, client.Object, client.Patch, ...client.SubResourcePatchOption) error {
+	return nil
+}
+
+func (s refusedSubResource) Apply(context.Context, runtime.ApplyConfiguration, ...client.SubResourceApplyOption) error {
+	return nil
+}
+
+// relocatable is a pod a drain can actually move: owned by a ReplicaSet whose
+// template binpack can read. A pod with no readable controller makes its node
+// infeasible, so nothing would ever be evicted from it.
+func relocatable(node, name string) (*corev1.Pod, client.Object) {
+	pod := mother.Pod("default", name,
+		mother.OnNode(node), mother.ControlledBy("ReplicaSet", name+"-rs"))
+	spec := *pod.Spec.DeepCopy()
+	spec.NodeName = ""
+	rs := &appsv1.ReplicaSet{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: pod.Namespace, Name: name + "-rs",
+			UID: mother.OwnerUID(name + "-rs"),
+		},
+		Spec: appsv1.ReplicaSetSpec{Template: corev1.PodTemplateSpec{
+			ObjectMeta: metav1.ObjectMeta{Labels: pod.Labels}, Spec: spec}},
+	}
+	return pod, rs
+}
+
+// drainingNode is a node binpack is part-way through draining.
+func drainingNode(name string) *corev1.Node {
+	stamp := time.Now().Add(-time.Minute).Format(time.RFC3339)
+	return inPool(name, mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted:  stamp,
+		engine.AnnotationDrainProgress: stamp,
+	}))
+}
+
+// evaluationErrors reads binpack_evaluation_errors_total through the same
+// registry a scrape would.
+func evaluationErrors(t *testing.T) float64 {
+	t.Helper()
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	for _, f := range families {
+		if f.GetName() != "binpack_evaluation_errors_total" {
+			continue
+		}
+		return f.GetMetric()[0].GetCounter().GetValue()
+	}
+	t.Fatal("binpack_evaluation_errors_total is not published at all")
+	return 0
+}
+
+func TestATransientEvictionRefusalDoesNotStopTheController(t *testing.T) {
+	var log captured
+	pod, rs := relocatable("a", "web")
+	ev := newEvaluator(t, &log, &fakeRecorder{},
+		drainingNode("a"), inPool("b"), inPool("c"), pod, rs, statusConfigMap())
+	ev.opts.DryRun = false
+	ev.opts.Once = false
+	ev.writer = refusingEvictions{
+		Client: ev.writer.(client.Client),
+		err:    apierrors.NewTooManyRequests("", 1),
+	}
+
+	before := evaluationErrors(t)
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("a refused eviction stopped the controller: %v", err)
+	}
+	if got := evaluationErrors(t) - before; got != 1 {
+		t.Errorf("binpack_evaluation_errors_total moved by %v, want 1", got)
+	}
+}
+
+// breakingWrites fails every node patch for as long as failing says so.
+//
+// The flag is a pointer because what is under test is a count of *consecutive*
+// failures, and a counter that resets on every call looks exactly like one that
+// accumulates if the failure is never turned off partway through.
+type breakingWrites struct {
+	client.Client
+	failing *bool
+	err     error
+}
+
+func (b breakingWrites) Patch(
+	ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption,
+) error {
+	if *b.failing {
+		return b.err
+	}
+	return b.Client.Patch(ctx, obj, patch, opts...)
+}
+
+// breakingReads is the same for the read at the top of an evaluation.
+type breakingReads struct {
+	client.Reader
+	failing *bool
+	err     error
+}
+
+func (b breakingReads) List(
+	ctx context.Context, list client.ObjectList, opts ...client.ListOption,
+) error {
+	if *b.failing {
+		return b.err
+	}
+	return b.Reader.List(ctx, list, opts...)
+}
+
+// breaking wires both wrappers onto an evaluator and returns the switch.
+func breaking(ev *evaluator, err error) *bool {
+	failing := new(bool)
+	c := ev.writer.(client.Client)
+	ev.writer = breakingWrites{Client: c, failing: failing, err: err}
+	ev.reader = breakingReads{Reader: c, failing: failing, err: err}
+	return failing
+}
+
+func TestAFailureThatNeverClearsStillStopsTheController(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		only func(*evaluator, *bool)
+	}{
+		{"a write nothing will accept", func(ev *evaluator, _ *bool) {
+			ev.reader = ev.reader.(breakingReads).Reader
+		}},
+		{"a read nothing will answer", func(ev *evaluator, _ *bool) {
+			ev.writer = ev.writer.(breakingWrites).Client
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var log captured
+			pod, rs := relocatable("a", "web")
+			ev := newEvaluator(t, &log, &fakeRecorder{},
+				drainingNode("a"), inPool("b"), inPool("c"), pod, rs, statusConfigMap())
+			ev.opts.DryRun, ev.opts.Once = false, false
+			failing := breaking(ev, apierrors.NewForbidden(
+				schema.GroupResource{Resource: "nodes"}, "a", errors.New("no")))
+			*failing = true
+			tc.only(ev, failing)
+
+			for i := 1; i < maxConsecutiveFailures; i++ {
+				if err := ev.evaluate(context.Background()); err != nil {
+					t.Fatalf("failure %d of %d stopped the controller: %v",
+						i, maxConsecutiveFailures, err)
+				}
+			}
+			if err := ev.evaluate(context.Background()); err == nil {
+				t.Fatalf("%d consecutive failures were retried quietly for ever",
+					maxConsecutiveFailures)
+			}
+		})
+	}
+}
+
+func TestAFailureThatClearsIsNotCountedTowardsTheNext(t *testing.T) {
+	var log captured
+	pod, rs := relocatable("a", "web")
+	ev := newEvaluator(t, &log, &fakeRecorder{},
+		drainingNode("a"), inPool("b"), inPool("c"), pod, rs, statusConfigMap())
+	ev.opts.DryRun, ev.opts.Once = false, false
+	failing := breaking(ev, apierrors.NewServiceUnavailable("etcd leader changed"))
+
+	for i := 0; i < 4*maxConsecutiveFailures; i++ {
+		*failing = i%2 == 0
+		if err := ev.evaluate(context.Background()); err != nil {
+			t.Fatalf("round %d stopped the controller over a cluster that keeps recovering: %v",
+				i, err)
+		}
+	}
+}
+
+func TestShutdownHandsTheLeaseOverRatherThanWaitingItOut(t *testing.T) {
+	opts := managerOptions(Options{LeaderElection: true, MetricsAddress: "0", ProbeAddress: "0"})
+	if !opts.LeaderElectionReleaseOnCancel {
+		t.Error("a rolling update would wait out the lease instead of handing over")
+	}
+	if opts.LeaderElectionID != LeaderElectionID {
+		t.Errorf("lease ID = %q, want the documented %q", opts.LeaderElectionID, LeaderElectionID)
+	}
+
+	var log captured
+	pod, rs := relocatable("a", "web")
+	ev := newEvaluator(t, &log, &fakeRecorder{},
+		drainingNode("a"), inPool("b"), pod, rs, statusConfigMap())
+	ev.opts.DryRun, ev.opts.Once = false, false
+	failing := breaking(ev, context.Canceled)
+	*failing = true
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	before := evaluationErrors(t)
+	done := make(chan error, 1)
+	go func() { done <- ev.Start(ctx) }()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Errorf("a shutdown was reported as a failure: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the evaluator held the manager past the graceful window")
+	}
+	if got := evaluationErrors(t) - before; got != 0 {
+		t.Errorf("a shutdown moved binpack_evaluation_errors_total by %v", got)
+	}
+}
+
+// nodesReported sums binpack_nodes across every verdict: how many nodes the
+// last evaluation actually assessed.
+func nodesReported(t *testing.T) float64 {
+	t.Helper()
+	families, err := ctrlmetrics.Registry.Gather()
+	if err != nil {
+		t.Fatalf("gathering metrics: %v", err)
+	}
+	var total float64
+	for _, f := range families {
+		if f.GetName() != "binpack_nodes" {
+			continue
+		}
+		for _, m := range f.GetMetric() {
+			total += m.GetGauge().GetValue()
+		}
+	}
+	return total
+}
+
+func TestDryRunStillReportsOnTheRestOfTheCluster(t *testing.T) {
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		drainingNode("a"), inPool("b"), inPool("c"), statusConfigMap())
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	var elsewhere, stranded bool
+	for _, e := range rec.events {
+		n, ok := e.object.(*corev1.Node)
+		if !ok {
+			continue
+		}
+		if n.Name != "a" {
+			elsewhere = true
+		}
+		if n.Name == "a" && e.reason == ReasonWouldAdvanceDrain {
+			stranded = true
+		}
+	}
+	if !elsewhere {
+		t.Error("dry run reported on nothing but the node it was told to leave alone")
+	}
+	if !stranded {
+		t.Errorf("nothing said what would happen to the drain binpack is not advancing: %+v",
+			rec.events)
+	}
+	if got := nodesReported(t); got != 3 {
+		t.Errorf("binpack_nodes covers %v nodes, want all 3", got)
+	}
+
+	var nodes corev1.NodeList
+	if err := ev.reader.(client.Client).List(context.Background(), &nodes); err != nil {
+		t.Fatalf("listing nodes: %v", err)
+	}
+	for _, n := range nodes.Items {
+		if n.Name != "a" && (n.Spec.Unschedulable || len(n.Annotations) > 0) {
+			t.Errorf("dry run wrote to node %s while carrying on past the drain", n.Name)
+		}
+	}
+}
+
+func TestDryRunForgetsADrainWhoseNodeHasGone(t *testing.T) {
+	// The autoscaler finished a drain that started before dry run was switched
+	// on. Nothing is stranded and there is nothing to report on, and a node
+	// binpack goes on remembering is one it writes an event about every
+	// evaluation for ever — on an object that is not there.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec, inPool("b"), inPool("c"), statusConfigMap())
+	ev.active = "a"
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if ev.active != "" {
+		t.Errorf("still remembering a drain of a node that has gone: %q", ev.active)
+	}
+	for _, e := range rec.events {
+		if e.reason == ReasonWouldAdvanceDrain {
+			t.Errorf("reported on a node that is no longer in the cluster: %+v", e)
+		}
+	}
+}
+
+func TestWhatAFrozenDrainIsToldAboutItself(t *testing.T) {
+	// The sentence an operator reads on a node binpack has stopped advancing,
+	// and the one place a dry run can mislead: every row here is something
+	// revalidation or the assessment observed, never a prediction of which
+	// ending Advance would reach. Two of the conditions below do not have one
+	// ending — a node the autoscaler is already removing is handed over rather
+	// than back, and one marked but uncordoned is repaired — so a sentence
+	// naming an ending would be wrong for them and right for the rest, which
+	// is the worst way to be wrong.
+	stalled := drain.Assessment{Action: drain.Abandon,
+		Code: drain.AbandonStalled, Reason: "no pod has left for 11m0s"}
+	moving := drain.Assessment{Action: drain.Continue, Remaining: 3}
+
+	for _, tc := range []struct {
+		name       string
+		assessment engine.NodeAssessment
+		drain      drain.Assessment
+		want       string
+	}{
+		{"the cluster moved underneath it",
+			engine.NodeAssessment{Skipped: true, SkipReason: "pool pool-4g is at its minimum size (1)"},
+			moving, "The cluster has moved underneath it: pool pool-4g is at its minimum size (1)."},
+		{"a pod can no longer be evicted",
+			engine.NodeAssessment{Blockers: []engine.EvictionBlocker{
+				{Message: "default/web is covered by two PodDisruptionBudgets"}}},
+			moving, "A pod on it can no longer be evicted: default/web is covered by two " +
+				"PodDisruptionBudgets."},
+		{"the pods no longer fit",
+			engine.NodeAssessment{Simulation: &engine.Simulation{Feasible: false}},
+			moving, "The pods still on it no longer fit anywhere else."},
+		// The bound, which is what a frozen drain does not have — and the row
+		// that says a drain nobody is advancing has run past it.
+		{"past its bound", engine.NodeAssessment{}, stalled,
+			"It has passed its bound and would be handed back: no pod has left for 11m0s (stalled)."},
+		{"still going", engine.NodeAssessment{}, moving,
+			"It is within its bounds, with 3 pods left to move."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := wouldHappen(tc.assessment, tc.drain); got != tc.want {
+				t.Errorf("wouldHappen() = %q, want %q", got, tc.want)
 			}
 		})
 	}
