@@ -319,13 +319,54 @@ func Advance(
 			inFlight.Namespace, inFlight.Name)}, nil
 	}
 
-	next, placed := nextToEvict(a.Simulation, pods)
-	if next == nil {
+	// A pod that arrived after the cordon is not a candidate. The scheduler
+	// puts a pod on a cordoned node only when the pod tolerates
+	// node.kubernetes.io/unschedulable:NoSchedule, so evicting one is an
+	// experiment whose answer is already on the node: it comes straight back,
+	// and on a workload that restarts quickly it comes back once an interval
+	// for as long as the drain lasts.
+	//
+	// The relocatable evictions never needed this, which is why it was not
+	// here. Their marker names a controller, and replacementFor already
+	// declines to read a pod bound to this node as a landed replacement, so
+	// the drain waits instead of evicting again. It is the evictions that owe
+	// no replacement — an expendable pod, and the step after a replacement has
+	// landed — that reach here with nothing holding the line.
+	//
+	// Measured against drain-started rather than the cordon itself, which is
+	// not timestamped. Begin marks before it cordons, so a pod created in
+	// between may have been placed on a node that was still schedulable; it is
+	// left alone anyway, because the cost of that is one evaluation's delay
+	// and the cost of the other direction is the churn above.
+	staying := residentSince(pods, a.Node)
+
+	next, placed := nextToEvict(a.Simulation, staying)
+	switch {
+	case next != nil:
+		// The ordinary case: a pod to evict.
+
+	case len(staying) > 0:
 		// Pods remain that the simulation did not name. Rather than guess at
 		// them, hand the node back: acting on a set binpack cannot account for
-		// is exactly what the allowlist exists to prevent.
+		// is exactly what the allowlist exists to prevent. Asked of the
+		// residents rather than of everything on the node, because an arrival
+		// is accounted for — binpack simply declines to evict it.
 		return Abandon(ctx, w, a.Node, drain.AbandonUnaccounted, fmt.Sprintf(
-			"%d pods remain that the simulation did not account for", len(pods)), s.Now)
+			"%d pods remain that the simulation did not account for", len(staying)), s.Now)
+
+	default:
+		// Nothing is left but pods that came back after the cordon. None of
+		// them can be moved, so the drain is achieving nothing — which is the
+		// question the assessment answers, and it has already had its say
+		// above. Waiting rather than abandoning here, because a workload that
+		// keeps returning may simply stop, and because an ending that reports
+		// "no progress" describes this node better than one that reports pods
+		// binpack could not account for.
+		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
+			return Step{}, err
+		}
+		return Step{Code: StepWaiting, Reason: fmt.Sprintf(
+			"%d pods came back to the node after it was cordoned", len(pods))}, nil
 	}
 
 	if err := Evict(ctx, w, next); err != nil {
@@ -466,6 +507,27 @@ func terminating(pods []*corev1.Pod) *corev1.Pod {
 		}
 	}
 	return nil
+}
+
+// residentSince drops the pods that arrived on the node after the drain began,
+// leaving the ones it was started to move.
+//
+// An unreadable drain-started marker keeps every pod, rather than none: the
+// annotation is the drain's own recovery state, and a drain that cannot read it
+// must not conclude that everything on the node is untouchable.
+func residentSince(pods []*corev1.Pod, node *corev1.Node) []*corev1.Pod {
+	started, err := time.Parse(time.RFC3339, node.Annotations[engine.AnnotationDrainStarted])
+	if err != nil {
+		return pods
+	}
+
+	resident := make([]*corev1.Pod, 0, len(pods))
+	for _, pod := range pods {
+		if !pod.CreationTimestamp.After(started) {
+			resident = append(resident, pod)
+		}
+	}
+	return resident
 }
 
 // nextToEvict picks the pod to evict, in the order the simulation placed them,

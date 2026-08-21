@@ -39,7 +39,9 @@ shows you, and because a drain that has gone wrong is explained by them.
 | `drain-awaiting` | The controller owing a replacement pod, as `<owner UID>@<RFC 3339>`, or `settled` when none is owed |
 
 `drain-started` is also the marker: while it is present, binpack advances *this* drain and makes
-no new decision anywhere in the cluster. One node at a time.
+no new decision anywhere in the cluster. One node at a time. It also fixes the set of pods the
+drain will move — a pod created after it arrived on a node that was already cordoned, so it
+tolerates the cordon, and evicting it would put it straight back.
 
 `drain-progress` is what the stall bound measures against, and it moves only when the node's
 state changed — a pod left, or a pod is shutting down inside its grace period. Accepting an

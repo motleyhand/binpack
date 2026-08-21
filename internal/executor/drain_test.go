@@ -1553,8 +1553,9 @@ func TestAHandOverForAPoolTheAutoscalerNoLongerManagesIsEnded(t *testing.T) {
 // which binpack therefore simulates no destination for. Its controller is the
 // load-bearing part: a bare pod is refused before anything is evicted, so the
 // only expendable pod that reaches an eviction is one something will recreate.
-func expendable(name string) *corev1.Pod {
-	return mother.Pod("default", name, mother.OnNode("a"), mother.Priority(-100))
+func expendable(name string, opts ...mother.PodOption) *corev1.Pod {
+	return mother.Pod("default", name,
+		append([]mother.PodOption{mother.OnNode("a"), mother.Priority(-100)}, opts...)...)
 }
 
 // consolidating is engineConfig with the autoscaler's own expendable cutoff
@@ -1683,5 +1684,52 @@ func TestAnUnrelatedUnschedulablePodDoesNotAbandonAnEmptiedNode(t *testing.T) {
 	}
 	if !nodeFrom(t, c, "a").Spec.Unschedulable {
 		t.Error("the node was uncordoned while the cluster-autoscaler was removing it")
+	}
+}
+
+func TestAnExpendablePodThatComesBackIsNotEvictedAgainEveryRound(t *testing.T) {
+	// Settling the marker takes the drain past the awaiting block, and the
+	// awaiting block is where the other half of this was being answered:
+	// replacementFor refuses to read a pod bound to the draining node as a
+	// landed replacement, so a workload tolerating the cordon left the drain
+	// waiting rather than evicting again. An expendable pod owes no
+	// replacement, so nothing sends it through that block any more — and a
+	// pod that tolerates the cordon is exactly the pod whose replacement the
+	// scheduler puts straight back where it came from.
+	//
+	// The drain ends either way, at the same minute, on the same bound. What
+	// differs is how much of the workload is destroyed on the way there, and
+	// evicting the same lineage once an interval for eleven minutes is the
+	// churn a bound is supposed to stop rather than merely outlast.
+	pods := []*corev1.Pod{
+		expendable("filler", mother.ControlledBy("ReplicaSet", "filler-rs"),
+			mother.ToleratingEverything()),
+	}
+	s := snapshot([]*corev1.Node{marked("a", 20*time.Minute, time.Minute, "2"), node("b")}, pods)
+	c := clientFor(s)
+
+	evicted := 0
+	round, step := drainRounds(t, c, 20, func(pod string, now time.Time) {
+		evicted++
+		back := expendable(fmt.Sprintf("filler-%s", now.Sub(at)),
+			mother.ControlledBy("ReplicaSet", "filler-rs"), mother.ToleratingEverything())
+		back.CreationTimestamp.Time = now
+		if err := c.Create(context.Background(), back); err != nil {
+			t.Fatalf("replacing %s: %v", pod, err)
+		}
+	})
+
+	// One. The first eviction is the one that finds out; every one after it is
+	// binpack repeating an experiment whose answer is already on the node.
+	if evicted != 1 {
+		t.Errorf("the workload was evicted %d times before the drain ended", evicted)
+	}
+	// And it must still end, on the bound that measures the absence of
+	// progress rather than on anything counting evictions.
+	if round != 11 || step.Code != drain.AbandonStalled {
+		t.Errorf("ended at +%dm with %+v; expected the stall bound at +11m", round, step)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the drain ended but left the node cordoned")
 	}
 }
