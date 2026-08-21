@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -208,6 +209,37 @@ func Advance(
 		return Step{Code: StepCordoned,
 			Reason: "the node carried a drain marker but was not cordoned"}, nil
 
+	case pausable(a.Blockers):
+		// A refusal that will lift on its own, so the drain waits for it
+		// instead of ending over it.
+		//
+		// The blockers are right, and they are right at selection too: a
+		// candidate whose pods cannot be evicted is not a candidate. What
+		// differs here is the price of agreeing. Refusing a candidate costs
+		// nothing — there are other nodes, and the next evaluation is sixty
+		// seconds away. Ending a drain that has already relocated pods keeps
+		// every one of those relocations, buys nothing with them, files thirty
+		// minutes of backoff against a node that did nothing wrong, and leaves
+		// on it an explanation that has stopped being true. A budget waiting
+		// for its own controller resolves in one disruption-controller sync;
+		// nothing about it survives to the interval that would have retried.
+		//
+		// Bounded by the same thing every other wait is bounded by, and
+		// checked before the wait rather than after it, because a pause that
+		// nothing ends is the failure this branch can introduce. If the
+		// blocker turns out to be durable after all, the node stops getting
+		// emptier, the assessment says so, and the drain ends as stalled.
+		if assessment.Action == drain.Abandon {
+			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+		}
+		// Recorded like every other wait: record moves the progress marker
+		// only where the assessment saw progress, so pausing cannot hold the
+		// stall clock at zero for as long as the pause lasts.
+		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
+			return Step{}, err
+		}
+		return Step{Code: StepWaiting, Reason: a.Blockers[0].Message}, nil
+
 	case a.Verdict() != engine.VerdictDrainable:
 		// The cluster moved underneath the drain. Nothing here distinguishes
 		// a drain that has evicted nothing from one that is half done: both
@@ -370,6 +402,30 @@ func Advance(
 	}
 
 	if err := Evict(ctx, w, next); err != nil {
+		// A refusal nothing can lift, which today means one pod covered by two
+		// disruption budgets: the eviction subresource declines to arbitrate
+		// between them and answers 500 rather than a retryable 429. No amount
+		// of waiting changes that, and binpack cannot fix it either — the
+		// budgets are somebody else's objects.
+		//
+		// Reached only as a race, because CheckEvictable refuses such a
+		// candidate before anything is cordoned; the second budget has to
+		// appear between the assessment and the eviction. Returning the error
+		// instead ends the evaluation — every write failure here does, today —
+		// and leaves a cordoned node carrying no record of why, until a later
+		// evaluation reaches this same answer through revalidation. The node
+		// recovers either way. What it costs is the recorded reason, which is
+		// the only thing on the node that tells an operator what happened.
+		//
+		// Under that same later route's code, deliberately. A drain stopped by
+		// a blocker reports the verdict, since a blocked node carries no skip
+		// code, and reaching the conclusion an interval earlier should not
+		// move which series counts it.
+		if errors.Is(err, ErrEvictionImpossible) {
+			return Abandon(ctx, w, a.Node, engine.VerdictBlocked, fmt.Sprintf(
+				"the eviction API refuses %s/%s outright, and will refuse it again on every retry",
+				next.Namespace, next.Name), s.Now)
+		}
 		return Step{}, err
 	}
 
@@ -481,6 +537,26 @@ func record(
 		return nil
 	}
 	return Annotate(ctx, w, node, markers)
+}
+
+// pausable reports whether every reason this drain cannot proceed is one that
+// lifts without anybody acting, so waiting is the right answer rather than
+// handing the node back.
+//
+// Every one, not any: a single durable blocker means the drain is over
+// whatever else is true, and a node held cordoned waiting for a condition that
+// has already resolved alongside one that never will is the worst of both.
+//
+// An empty list is not pausable. It is not a pause at all — it is a drainable
+// node, or one stopped for a reason that is not a blocker — and answering true
+// here would put this branch in front of the verdict it does not speak for.
+func pausable(blockers []engine.EvictionBlocker) bool {
+	for _, b := range blockers {
+		if !b.Transient {
+			return false
+		}
+	}
+	return len(blockers) > 0
 }
 
 func podsOn(s engine.Snapshot, name string) []*corev1.Pod {

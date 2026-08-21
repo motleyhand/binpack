@@ -2,6 +2,7 @@ package executor_test
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -9,6 +10,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+	policyv1 "k8s.io/api/policy/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
@@ -1728,6 +1731,224 @@ func TestAnExpendablePodThatComesBackIsNotEvictedAgainEveryRound(t *testing.T) {
 	// progress rather than on anything counting evictions.
 	if round != 11 || step.Code != drain.AbandonStalled {
 		t.Errorf("ended at +%dm with %+v; expected the stall bound at +11m", round, step)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the drain ended but left the node cordoned")
+	}
+}
+
+// stalePDB is a budget covering the drain's remaining work whose controller has
+// not yet observed the current spec. The eviction API refuses every disruption
+// in that state, whatever the recorded allowance says.
+func stalePDB() *policyv1.PodDisruptionBudget {
+	return mother.Stale(mother.PDB("default", "web", 1, map[string]string{"app": "web"}))
+}
+
+// covered is an ordinary pod on the draining node, labelled so that a budget
+// can select it.
+func covered(name, app string) *corev1.Pod {
+	return mother.Pod("default", name, mother.OnNode("a"),
+		mother.PodLabels(map[string]string{"app": app}))
+}
+
+func TestABudgetWhoseControllerIsCatchingUpDoesNotEndACommittedDrain(t *testing.T) {
+	// A budget whose observedGeneration is behind its generation has not been
+	// recomputed yet; disruptionsAllowed is stale rather than zero-because-the
+	// -application-is-degraded. The disruption controller resyncs on the very
+	// update that bumped the generation, so the condition lasts one sync — and
+	// the write that causes it is a Helm upgrade, an Argo sync or a kubectl
+	// edit touching any budget in the namespace, which is a routine event on a
+	// cluster with continuous delivery.
+	//
+	// Ending the drain over it uncordons a node that has already relocated
+	// pods, keeps the relocations, buys nothing with them, and files thirty
+	// minutes of backoff under a reason that has stopped being true before
+	// anybody reads it.
+	replacement := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+	replacement.Spec.NodeName = "b"
+
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")},
+		[]*corev1.Pod{covered("stayer", "web"), replacement})
+	s.PDBs = []*policyv1.PodDisruptionBudget{stalePDB()}
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Done || step.Failed {
+		t.Errorf("a budget waiting for its own controller ended the drain: %+v", step)
+	}
+	if step.Code != executor.StepWaiting {
+		t.Errorf("expected the drain to wait, got %+v", step)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node was uncordoned by a blocker that pauses rather than ends a drain")
+	}
+}
+
+func TestABudgetThatNeverCatchesUpStillEndsTheDrain(t *testing.T) {
+	// The other half of pausing, and the failure this change can introduce: a
+	// blocker classed transient that turns out to be durable converts a
+	// bounded abandon into a wait, and a wait is only safe while something
+	// ends it.
+	//
+	// So the blocker is held true for the drain's whole life rather than for
+	// its first evaluation. A pause re-derives the same answer every interval,
+	// which is indistinguishable from progress if you only ever look once.
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")},
+		[]*corev1.Pod{covered("stayer", "web")})
+	c := clientFor(s)
+
+	stale := stalePDB()
+	round, step := drainRounds(t, c, 20,
+		func(pod string, now time.Time) {
+			t.Errorf("%s was evicted while every eviction was being refused", pod)
+		},
+		func(round *engine.Snapshot) {
+			round.PDBs = []*policyv1.PodDisruptionBudget{stale}
+		})
+
+	// At +10m: the last progress is the marker awaitingNode left a minute
+	// before round zero, and a paused drain moves nothing, so the clock runs
+	// from there uninterrupted.
+	if round != 10 || step.Code != drain.AbandonStalled {
+		t.Errorf("ended at +%dm with %+v; expected the stall bound at +10m", round, step)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the drain ended but left the node cordoned")
+	}
+}
+
+func TestOnlyABlockerThatLiftsItselfPausesADrain(t *testing.T) {
+	// The transient set is one member wide on purpose, and the cost of
+	// widening it is asymmetric. A blocker that really does lift costs one
+	// evaluation to wait for. A durable one classed transient converts an
+	// abandonment that is immediate and names its cause into a cordoned node
+	// that ends eleven minutes later reporting "no progress" — the same
+	// outcome, later, described worse.
+	//
+	// So the others are asserted to end the drain rather than left to end it
+	// by not having been thought about. Marking any of them transient makes a
+	// row here fail, which is the whole point of writing them down.
+	tests := []struct {
+		name  string
+		pods  []*corev1.Pod
+		pdbs  []*policyv1.PodDisruptionBudget
+		pause bool
+	}{
+		{
+			name:  "a budget waiting for its own controller",
+			pods:  []*corev1.Pod{covered("stayer", "web")},
+			pdbs:  []*policyv1.PodDisruptionBudget{stalePDB()},
+			pause: true,
+		},
+		{
+			// An allowance of zero is the application saying it cannot spare a
+			// replica. It may resolve as replicas become healthy, and it may
+			// equally be a budget that can never have slack — minAvailable at
+			// 100%, a workload that is not coming back — and nothing in the
+			// object distinguishes the two.
+			name: "a budget with no disruption to spare",
+			pods: []*corev1.Pod{covered("stayer", "web")},
+			pdbs: []*policyv1.PodDisruptionBudget{
+				mother.PDB("default", "web", 0, map[string]string{"app": "web"})},
+		},
+		{
+			// Two budgets over one pod. The eviction subresource does not
+			// arbitrate between them and answers 500, so nothing evicts that
+			// pod: not binpack, not kubectl drain, not the autoscaler.
+			name: "a pod under two budgets",
+			pods: []*corev1.Pod{covered("stayer", "web")},
+			pdbs: []*policyv1.PodDisruptionBudget{
+				mother.PDB("default", "web", 1, map[string]string{"app": "web"}),
+				mother.PDB("default", "web-also", 1, map[string]string{"app": "web"})},
+		},
+		{
+			// Every blocker, not any. A node held cordoned waiting for a
+			// condition that lifted a minute ago, alongside one that never
+			// will, is the worst of both answers.
+			name: "one of each",
+			pods: []*corev1.Pod{covered("stayer", "web"), covered("other", "api")},
+			pdbs: []*policyv1.PodDisruptionBudget{stalePDB(),
+				mother.PDB("default", "api", 0, map[string]string{"app": "api"})},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			s := snapshot(
+				[]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, tc.pods)
+			s.PDBs = tc.pdbs
+			c := clientFor(s)
+
+			step, err := executor.Advance(
+				context.Background(), c, s, "a", engineConfig(), drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+
+			cordoned := nodeFrom(t, c, "a").Spec.Unschedulable
+			if tc.pause {
+				if step.Done || step.Failed || !cordoned {
+					t.Errorf("expected the drain to pause and the node to stay cordoned, "+
+						"got %+v (cordoned %v)", step, cordoned)
+				}
+				return
+			}
+			if !step.Done || !step.Failed || cordoned {
+				t.Errorf("expected the drain to end and the node to be handed back, "+
+					"got %+v (cordoned %v)", step, cordoned)
+			}
+		})
+	}
+}
+
+// refusingEvictions answers every eviction with err while letting the node
+// patches through, so a test can assert what the drain did about the refusal
+// rather than only that it stopped.
+type refusingEvictions struct {
+	executor.Writer
+	err error
+}
+
+func (r refusingEvictions) SubResource(string) client.SubResourceClient {
+	return subResource{r.err}
+}
+
+func TestAPermanentEvictionRefusalAbandonsRatherThanRetries(t *testing.T) {
+	// The mirror of the case above. A pod covered by two budgets is refused
+	// with HTTP 500 rather than a retryable 429, because the eviction
+	// subresource does not arbitrate between budgets — so nothing evicts that
+	// pod: not binpack, not kubectl drain, not the autoscaler.
+	//
+	// Reachable only as a race, since CheckEvictable otherwise refuses the
+	// candidate first: the second budget is created between the assessment and
+	// the eviction. Failing the reconcile leaves the node cordoned until the
+	// next evaluation reaches the same conclusion through a different route,
+	// so the conclusion is reached here instead, under the same code that
+	// route would have produced.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "one", mother.OnNode("a")),
+		mother.Pod("default", "two", mother.OnNode("a")),
+	}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, time.Minute, "2"), node("b")}, pods)
+	c := clientFor(s)
+	w := refusingEvictions{Writer: c, err: apierrors.NewInternalError(errors.New(
+		"This pod has more than one PodDisruptionBudget, which the eviction subresource does not support."))}
+
+	step, err := executor.Advance(context.Background(), w, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Done || !step.Failed {
+		t.Errorf("an eviction nothing can accept did not end the drain: %+v", step)
+	}
+	if step.Code != engine.VerdictBlocked {
+		t.Errorf("code = %q, want %q — the same code revalidation reaches an interval later",
+			step.Code, engine.VerdictBlocked)
 	}
 	if nodeFrom(t, c, "a").Spec.Unschedulable {
 		t.Error("the drain ended but left the node cordoned")

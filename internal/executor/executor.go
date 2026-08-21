@@ -124,17 +124,25 @@ func patchNode(ctx context.Context, w Writer, node *corev1.Node, patch string) e
 }
 
 // Eviction outcomes. The distinction between them is the whole reason this
-// function exists rather than a bare API call.
+// function exists rather than a bare API call, and [Advance] is where it is
+// spent: a refusal nothing can lift ends the drain there, rather than travelling
+// out of the executor as an error like every other failure.
 var (
 	// ErrEvictionBlocked is a disruption budget refusing right now. Retryable:
 	// the budget's allowance is recomputed as replicas become healthy, so the
-	// same eviction may well succeed a moment later.
+	// same eviction may well succeed a moment later. Returned to the caller
+	// all the same, and nothing above treats it as the retry it is — the
+	// drain's recovery state is on the node, so it resumes, but not from here.
 	ErrEvictionBlocked = errors.New("a PodDisruptionBudget currently allows no disruption")
 
 	// ErrEvictionImpossible is the API refusing outright, which it does when a
 	// pod is covered by more than one budget. Not retryable, by anyone: the
 	// eviction subresource does not arbitrate between budgets and returns 500
-	// rather than a retryable 429. Retrying is how a drain hangs forever.
+	// rather than a retryable 429. Retrying is how a drain hangs forever, and
+	// returning it would end an evaluation over a condition no evaluation can
+	// fix. So the drain is handed back instead — the same conclusion the next
+	// revalidation reaches through CheckEvictable, without the trip through
+	// the caller's error path first.
 	ErrEvictionImpossible = errors.New("the eviction API refuses this pod outright")
 )
 
@@ -149,6 +157,12 @@ var (
 // transient failure treated as permanent abandons a drain that would have
 // worked, and etcd hiccups and webhook timeouts are far commoner than a pod
 // under two budgets.
+//
+// That asymmetry is what the match is for, and it is now paid in behaviour
+// rather than only argued: a match here ends the drain on the spot. Upstream
+// rewording costs whatever a non-match costs today — the error leaves the
+// executor, and revalidation abandons the node under the same code on a later
+// evaluation. A false match costs a drain that would have worked.
 const multiplePDBs = "more than one PodDisruptionBudget"
 
 // Evict asks the API server to remove a pod, respecting disruption budgets.

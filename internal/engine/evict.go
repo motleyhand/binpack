@@ -65,6 +65,20 @@ type EvictionBlocker struct {
 	// point at the object to change.
 	PDB     string
 	Message string
+
+	// Transient marks a blocker that resolves without anybody doing anything,
+	// so a drain already under way should wait for it rather than end over it.
+	//
+	// Read only by the executor, and only mid-drain: at selection a blocker of
+	// any kind is a reason to choose a different candidate, where refusing
+	// costs nothing at all.
+	//
+	// Deliberately opt-in, and deliberately a small set. False is the safe
+	// default — a durable blocker classed transient turns an abandonment that
+	// is immediate and explains itself into a wait that only the drain's stall
+	// timeout ends — so a blocker added later is durable until somebody argues
+	// otherwise, rather than transient by omission.
+	Transient bool
 }
 
 // CheckEvictable predicts whether every pod that must leave a node actually
@@ -206,6 +220,13 @@ func checkAllowances(demand map[*policyv1.PodDisruptionBudget]*budgetDemand) []E
 				Pod:  d.first,
 				Code: BlockedPDBStale,
 				PDB:  pdb.Namespace + "/" + pdb.Name,
+				// Transient by definition, and the only blocker that is. The
+				// disruption controller resyncs the budget on the very update
+				// that bumped its generation, so the gap closes in one sync —
+				// well inside an evaluation interval. Nothing is wrong with
+				// the application; binpack is looking at the budget between
+				// the write and the recomputation.
+				Transient: true,
 				Message: fmt.Sprintf(
 					"%s/%s was edited and its controller has not caught up (generation %d, observed %d), so evictions are refused until it does",
 					pdb.Namespace, pdb.Name, pdb.Generation, pdb.Status.ObservedGeneration),
