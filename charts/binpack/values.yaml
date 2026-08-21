@@ -45,7 +45,13 @@ rbac:
   allowDraining: false
 
 serviceAccount:
+  # The account binpack runs as, and the subject of every binding above.
   create: true
+  # Required when create is false, and the chart refuses to render without it.
+  # Helm's scaffold defaults that case to the namespace's `default` account —
+  # the one every pod that names none already has — so binpack's cluster-wide
+  # node and eviction verbs would be granted to all of them. binpack runs
+  # perfectly well as `default`, so nothing would ever report it.
   name: ""
   annotations: {}
 

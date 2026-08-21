@@ -80,7 +80,8 @@ jobs:
             --set metrics.serviceMonitor.enabled=true \
             --set metrics.service.enabled=true \
             --set leaderElection.enabled=false \
-            --set serviceAccount.create=false
+            --set serviceAccount.create=false \
+            --set serviceAccount.name=externally-managed
 
       # A chart that installs cleanly and then cannot work is the failure worth
       # catching at render time: binpack would hold its lease, serve its
@@ -106,6 +107,46 @@ jobs:
                       "--set config.dryRun=false --set rbac.create=false --set rbac.allowDraining=true"; do
             helm template binpack charts/binpack --namespace binpack-system $args > /dev/null \
               || { echo "refused a valid acting configuration: $args"; exit 1; }
+          done
+
+      # An externally managed ServiceAccount has to be named. Helm's scaffold
+      # falls back to the namespace's `default` account, which is the one every
+      # pod that names none already has — so binpack's cluster-wide `nodes:
+      # patch` and `pods/eviction: create` would be granted to all of them,
+      # while binpack itself ran perfectly well and reported nothing. Asserted
+      # in both directions, since a refusal that fired one step too eagerly
+      # would break every ordinary install instead.
+      - name: An unnamed external ServiceAccount is refused, not defaulted
+        run: |
+          set +e
+          out=$(helm template binpack charts/binpack --namespace binpack-system \
+            --set rbac.allowDraining=true --set serviceAccount.create=false 2>&1)
+          if [ $? -eq 0 ]; then
+            echo "rendered without a ServiceAccount name, binding binpack's roles to default"
+            exit 1
+          fi
+          case "$out" in
+            *serviceAccount.name*) ;;
+            *) echo "refused without naming the value to set:"; echo "$out"; exit 1 ;;
+          esac
+          set -e
+
+          # The chart's own account, and an external one that is named. Three
+          # subjects each: the ClusterRoleBinding, the autoscaler-status
+          # RoleBinding in kube-system, and the leader-election RoleBinding.
+          helm template binpack charts/binpack --namespace binpack-system \
+            --set rbac.allowDraining=true > /tmp/sa-created.yaml
+          helm template binpack charts/binpack --namespace binpack-system \
+            --set rbac.allowDraining=true \
+            --set serviceAccount.create=false --set serviceAccount.name=mine > /tmp/sa-named.yaml
+          [ "$(grep -c '^    name: binpack$' /tmp/sa-created.yaml)" = 3 ] \
+            || { echo "the created ServiceAccount is not the subject of all three bindings"; exit 1; }
+          [ "$(grep -c '^    name: mine$' /tmp/sa-named.yaml)" = 3 ] \
+            || { echo "the named ServiceAccount is not the subject of all three bindings"; exit 1; }
+          for rendered in /tmp/sa-created.yaml /tmp/sa-named.yaml; do
+            if grep -q "name: default" $rendered; then
+              echo "a binding subject is the default ServiceAccount: $rendered"; exit 1
+            fi
           done
 
       # podLabels is exposed for arbitrary additions, so it can name a

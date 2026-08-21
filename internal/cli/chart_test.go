@@ -103,3 +103,170 @@ func TestTheChartGivesTheShutdownTimeToHappen(t *testing.T) {
 			grace, controller.DefaultLeaseDuration)
 	}
 }
+
+// binpack's roles must never be bound to the namespace's default ServiceAccount.
+//
+// `serviceAccount.create: false` with `serviceAccount.name` left empty is the
+// `helm create` scaffold's fallback, and it reads as safe — `default` is the
+// account a pod gets when it names none. That is exactly what makes binding to
+// it wrong: every other pod in the release namespace that names no account of
+// its own inherits whatever binpack was granted, which under
+// `rbac.allowDraining` is cluster-wide `nodes: patch` and `pods/eviction:
+// create`. binpack itself runs perfectly well as `default`, so nothing reports
+// the over-grant; the install works, wrongly.
+//
+// The name reaches all three bindings and the Deployment through one helper,
+// so there is no half of it the chart could get right. The helper has to
+// refuse, the way _validate.tpl refuses the other combination that installs
+// cleanly and then does the wrong thing.
+//
+// Read from the templates rather than rendered, because `make check` may not
+// have Helm: CONTRIBUTING asks for Go and golangci-lint, and
+// hack/check-workflows.py holds the release job to whatever the build job
+// installs, so shelling out to `helm template` would either skip in CI or make
+// Helm a release-time dependency. The render itself is asserted in the chart
+// CI job, which has Helm.
+func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
+	bindings := roleBindings(t)
+	// Three: the ClusterRoleBinding, the autoscaler-status RoleBinding in
+	// kube-system, and the leader-election RoleBinding. A parse that found
+	// none would satisfy every assertion below without checking anything.
+	if len(bindings) < 3 {
+		t.Fatalf("found %d subjects in the chart's bindings, want the three it renders: "+
+			"the parse has lost the structure it is checking", len(bindings))
+	}
+
+	const helper = `include "binpack.serviceAccountName"`
+	for _, b := range bindings {
+		if !strings.Contains(b.subject, helper) {
+			t.Errorf("the %s at rbac.yaml:%d binds %s, which does not come from %s; "+
+				"a guard on one helper covers only the bindings that use it",
+				b.kind, b.line, b.subject, helper)
+		}
+	}
+
+	managed, external := serviceAccountNameArms(t)
+
+	// The arm taken when the operator manages the ServiceAccount themselves.
+	if refusal := refusalIn(external); refusal == "" {
+		for _, b := range bindings {
+			t.Errorf("the %s at rbac.yaml:%d binds the %q ServiceAccount when "+
+				"serviceAccount.create is false and serviceAccount.name is unset",
+				b.kind, b.line, literalIn(external))
+		}
+	} else {
+		// Named values, not prose: the operator has to be told which one to
+		// set and when, and a reworded refusal that stopped saying so would
+		// otherwise still pass.
+		for _, value := range []string{"serviceAccount.name", "serviceAccount.create"} {
+			if !strings.Contains(refusal, value) {
+				t.Errorf("the refusal does not name %s, so it does not say what to set: %q",
+					value, refusal)
+			}
+		}
+	}
+
+	// And the ordinary install must still render. A refusal that fired on the
+	// chart's own defaults would break every install there is.
+	if refusal := refusalIn(managed); refusal != "" {
+		t.Errorf("the chart refuses to render when it creates the ServiceAccount itself: %q", refusal)
+	}
+	if !strings.Contains(managed, `include "binpack.fullname"`) {
+		t.Errorf("a created ServiceAccount is no longer named after the release: %s", oneLine(managed))
+	}
+}
+
+// roleBinding is one subject of one binding, as the template writes it.
+type roleBinding struct {
+	kind    string // ClusterRoleBinding or RoleBinding
+	line    int    // in rbac.yaml, so a failure can be read against the source
+	subject string // the expression the subject's name comes from
+}
+
+// roleBindings reads every binding subject out of the chart's RBAC template.
+func roleBindings(t *testing.T) []roleBinding {
+	t.Helper()
+
+	rbac, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+
+	var bindings []roleBinding
+	var kind, section string
+	for i, line := range strings.Split(string(rbac), "\n") {
+		switch {
+		case strings.HasPrefix(line, "---"):
+			kind, section = "", ""
+		case strings.HasPrefix(line, "kind: "):
+			kind, section = strings.TrimPrefix(line, "kind: "), ""
+		case !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":"):
+			section = strings.TrimSuffix(line, ":")
+		case section == "subjects" && strings.HasPrefix(line, "    name: ") &&
+			strings.HasSuffix(kind, "Binding"):
+			bindings = append(bindings, roleBinding{
+				kind:    kind,
+				line:    i + 1,
+				subject: strings.TrimPrefix(line, "    name: "),
+			})
+		}
+	}
+	return bindings
+}
+
+// serviceAccountNameArms returns the two arms of binpack.serviceAccountName:
+// what it names when the chart creates the ServiceAccount, and what it names
+// when the operator manages it elsewhere.
+func serviceAccountNameArms(t *testing.T) (managed, external string) {
+	t.Helper()
+
+	helpers, err := os.ReadFile("../../charts/binpack/templates/_helpers.tpl")
+	if err != nil {
+		t.Fatalf("reading the chart's helpers: %v", err)
+	}
+
+	const opening = `{{- define "binpack.serviceAccountName" -}}`
+	start := strings.Index(string(helpers), opening)
+	if start < 0 {
+		t.Fatal("the chart has no binpack.serviceAccountName helper, though its bindings name one")
+	}
+	body := string(helpers)[start+len(opening):]
+	if next := strings.Index(body, `{{- define "`); next >= 0 {
+		body = body[:next]
+	}
+
+	if !strings.Contains(body, ".Values.serviceAccount.create") {
+		t.Fatalf("binpack.serviceAccountName no longer branches on serviceAccount.create: %s", oneLine(body))
+	}
+	arms := strings.SplitN(body, "{{- else -}}", 2)
+	if len(arms) != 2 {
+		t.Fatalf("binpack.serviceAccountName is no longer one if/else, so this test cannot "+
+			"tell its arms apart: %s", oneLine(body))
+	}
+	return arms[0], arms[1]
+}
+
+// refusalIn returns the message a template arm refuses with, or "" if it
+// renders a name instead.
+func refusalIn(arm string) string {
+	return firstGroup(regexp.MustCompile(`(?:required|fail)\s+"([^"]*)"`), arm)
+}
+
+// literalIn returns the name an arm falls back to when the value it prefers is
+// empty.
+func literalIn(arm string) string {
+	return firstGroup(regexp.MustCompile(`default\s+"([^"]*)"`), arm)
+}
+
+// oneLine folds a template fragment onto one line, so a failure reads as one
+// failure rather than as a stray block of chart.
+func oneLine(s string) string {
+	return strings.Join(strings.Fields(s), " ")
+}
+
+func firstGroup(re *regexp.Regexp, s string) string {
+	if m := re.FindStringSubmatch(s); m != nil {
+		return m[1]
+	}
+	return ""
+}
