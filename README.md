@@ -85,7 +85,7 @@ watch, and how to uninstall it without stranding a node.
 | [Diagnostics](docs/reference/diagnostics.md) | Every `binpack diagnose` code, its severity, and the fix |
 | [Versioning](docs/reference/versioning.md) | What a version number covers, what is public API, and what 0.x means |
 | [Metrics](docs/reference/metrics.md) | Every `binpack_` series, what to alert on, and why prose is never a label |
-| [Annotations and labels](docs/reference/annotations.md) | The one you set, the six binpack writes, the label that says it is draining, and how to read a drain in flight |
+| [Annotations and labels](docs/reference/annotations.md) | The one you set, the seven binpack writes, the label that says it is draining, and how to hand a stuck node back |
 | [Helm chart](charts/binpack) | Values, RBAC, and what each permission is for |
 | [RBAC](docs/reference/rbac.md) | Every permission binpack needs, and what it is deliberately never granted |
 | [Let binpack drain nodes](docs/how-to/let-binpack-drain-nodes.md) | Turning off dry run: what to read first, and what it can then do |

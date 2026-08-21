@@ -34,7 +34,7 @@ implementation:
 |---|---|
 | API group | `binpack.motleyhand.com/v1alpha1` |
 | Configuration fields | `policy.feasibility.reserveForLargestPod` |
-| Node annotations | `binpack.motleyhand.com/skip` |
+| Node annotations and labels | `binpack.motleyhand.com/skip`, `binpack.motleyhand.com/draining` |
 | Metric names and label values | `binpack_drainable_nodes`, `verdict="infeasible"` |
 | Diagnostic codes | `pdb-zero-disruptions` |
 | Event reasons and actions | `WouldDrain`, `Consolidate` |

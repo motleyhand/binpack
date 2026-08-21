@@ -142,7 +142,11 @@ kubectl get events -A --field-selector reason=WouldAdvanceDrain
 
 Every other node goes on being evaluated and reported on as usual.
 
-To hand a node back yourself:
+To hand a node back yourself, uncordon it first and clear the markers afterwards:
+
+```bash
+kubectl uncordon NODE
+```
 
 ```bash
 kubectl annotate node NODE binpack.motleyhand.com/drain-started- binpack.motleyhand.com/drain-progress- binpack.motleyhand.com/drain-pods-remaining- binpack.motleyhand.com/drain-awaiting-
@@ -152,12 +156,21 @@ kubectl annotate node NODE binpack.motleyhand.com/drain-started- binpack.motleyh
 kubectl label node NODE binpack.motleyhand.com/draining-
 ```
 
-```bash
-kubectl uncordon NODE
-```
+The order is the point, because three commands are three chances to be interrupted. Clearing the
+markers while the node is still cordoned leaves it reading as a cordon somebody else applied:
+binpack skips it as `cordoned` and will not touch it again, so if the uncordon never happens —
+a denied patch, a runbook that stopped, a shell that died — the node stays out of service with
+nothing on it to say why. Doing the uncordon first means every state you can stop in has the
+node back in service, which is what you came here for.
 
-The label goes too. binpack never reads it, so nothing clears it for you — and a node still
-reporting `draining=true` after the drain has ended makes the label worth nothing.
+While dry run is on, that is where it stays: binpack changes nothing, so a schedulable node with
+markers on it is left alone rather than cordoned and resumed. Set `dryRun: false` before you
+start if what you want is for binpack to finish the drain instead.
+
+The label goes too, last. Nothing clears it for you, and a node still reporting `draining=true`
+after the drain has ended makes the label worth nothing. It is also what `binpack diagnose` reads
+to report a node that is *still cordoned* and has lost its markers — the residue of the other
+order — so leaving it on until the end is what keeps a half-finished hand-back visible.
 
 ## What binpack cannot promise
 
