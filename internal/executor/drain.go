@@ -481,11 +481,29 @@ func Advance(
 	// value awaitingMarker would return, and a second patch saying what the
 	// node already says is a write per eviction bought for nothing.
 	//
-	// Losing this one costs the wait rather than the drain. The next
-	// evaluation reads a settled marker, so it evicts again without waiting
-	// for this replacement to be bound — one extra pod in flight against a
-	// simulation that assumed one, which the assessment still bounds. Before
-	// the commitment moved it cost both.
+	// Losing this one costs the wait, and the wait is not nothing. The next
+	// evaluation reads a settled marker, so it evicts again without waiting for
+	// this replacement to be bound — and an unbound pod sits on no node, so the
+	// simulation that approves the second eviction has reserved nothing for it.
+	// Two replacements are then placed against room proved for one, which is
+	// the risk sequential eviction exists to remove: binpack cannot steer the
+	// scheduler, so a wrong prediction surfaces as a Pending pod or a scale-up
+	// rather than as an error here. The drain itself stays bounded — every
+	// later evaluation re-commits, and the assessment ends one that stops
+	// making progress — but bounded is not the same as safe.
+	//
+	// Accepted rather than closed, because the alternative was measured.
+	// Writing the controller's identity before the eviction keeps the wait
+	// through this failure and loses a whole drain to the commoner one: a
+	// budget answering 429 leaves a marker claiming a replacement nobody owes,
+	// and the drain waits out its stall timeout for a pod that will never be
+	// created. This window needs a node patch to fail in the one evaluation
+	// between an accepted eviction and its record. That one needs a disruption
+	// budget to be exhausted, which is what disruption budgets are for.
+	//
+	// And it is strictly narrower than what it replaces. The same failed patch
+	// used to leave no marker at all, which lost this same wait *and* the
+	// commitment — the drain over-committed and read as untouched at once.
 	if marker := awaitingMarker(next, placed, s.Now); marker != engine.AwaitingSettled {
 		if err := Annotate(ctx, w, a.Node, map[string]string{
 			engine.AnnotationDrainAwaiting: marker,

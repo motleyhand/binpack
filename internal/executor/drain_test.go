@@ -2262,6 +2262,65 @@ func TestARefusedEvictionLeavesTheDrainOwingNoReplacement(t *testing.T) {
 	}
 }
 
+func TestALostReplacementWaitCostsTheWaitAndNotTheDrain(t *testing.T) {
+	// What the residual window actually costs, measured rather than argued.
+	//
+	// The commitment survives a failed marker write; the wait for the
+	// replacement does not, because the value naming the controller is the one
+	// written after the eviction. So the next evaluation evicts again with a
+	// replacement still unbound — and an unbound pod sits on no node, so the
+	// simulation approving that eviction has reserved nothing for it. Two
+	// replacements against room proved for one is the risk sequential eviction
+	// exists to remove, and it is why this window is worth stating rather than
+	// waving at.
+	//
+	// It is bounded, though, and narrower than the window it replaces, where
+	// the same failed patch lost the commitment as well. Both halves are
+	// asserted: neither follows from the other, and the second is the reason
+	// the first is acceptable.
+	s, _ := commitment()
+	c := clientFor(s)
+
+	if _, err := executor.Advance(context.Background(),
+		&interrupted{Writer: c, keep: 1}, s, "a", engineConfig(), drainPolicy()); err == nil {
+		t.Fatal("expected the lost marker write to end the evaluation")
+	}
+
+	// Unbound, which is precisely the state the lost wait would have waited
+	// for, and which the simulation cannot see.
+	unbound := pending("one-back", "one-rs", at.Add(30*time.Second), false)
+	if err := c.Create(context.Background(), unbound); err != nil {
+		t.Fatalf("creating the replacement: %v", err)
+	}
+
+	next, err := executor.Advance(context.Background(), c,
+		cluster(t, c, at.Add(time.Minute)), "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if next.Code != executor.StepEvicted {
+		t.Errorf("the lost write should cost the wait, not the eviction: %+v", next)
+	}
+
+	// The second eviction's own marker was written, so its replacement is
+	// waited for as usual. Bind it and let the drain reach its ending: a lost
+	// wait must not leave the node cordoned with nothing to finish it.
+	landed := pending("two-back", "two-rs", at.Add(90*time.Second), false)
+	landed.Spec.NodeName = "d"
+	if err := c.Create(context.Background(), landed); err != nil {
+		t.Fatalf("binding the second replacement: %v", err)
+	}
+
+	last, err := executor.Advance(context.Background(), c,
+		cluster(t, c, at.Add(2*time.Minute)), "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if last.Code != executor.StepAwaitRemoval {
+		t.Errorf("a drain that lost a replacement wait was left unfinished: %+v", last)
+	}
+}
+
 func TestALostAwaitingMarkerDoesNotReapplyTheReserve(t *testing.T) {
 	// The same thing asked of the engine rather than of the annotation, and
 	// asked of both outcomes of the write. Whether the patch that carries the
