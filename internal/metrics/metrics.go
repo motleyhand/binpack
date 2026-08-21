@@ -81,7 +81,8 @@ var (
 
 	evaluationErrors = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: "binpack_evaluation_errors_total",
-		Help: "Evaluations that could not be completed, usually a failed read of the cluster.",
+		Help: "Evaluations that could not be completed: a failed read of the cluster, " +
+			"or a write the API server refused.",
 	})
 
 	evaluationDuration = prometheus.NewHistogram(prometheus.HistogramOpts{
@@ -229,6 +230,11 @@ func DrainAbandoned(reason string) { drainsAbandoned.WithLabelValues(reason).Inc
 // The gauges are left alone deliberately. They describe the last evaluation
 // that reached a conclusion, and zeroing them on a failed read would turn a
 // broken permission into what looks like a cluster with nothing to consolidate.
+//
+// Reached by a failed write as well as a failed read. Neither stops binpack on
+// its own — the next evaluation re-reads and re-decides — so this counter, and
+// not the process exiting, is what says a cluster is refusing what binpack
+// asks of it.
 func Failed() {
 	evaluationErrors.Inc()
 }

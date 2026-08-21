@@ -103,6 +103,7 @@ binpack writes three events per drain, on the node itself:
 | `Draining` | A drain has started on this node |
 | `Drained` | It finished, and the cluster-autoscaler removed the node |
 | `DrainAbandoned` | It stopped, the node is uncordoned, and the note says why |
+| `WouldAdvanceDrain` | A drain is in progress and dry run is on, so binpack is not advancing it |
 
 ```bash
 kubectl get events -A --sort-by=.lastTimestamp --field-selector reason=DrainAbandoned
@@ -130,6 +131,16 @@ config:
 A drain already in progress is left exactly as it is: still cordoned, still marked, not advanced.
 binpack has been told to change nothing, and uncordoning would itself be a change. Finish it by
 hand, or set `dryRun: false` again and let binpack finish it.
+
+Unlike a drain binpack is advancing, this one has no end of its own — nothing clears the markers
+while dry run is on — so binpack writes a `WouldAdvanceDrain` event on that node every
+evaluation, saying what advancing it would do:
+
+```bash
+kubectl get events -A --field-selector reason=WouldAdvanceDrain
+```
+
+Every other node goes on being evaluated and reported on as usual.
 
 To hand a node back yourself:
 

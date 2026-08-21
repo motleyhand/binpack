@@ -27,6 +27,15 @@ const (
 	// filtering events — including a person skimming `kubectl describe node`.
 	ReasonDraining = "Draining"
 
+	// ReasonWouldAdvanceDrain is a drain already in progress that binpack is
+	// not advancing, because it is running in dry-run. Its own reason for the
+	// same purpose the two above have theirs: nothing filtering events should
+	// have to read a note to tell a node binpack is emptying from one it has
+	// stopped touching. It is also the only one of these that repeats
+	// indefinitely — a frozen drain is ended by an operator, not by binpack —
+	// which is why it carries what advancing it would do.
+	ReasonWouldAdvanceDrain = "WouldAdvanceDrain"
+
 	// ReasonDrained and ReasonDrainAbandoned are how a drain ended. Both are
 	// worth an event: the first is what binpack exists to do, and the second
 	// carries the sentence saying what stopped it.

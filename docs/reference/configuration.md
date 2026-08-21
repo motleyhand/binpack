@@ -91,8 +91,13 @@ than letting binpack decide to drain and then be refused by RBAC on every attemp
 
 Switching back to `true` while a drain is in progress leaves that drain exactly as it is —
 cordoned and marked, neither advanced nor undone. Uncordoning would itself be a change, which is
-the one thing dry run promises not to make. See
-[Let binpack drain nodes](../how-to/let-binpack-drain-nodes.md).
+the one thing dry run promises not to make.
+
+That node stays cordoned for as long as the setting stands, so binpack says so on it: a
+`WouldAdvanceDrain` event each evaluation, carrying what advancing the drain would do. The rest
+of the cluster goes on being evaluated and reported on meanwhile — a frozen drain does not stop
+binpack deciding about any other node. Hand the node back yourself, or set `dryRun: false` again
+and let binpack finish it. See [Let binpack drain nodes](../how-to/let-binpack-drain-nodes.md).
 
 ### `discovery.nodeGroupIDLabel`
 
