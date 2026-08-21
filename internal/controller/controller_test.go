@@ -11,7 +11,6 @@ import (
 
 	"github.com/go-logr/logr"
 	"github.com/go-logr/logr/funcr"
-	dto "github.com/prometheus/client_model/go"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	eventsv1 "k8s.io/api/events/v1"
@@ -1345,21 +1344,7 @@ func evaluationErrors(t *testing.T) float64 {
 // evaluationsWithCode is binpack_evaluations_total for one outcome code.
 func evaluationsWithCode(t *testing.T, code string) float64 {
 	t.Helper()
-	families, err := ctrlmetrics.Registry.Gather()
-	if err != nil {
-		t.Fatalf("gathering metrics: %v", err)
-	}
-	for _, f := range families {
-		if f.GetName() != "binpack_evaluations_total" {
-			continue
-		}
-		for _, m := range f.GetMetric() {
-			if hasLabel(m.GetLabel(), "code", code) {
-				return m.GetCounter().GetValue()
-			}
-		}
-	}
-	return 0
+	return series(t, "binpack_evaluations_total", "code", code)
 }
 
 func TestATransientEvictionRefusalDoesNotStopTheController(t *testing.T) {
@@ -1523,39 +1508,49 @@ func TestShutdownHandsTheLeaseOverRatherThanWaitingItOut(t *testing.T) {
 // last evaluation actually assessed.
 func nodesReported(t *testing.T) float64 {
 	t.Helper()
-	return nodesWithVerdict(t, "")
+	return series(t, "binpack_nodes", "", "")
 }
 
-// nodesWithVerdict is binpack_nodes for one verdict, or all of them when the
-// verdict is empty.
+// nodesWithVerdict is binpack_nodes for one verdict.
 func nodesWithVerdict(t *testing.T, verdict string) float64 {
+	t.Helper()
+	return series(t, "binpack_nodes", "verdict", verdict)
+}
+
+// series sums one binpack_ metric family, keeping only the children carrying a
+// given label value — or all of them when the label name is empty.
+//
+// Gauge and counter values are added because exactly one of them is ever set
+// and the protobuf getters are nil-safe on the other, which lets the callers
+// below read a gauge and a counter through one function. Written against the
+// gathered families rather than against prometheus/client_model's types on
+// purpose: naming that package here would promote it from an indirect
+// dependency to a direct one, for a test helper, and CI checks tidiness.
+func series(t *testing.T, family, label, value string) float64 {
 	t.Helper()
 	families, err := ctrlmetrics.Registry.Gather()
 	if err != nil {
 		t.Fatalf("gathering metrics: %v", err)
 	}
+
 	var total float64
 	for _, f := range families {
-		if f.GetName() != "binpack_nodes" {
+		if f.GetName() != family {
 			continue
 		}
 		for _, m := range f.GetMetric() {
-			if verdict != "" && !hasLabel(m.GetLabel(), "verdict", verdict) {
-				continue
+			matched := label == ""
+			for _, l := range m.GetLabel() {
+				if l.GetName() == label && l.GetValue() == value {
+					matched = true
+				}
 			}
-			total += m.GetGauge().GetValue()
+			if matched {
+				total += m.GetGauge().GetValue() + m.GetCounter().GetValue()
+			}
 		}
 	}
 	return total
-}
-
-func hasLabel(labels []*dto.LabelPair, name, value string) bool {
-	for _, l := range labels {
-		if l.GetName() == name && l.GetValue() == value {
-			return true
-		}
-	}
-	return false
 }
 
 func TestDryRunStillReportsOnTheRestOfTheCluster(t *testing.T) {
