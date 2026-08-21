@@ -310,10 +310,10 @@ func Advance(
 				return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
 			}
 			// Recorded like every other wait, and here it is what makes the
-			// bound above reachable rather than decorative. record runs before
-			// the eviction it accompanies, so the count on the node is one
-			// higher than what the next evaluation finds: that evaluation sees
-			// fewer pods and calls it progress, correctly, once. Returning
+			// bound above reachable rather than decorative. The count is
+			// written before the eviction it accompanies, so the node records
+			// one more pod than the next evaluation finds: that evaluation
+			// sees fewer and calls it progress, correctly, once. Returning
 			// without lowering the count leaves the same departure being read
 			// as fresh progress every interval afterwards, and a stall clock
 			// that restarts every interval never runs out.
@@ -420,6 +420,34 @@ func Advance(
 			"%d pods came back to the node after it was cordoned", len(pods))}, nil
 	}
 
+	// Committed before the eviction rather than after it, and in the same
+	// write as the markers that used to follow it.
+	//
+	// The marker is the only record that this drain has disrupted anything,
+	// and what reads it decides which questions revalidation re-asks. Written
+	// afterwards it is lost by exactly the failures it exists to survive: a
+	// patch the API server refuses, a lease lost, a SIGTERM on a rolling
+	// update. The eviction is not undone by any of them, so what is left is a
+	// disrupted pod on a node that reads as untouched — and the next
+	// evaluation puts the reserve, the pod cap and the scale-up cooldown back
+	// in force against a node the departed pod has already made tighter.
+	//
+	// The settled sentinel and not the controller's identity, because the two
+	// say different things and only one of them is true yet. "Committed,
+	// nothing owed" survives an eviction that is then refused; a marker naming
+	// a controller claims a replacement is owed, and a budget answering 429
+	// after the write would leave the drain waiting out its stall timeout for
+	// a pod nobody was ever going to create. The identity goes on afterwards,
+	// where being lost costs a wait rather than the drain.
+	//
+	// So a drain whose first eviction is refused reads as committed having
+	// disrupted nothing. That is the conservative direction — it withdraws two
+	// preferences and changes no question of soundness — and it is the whole
+	// of what this ordering trades away.
+	if err := commit(ctx, w, a.Node, assessment, s.Now); err != nil {
+		return Step{}, err
+	}
+
 	if err := Evict(ctx, w, next); err != nil {
 		// A refusal nothing can lift, which today means one pod covered by two
 		// disruption budgets: the eviction subresource declines to arbitrate
@@ -448,26 +476,22 @@ func Advance(
 		return Step{}, err
 	}
 
-	// Recorded on the assessment's terms, not on the eviction's. An accepted
-	// eviction feels like progress and is not: it is an event, and a bound
-	// defined over the *absence* of progress cannot be kept alive by something
-	// that can be emitted every interval for ever. A node whose population
-	// never falls is not being emptied however many evictions it has accepted
-	// — which is the state a workload tolerating the cordon produces, since
-	// every pod evicted off the node is placed straight back onto it.
+	// Upgraded to name the controller that owes the replacement, now that one
+	// is actually owed. Skipped where none is: commit has already written the
+	// value awaitingMarker would return, and a second patch saying what the
+	// node already says is a write per eviction bought for nothing.
 	//
-	// Nothing is lost by not asserting it. record writes the count as it was
-	// *before* this eviction, so the next evaluation finds one fewer pod than
-	// the node records and reads the departure as progress — from the state,
-	// where it can be checked, rather than from an event only this process
-	// remembers.
-	if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
-		return Step{}, err
-	}
-	if err := Annotate(ctx, w, a.Node, map[string]string{
-		engine.AnnotationDrainAwaiting: awaitingMarker(next, placed, s.Now),
-	}); err != nil {
-		return Step{}, err
+	// Losing this one costs the wait rather than the drain. The next
+	// evaluation reads a settled marker, so it evicts again without waiting
+	// for this replacement to be bound — one extra pod in flight against a
+	// simulation that assumed one, which the assessment still bounds. Before
+	// the commitment moved it cost both.
+	if marker := awaitingMarker(next, placed, s.Now); marker != engine.AwaitingSettled {
+		if err := Annotate(ctx, w, a.Node, map[string]string{
+			engine.AnnotationDrainAwaiting: marker,
+		}); err != nil {
+			return Step{}, err
+		}
 	}
 
 	return Step{Code: StepEvicted,
@@ -476,27 +500,30 @@ func Advance(
 
 // Abandon hands the node back and records why.
 //
-// Uncordon first, deliberately. If the annotation write then fails, the node
-// is at worst marked and schedulable, which the next evaluation detects and
-// repairs — the drain resumes, revalidation governs it, and no capacity is
-// lost. The other order fails the other way: a node left cordoned with its
-// marker cleared reads as "cordoned by somebody else", and binpack would
-// leave it alone indefinitely while the cluster paid for it.
+// One patch: the cordon lifts, the markers clear and the backoff appears
+// together, or none of it does. A node that forgot it was draining but never
+// recorded the failure would be retried immediately, and it is now the
+// emptiest candidate in the pool.
+//
+// Uncordoning first and recording afterwards was the other candidate, on the
+// reasoning that a node left marked and schedulable is detected and repaired
+// by the next evaluation. It is — but the repair belongs to Begin's half-state,
+// not to this one, and the two are byte-identical: cordon and carry on, which
+// resumes the drain this call had just decided to end and discards the reason,
+// the attempt count, the backoff, the metric and the event with it. The
+// condition that caused the abandonment is then met again a minute later, so
+// the node flaps for as long as it lasts.
+//
+// Failing wholesale leaves the node cordoned and still marked, which is a drain
+// in flight — the one state binpack already knows how to finish. The next
+// evaluation reaches this same conclusion and records it.
 func Abandon(
 	ctx context.Context, w Writer,
 	node *corev1.Node, code, reason string, now time.Time,
 ) (Step, error) {
-	if err := Uncordon(ctx, w, node); err != nil {
-		return Step{}, fmt.Errorf("handing back node %s: %w", node.Name, err)
-	}
-
 	attempts, until := drain.Backoff(node, now)
 
-	// One patch: the markers clear and the backoff appears together, or
-	// neither does. A node that forgot it was draining but never recorded the
-	// failure would be retried immediately, and it is now the emptiest
-	// candidate in the pool.
-	err := patchMeta(ctx, w, node,
+	err := HandBack(ctx, w, node,
 		map[string]string{engine.LabelDraining: ""},
 		map[string]string{
 			engine.AnnotationDrainStarted:       "",
@@ -541,6 +568,44 @@ func record(
 	ctx context.Context, w Writer,
 	node *corev1.Node, a drain.Assessment, now time.Time,
 ) error {
+	markers := progressMarkers(node, a, now)
+	if len(markers) == 0 {
+		return nil
+	}
+	return Annotate(ctx, w, node, markers)
+}
+
+// commit records that this drain has begun disrupting workload, together with
+// whatever [record] had to say.
+//
+// One write rather than two, because there is no useful state between them and
+// the one they would leave is unreadable: a node carrying fresh progress and no
+// commitment says both that an eviction has just happened and that none ever
+// has. [Abandon] has taken the same view of its own pair of writes since it was
+// written, for the same reason.
+//
+// The count is the one *before* this eviction, which is what [record] writes
+// anyway and is what makes the departure legible: the next evaluation finds one
+// fewer pod than the node records and reads that as progress — from the state,
+// where it can be checked, rather than from an event only this process
+// remembers. An accepted eviction is not itself progress. It is an event, and a
+// bound defined over the absence of progress cannot be kept alive by something
+// that can be emitted every interval for ever.
+func commit(
+	ctx context.Context, w Writer,
+	node *corev1.Node, a drain.Assessment, now time.Time,
+) error {
+	markers := progressMarkers(node, a, now)
+	markers[engine.AnnotationDrainAwaiting] = engine.AwaitingSettled
+	return Annotate(ctx, w, node, markers)
+}
+
+// progressMarkers is what [record] and [commit] have to say about the drain's
+// progress, which is nothing at all on an evaluation where the node neither
+// emptied nor arrived without a count.
+func progressMarkers(
+	node *corev1.Node, a drain.Assessment, now time.Time,
+) map[string]string {
 	markers := map[string]string{}
 	if a.Progressed {
 		markers[engine.AnnotationDrainProgress] = now.UTC().Format(time.RFC3339)
@@ -551,11 +616,7 @@ func record(
 	if a.Progressed || unseeded {
 		markers[engine.AnnotationDrainPodsRemaining] = strconv.Itoa(a.Remaining)
 	}
-
-	if len(markers) == 0 {
-		return nil
-	}
-	return Annotate(ctx, w, node, markers)
+	return markers
 }
 
 // pausable reports whether every reason this drain cannot proceed is one that

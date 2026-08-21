@@ -58,10 +58,16 @@ is what tells binpack a pod left while it was not watching.
 `drain-awaiting` is why evictions are sequential. binpack waits for the replacement pod to be
 *bound to a node*, not merely created, before evicting the next one.
 
-It carries `settled` when no replacement is owed, which happens two ways: the replacement has
-landed, or the pod that left was
+It carries `settled` when no replacement is owed, which happens three ways: the replacement has
+landed, the pod that left was
 [expendable](../explanation/overprovisioning-and-expendable-pods.md) and binpack reserved it no
-destination in the first place. The distinction between `settled` and the annotation being absent
+destination in the first place, or an eviction is about to be attempted. binpack writes the marker
+immediately *before* it evicts, because a marker written afterwards is lost by the failures it
+exists to survive — a refused patch, a lost lease, a restart — while the eviction is not. So a
+node whose eviction was then refused by a disruption budget carries `settled` having disrupted
+nothing; the annotation records what binpack has committed to, not what the cluster has done.
+
+The distinction between `settled` and the annotation being absent
 is load-bearing rather than cosmetic — absent means this drain has evicted nothing at all, and
 binpack asks a drain that has moved pods a narrower set of questions than one that has not
 ([ADR-0009](../design/adr-0009-revalidation-asks-soundness-not-preference.md),

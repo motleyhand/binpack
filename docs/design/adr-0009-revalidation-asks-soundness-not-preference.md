@@ -64,9 +64,11 @@ What it does is abandon a half-drained node, which is worse than either finishin
 starting.
 
 "Committed" is read from the node itself — the marker naming the replacement the drain is
-waiting for, written with the first eviction and cleared only when the drain ends. Read inside
-`Revalidate` rather than passed by the caller, so nothing can disagree with the node about what
-has already happened.
+waiting for, written immediately before the first eviction and cleared only when the drain ends.
+Read inside `Revalidate` rather than passed by the caller, so nothing can disagree with the node
+about what has already happened. Before rather than after, because a marker written afterwards is
+lost by exactly the failures it exists to survive while the eviction it records is not; see
+[ADR-0010](adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md)'s consequences.
 
 The first revalidation, immediately after the cordon, still applies the preferences. Nothing has
 been evicted at that point, so aborting is free — and that is precisely the revalidation that
