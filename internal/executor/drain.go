@@ -224,6 +224,26 @@ func Advance(
 		// for its own controller resolves in one disruption-controller sync;
 		// nothing about it survives to the interval that would have retried.
 		//
+		// A replacement the scheduler has already refused outranks the pause,
+		// and it is the one thing that does. Every other non-drainable verdict
+		// uncordons, so before this branch existed a refused replacement got
+		// its node back whatever else was wrong with the drain; pausing is the
+		// first verdict that keeps the cordon, and the cordon is precisely
+		// what that pod is waiting for — uncordoning is its repair, as the
+		// awaiting block below says. Holding it down until a budget catches up
+		// trades a Pending workload for a consolidation, which is the wrong
+		// way round, and the trade lasts until the stall timeout if the thing
+		// that is broken is the disruption controller itself.
+		//
+		// Ahead of the assessment's abandonment for the reason the assessment
+		// is always ranked behind a named cause: "the replacement could not be
+		// scheduled" tells an operator where to look, and "nothing has moved
+		// for eleven minutes" is the same node with the reason filed off. The
+		// awaiting block orders these two the same way.
+		if pod, ok := refusedReplacement(s, name, a.Node); ok {
+			return Abandon(ctx, w, a.Node,
+				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now)
+		}
 		// Bounded by the same thing every other wait is bounded by, and
 		// checked before the wait rather than after it, because a pause that
 		// nothing ends is the failure this branch can introduce. If the
@@ -273,9 +293,8 @@ func Advance(
 			// Unschedulable — so this is detected rather than inferred from a
 			// timeout, and it names the pod. Uncordoning is also the repair:
 			// this node is where that pod can go.
-			return Abandon(ctx, w, a.Node, drain.AbandonUnschedulable, fmt.Sprintf(
-				"pod %s/%s could not be scheduled after moving off this node",
-				pod.Namespace, pod.Name), s.Now)
+			return Abandon(ctx, w, a.Node,
+				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now)
 
 		case awaited:
 			// Bounded, because having a controller does not mean the
@@ -731,6 +750,33 @@ func replacementFor(
 		return landed, landedPod
 	}
 	return awaited, pendingPod
+}
+
+// refusedReplacement reports the pod this drain awaits when the scheduler has
+// definitively refused it, and nothing otherwise.
+//
+// A narrow reading of the awaiting block below, for the one caller that has to
+// ask the question before that block is reached. Kept to the refused state on
+// purpose: "awaited" and "landed" both mean the drain should carry on doing
+// whatever it was doing, and only a refusal is a fact that outranks another
+// branch's answer.
+func refusedReplacement(s engine.Snapshot, name string, node *corev1.Node) (*corev1.Pod, bool) {
+	owner, since, ok := awaiting(node)
+	if !ok {
+		return nil, false
+	}
+	if state, pod := replacementFor(s, name, owner, since); state == refused {
+		return pod, true
+	}
+	return nil, false
+}
+
+// unschedulableReason renders a refused replacement, in one place because two
+// branches now report it and a drain's recorded failure is what an operator
+// reads to find out what happened.
+func unschedulableReason(pod *corev1.Pod) string {
+	return fmt.Sprintf("pod %s/%s could not be scheduled after moving off this node",
+		pod.Namespace, pod.Name)
 }
 
 // awaitingMarker records which controller owes this drain a pod, so the next

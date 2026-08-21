@@ -1905,6 +1905,41 @@ func TestOnlyABlockerThatLiftsItselfPausesADrain(t *testing.T) {
 	}
 }
 
+func TestARefusedReplacementEndsTheDrainEvenWhileABudgetIsCatchingUp(t *testing.T) {
+	// Pausing is for a refusal that lifts on its own. A replacement the
+	// scheduler has already given up on is not that, and it outranks the
+	// pause for the reason the awaiting block gives: uncordoning is that
+	// pod's repair, because this node is where it can go.
+	//
+	// Before the pause existed every non-drainable verdict uncordoned, so a
+	// refused replacement always got its node back whatever else was wrong.
+	// The pause is the first verdict that does not, which is what makes this
+	// a hole the branch opened rather than one it inherited — a Pending pod
+	// held down for as long as a budget takes to catch up, and up to the
+	// stall timeout if the disruption controller is the thing that is broken.
+	refused := pending("replacement", "web-rs", at.Add(-30*time.Second), true)
+
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")},
+		[]*corev1.Pod{covered("stayer", "web"), refused})
+	s.PDBs = []*policyv1.PodDisruptionBudget{stalePDB()}
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Code != drain.AbandonUnschedulable || !step.Done || !step.Failed {
+		t.Errorf("expected the refused replacement to end the drain, got %+v", step)
+	}
+	if !strings.Contains(step.Reason, "replacement") {
+		t.Errorf("the reason should name the pod that cannot be placed, got %q", step.Reason)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node stayed cordoned, so the pod that needs it still cannot be placed")
+	}
+}
+
 // refusingEvictions answers every eviction with err while letting the node
 // patches through, so a test can assert what the drain did about the refusal
 // rather than only that it stopped.
