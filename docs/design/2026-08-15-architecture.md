@@ -416,6 +416,10 @@ elapsed time. The reasoning is in [ADR-0007](adr-0007-drain-progress-not-deadlin
    forty-minute drain would have forty evaluations running alongside it, each free to start a
    second one. The check itself is `engine.Marked`, and `Decide` applies it too — reporting the
    drain in progress instead of choosing — so the answer cannot depend on which command asked.
+   Describing that drain takes two questions, not one: `engine.Revalidate` says whether the node
+   could still be emptied, and `drain.Assess` says whether the drain is getting anywhere. A node
+   whose pods still fit elsewhere revalidates drainable however long it has been stuck, so
+   `drain.WouldHappen` pairs them and both `run` and `explain` report through it.
 1. **Mark, then cordon.** Write the drain annotations, then cordon. Cordoning first and deciding
    afterwards is what makes the next step meaningful: until the node is unschedulable, its pod
    set can still grow.

@@ -26,7 +26,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/motleyhand/binpack/internal/collect"
-	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
 )
@@ -1631,51 +1630,6 @@ func TestDryRunForgetsADrainWhoseNodeHasGone(t *testing.T) {
 		if e.reason == ReasonWouldAdvanceDrain {
 			t.Errorf("reported on a node that is no longer in the cluster: %+v", e)
 		}
-	}
-}
-
-func TestWhatAFrozenDrainIsToldAboutItself(t *testing.T) {
-	// The sentence an operator reads on a node binpack has stopped advancing,
-	// and the one place a dry run can mislead: every row here is something
-	// revalidation or the assessment observed, never a prediction of which
-	// ending Advance would reach. Two of the conditions below do not have one
-	// ending — a node the autoscaler is already removing is handed over rather
-	// than back, and one marked but uncordoned is repaired — so a sentence
-	// naming an ending would be wrong for them and right for the rest, which
-	// is the worst way to be wrong.
-	stalled := drain.Assessment{Action: drain.Abandon,
-		Code: drain.AbandonStalled, Reason: "no pod has left for 11m0s"}
-	moving := drain.Assessment{Action: drain.Continue, Remaining: 3}
-
-	for _, tc := range []struct {
-		name       string
-		assessment engine.NodeAssessment
-		drain      drain.Assessment
-		want       string
-	}{
-		{"the cluster moved underneath it",
-			engine.NodeAssessment{Skipped: true, SkipReason: "pool pool-4g is at its minimum size (1)"},
-			moving, "The cluster has moved underneath it: pool pool-4g is at its minimum size (1)."},
-		{"a pod can no longer be evicted",
-			engine.NodeAssessment{Blockers: []engine.EvictionBlocker{
-				{Message: "default/web is covered by two PodDisruptionBudgets"}}},
-			moving, "A pod on it can no longer be evicted: default/web is covered by two " +
-				"PodDisruptionBudgets."},
-		{"the pods no longer fit",
-			engine.NodeAssessment{Simulation: &engine.Simulation{Feasible: false}},
-			moving, "The pods still on it no longer fit anywhere else."},
-		// The bound, which is what a frozen drain does not have — and the row
-		// that says a drain nobody is advancing has run past it.
-		{"past its bound", engine.NodeAssessment{}, stalled,
-			"It has passed its bound and would be handed back: no pod has left for 11m0s (stalled)."},
-		{"still going", engine.NodeAssessment{}, moving,
-			"It is within its bounds, with 3 pods left to move."},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := wouldHappen(tc.assessment, tc.drain); got != tc.want {
-				t.Errorf("wouldHappen() = %q, want %q", got, tc.want)
-			}
-		})
 	}
 }
 

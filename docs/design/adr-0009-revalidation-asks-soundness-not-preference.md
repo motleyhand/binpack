@@ -91,7 +91,10 @@ catches pods the scheduler bound to the node between the decision and the cordon
   same as before. But the row `explain` prints for the node being drained is `Revalidate`'s
   answer rather than selection's, because the question an operator is asking about that node is
   whether the drain survives another step — and that question is the one this document narrowed.
-  The row is marked as such in both renderings, so the two are not read as one.
+  The row is marked as such in both renderings, so the two are not read as one. Revalidation is
+  paired with the drain's own bound there, never printed alone: a node whose pods still fit
+  elsewhere revalidates drainable however long the drain has been stuck, so the verdict by itself
+  would report a stalled drain as healthy.
 
 ## Alternatives considered
 

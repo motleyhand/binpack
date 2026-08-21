@@ -61,6 +61,11 @@ func explainConfig() engine.Config {
 			Enabled: true,
 			Sim:     engine.SimConfig{ExpendablePriorityCutoff: -10},
 			Evict:   engine.DefaultEvictConfig(),
+			// The shipped defaults. Left at zero every drain reads as stalled
+			// the instant it starts, which would make the ordinary fixtures
+			// describe a cluster nobody has.
+			StallTimeout:   10 * time.Minute,
+			RemovalTimeout: 15 * time.Minute,
 		},
 	}
 }
@@ -71,7 +76,7 @@ func explainConfig() engine.Config {
 func renderedExplain(t *testing.T, format outputFormat, s engine.Snapshot, cfg engine.Config) string {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := renderExplain(&options{output: format, out: &buf}, s, explainDecision(s, cfg)); err != nil {
+	if err := renderExplain(&options{output: format, out: &buf}, s, explainOutcome(s, cfg)); err != nil {
 		t.Fatalf("rendering: %v", err)
 	}
 	return buf.String()
@@ -123,8 +128,8 @@ func TestExplainReportsTheDrainInProgressRatherThanASecondNode(t *testing.T) {
 	if view.Code != engine.CodeDraining {
 		t.Errorf("json code = %q, want %q", view.Code, engine.CodeDraining)
 	}
-	if view.Node != "node-a" {
-		t.Errorf("json node = %q, want the node being drained", view.Node)
+	if view.Drain == nil || view.Drain.Node != "node-a" {
+		t.Errorf("json drain = %+v, want the node being drained", view.Drain)
 	}
 }
 
@@ -232,5 +237,67 @@ func TestExplainStillPreviewsAnOrdinaryDrain(t *testing.T) {
 	}
 	if chosen != 1 {
 		t.Errorf("%d nodes marked chosen, want exactly the one being drained", chosen)
+	}
+}
+
+// TestExplainSaysADrainHasPassedItsBound is Codex's first finding on #64, and
+// it is the case an operator is likeliest to be running this command for.
+//
+// Revalidation and the drain's own bounds answer different questions. A node
+// whose pods still fit elsewhere revalidates drainable however long it has been
+// stuck, because "could this node be emptied" is not "is this drain getting
+// anywhere" — and executor.Advance asks both, abandoning on the second. So a
+// row reading `drainable` under a footer saying that verdict decides whether
+// the drain continues is exactly wrong for a drain about to be handed back.
+func TestExplainSaysADrainHasPassedItsBound(t *testing.T) {
+	stalled := explainNode("node-a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+		engine.AnnotationDrainStarted:  explainNow.Add(-2 * time.Hour).Format(time.RFC3339),
+		engine.AnnotationDrainAwaiting: engine.AwaitingSettled,
+		engine.AnnotationDrainProgress: explainNow.Add(-90 * time.Minute).Format(time.RFC3339),
+	}))
+
+	s := explainCluster(
+		[]*corev1.Node{stalled, explainNode("node-b"), explainNode("node-c")},
+		[]*corev1.Pod{mother.Pod("default", "web", mother.OnNode("node-a"))})
+
+	cfg := explainConfig()
+	cfg.Default.StallTimeout = 10 * time.Minute
+	cfg.Default.RemovalTimeout = 15 * time.Minute
+
+	text := renderedExplain(t, outputText, s, cfg)
+	if !strings.Contains(text, "no progress") {
+		t.Errorf("explain did not say the drain has stalled:\n%s", text)
+	}
+	if strings.Contains(text, "still drainable") {
+		t.Errorf("explain called a stalled drain drainable and stopped there:\n%s", text)
+	}
+}
+
+// TestExplainReportsADrainWhenTheAutoscalerHasGone is Codex's second finding on
+// #64: the drain-in-progress gate sits below Decide's liveness check, so it
+// never runs when there is no live autoscaler — and the text renderer returns
+// before the node table.
+//
+// That is not a corner: an autoscaler that dies mid-drain is the one condition
+// revalidation refuses to continue a drain through, so `run` hands the node
+// back on its very next tick. explain reported the dead autoscaler and nothing
+// whatsoever about the cordoned node, which is the state somebody is staring at.
+func TestExplainReportsADrainWhenTheAutoscalerHasGone(t *testing.T) {
+	s := explainCluster(
+		[]*corev1.Node{draining("node-a"), explainNode("node-b")},
+		[]*corev1.Pod{mother.Pod("default", "web", mother.OnNode("node-a"))})
+	s.Autoscaler = engine.Autoscaler{}
+
+	text := renderedExplain(t, outputText, s, explainConfig())
+	if !strings.Contains(text, "node-a") {
+		t.Errorf("explain hid the drain in progress behind the dead autoscaler:\n%s", text)
+	}
+
+	var view explainView
+	if err := json.Unmarshal([]byte(renderedExplain(t, outputJSON, s, explainConfig())), &view); err != nil {
+		t.Fatalf("decoding the JSON output: %v", err)
+	}
+	if view.Drain == nil || view.Drain.Node != "node-a" {
+		t.Errorf("json drain = %+v, want the node being drained", view.Drain)
 	}
 }

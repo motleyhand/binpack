@@ -764,8 +764,8 @@ func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) 
 		return nil
 	}
 
-	would := wouldHappen(a, drain.Assess(
-		drain.State{Node: a.Node, Pods: podsOn(s, name), Now: s.Now}, e.drainPolicy(name, s)))
+	would := drain.WouldHappen(a, drain.Assess(
+		drain.State{Node: a.Node, Pods: drain.PodsOn(s, name), Now: s.Now}, drain.PolicyFor(e.opts.Engine, s, name)))
 
 	e.log.Info("a drain is in progress but dryRun is set; leaving it alone",
 		"node", name, "wouldHappen", would)
@@ -781,53 +781,10 @@ func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) 
 	return nil
 }
 
-// wouldHappen describes a frozen drain in one sentence.
-//
-// What revalidation and the assessment observed, not a rehearsal of
-// [executor.Advance]. Predicting the ending would mean a second copy of that
-// function's precedence living here, and most of the conditions below do not
-// have one ending: a node the autoscaler is already removing is handed over
-// rather than back, and one marked but uncordoned is repaired. A copy that
-// drifted would tell an operator something confidently wrong about their own
-// cluster, which is worse than telling them less.
-func wouldHappen(a engine.NodeAssessment, assessment drain.Assessment) string {
-	switch {
-	case a.Skipped:
-		return "The cluster has moved underneath it: " + a.SkipReason + "."
-	case len(a.Blockers) > 0:
-		return "A pod on it can no longer be evicted: " + a.Blockers[0].Message + "."
-	case a.Verdict() == engine.VerdictInfeasible:
-		return "The pods still on it no longer fit anywhere else."
-	case assessment.Action == drain.Abandon:
-		return fmt.Sprintf("It has passed its bound and would be handed back: %s (%s).",
-			assessment.Reason, assessment.Code)
-	default:
-		return fmt.Sprintf("It is within its bounds, with %d pods left to move.",
-			assessment.Remaining)
-	}
-}
-
-// podsOn is the pods the drain assessment reads. Terminating ones included: a
-// pod on its way out is still occupying the node.
-//
-// The same filter the executor applies before its own [drain.Assess] call, and
-// it has to stay the same: the sentence this feeds tells an operator what
-// acting would do, so a pod set that differed from the acting path's would make
-// a dry run describe a drain nobody would get.
-func podsOn(s engine.Snapshot, name string) []*corev1.Pod {
-	var on []*corev1.Pod
-	for _, pod := range s.Pods {
-		if pod.Spec.NodeName == name {
-			on = append(on, pod)
-		}
-	}
-	return on
-}
-
 // advance moves an in-progress drain on by one step. Only ever reached when
 // binpack is acting; a dry run reports through [evaluator.frozen] instead.
 func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string) error {
-	step, err := executor.Advance(ctx, e.writer, s, name, e.opts.Engine, e.drainPolicy(name, s))
+	step, err := executor.Advance(ctx, e.writer, s, name, e.opts.Engine, drain.PolicyFor(e.opts.Engine, s, name))
 	if err != nil {
 		return fmt.Errorf("advancing the drain of %s: %w", name, err)
 	}
@@ -875,27 +832,6 @@ func (e *evaluator) emitDrainEnded(ctx context.Context, name, reason, note strin
 	node := &corev1.Node{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	if err := e.reporter.emit(ctx, node, reason, ActionConsolidate, note); err != nil {
 		e.log.Error(err, "could not record how the drain ended", "node", name)
-	}
-}
-
-// drainPolicy resolves the drain bounds for the pool the node belongs to.
-//
-// Per pool rather than global, because everything else about a policy is: a
-// pool of batch workers with hour-long shutdowns and a pool of web replicas
-// have no business sharing a stall timeout.
-func (e *evaluator) drainPolicy(name string, s engine.Snapshot) drain.Policy {
-	for _, node := range s.Nodes {
-		if node.Name != name {
-			continue
-		}
-		p := e.opts.Engine.PolicyFor(
-			node.Labels[e.opts.Engine.NodeGroupIDLabel],
-			node.Labels[e.opts.Engine.PoolNameLabel])
-		return drain.Policy{StallTimeout: p.StallTimeout, RemovalTimeout: p.RemovalTimeout}
-	}
-	return drain.Policy{
-		StallTimeout:   e.opts.Engine.Default.StallTimeout,
-		RemovalTimeout: e.opts.Engine.Default.RemovalTimeout,
 	}
 }
 
