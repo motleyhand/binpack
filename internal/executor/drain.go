@@ -195,7 +195,7 @@ func Advance(
 			return Step{}, err
 		}
 		if assessment.Action == drain.Abandon {
-			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now, policy)
 		}
 		// Recorded rather than asserted: record moves the progress marker only
 		// when the assessment saw progress of its own, so the repair leaves a
@@ -242,7 +242,7 @@ func Advance(
 		// awaiting block orders these two the same way.
 		if pod, ok := refusedReplacement(s, name, a.Node); ok {
 			return Abandon(ctx, w, a.Node,
-				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now)
+				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now, policy)
 		}
 		// Bounded by the same thing every other wait is bounded by, and
 		// checked before the wait rather than after it, because a pause that
@@ -250,7 +250,7 @@ func Advance(
 		// blocker turns out to be durable after all, the node stops getting
 		// emptier, the assessment says so, and the drain ends as stalled.
 		if assessment.Action == drain.Abandon {
-			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+			return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now, policy)
 		}
 		// Recorded like every other wait: record moves the progress marker
 		// only where the assessment saw progress, so pausing cannot hold the
@@ -277,7 +277,7 @@ func Advance(
 		// changed. "The remaining pods no longer fit" tells an operator where
 		// to look; a node that has also been quiet for eleven minutes is the
 		// same node with the reason filed off.
-		return Abandon(ctx, w, a.Node, revalidationCode(a), revalidationReason(a), s.Now)
+		return Abandon(ctx, w, a.Node, revalidationCode(a), revalidationReason(a), s.Now, policy)
 	}
 
 	// A replacement owed by an earlier eviction settles what happens next,
@@ -294,7 +294,7 @@ func Advance(
 			// timeout, and it names the pod. Uncordoning is also the repair:
 			// this node is where that pod can go.
 			return Abandon(ctx, w, a.Node,
-				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now)
+				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now, policy)
 
 		case awaited:
 			// Bounded, because having a controller does not mean the
@@ -307,7 +307,7 @@ func Advance(
 			// all of them show up as an absence of progress — which is the
 			// question the assessment already answers.
 			if assessment.Action == drain.Abandon {
-				return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+				return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now, policy)
 			}
 			// Recorded like every other wait, and here it is what makes the
 			// bound above reachable rather than decorative. The count is
@@ -347,7 +347,7 @@ func Advance(
 
 	switch assessment.Action {
 	case drain.Abandon:
-		return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now)
+		return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now, policy)
 
 	case drain.AwaitRemoval:
 		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
@@ -403,7 +403,7 @@ func Advance(
 		// residents rather than of everything on the node, because an arrival
 		// is accounted for — binpack simply declines to evict it.
 		return Abandon(ctx, w, a.Node, drain.AbandonUnaccounted, fmt.Sprintf(
-			"%d pods remain that the simulation did not account for", len(staying)), s.Now)
+			"%d pods remain that the simulation did not account for", len(staying)), s.Now, policy)
 
 	default:
 		// Nothing is left but pods that came back after the cordon. None of
@@ -471,7 +471,7 @@ func Advance(
 		if errors.Is(err, ErrEvictionImpossible) {
 			return Abandon(ctx, w, a.Node, engine.VerdictBlocked, fmt.Sprintf(
 				"the eviction API refuses %s/%s outright, and will refuse it again on every retry",
-				next.Namespace, next.Name), s.Now)
+				next.Namespace, next.Name), s.Now, policy)
 		}
 		return Step{}, err
 	}
@@ -537,9 +537,9 @@ func Advance(
 // evaluation reaches this same conclusion and records it.
 func Abandon(
 	ctx context.Context, w Writer,
-	node *corev1.Node, code, reason string, now time.Time,
+	node *corev1.Node, code, reason string, now time.Time, policy drain.Policy,
 ) (Step, error) {
-	attempts, until := drain.Backoff(node, now)
+	attempts, until := drain.Backoff(node, now, policy)
 
 	err := HandBack(ctx, w, node,
 		map[string]string{engine.LabelDraining: ""},

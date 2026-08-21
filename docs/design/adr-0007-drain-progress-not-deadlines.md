@@ -127,7 +127,8 @@ binpack.motleyhand.com/backoff-until:  "2026-08-15T14:00:00Z"
 binpack.motleyhand.com/last-failure:   "pod monitoring/prometheus-0 is 12m past its termination deadline"
 ```
 
-Backoff starts at 30 minutes and doubles to a 24-hour cap. A node in backoff is not a candidate.
+Backoff starts at `policy.backoff.initial` and doubles to `policy.backoff.max` — 30 minutes and
+24 hours unless configured otherwise. A node in backoff is not a candidate.
 
 This is a correctness requirement rather than politeness: without it, the candidate ordering
 actively prefers nodes that have just failed. It also self-cleans — a drain that succeeds

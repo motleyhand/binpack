@@ -9,18 +9,6 @@ import (
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
-// Backoff bounds: 30 minutes doubling to a day.
-//
-// The cap is not a give-up. A node is never permanently skipped after N
-// attempts, because clearing that would need a human — which contradicts
-// leaving the cluster working without intervention, and would strand a node
-// blocked by something transient. A daily retry is slow enough to be harmless
-// and fast enough to recover on its own.
-const (
-	BackoffInitial = 30 * time.Minute
-	BackoffMax     = 24 * time.Hour
-)
-
 // Backoff is what to record on a node whose drain has just been abandoned.
 //
 // This is a correctness requirement rather than politeness. Abandoning a drain
@@ -33,17 +21,33 @@ const (
 // *successful* drain. One prevents thrash after failure; the other lets the
 // cluster settle after success.
 //
+// The bounds come from the resolved policy. They were package constants here
+// until the two configuration fields naming them — policy.backoff.initial and
+// policy.backoff.max — turned out to be parsed, defaulted, validated and
+// printed back by `binpack config validate` while reaching no decision point:
+// an operator lengthening backoff.max for a fragile pool was told it had been
+// set, and binpack went on retrying the node every day. The defaults now have
+// one home, in api/v1alpha1, which is the layer that fills them in; a second
+// copy here could only ever agree with that one by coincidence, and would
+// take the unconfigured case with it when it stopped.
+//
+// The cap is not a give-up. A node is never permanently skipped after N
+// attempts, because clearing that would need a human — which contradicts
+// leaving the cluster working without intervention, and would strand a node
+// blocked by something transient. A retry that is slow enough to be harmless
+// is still fast enough to recover on its own.
+//
 // Self-cleaning: a drain that succeeds deletes the node and takes the
 // annotations with it.
-func Backoff(node *corev1.Node, now time.Time) (attempts int, until time.Time) {
+func Backoff(node *corev1.Node, now time.Time, policy Policy) (attempts int, until time.Time) {
 	attempts = priorAttempts(node) + 1
 
-	wait := BackoffInitial
-	for i := 1; i < attempts && wait < BackoffMax; i++ {
+	wait := policy.BackoffInitial
+	for i := 1; i < attempts && wait < policy.BackoffMax; i++ {
 		wait *= 2
 	}
-	if wait > BackoffMax {
-		wait = BackoffMax
+	if wait > policy.BackoffMax {
+		wait = policy.BackoffMax
 	}
 
 	return attempts, now.Add(wait)

@@ -494,9 +494,10 @@ was. Without memory, binpack would preferentially retry its own failures, evicti
 pods each time.
 
 So a failed drain records per-node backoff on the node: an attempt count, a
-`backoff-until` timestamp and the failure reason. Backoff starts at 30 minutes and doubles to a
-24-hour cap, and a node in backoff is not a candidate. Because a successful drain deletes the
-node, the state cleans itself up.
+`backoff-until` timestamp and the failure reason. Backoff starts at `policy.backoff.initial` and
+doubles to `policy.backoff.max` — 30 minutes and 24 hours unless configured otherwise — and a node
+in backoff is not a candidate. Because a successful drain deletes the node, the state cleans itself
+up.
 
 This is distinct from `cooldown.afterDrain`, which is cluster-wide and follows a *successful*
 drain. One prevents thrash after failure; the other lets the cluster settle after success.

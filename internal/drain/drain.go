@@ -43,13 +43,26 @@ type State struct {
 
 // Policy is the part of a resolved pool policy this package needs.
 //
-// No expendable cutoff: the two bounds here ask whether a drain is moving, and
-// a pod below the cutoff still has to leave the node before it is empty. What
-// a pod's priority changes is whether it needed a destination, which was
-// settled before the drain started.
+// No expendable cutoff: the bounds here ask whether a drain is moving, and a
+// pod below the cutoff still has to leave the node before it is empty. What a
+// pod's priority changes is whether it needed a destination, which was settled
+// before the drain started.
+//
+// The two backoff durations are read only by [Backoff], and only once a drain
+// has been given up on. They travel with the timeouts because they are
+// resolved from the same per-pool policy and the alternative is resolving
+// pools twice: the value that says how long to wait would then be free to
+// disagree with the value that decided the wait was owed.
+//
+// All four are taken as resolved. Nothing here defaults a zero, for the same
+// reason [Assess] does not: a caller that built this by hand has skipped the
+// layer that fills values in, and quietly supplying one is how a configured
+// setting comes to differ from the setting that is applied.
 type Policy struct {
 	StallTimeout   time.Duration
 	RemovalTimeout time.Duration
+	BackoffInitial time.Duration
+	BackoffMax     time.Duration
 }
 
 // Action is what to do with a drain that is already under way.
@@ -146,11 +159,22 @@ func PolicyFor(cfg engine.Config, s engine.Snapshot, name string) Policy {
 			continue
 		}
 		p := cfg.PolicyFor(node.Labels[cfg.NodeGroupIDLabel], node.Labels[cfg.PoolNameLabel])
-		return Policy{StallTimeout: p.StallTimeout, RemovalTimeout: p.RemovalTimeout}
+		return policyFrom(p)
 	}
+	return policyFrom(cfg.Default)
+}
+
+// policyFrom narrows a resolved engine policy to the part this package reads.
+//
+// One conversion rather than one per branch above: the fall-through and the
+// matched node have to agree, and two literals listing the same fields is an
+// invariant with nobody enforcing it.
+func policyFrom(p engine.Policy) Policy {
 	return Policy{
-		StallTimeout:   cfg.Default.StallTimeout,
-		RemovalTimeout: cfg.Default.RemovalTimeout,
+		StallTimeout:   p.StallTimeout,
+		RemovalTimeout: p.RemovalTimeout,
+		BackoffInitial: p.BackoffInitial,
+		BackoffMax:     p.BackoffMax,
 	}
 }
 

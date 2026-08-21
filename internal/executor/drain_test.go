@@ -30,7 +30,10 @@ const (
 var at = time.Date(2026, 8, 17, 12, 0, 0, 0, time.UTC)
 
 func drainPolicy() drain.Policy {
-	return drain.Policy{StallTimeout: 10 * time.Minute, RemovalTimeout: 15 * time.Minute}
+	return drain.Policy{
+		StallTimeout: 10 * time.Minute, RemovalTimeout: 15 * time.Minute,
+		BackoffInitial: 30 * time.Minute, BackoffMax: 24 * time.Hour,
+	}
 }
 
 func engineConfig() engine.Config {
@@ -1214,7 +1217,7 @@ func TestTheDrainingLabelAppearsAndGoesWithTheMarkers(t *testing.T) {
 	}
 
 	if _, err := executor.Abandon(
-		context.Background(), c, n, "test", "because", at); err != nil {
+		context.Background(), c, n, "test", "because", at, drainPolicy()); err != nil {
 		t.Fatalf("Abandon: %v", err)
 	}
 
@@ -1259,7 +1262,7 @@ func TestOtherLabelsAreLeftAlone(t *testing.T) {
 		t.Fatalf("Begin: %v", err)
 	}
 	if _, err := executor.Abandon(
-		context.Background(), c, n, "test", "because", at); err != nil {
+		context.Background(), c, n, "test", "because", at, drainPolicy()); err != nil {
 		t.Fatalf("Abandon: %v", err)
 	}
 
@@ -2536,7 +2539,7 @@ func TestTheHandBackAndItsRecordMoveInOneWrite(t *testing.T) {
 	rec := &recorder{Writer: c}
 
 	if _, err := executor.Abandon(context.Background(), rec,
-		s.Nodes[0], "test", "because", at); err != nil {
+		s.Nodes[0], "test", "because", at, drainPolicy()); err != nil {
 		t.Fatalf("Abandon: %v", err)
 	}
 

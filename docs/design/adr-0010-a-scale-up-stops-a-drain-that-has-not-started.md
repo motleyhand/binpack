@@ -30,8 +30,8 @@ not to *start* a drain. It is not a statement about whether a drain already unde
 
 `Revalidate` runs the whole eligibility check on every evaluation of a drain in flight, and the
 executor turns any resulting skip into an abandonment: the node is uncordoned, the drain marker
-is cleared, `binpack_drains_abandoned_total` increments, and thirty minutes of per-node backoff
-are recorded. So on a node that had already evicted pods:
+is cleared, `binpack_drains_abandoned_total` increments, and `policy.backoff.initial` of per-node
+backoff is recorded — thirty minutes unless configured otherwise. So on a node that had already evicted pods:
 
 - the cluster-autoscaler publishing `clusterWide.scaleUp.status: InProgress`, or
 - `clusterWide.scaleUp.lastTransitionTime` falling inside `policy.cooldown.afterScaleUp`

@@ -15,10 +15,16 @@ import (
 
 var now = time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
 
+// policy is a resolved policy, every field filled the way the layer above
+// fills them: the backoff bounds are the documented defaults, so the table in
+// TestBackoffDoublesToACap reads as the shape it is testing rather than as two
+// arbitrary durations.
 func policy() drain.Policy {
 	return drain.Policy{
 		StallTimeout:   10 * time.Minute,
 		RemovalTimeout: 15 * time.Minute,
+		BackoffInitial: 30 * time.Minute,
+		BackoffMax:     24 * time.Hour,
 	}
 }
 
@@ -216,6 +222,60 @@ func TestANodeSeenEmptyForTheFirstTimeGetsTheFullRemovalWindow(t *testing.T) {
 	}
 }
 
+func TestBackoffHonoursTheConfiguredInitial(t *testing.T) {
+	// The configured value has to reach the arithmetic. Everything above this
+	// call already carries it — the schema parses it, the defaults fill it in,
+	// validation enforces max >= initial and `config validate` prints it back
+	// — so a policy that stops here is a safety control the operator was told
+	// they had set.
+	node := mother.SmallNode("a")
+
+	_, until := drain.Backoff(node, now, drain.Policy{
+		BackoffInitial: 5 * time.Minute,
+		BackoffMax:     time.Hour,
+	})
+
+	if got := until.Sub(now); got != 5*time.Minute {
+		t.Errorf("first wait: got %s, want the configured %s", got, 5*time.Minute)
+	}
+}
+
+func TestBackoffHonoursTheConfiguredMax(t *testing.T) {
+	// The cap is the half a test using the defaults cannot see: every other
+	// case here caps at 24 hours, so the constant this replaced agreed with
+	// all of them and reverting to it was invisible. Both cases below name a
+	// cap the default would get wrong, in opposite directions.
+	//
+	// The second is the reported one. An operator lengthening the pause on a
+	// fragile pool sets backoff.max: 72h, is told it is set, and gets a node
+	// retried daily — and a partially drained node is the most attractive
+	// candidate in its pool, so each retry evicts a few more pods.
+	for _, tc := range []struct {
+		name     string
+		policy   drain.Policy
+		recorded string
+		wait     time.Duration
+	}{
+		{"a cap below the default",
+			drain.Policy{BackoffInitial: 5 * time.Minute, BackoffMax: 20 * time.Minute},
+			"5", 20 * time.Minute},
+		{"a cap above the default",
+			drain.Policy{BackoffInitial: 30 * time.Minute, BackoffMax: 72 * time.Hour},
+			"9", 72 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := mother.SmallNode("a", mother.NodeAnnotations(
+				map[string]string{engine.AnnotationDrainAttempts: tc.recorded}))
+
+			_, until := drain.Backoff(node, now, tc.policy)
+
+			if got := until.Sub(now); got != tc.wait {
+				t.Errorf("wait: got %s, want the configured %s", got, tc.wait)
+			}
+		})
+	}
+}
+
 func TestBackoffDoublesToACap(t *testing.T) {
 	// Without this the candidate ordering actively prefers nodes that just
 	// failed: abandoning uncordons, and a partially drained node has fewer
@@ -240,7 +300,7 @@ func TestBackoffDoublesToACap(t *testing.T) {
 			node := mother.SmallNode("a", mother.NodeAnnotations(
 				map[string]string{engine.AnnotationDrainAttempts: tc.recorded}))
 
-			attempts, until := drain.Backoff(node, now)
+			attempts, until := drain.Backoff(node, now, policy())
 
 			if attempts != tc.attempts {
 				t.Errorf("attempts: got %d, want %d", attempts, tc.attempts)
@@ -259,7 +319,7 @@ func TestBackoffIsNeverPermanent(t *testing.T) {
 	node := mother.SmallNode("a", mother.NodeAnnotations(
 		map[string]string{engine.AnnotationDrainAttempts: "1000"}))
 
-	if _, until := drain.Backoff(node, now); until.Sub(now) > drain.BackoffMax {
+	if _, until := drain.Backoff(node, now, policy()); until.Sub(now) > policy().BackoffMax {
 		t.Errorf("backoff grew past the cap: %s", until.Sub(now))
 	}
 }
