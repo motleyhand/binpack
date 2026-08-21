@@ -17,9 +17,10 @@ import (
 // filesystem — see ADR-0008 — and because this package already reads the
 // documentation tree; see diagnostics_doc_test.go and capability_doc_test.go.
 const (
-	conventionsSpec = "../../docs/design/2026-08-15-architecture.md"
-	nodeKeySource   = "../../internal/engine/decide.go"
-	nodeKeyPrefix   = "binpack.motleyhand.com/"
+	conventionsSpec    = "../../docs/design/2026-08-15-architecture.md"
+	conventionsHeading = "## Conventions"
+	nodeKeySource      = "../../internal/engine/decide.go"
+	nodeKeyPrefix      = "binpack.motleyhand.com/"
 )
 
 // nodeKeys parses the engine's constant block and returns every declared
@@ -76,19 +77,50 @@ func nodeKeys(t *testing.T) map[string]string {
 	return keys
 }
 
-func TestEveryNodeKeyBinpackWritesIsInTheConventions(t *testing.T) {
-	// CLAUDE.md calls the architecture document the specification, and its
-	// Conventions table is headed "treated as public API from the first
-	// release". A key binpack writes on somebody's nodes and the spec does not
-	// mention is a promise nobody made, discovered by the next maintainer.
+// conventionsTable returns the rows of the Conventions table and nothing else
+// in the document.
+//
+// Scoped to the table rather than to the whole file, or even to the section,
+// because the document names most of these keys again in prose: the
+// recovery-state block spells three of them out, and the paragraph directly
+// under the table quotes the label inside a kubectl selector. Searched against
+// the whole file, the check below passes with both table rows deleted — which
+// is the only edit it exists to catch. That was measured, not reasoned about.
+func conventionsTable(t *testing.T) string {
+	t.Helper()
+
 	data, err := os.ReadFile(conventionsSpec)
 	if err != nil {
 		t.Fatalf("reading the specification: %v", err)
 	}
-	doc := string(data)
+
+	var rows []string
+	inSection := false
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.HasPrefix(line, "## ") {
+			inSection = line == conventionsHeading
+			continue
+		}
+		if inSection && strings.HasPrefix(line, "|") {
+			rows = append(rows, line)
+		}
+	}
+	if len(rows) == 0 {
+		t.Fatalf("no %q table in %s — the section was renamed or reformatted, and every check "+
+			"reading it is now vacuous", conventionsHeading, conventionsSpec)
+	}
+	return strings.Join(rows, "\n")
+}
+
+func TestEveryNodeKeyBinpackWritesIsInTheConventions(t *testing.T) {
+	// CLAUDE.md calls the architecture document the specification, and its
+	// Conventions table is headed "treated as public API from the first
+	// release". A key binpack writes on somebody's nodes and the spec does not
+	// promise is a promise nobody made, discovered by the next maintainer.
+	table := conventionsTable(t)
 
 	for name, key := range nodeKeys(t) {
-		if !strings.Contains(doc, key) {
+		if !strings.Contains(table, key) {
 			t.Errorf("engine.%s writes %s, which the Conventions table does not list", name, key)
 		}
 	}

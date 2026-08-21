@@ -38,7 +38,10 @@ node.
 The list is exhaustive and a test keeps it that way: `TestEveryNodeKeyBinpackWritesIsInTheConventions`
 parses the constant block in `internal/engine/decide.go` and fails if a key binpack writes is
 missing from the table above. It parses rather than enumerating by hand because the commit that
-adds a key and forgets this document is the same commit that would forget a hand-written list.
+adds a key and forgets this document is the same commit that would forget a hand-written list. It
+reads the table itself rather than the file, because several of these keys are named again in the
+prose below — and a check satisfied by a passing mention is one that stays green when a row is
+deleted, which is the only edit it exists to catch.
 
 The label is here rather than only in the reference because operators are told to select on it —
 `kubectl get nodes -l binpack.motleyhand.com/draining=true` is the pre-uninstall check — and a
