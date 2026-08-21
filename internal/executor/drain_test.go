@@ -448,6 +448,163 @@ func TestABoundReplacementLetsTheDrainProceed(t *testing.T) {
 	}
 }
 
+// committedDrain is the ordinary state of a drain that has done some of its
+// work: one pod already evicted and its replacement bound elsewhere, one pod
+// still to go. The config carries a cooldown so that window exists to fall
+// inside.
+func committedDrain() (engine.Snapshot, engine.Config) {
+	replacement := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+	replacement.Spec.NodeName = "b"
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), replacement}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+
+	cfg := engineConfig()
+	cfg.Default.CooldownAfterScaleUp = 10 * time.Minute
+	return s, cfg
+}
+
+func TestAScaleUpElsewhereDoesNotAbandonACommittedDrain(t *testing.T) {
+	// A drain that has evicted pods has spent something, and abandoning does
+	// not refund it: the pods stay where they went, the consolidation is lost,
+	// and the node is billed thirty minutes of backoff for an event it had no
+	// part in. The trigger is not even pool-scoped — the autoscaler publishes
+	// scale-up state for the whole cluster, so growth in a pool binpack cannot
+	// touch used to end a drain in one it can.
+	//
+	// Neither arm makes the drain unsound. A scale-up adds nodes, so the pods
+	// still on this one cannot fit less well than they did a minute ago; and
+	// the cooldown arm reports growth that finished up to ten minutes back.
+	// See ADR-0010.
+	for _, tc := range []struct {
+		name string
+		to   func(*engine.Snapshot)
+	}{
+		{"the cluster is growing right now",
+			func(s *engine.Snapshot) { s.Autoscaler.ScaleUpInProgress = true }},
+		{"the cluster grew a minute ago",
+			func(s *engine.Snapshot) { s.Autoscaler.LastScaleUp = at.Add(-time.Minute) }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cfg := committedDrain()
+			tc.to(&s)
+			c := clientFor(s)
+
+			step, err := executor.Advance(context.Background(), c, s, "a", cfg, drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+
+			if step.Failed {
+				t.Errorf("a drain that had already moved a pod was abandoned: %+v", step)
+			}
+			if step.Code != executor.StepEvicted {
+				t.Errorf("expected the drain to carry on, got %+v", step)
+			}
+			if !nodeFrom(t, c, "a").Spec.Unschedulable {
+				t.Error("the node was handed back, so it is accepting pods again while " +
+					"the ones it already lost stay where they went")
+			}
+		})
+	}
+}
+
+func TestAnEmptiedNodeIsNotAbandonedByAScaleUp(t *testing.T) {
+	// The worst moment available. Every pod has already been moved and the
+	// drain is one autoscaler pass from succeeding, so handing the node back
+	// discards the whole of the work — and the same window is open for as long
+	// as the removal takes, which is minutes, not seconds.
+	s, cfg := committedDrain()
+	// The pod that was still to go has gone too, and the node records it.
+	s.Pods = s.Pods[1:]
+	s.Nodes[0].Annotations[engine.AnnotationDrainPodsRemaining] = "0"
+	s.Autoscaler.ScaleUpInProgress = true
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", cfg, drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Failed || step.Code != executor.StepAwaitRemoval {
+		t.Errorf("an emptied node was abandoned instead of waiting to be reaped: %+v", step)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("an emptied node was uncordoned, so it will fill up again before " +
+			"the autoscaler gets to it")
+	}
+}
+
+func TestPoolAtMinimumEndsEvenACommittedDrain(t *testing.T) {
+	// The arm that must not move with the scale-up checks, asserted here
+	// because this is where abandoning means something: the node is uncordoned
+	// and backed off.
+	//
+	// At the floor the autoscaler will never remove this node, so finishing the
+	// drain would strand an empty cordoned node until removalTimeout abandoned
+	// it anyway — after more pods had been bounced, not fewer. That is what
+	// makes it soundness rather than preference, and it is the reason the
+	// narrowing above is written as one case of eligibility's switch and not as
+	// a blanket rule about resuming.
+	s, cfg := committedDrain()
+	s.Autoscaler.Groups[0].MinSize = 3
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", cfg, drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Done || !step.Failed || step.Code != engine.SkipPoolAtMinimum {
+		t.Errorf("expected the drain abandoned as %q, got %+v", engine.SkipPoolAtMinimum, step)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node was left cordoned in a pool nothing will shrink further")
+	}
+}
+
+func TestADrainFinishesThroughAScaleUpThatOutlastsIt(t *testing.T) {
+	// A single evaluation surviving a scale-up proves nothing about a drain,
+	// because a drain is not a single evaluation: it is one eviction an
+	// interval for as long as the node has pods, and the scale-up check is
+	// re-asked on every one of them. A fifteen-pod node spends a quarter of an
+	// hour exposed, and the cluster only has to grow once in that time.
+	//
+	// The scale-up starts after the first eviction, which is also the pair
+	// property in one test: round zero is uncommitted and would rightly stop,
+	// and every round after it has pods on other nodes that this drain put
+	// there.
+	var pods []*corev1.Pod
+	for i := range 15 {
+		pods = append(pods, mother.Pod("default", fmt.Sprintf("p%02d", i), mother.OnNode("a")))
+	}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, 0, ""), node("b")}, pods)
+	c := clientFor(s)
+
+	round, step := drainRounds(t, c, 3*len(pods), func(pod string, now time.Time) {
+		moved := mother.Pod("default", pod+"-r", mother.OnNode("b"),
+			mother.ControlledBy("ReplicaSet", pod+"-rs"))
+		moved.CreationTimestamp.Time = now
+		if err := c.Create(context.Background(), moved); err != nil {
+			t.Fatalf("relocating %s: %v", pod, err)
+		}
+	}, func(round *engine.Snapshot) {
+		if round.Now.After(at) {
+			round.Autoscaler.ScaleUpInProgress = true
+		}
+	})
+
+	if step.Failed {
+		t.Fatalf("a drain in a growing cluster was abandoned at +%dm: %+v", round, step)
+	}
+	// One pod an evaluation, so the fifteenth evaluation is the one that finds
+	// the node empty — the same round it reaches without a scale-up at all.
+	if round != len(pods) || step.Code != executor.StepAwaitRemoval {
+		t.Errorf("ended at +%dm with %+v; expected an empty node at +%dm",
+			round, step, len(pods))
+	}
+}
+
 func TestAReplacementRescheduledOntoTheDrainingNodeIsNotLanded(t *testing.T) {
 	// Bound is not the same question as moved, and binpack was asking the
 	// wrong one. kube-scheduler admits a pod onto a cordoned node when the pod
@@ -737,12 +894,22 @@ func cluster(t *testing.T, c client.Client, now time.Time) engine.Snapshot {
 // bound is a question about a clock, and a clock that is reset once an interval
 // looks exactly like a clock that is running if you only ever look at it once.
 // The bound this file is about was shipped reachable and inert for that reason.
+//
+// to perturbs each round's snapshot after it is rebuilt, so a test can hold a
+// cluster-wide condition true for the whole drain rather than for its first
+// evaluation only. A condition that ends a drain is easy to assert once; a
+// condition that must *not* end one has to be held for the drain's whole life,
+// because surviving it in round zero says nothing about round nine.
 func drainRounds(
 	t *testing.T, c client.Client, rounds int, left func(pod string, now time.Time),
+	to ...func(*engine.Snapshot),
 ) (int, executor.Step) {
 	t.Helper()
 	for i := 0; i <= rounds; i++ {
 		round := cluster(t, c, at.Add(time.Duration(i)*time.Minute))
+		for _, perturb := range to {
+			perturb(&round)
+		}
 		before := map[string]bool{}
 		for _, p := range round.Pods {
 			before[p.Name] = true

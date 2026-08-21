@@ -251,6 +251,16 @@ for the cluster to settle after.
 Both are distinct from the per-node backoff that follows a *failed* drain, which lives on the
 node and does survive a restart — and is therefore the one bound that works in every mode.
 
+Both govern whether a drain **starts**, not whether one continues. A cooldown opening while a
+drain is already relocating pods does not end it, and neither does the autoscaler reporting a
+scale-up in progress: the pods that have already moved would stay moved, so stopping would spend
+the disruption and keep none of the benefit. Up until the first eviction the checks do apply,
+which is the window in which stopping is free. Whether the remaining pods still fit, whether they
+are still evictable, and whether anything will still remove the node are re-asked before every
+eviction regardless —
+[ADR-0010](../design/adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md) draws the line
+and says why.
+
 Distinct from `backoff`, which is per-node and follows a *failed* drain.
 
 ### `policy.exclusions.namespaces`
