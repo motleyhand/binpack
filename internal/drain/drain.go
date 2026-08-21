@@ -121,6 +121,72 @@ func AbandonCodes() []string {
 	}
 }
 
+// PodsOn is the pods a drain assessment reads. Terminating ones included: a pod
+// on its way out is still occupying the node.
+//
+// The same filter the executor applies before its own [Assess] call, and it has
+// to stay the same — which is why there is one of it rather than one per
+// caller. What it feeds tells an operator what acting would do, so a pod set
+// that differed from the acting path's would describe a drain nobody would get.
+func PodsOn(s engine.Snapshot, name string) []*corev1.Pod {
+	var on []*corev1.Pod
+	for _, pod := range s.Pods {
+		if pod.Spec.NodeName == name {
+			on = append(on, pod)
+		}
+	}
+	return on
+}
+
+// PolicyFor resolves the bounds that govern the drain of one named node, from
+// that node's own pool.
+func PolicyFor(cfg engine.Config, s engine.Snapshot, name string) Policy {
+	for _, node := range s.Nodes {
+		if node.Name != name {
+			continue
+		}
+		p := cfg.PolicyFor(node.Labels[cfg.NodeGroupIDLabel], node.Labels[cfg.PoolNameLabel])
+		return Policy{StallTimeout: p.StallTimeout, RemovalTimeout: p.RemovalTimeout}
+	}
+	return Policy{
+		StallTimeout:   cfg.Default.StallTimeout,
+		RemovalTimeout: cfg.Default.RemovalTimeout,
+	}
+}
+
+// WouldHappen describes a drain already under way in one sentence.
+//
+// Both halves, because neither answers alone. Revalidation says whether this
+// node could still be emptied; the assessment says whether this drain is
+// getting anywhere. A node whose pods still fit elsewhere revalidates drainable
+// however long it has been stuck — so reporting only the verdict tells an
+// operator a stalled drain is healthy, in the one situation they are most
+// likely to be asking.
+//
+// What the two observed, though, and not a rehearsal of [executor.Advance].
+// Predicting the ending would mean a second copy of that function's precedence
+// living here, and most of the conditions below do not have one ending: a node
+// the autoscaler is already removing is handed over rather than back, and one
+// marked but uncordoned is repaired. A copy that drifted would tell an operator
+// something confidently wrong about their own cluster, which is worse than
+// telling them less.
+func WouldHappen(a engine.NodeAssessment, assessment Assessment) string {
+	switch {
+	case a.Skipped:
+		return "The cluster has moved underneath it: " + a.SkipReason + "."
+	case len(a.Blockers) > 0:
+		return "A pod on it can no longer be evicted: " + a.Blockers[0].Message + "."
+	case a.Verdict() == engine.VerdictInfeasible:
+		return "The pods still on it no longer fit anywhere else."
+	case assessment.Action == Abandon:
+		return fmt.Sprintf("It has passed its bound and would be handed back: %s (%s).",
+			assessment.Reason, assessment.Code)
+	default:
+		return fmt.Sprintf("It is within its bounds, with %d pods left to move.",
+			assessment.Remaining)
+	}
+}
+
 // Assessment is the answer, and what to record on the node.
 type Assessment struct {
 	Action Action

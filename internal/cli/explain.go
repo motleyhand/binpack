@@ -16,6 +16,7 @@ import (
 
 	"github.com/motleyhand/binpack/api/v1alpha1"
 	"github.com/motleyhand/binpack/internal/collect"
+	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
@@ -54,9 +55,8 @@ func newExplainCommand(opts *options) *cobra.Command {
 				return err
 			}
 
-			decision := engine.Decide(snapshot, engineConfig(cfg))
 			opts.configSource = source
-			return renderExplain(opts, snapshot, decision)
+			return renderExplain(opts, snapshot, explainOutcome(snapshot, engineConfig(cfg)))
 		},
 	}
 
@@ -65,6 +65,75 @@ func newExplainCommand(opts *options) *cobra.Command {
 	cmd.Flags().StringVar(&kubecontext, "context", "", "kubeconfig context to use")
 
 	return cmd
+}
+
+// explainOutcome is everything explain reports: the decision, and — separately
+// — the drain already under way, if there is one.
+//
+// Separately, because they answer different questions and one of them can be
+// unavailable while the other is not. [engine.Decide] returns before assessing
+// anything when there is no live cluster-autoscaler, which is precisely the
+// condition that makes `run` hand a drain back on its next tick — so a drain
+// report derived from the decision's code would go missing in the failure an
+// operator is most likely to be investigating. This one is derived from the
+// marker on the node, which is where the drain actually lives.
+func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
+	out := explainOutput{Decision: engine.Decide(s, cfg)}
+
+	name := engine.Marked(s)
+	if name == "" {
+		return out
+	}
+
+	// The same pair the controller reports for a drain it is not advancing,
+	// through the same function, so a dry run's log line and this command
+	// cannot describe one node two ways. Revalidation says whether the node
+	// could still be emptied; the bound says whether this drain is getting
+	// anywhere. Neither answers alone.
+	a := engine.Revalidate(s, name, cfg)
+	out.Drain = &drainReport{
+		Node: name,
+		WouldHappen: drain.WouldHappen(a, drain.Assess(
+			drain.State{Node: a.Node, Pods: drain.PodsOn(s, name), Now: s.Now},
+			drain.PolicyFor(cfg, s, name))),
+	}
+
+	// The marked node's own row, replaced. Selection assessed it as a node
+	// binpack might newly pick, so it reports "a drain is already in progress
+	// on this node" — true, and useless to somebody watching a cordoned node.
+	// Revalidate asks what actually governs it: the call executor.Advance makes
+	// before every eviction, with binpack's own marker and cordon ignored and
+	// the reserve suppressed once pods have moved.
+	//
+	// Substituted here rather than inside Decide, deliberately. Those
+	// assessments are also what the metrics count, and `drain-in-progress` is a
+	// published binpack_nodes_skipped code: swapping the row in the engine would
+	// leave it unreachable whenever there is a single marker, which is the
+	// ordinary case, and would count a node already being drained towards
+	// binpack_drainable_nodes.
+	for i := range out.Decision.Assessments {
+		if out.Decision.Assessments[i].Node.Name == name {
+			out.Decision.Assessments[i] = a
+		}
+	}
+	return out
+}
+
+// explainOutput is what the renderers are given.
+type explainOutput struct {
+	Decision engine.Decision
+	// Drain is the drain already under way, or nil. Never derived from the
+	// decision: see [explainOutcome].
+	Drain *drainReport
+}
+
+// drainReport describes a drain in progress, in the words the controller uses
+// for the same one.
+type drainReport struct {
+	Node string `json:"node"`
+	// WouldHappen is what revalidation and the drain's own bound observed. Not
+	// a prediction of how the drain ends — see [drain.WouldHappen].
+	WouldHappen string `json:"wouldHappen"`
 }
 
 // restConfigFor resolves a connection from the usual kubeconfig rules, so the
@@ -207,17 +276,25 @@ type explainView struct {
 	Config string `json:"config"`
 	Action string `json:"action"`
 	// Code names the outcome, from the engine's bounded set.
-	Code   string       `json:"code"`
-	Node   string       `json:"node,omitempty"`
-	Reason string       `json:"reason,omitempty"`
-	Nodes  []nodeReport `json:"nodes"`
+	Code   string `json:"code"`
+	Node   string `json:"node,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// Drain is the drain already under way, absent when there is none. It is
+	// reported whatever the decision was, including the one that assesses
+	// nothing because no autoscaler is running.
+	Drain *drainReport `json:"drain,omitempty"`
+	Nodes []nodeReport `json:"nodes"`
 }
 
 type nodeReport struct {
-	Name    string `json:"name"`
-	Pool    string `json:"pool,omitempty"`
-	Chosen  bool   `json:"chosen,omitempty"`
-	Verdict string `json:"verdict"`
+	Name   string `json:"name"`
+	Pool   string `json:"pool,omitempty"`
+	Chosen bool   `json:"chosen,omitempty"`
+	// Draining marks the node binpack is part-way through emptying. Its
+	// verdict is the one revalidation reached, not the one selection would —
+	// they are different questions and this says which was asked.
+	Draining bool   `json:"draining,omitempty"`
+	Verdict  string `json:"verdict"`
 	// Code names why a node was skipped, from the engine's bounded set. The
 	// detail says it in prose; this is what a consumer can branch on without
 	// matching a sentence that may be reworded.
@@ -231,9 +308,11 @@ type nodeReport struct {
 	Refusals map[string]string `json:"refusals,omitempty"`
 }
 
-func renderExplain(opts *options, s engine.Snapshot, d engine.Decision) error {
+func renderExplain(opts *options, s engine.Snapshot, out explainOutput) error {
+	d := out.Decision
 	view := buildView(s, d)
 	view.Config = opts.configSource
+	view.Drain = out.Drain
 
 	if opts.output == outputJSON {
 		enc := json.NewEncoder(opts.out)
@@ -266,18 +345,19 @@ func buildView(s engine.Snapshot, d engine.Decision) explainView {
 	}
 
 	for _, a := range d.Assessments {
-		v.Nodes = append(v.Nodes, reportFor(a))
+		v.Nodes = append(v.Nodes, reportFor(a, d))
 	}
 	return v
 }
 
-func reportFor(a engine.NodeAssessment) nodeReport {
+func reportFor(a engine.NodeAssessment, d engine.Decision) nodeReport {
 	// The verdict comes from the engine rather than being recomputed here.
 	// Two implementations of "what happened to this node" is one more than
 	// can be kept in step, and the metrics read the same one.
 	r := nodeReport{
 		Name: a.Node.Name, Pool: a.Pool, Chosen: a.Chosen,
 		Verdict: a.Verdict(), Code: a.SkipCode,
+		Draining: d.Code == engine.CodeDraining && d.Node != nil && a.Node.Name == d.Node.Name,
 	}
 
 	switch r.Verdict {
@@ -294,7 +374,15 @@ func reportFor(a engine.NodeAssessment) nodeReport {
 			r.Refusals = a.Simulation.Blocked.PerNode
 		}
 	default:
-		if !a.Chosen {
+		// Why this node is not being drained, which during a drain is a
+		// different sentence: nothing was chosen, so "another node was chosen
+		// first" would name a choice that was never made.
+		switch {
+		case r.Draining:
+			r.Detail = "its workload still fits elsewhere"
+		case d.Code == engine.CodeDraining:
+			r.Detail = "it could be drained, but a drain is already in progress"
+		case !a.Chosen:
 			r.Detail = "another node was chosen first"
 		}
 		if a.Simulation != nil {
@@ -327,6 +415,15 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 	if !live {
 		p("unavailable\n\n")
 		p("binpack will not act: %s\n", why)
+		// Still said, because this is the condition that ends a drain rather
+		// than one that merely stops a new one starting: revalidation refuses
+		// to continue through a dead autoscaler, so the next evaluation hands
+		// the node back. Returning here reported the dead autoscaler and
+		// nothing at all about the cordoned node somebody is looking at.
+		if v.Drain != nil {
+			p("\n")
+			writeDrain(p, v.Drain)
+		}
 		return errors.Join(errs...)
 	}
 	p("running")
@@ -347,8 +444,11 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 	p("\nnodes\n")
 	for _, r := range v.Nodes {
 		marker := " "
-		if r.Chosen {
+		switch {
+		case r.Chosen:
 			marker = "*"
+		case r.Draining:
+			marker = ">"
 		}
 		name := r.Name
 		if r.Pool != "" {
@@ -364,14 +464,39 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 	}
 
 	p("\n")
-	if d.Action == engine.Drain {
+	switch {
+	case d.Action == engine.Drain:
 		p("would drain %s\n", d.Node.Name)
 		p("(dry run: explain never changes anything)\n")
-	} else {
+
+	case d.Code == engine.CodeDraining:
+		// Narrowed rather than lost. What binpack will do next is advance this
+		// drain, and the honest answer to "which node would you pick" is that
+		// it is not picking one — so the preview that remains is the node table
+		// above, and the row that matters is the one being emptied.
+		writeDrain(p, v.Drain)
+		p("binpack advances that drain rather than choosing another node; its row is\n")
+		p("marked > above.\n")
+
+	default:
 		p("nothing to do: %s\n", d.Reason)
 	}
 
 	return errors.Join(errs...)
+}
+
+// writeDrain says which node is being drained and what the two halves of the
+// question observed about it. Nothing when no drain is under way.
+//
+// It does not say where the node's row is, because one caller prints no node
+// table: without a live autoscaler the engine assesses nothing, and this is
+// still the moment to say a node is cordoned.
+func writeDrain(p func(string, ...any), r *drainReport) {
+	if r == nil {
+		return
+	}
+	p("a drain is in progress on %s\n", r.Node)
+	p("%s\n", r.WouldHappen)
 }
 
 func sortedKeys(m map[string]string) []string {

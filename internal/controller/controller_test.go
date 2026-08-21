@@ -26,7 +26,6 @@ import (
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	"github.com/motleyhand/binpack/internal/collect"
-	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
 )
@@ -1341,6 +1340,12 @@ func evaluationErrors(t *testing.T) float64 {
 	return 0
 }
 
+// evaluationsWithCode is binpack_evaluations_total for one outcome code.
+func evaluationsWithCode(t *testing.T, code string) float64 {
+	t.Helper()
+	return series(t, "binpack_evaluations_total", "code", code)
+}
+
 func TestATransientEvictionRefusalDoesNotStopTheController(t *testing.T) {
 	var log captured
 	pod, rs := relocatable("a", "web")
@@ -1502,17 +1507,46 @@ func TestShutdownHandsTheLeaseOverRatherThanWaitingItOut(t *testing.T) {
 // last evaluation actually assessed.
 func nodesReported(t *testing.T) float64 {
 	t.Helper()
+	return series(t, "binpack_nodes", "", "")
+}
+
+// nodesWithVerdict is binpack_nodes for one verdict.
+func nodesWithVerdict(t *testing.T, verdict string) float64 {
+	t.Helper()
+	return series(t, "binpack_nodes", "verdict", verdict)
+}
+
+// series sums one binpack_ metric family, keeping only the children carrying a
+// given label value — or all of them when the label name is empty.
+//
+// Gauge and counter values are added because exactly one of them is ever set
+// and the protobuf getters are nil-safe on the other, which lets the callers
+// below read a gauge and a counter through one function. Written against the
+// gathered families rather than against prometheus/client_model's types on
+// purpose: naming that package here would promote it from an indirect
+// dependency to a direct one, for a test helper, and CI checks tidiness.
+func series(t *testing.T, family, label, value string) float64 {
+	t.Helper()
 	families, err := ctrlmetrics.Registry.Gather()
 	if err != nil {
 		t.Fatalf("gathering metrics: %v", err)
 	}
+
 	var total float64
 	for _, f := range families {
-		if f.GetName() != "binpack_nodes" {
+		if f.GetName() != family {
 			continue
 		}
 		for _, m := range f.GetMetric() {
-			total += m.GetGauge().GetValue()
+			matched := label == ""
+			for _, l := range m.GetLabel() {
+				if l.GetName() == label && l.GetValue() == value {
+					matched = true
+				}
+			}
+			if matched {
+				total += m.GetGauge().GetValue() + m.GetCounter().GetValue()
+			}
 		}
 	}
 	return total
@@ -1524,25 +1558,29 @@ func TestDryRunStillReportsOnTheRestOfTheCluster(t *testing.T) {
 	ev := newEvaluator(t, &log, rec,
 		drainingNode("a"), inPool("b"), inPool("c"), statusConfigMap())
 
+	drainingBefore := evaluationsWithCode(t, engine.CodeDraining)
+
 	if err := ev.evaluate(context.Background()); err != nil {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	var elsewhere, stranded bool
+	// Counted as what it was. Before the drain-in-progress gate moved into the
+	// engine this evaluation ended in a decision to drain a second node, so it
+	// was counted `drain` — an outcome nothing acted on, in the mode whose
+	// whole purpose is saying what would happen.
+	if got := evaluationsWithCode(t, engine.CodeDraining) - drainingBefore; got != 1 {
+		t.Errorf("binpack_evaluations_total{code=draining} moved by %v, want 1", got)
+	}
+
+	var stranded bool
 	for _, e := range rec.events {
 		n, ok := e.object.(*corev1.Node)
 		if !ok {
 			continue
 		}
-		if n.Name != "a" {
-			elsewhere = true
-		}
 		if n.Name == "a" && e.reason == ReasonWouldAdvanceDrain {
 			stranded = true
 		}
-	}
-	if !elsewhere {
-		t.Error("dry run reported on nothing but the node it was told to leave alone")
 	}
 	if !stranded {
 		t.Errorf("nothing said what would happen to the drain binpack is not advancing: %+v",
@@ -1550,6 +1588,14 @@ func TestDryRunStillReportsOnTheRestOfTheCluster(t *testing.T) {
 	}
 	if got := nodesReported(t); got != 3 {
 		t.Errorf("binpack_nodes covers %v nodes, want all 3", got)
+	}
+	// Assessed, not merely counted. A drain in progress stops binpack choosing
+	// a second node, so nothing here names b or c any more — but the whole of
+	// what dry run is for is that the rest of the cluster is still evaluated,
+	// and three nodes counted would be satisfied by three skips. Reaching
+	// drainable means the simulation ran for both.
+	if got := nodesWithVerdict(t, engine.VerdictDrainable); got != 2 {
+		t.Errorf("binpack_nodes{verdict=drainable} = %v, want b and c both assessed", got)
 	}
 
 	var nodes corev1.NodeList
@@ -1584,51 +1630,6 @@ func TestDryRunForgetsADrainWhoseNodeHasGone(t *testing.T) {
 		if e.reason == ReasonWouldAdvanceDrain {
 			t.Errorf("reported on a node that is no longer in the cluster: %+v", e)
 		}
-	}
-}
-
-func TestWhatAFrozenDrainIsToldAboutItself(t *testing.T) {
-	// The sentence an operator reads on a node binpack has stopped advancing,
-	// and the one place a dry run can mislead: every row here is something
-	// revalidation or the assessment observed, never a prediction of which
-	// ending Advance would reach. Two of the conditions below do not have one
-	// ending — a node the autoscaler is already removing is handed over rather
-	// than back, and one marked but uncordoned is repaired — so a sentence
-	// naming an ending would be wrong for them and right for the rest, which
-	// is the worst way to be wrong.
-	stalled := drain.Assessment{Action: drain.Abandon,
-		Code: drain.AbandonStalled, Reason: "no pod has left for 11m0s"}
-	moving := drain.Assessment{Action: drain.Continue, Remaining: 3}
-
-	for _, tc := range []struct {
-		name       string
-		assessment engine.NodeAssessment
-		drain      drain.Assessment
-		want       string
-	}{
-		{"the cluster moved underneath it",
-			engine.NodeAssessment{Skipped: true, SkipReason: "pool pool-4g is at its minimum size (1)"},
-			moving, "The cluster has moved underneath it: pool pool-4g is at its minimum size (1)."},
-		{"a pod can no longer be evicted",
-			engine.NodeAssessment{Blockers: []engine.EvictionBlocker{
-				{Message: "default/web is covered by two PodDisruptionBudgets"}}},
-			moving, "A pod on it can no longer be evicted: default/web is covered by two " +
-				"PodDisruptionBudgets."},
-		{"the pods no longer fit",
-			engine.NodeAssessment{Simulation: &engine.Simulation{Feasible: false}},
-			moving, "The pods still on it no longer fit anywhere else."},
-		// The bound, which is what a frozen drain does not have — and the row
-		// that says a drain nobody is advancing has run past it.
-		{"past its bound", engine.NodeAssessment{}, stalled,
-			"It has passed its bound and would be handed back: no pod has left for 11m0s (stalled)."},
-		{"still going", engine.NodeAssessment{}, moving,
-			"It is within its bounds, with 3 pods left to move."},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := wouldHappen(tc.assessment, tc.drain); got != tc.want {
-				t.Errorf("wouldHappen() = %q, want %q", got, tc.want)
-			}
-		})
 	}
 }
 

@@ -804,3 +804,63 @@ func TestAnOrdinaryTaintIsNotTheAutoscalers(t *testing.T) {
 		t.Errorf("an ordinary taint is not a reason to skip a node: %s", a.SkipReason)
 	}
 }
+
+// TestDecideReportsADrainInProgressRatherThanChoosingASecondNode is the whole
+// of "one node per run", asked of the function that is supposed to enforce it.
+//
+// The rule used to live above Decide, in the controller's loop, so the only
+// other caller — `binpack explain` — did not have it. During a drain explain
+// therefore announced a drain of a *different* node, in the one window an
+// operator is most likely to be looking at a cordoned node and asking what
+// binpack is doing to it.
+func TestDecideReportsADrainInProgressRatherThanChoosingASecondNode(t *testing.T) {
+	s := cluster([]*corev1.Node{
+		inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+			engine.AnnotationDrainStarted: now.Add(-5 * time.Minute).Format(time.RFC3339),
+		})),
+		inPool("b"), inPool("c"),
+	}, []*corev1.Pod{mother.Pod("default", "web", mother.OnNode("a"))})
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Errorf("action = %s naming %s, want none: a drain is already running on a",
+			d.Action, d.Node.Name)
+	}
+	if d.Code != engine.CodeDraining {
+		t.Errorf("code = %q, want %q", d.Code, engine.CodeDraining)
+	}
+	switch {
+	case d.Node == nil:
+		t.Error("the decision must name the node being drained, it named none")
+	case d.Node.Name != "a":
+		t.Errorf("the decision named %s, want the node being drained, a", d.Node.Name)
+	}
+}
+
+// TestADrainInProgressStillAccountsForEveryNode is the half the gate could
+// silently take away.
+//
+// Returning early from Decide would be the cheap way to write the rule and it
+// would leave explain with an empty node table — losing the arithmetic the
+// command exists to show, in the same window that made the gate necessary. So
+// the gate sits below the assessments, not above them.
+func TestADrainInProgressStillAccountsForEveryNode(t *testing.T) {
+	nodes := []*corev1.Node{
+		inPool("a", mother.Cordoned(), mother.NodeAnnotations(map[string]string{
+			engine.AnnotationDrainStarted: now.Add(-5 * time.Minute).Format(time.RFC3339),
+		})),
+		inPool("b"), inPool("c"),
+	}
+
+	d := engine.Decide(cluster(nodes, nil), config())
+
+	for _, node := range nodes {
+		if assessmentFor(d, node.Name) == nil {
+			t.Errorf("%s is missing from the assessments", node.Name)
+		}
+	}
+	if a := assessmentFor(d, "b"); a != nil && a.Chosen {
+		t.Error("b is marked chosen; a drain in progress must choose nothing")
+	}
+}

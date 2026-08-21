@@ -1,6 +1,7 @@
 package drain_test
 
 import (
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -260,5 +261,114 @@ func TestBackoffIsNeverPermanent(t *testing.T) {
 
 	if _, until := drain.Backoff(node, now); until.Sub(now) > drain.BackoffMax {
 		t.Errorf("backoff grew past the cap: %s", until.Sub(now))
+	}
+}
+
+func TestWhatADrainInProgressIsToldAboutItself(t *testing.T) {
+	// The sentence an operator reads about a drain already under way — logged
+	// by a dry run, printed by explain — and the one place either can mislead:
+	// every row here is something revalidation or the assessment observed,
+	// never a prediction of which ending Advance would reach. Two of the
+	// conditions below do not have one ending — a node the autoscaler is
+	// already removing is handed over rather than back, and one marked but
+	// uncordoned is repaired — so a sentence naming an ending would be wrong
+	// for them and right for the rest, which is the worst way to be wrong.
+	//
+	// Both halves are asked, and the last two rows are why. Revalidation alone
+	// cannot tell a drain that is moving from one that has been stuck for an
+	// hour: a node whose pods still fit elsewhere is drainable either way.
+	stalled := drain.Assessment{Action: drain.Abandon,
+		Code: drain.AbandonStalled, Reason: "no pod has left for 11m0s"}
+	moving := drain.Assessment{Action: drain.Continue, Remaining: 3}
+
+	for _, tc := range []struct {
+		name       string
+		assessment engine.NodeAssessment
+		bound      drain.Assessment
+		want       string
+	}{
+		{"the cluster moved underneath it",
+			engine.NodeAssessment{Skipped: true, SkipReason: "pool pool-4g is at its minimum size (1)"},
+			moving, "The cluster has moved underneath it: pool pool-4g is at its minimum size (1)."},
+		{"a pod can no longer be evicted",
+			engine.NodeAssessment{Blockers: []engine.EvictionBlocker{
+				{Message: "default/web is covered by two PodDisruptionBudgets"}}},
+			moving, "A pod on it can no longer be evicted: default/web is covered by two " +
+				"PodDisruptionBudgets."},
+		{"the pods no longer fit",
+			engine.NodeAssessment{Simulation: &engine.Simulation{Feasible: false}},
+			moving, "The pods still on it no longer fit anywhere else."},
+		// The bound, which revalidation does not have — and the row that says a
+		// drain nobody is advancing has run past it.
+		{"past its bound", engine.NodeAssessment{}, stalled,
+			"It has passed its bound and would be handed back: no pod has left for 11m0s (stalled)."},
+		{"still going", engine.NodeAssessment{}, moving,
+			"It is within its bounds, with 3 pods left to move."},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := drain.WouldHappen(tc.assessment, tc.bound); got != tc.want {
+				t.Errorf("WouldHappen() = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestPodsOnKeepsTheTerminatingPods is the claim PodsOn's doc comment makes,
+// and it had no test while the function was a private copy in the controller.
+//
+// A pod on its way out is the pod a drain is waiting for. Filtering it away
+// reports an occupied node as empty, which moves the drain to await-removal and
+// hands a node with running workload to the cluster-autoscaler. The two
+// meanings of "node-local" are the trap: a DaemonSet pod is bound to its node
+// by nature and needs no destination, while a terminating pod is bound to it by
+// circumstance and is precisely what the wait is about. Assess draws that line
+// itself; this must hand it everything so it can.
+func TestPodsOnKeepsTheTerminatingPods(t *testing.T) {
+	s := engine.Snapshot{Now: now, Pods: []*corev1.Pod{
+		mother.Pod("default", "web", mother.OnNode("a")),
+		mother.Pod("default", "leaving", mother.OnNode("a"),
+			mother.Terminating(now.Add(-time.Minute), 30*time.Second)),
+		mother.DaemonSetPod("kube-system", "agent", mother.OnNode("a")),
+		mother.Pod("default", "elsewhere", mother.OnNode("b")),
+	}}
+
+	var names []string
+	for _, pod := range drain.PodsOn(s, "a") {
+		names = append(names, pod.Name)
+	}
+
+	want := []string{"web", "leaving", "agent"}
+	if !slices.Equal(names, want) {
+		t.Errorf("PodsOn = %v, want %v", names, want)
+	}
+}
+
+// TestPolicyForResolvesTheNodesOwnPool: the bounds a drain runs under are the
+// pool's, not the cluster's, so reading them from the wrong place would bound a
+// drain by a number nobody configured for it.
+func TestPolicyForResolvesTheNodesOwnPool(t *testing.T) {
+	cfg := engine.Config{
+		NodeGroupIDLabel: "doks.digitalocean.com/node-pool-id",
+		PoolNameLabel:    "doks.digitalocean.com/node-pool",
+		Default:          engine.Policy{StallTimeout: time.Minute, RemovalTimeout: 2 * time.Minute},
+		ByPool: map[string]engine.Policy{
+			"slow": {StallTimeout: time.Hour, RemovalTimeout: 2 * time.Hour},
+		},
+	}
+	s := engine.Snapshot{Nodes: []*corev1.Node{
+		mother.SmallNode("a", mother.InPool("slow", "id-slow")),
+		mother.SmallNode("b"),
+	}}
+
+	if got := drain.PolicyFor(cfg, s, "a"); got.StallTimeout != time.Hour {
+		t.Errorf("stall timeout for a = %s, want the slow pool's 1h", got.StallTimeout)
+	}
+	if got := drain.PolicyFor(cfg, s, "b"); got.StallTimeout != time.Minute {
+		t.Errorf("stall timeout for b = %s, want the default 1m", got.StallTimeout)
+	}
+	// A node that is not in the snapshot at all — a drain whose node the
+	// autoscaler has already removed still needs bounds to be assessed against.
+	if got := drain.PolicyFor(cfg, s, "gone"); got.RemovalTimeout != 2*time.Minute {
+		t.Errorf("removal timeout for a missing node = %s, want the default 2m", got.RemovalTimeout)
 	}
 }

@@ -253,10 +253,40 @@ func Observe(s engine.Snapshot, d engine.Decision, cfg engine.Config, took float
 	autoscalerUp.Set(boolAsFloat(live))
 
 	state.publish(func() {
-		observeNodes(d)
+		if advancedADrain(d) {
+			// Left standing rather than reset. The same reasoning [Failed]
+			// applies: these gauges describe the last evaluation that reached a
+			// conclusion about the cluster's nodes, and this one reached none —
+			// it advanced a drain instead of deciding. Reset-then-recount over
+			// no assessments republished an empty cluster for the whole
+			// duration of every drain, which is minutes to tens of minutes, and
+			// the alerts the reference prescribes went false throughout.
+			//
+			// Seeded even so, because a leader that restarts mid-drain opens the
+			// gate here without ever having counted anything, and an absent
+			// series reads as "binpack is not reporting" rather than as zero.
+			seedVerdicts()
+		} else {
+			observeNodes(d)
+		}
 		observePools(s, cfg)
 		observeBackoff(s)
 	})
+}
+
+// advancedADrain reports an evaluation that carries no reading of the cluster's
+// nodes because it never asked for one.
+//
+// Both halves are load-bearing, and they fail in opposite directions. Without
+// the code, the decision that finds no autoscaler would also stop resetting —
+// and there the zeroes are the answer rather than the absence of one, since
+// binpack has refused to assess anything and binpack_autoscaler_up says so in
+// the same scrape. Without the assessment count, a dry run — which reports the
+// frozen drain and then decides past it, so its decision carries this code and
+// a full set of assessments — would publish an empty cluster for as long as
+// dryRun stood, which is for ever, since the marker is never cleared.
+func advancedADrain(d engine.Decision) bool {
+	return d.Code == engine.CodeDraining && len(d.Assessments) == 0
 }
 
 func observeNodes(d engine.Decision) {
@@ -266,15 +296,7 @@ func observeNodes(d engine.Decision) {
 	nodes.Reset()
 	skipped.Reset()
 
-	// Seeded so that a verdict nobody currently holds reports zero rather than
-	// vanishing. The difference matters to an alert: "no drainable nodes" and
-	// "binpack is not reporting" must not look the same.
-	for _, verdict := range []string{
-		engine.VerdictSkipped, engine.VerdictInfeasible,
-		engine.VerdictBlocked, engine.VerdictDrainable,
-	} {
-		nodes.WithLabelValues(verdict).Set(0)
-	}
+	seedVerdicts()
 
 	var canDrain, cannotModel float64
 	for _, a := range d.Assessments {
@@ -300,6 +322,24 @@ func observeNodes(d engine.Decision) {
 	}
 	drainable.Set(canDrain)
 	unmodelled.Set(cannotModel)
+}
+
+// seedVerdicts makes sure every verdict has a series, without disturbing one
+// that already has a count.
+//
+// A verdict nobody currently holds must report zero rather than vanishing: to
+// an alert, "no drainable nodes" and "binpack is not reporting" must not look
+// the same. WithLabelValues gives exactly the two behaviours that needs — it
+// creates a child at zero on first sight and returns the existing one
+// afterwards — so this seeds a fresh process and leaves a draining tick's
+// inherited counts alone, from the one line.
+func seedVerdicts() {
+	for _, verdict := range []string{
+		engine.VerdictSkipped, engine.VerdictInfeasible,
+		engine.VerdictBlocked, engine.VerdictDrainable,
+	} {
+		nodes.WithLabelValues(verdict)
+	}
 }
 
 func observePools(s engine.Snapshot, cfg engine.Config) {
