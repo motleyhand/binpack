@@ -121,6 +121,19 @@ pod's request map.
 regular-container sum and the init-container peak, keeps native sidecars in the running total,
 and adds RuntimeClass `spec.overhead`. Use `k8s.io/component-helpers/resource.PodRequests`.
 
+**And that function answers two different questions, chosen by options rather than by argument.**
+The scheduler sizes an incoming pod from spec alone and a pod already on a node from
+`max(spec, actuated, allocated)` — an in-place vertical scale moves the two apart, durably, since
+a memory decrease cannot be actuated below current usage. Hence `fit.ObservedRequests` for
+anything read from the cluster and `fit.EffectiveRequests` for anything binpack built. One entry
+point taking the options unconditionally does not work: a replacement carries the running pod's
+`Status` for the sake of the status-based refusals while the reserve's probe is rebuilt without
+one, so it would size the frontier from a figure the probe throws away and under-reserve by the
+same amount it had been over-reserving. `ObservedRequests` computes its pod-level half *both* ways
+and keeps the larger, because that option's gate is Beta rather than GA-locked and neither
+constant is sound: with it on, a refused pod-level resize drops `spec` from the maximum; with it
+off, the scheduler charges that `spec`.
+
 **PDB demand aggregates across the whole drain.** Two pods matching one PDB with
 `disruptionsAllowed: 1` passes a naive zero-check and then half-drains the node. And a pod
 matched by *two* PDBs can never be evicted at all — the eviction subresource returns HTTP 500,

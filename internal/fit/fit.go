@@ -68,9 +68,11 @@ const (
 // free there.
 //
 // remaining is the caller's simulation state: a node's allocatable minus
-// whatever the caller has decided stays or has already placed. Use
-// [Allocatable] to start it and [EffectiveRequests] to subtract from it, so
-// that the arithmetic here and the caller's agree by construction.
+// whatever the caller has decided stays or has already placed. Start it with
+// [Allocatable] and subtract with the entry point that matches where each pod
+// came from — [ObservedRequests] for the residents the node was already
+// holding, [EffectiveRequests] for anything the caller built and is placing —
+// so that the arithmetic here and the caller's agree by construction.
 //
 // residents are the pods already on node. They matter because inter-pod
 // anti-affinity is symmetric: a pod that is already there can reject an
@@ -196,27 +198,112 @@ func firstShortfall(need, have corev1.ResourceList) (string, bool) {
 	return "", true
 }
 
-// EffectiveRequests returns what the scheduler would reserve for pod.
+// EffectiveRequests returns what the scheduler would reserve for a pod being
+// placed.
 //
 // This is not a copy of resources.requests. Kubernetes reserves the larger of
 // the regular-container sum and the init-container peak, keeps native sidecars
 // in the running total, and adds RuntimeClass overhead — arithmetic that is
 // fiddly enough to be worth delegating to the same library the scheduler uses.
 //
-// It describes the pod as it exists now, which is a proxy for the pod that
-// would replace it — and the two can differ. An in-place vertical scale
-// applies to a running pod without touching its controller's template, so a
-// pod resized *downward* reports less here than its replacement will request.
-// Detecting that needs the owner's template, which binpack does not yet read;
-// a resize still in flight is refused outright by UnsupportedPod, but a
-// completed one leaves no marker on the pod. See ADR-0006.
+// Spec alone, and that is the whole of what separates it from
+// [ObservedRequests]. The scheduler makes the same distinction and states its
+// reason at the call site: computePodResourceRequest, which sizes the incoming
+// pod for the NodeResourcesFit filter, passes no status option because "pod
+// hasn't scheduled yet so we don't need to worry about
+// InPlacePodVerticalScalingEnabled". A pod that is not on the node has
+// actuated nothing there.
+//
+// Every caller here is asking about a placement: a replacement built from a
+// controller's template, and the probe the reserve asks a destination about.
+// A replacement does carry the running pod's Status, so
+// that the status-based refusals still apply to it — but that Status describes
+// the pod it replaces, and charging what a predecessor's kubelet happens to
+// have actuated reserves room for a size nothing will ask for.
 //
 // It also carries a synthetic pods:1 entry. `pods` appears in a node's
 // allocatable but never in a pod's requests, so without it a uniform
 // subtract-request-from-remaining loop would never consume a slot and the
 // simulation would pack unlimited pods onto a node capped at 110.
 func EffectiveRequests(pod *corev1.Pod) corev1.ResourceList {
-	requests := resourcehelper.PodRequests(pod, resourcehelper.PodResourcesOptions{})
+	return requestsWithPodSlot(pod, resourcehelper.PodResourcesOptions{})
+}
+
+// ObservedRequests returns what a node has already reserved for a pod running
+// on it.
+//
+// [EffectiveRequests] plus one option, and the option is the difference
+// between what a pod asks for and what it has been given. An in-place vertical
+// scale moves the two apart: spec carries the new figure from the moment
+// something patches it, and the kubelet actuates afterwards — but a memory
+// decrease cannot be actuated below what the workload is currently using, so
+// the kubelet keeps PodResizeInProgress set and the gap lasts as long as the
+// usage does. Under UseStatusResources, k8s.io/component-helpers
+// resource.PodRequests resolves it to max(spec, actuated, allocated), which is
+// what the node is holding and therefore what is not free.
+//
+// The options are the scheduler's own, read off its call site rather than
+// chosen. PodInfo.CalculateResource sets UseStatusResources from
+// InPlacePodVerticalScaling, which has been GA and LockToDefault since 1.35 —
+// there is no cluster where it is off, so `true` there is a fact about every
+// scheduler binpack will meet rather than a guess about a gate.
+//
+// InPlacePodLevelResourcesVerticalScalingEnabled is the one that is not
+// settled, and it is handled by asking upstream both ways. It comes from a
+// Beta gate — default-on at 1.36, and so switchable off — and neither constant
+// is sound alone. With it on, a pod-level request whose resize the kubelet has
+// refused as infeasible resolves to max(actuated, allocated), dropping spec
+// entirely; with it off, the scheduler charges that spec. So `true`
+// under-charges such a resident against a scheduler with the gate disabled,
+// and `false` under-charges every pod-level resize against the default one.
+// Under-charging a resident is the unsound direction: it invents free space
+// the node has already given away, and the packing spends it. binpack cannot
+// read another component's feature gates, so it charges the larger of the two
+// answers, which is at least what either scheduler reserves. The cost falls
+// only on a pod-level request in the refused state, and it is a consolidation
+// rather than a wrong answer — ADR-0006's rule for a version-dependent answer,
+// applied to a configuration-dependent one.
+//
+// The second reading is computed only where it can differ. Outside
+// IsPodLevelRequestsSet the option is never consulted, so both calls return the
+// same map and an ordinary pod pays nothing for the corner.
+//
+// The split is by where the pod came from, not by what it looks like. Anything
+// read from the cluster belongs here — the residents a destination starts out
+// holding, and the workload total that orders candidates. Anything binpack
+// built belongs in [EffectiveRequests].
+func ObservedRequests(pod *corev1.Pod) corev1.ResourceList {
+	opts := resourcehelper.PodResourcesOptions{
+		UseStatusResources: true,
+		InPlacePodLevelResourcesVerticalScalingEnabled: true,
+	}
+	out := requestsWithPodSlot(pod, opts)
+
+	if resourcehelper.IsPodLevelRequestsSet(pod) {
+		opts.InPlacePodLevelResourcesVerticalScalingEnabled = false
+		raiseTo(out, requestsWithPodSlot(pod, opts))
+	}
+
+	return out
+}
+
+// raiseTo lifts have to other wherever other asks for more, in place. The
+// counterpart of [Subtract] for a caller holding two readings of one pod that
+// has to keep the conservative one.
+func raiseTo(have, other corev1.ResourceList) {
+	for name, want := range other {
+		got, present := have[name]
+		if !present || got.Cmp(want) < 0 {
+			have[name] = want.DeepCopy()
+		}
+	}
+}
+
+// requestsWithPodSlot is the shared body of the two entry points above: the
+// upstream computation under whichever options, plus the pod slot neither of
+// them may be without.
+func requestsWithPodSlot(pod *corev1.Pod, opts resourcehelper.PodResourcesOptions) corev1.ResourceList {
+	requests := resourcehelper.PodRequests(pod, opts)
 
 	out := make(corev1.ResourceList, len(requests)+1)
 	for name, quantity := range requests {
