@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -423,7 +424,6 @@ func relocatableShapes(
 	cfg SimConfig,
 ) ([]headroomShape, *Blocked) {
 	shapes := make([]headroomShape, 0, len(pods))
-	seen := make(map[OwnerRef]int, len(pods))
 	for _, pod := range pods {
 		if pod.Spec.NodeName == "" {
 			continue
@@ -445,45 +445,91 @@ func relocatableShapes(
 				NoTemplate: true,
 			}
 		}
-		shape := headroomShape{
+		shapes = append(shapes, headroomShape{
 			running: pod, replacement: next, requests: fit.EffectiveRequests(next),
-		}
-
-		// A workload's replicas are the same shape as each other, and on a real
-		// cluster that is most of the list: collapsing them here is what keeps
-		// the frontier below quadratic in *pods* rather than in workloads.
-		//
-		// Checked rather than assumed, which is the whole reason the key is not
-		// the owner reference on its own. sizedReplacement raises each
-		// replica's requests to what that replica is actually running, so a
-		// replica an in-place resize or an admission webhook has touched is
-		// genuinely a different shape from its siblings — and keeping an
-		// arbitrary one of a group that is not really uniform would reserve for
-		// the smaller and lose exactly the margin this check exists to hold.
-		// Owned, always: sizedReplacement has already refused a pod with no
-		// controller to read a template from.
-		ref, _ := ControllerOf(pod)
-		if at, ok := seen[ref]; ok && sameShape(shapes[at], shape) {
-			// The lowest name of the group, not the first one listed, because
-			// this is the pod a refusal will name.
-			if podRef(shape.running) < podRef(shapes[at].running) {
-				shapes[at] = shape
-			}
-			continue
-		}
-		seen[ref] = len(shapes)
-		shapes = append(shapes, shape)
+		})
 	}
-	// Total, like every other ordering in the engine. Two workloads of the same
-	// shape tie in the frontier below, which keeps one of them and names it in
-	// a refusal — and a tie settled by list order names one pod through the
-	// controller, whose snapshot comes from a watch-backed cache in Go map
-	// order, and another through `explain`, whose comes from a live client in
-	// storage-key order.
+	// Total, like every other ordering in the engine, and sorted before the
+	// collapse below rather than after it so that which member of a group of
+	// equal shapes survives is a fact about their names. A tie settled by list
+	// order would name one pod through the controller, whose snapshot comes
+	// from a watch-backed cache in Go map order, and another through `explain`,
+	// whose comes from a live client in storage-key order.
 	slices.SortFunc(shapes, func(a, b headroomShape) int {
 		return cmp.Compare(podRef(a.running), podRef(b.running))
 	})
-	return shapes, nil
+
+	// Two workloads of the same shape are one question, and on a real cluster
+	// most of this list is duplicates — a Deployment's replicas, and the several
+	// Deployments in a namespace that were copied from one another. Collapsing
+	// them is the whole of what keeps [maximalShapes] from being quadratic in
+	// *pods*, and it runs once per candidate node.
+	//
+	// Keyed on the shape and not on the owner reference, which is the cheaper
+	// key and the wrong one twice over. It collapses nothing on a cluster of
+	// single-replica Deployments — a thousand of those are a thousand owners and
+	// perhaps a dozen shapes — and within one owner it would have to *assume*
+	// the replicas match, which [sizedReplacement] makes untrue for any replica
+	// an in-place resize or an admission webhook has touched.
+	//
+	// The whole of it is a performance device. [shapeKey] only buckets and
+	// [sameShape] decides, so a bad key costs comparisons; and a duplicate that
+	// survives the collapse entirely is pruned by [dominates] a moment later
+	// anyway, which is where the correctness lives.
+	//
+	// First occurrence wins, and the sort above is what makes that the lowest
+	// name rather than whichever the caller happened to list first.
+	unique := make([]headroomShape, 0, len(shapes))
+	buckets := make(map[string][]int, len(shapes))
+	for _, shape := range shapes {
+		key := shapeKey(shape.requests)
+		duplicate := false
+		for _, at := range buckets[key] {
+			if sameShape(unique[at], shape) {
+				duplicate = true
+				break
+			}
+		}
+		if duplicate {
+			continue
+		}
+		buckets[key] = append(buckets[key], len(unique))
+		unique = append(unique, shape)
+	}
+	return unique, nil
+}
+
+// shapeKey buckets shapes that may be equal. It decides nothing, and that is
+// worth stating plainly rather than leaving to be discovered: [sameShape]
+// settles every bucket, so a key that put every shape in one bucket would still
+// give the right answer, slowly. Measured, not assumed — the suite is green
+// with this returning a constant.
+//
+// So what the key is for is short buckets, and every resource name is in it for
+// that reason: two workloads alike but for a GPU belong in different buckets,
+// or the scan does the comparison the key exists to avoid. And MilliValue
+// saturates rather than wrapping past about nine petabytes, which is a
+// collision and therefore a comparison, not an answer.
+func shapeKey(requests corev1.ResourceList) string {
+	names := make([]string, 0, len(requests))
+	for name := range requests {
+		names = append(names, string(name))
+	}
+	slices.Sort(names)
+
+	// Appended into one buffer, and the quantity as a scaled integer rather
+	// than through fmt: this is per relocatable pod on every candidate node, so
+	// a reflection-based format here is the difference between the collapse
+	// paying for itself and not.
+	key := make([]byte, 0, 64)
+	for _, name := range names {
+		quantity := requests[corev1.ResourceName(name)]
+		key = append(key, name...)
+		key = append(key, '=')
+		key = strconv.AppendInt(key, quantity.MilliValue(), 10)
+		key = append(key, ';')
+	}
+	return string(key)
 }
 
 // maximalShapes reduces the cluster's relocatable shapes to the ones worth
@@ -496,11 +542,14 @@ func relocatableShapes(
 // each survivor costs one sweep of the destinations and [assess] simulates every
 // candidate node rather than stopping at the first that works.
 //
-// Quadratic, and in the number of shapes rather than of pods, which is what
-// [relocatableShapes] having already collapsed each workload's replicas buys.
-// Left quadratic because the input is workload-sized: a sort by any one
-// resource does not order a frontier, so the alternatives are a divide and
-// conquer whose crossover point is far above any cluster this runs on.
+// Quadratic, and in the number of *distinct shapes* — which is the whole reason
+// [relocatableShapes] collapses duplicates on the shape rather than on the owner
+// reference. Keyed on the owner it would be quadratic in controllers instead,
+// and a cluster of single-replica Deployments has as many controllers as pods.
+// Left quadratic on shapes because that input is small and does not grow with
+// the cluster: a sort by any one resource does not order a frontier, so the
+// alternative is a divide and conquer whose crossover point is far above any
+// number of distinct shapes this will be handed.
 func maximalShapes(shapes []headroomShape) []headroomShape {
 	out := make([]headroomShape, 0, len(shapes))
 	for i, shape := range shapes {
@@ -586,8 +635,10 @@ func dominates(a, b headroomShape) bool {
 // sameShape reports whether two replacements would produce the same probe, as
 // far as anything fit reads is concerned.
 //
-// Only ever asked of two replicas of one workload, where it is nearly always
-// true. It exists so that "nearly" is not "always": see [relocatableShapes].
+// The exact half of the collapse in [relocatableShapes], asked only of shapes
+// that already share a bucket. Quantities go through Cmp rather than through a
+// value or a string, so two workloads asking for 1Gi and for 1024Mi are the one
+// shape that they are.
 func sameShape(a, b headroomShape) bool {
 	if len(a.requests) != len(b.requests) || !sameTolerations(a, b) {
 		return false

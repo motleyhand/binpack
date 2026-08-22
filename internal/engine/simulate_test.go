@@ -1800,13 +1800,15 @@ func TestTheReserveNamesTheSameShapeWhicheverWayThePodsAreListed(t *testing.T) {
 // TestTwoReplicasOfOneWorkloadCanBeDifferentShapes holds the reserve's replica
 // collapse to checking rather than assuming.
 //
-// Collapsing a workload's replicas to one shape is what keeps the frontier
-// cheap, and "one workload, one shape" is true of almost every pair. The
-// exceptions are the ones this whole file is about: a replica resized in place,
-// or one an admission webhook has added to, is bigger than its siblings and its
-// replacement will be bigger too. Keyed on the owner reference alone the
-// collapse keeps an arbitrary replica of the group, and reserving for the
-// smaller of two is losing exactly the margin the check exists to hold.
+// Collapsing duplicate shapes is what keeps the frontier cheap, and the obvious
+// cheap key for it is the owner reference, since "one workload, one shape" is
+// true of almost every pair. The exceptions are the ones this whole file is
+// about: a replica resized in place, or one an admission webhook has added to,
+// is bigger than its siblings and its replacement will be bigger too. An
+// owner-keyed collapse keeps an arbitrary replica of the group, and reserving
+// for the smaller of two loses exactly the margin the check exists to hold. The
+// collapse is keyed on the shape instead, which cannot make this mistake — this
+// is here so that a later attempt to make it cheaper cannot reintroduce it.
 func TestTwoReplicasOfOneWorkloadCanBeDifferentShapes(t *testing.T) {
 	candidate := sized("candidate", "8Gi")
 	// 6Gi, holding 4Gi of replicas: after the drain takes another 128Mi there
