@@ -57,7 +57,9 @@ func node(name string, opts ...mother.NodeOption) *corev1.Node {
 
 // marked is a node binpack has already begun draining: cordoned, with the
 // markers Begin writes.
-func marked(name string, startedAgo, progressAgo time.Duration, remaining string) *corev1.Node {
+func marked(
+	name string, startedAgo, progressAgo time.Duration, remaining string, opts ...mother.NodeOption,
+) *corev1.Node {
 	ann := map[string]string{
 		engine.AnnotationDrainStarted:  at.Add(-startedAgo).Format(time.RFC3339),
 		engine.AnnotationDrainProgress: at.Add(-progressAgo).Format(time.RFC3339),
@@ -65,7 +67,9 @@ func marked(name string, startedAgo, progressAgo time.Duration, remaining string
 	if remaining != "" {
 		ann[engine.AnnotationDrainPodsRemaining] = remaining
 	}
-	return node(name, mother.Cordoned(), mother.NodeAnnotations(ann))
+	return node(name, append([]mother.NodeOption{
+		mother.Cordoned(), mother.NodeAnnotations(ann),
+	}, opts...)...)
 }
 
 func snapshot(nodes []*corev1.Node, pods []*corev1.Pod) engine.Snapshot {
@@ -2549,5 +2553,53 @@ func TestTheHandBackAndItsRecordMoveInOneWrite(t *testing.T) {
 	if !strings.Contains(rec.patches[0], "unschedulable") ||
 		!strings.Contains(rec.patches[0], engine.AnnotationBackoffUntil) {
 		t.Errorf("the hand-back and its record were not written together: %s", rec.patches[0])
+	}
+}
+
+// TestTheHardestPodToPlaceIsEvictedFirst is the eviction order's stated
+// purpose, asked of a node whose binding dimension is not memory.
+//
+// Evictions are one per interval with a full revalidation between them, so a
+// drain spans minutes and the cluster moves underneath it. The order exists so
+// that a prediction which turns out to be wrong costs one eviction rather than
+// all of them — which requires the pod likeliest to lose its destination to go
+// first. Ordering by memory put a 7-core pod behind every 2Gi one, so the
+// riskiest eviction was scheduled last, after the cheap ones had already been
+// spent.
+func TestTheHardestPodToPlaceIsEvictedFirst(t *testing.T) {
+	// Wide enough that all four pods have somewhere to go, so nothing about
+	// this test turns on the drain being tight.
+	roomy := mother.Allocatable(corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse("16"),
+		corev1.ResourceMemory: resource.MustParse("16Gi"),
+		corev1.ResourcePods:   resource.MustParse("110"),
+	})
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web-a", mother.OnNode("a"), mother.Requests("500m", "2Gi")),
+		mother.Pod("default", "web-b", mother.OnNode("a"), mother.Requests("500m", "2Gi")),
+		mother.Pod("default", "web-c", mother.OnNode("a"), mother.Requests("500m", "2Gi")),
+		mother.Pod("default", "hog", mother.OnNode("a"), mother.Requests("7", "100Mi")),
+	}
+	s := snapshot([]*corev1.Node{marked("a", time.Minute, 0, "", roomy), node("b", roomy)}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code != executor.StepEvicted {
+		t.Fatalf("expected an eviction, got %+v", step)
+	}
+
+	var after corev1.PodList
+	if err := c.List(context.Background(), &after); err != nil {
+		t.Fatalf("listing pods: %v", err)
+	}
+	remaining := map[string]bool{}
+	for _, p := range after.Items {
+		remaining[p.Name] = true
+	}
+	if remaining["hog"] {
+		t.Errorf("evicted a 2Gi pod first; the 7-core one is the hard placement, and it is still on the node")
 	}
 }

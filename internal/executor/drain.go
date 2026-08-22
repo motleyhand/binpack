@@ -707,9 +707,16 @@ func residentSince(pods []*corev1.Pod, node *corev1.Node) []*corev1.Pod {
 // nextToEvict picks the pod to evict, in the order the simulation placed them,
 // and reports whether it placed this one at all.
 //
-// Largest first, which is the order the packing found a home for them in. The
-// hardest pod to place goes first, so a prediction that was wrong costs one
-// eviction rather than all of them.
+// Hardest to place first, which is the order the packing found a home for them
+// in. A prediction that turns out to be wrong then costs one eviction rather
+// than all of them: the pod likeliest to lose its destination goes while the
+// easy ones are still on the node, not after they have been spent on it.
+//
+// Ordering the packing by memory alone did not deliver that. A 7-core pod
+// requesting 100Mi sorted below every 2Gi pod on the node and was evicted last,
+// so on a CPU-, GPU- or pod-slot-bound node the sentence above was inverted
+// exactly where it was supposed to pay. [engine.Simulate] ranks by placement
+// difficulty across every resource now.
 //
 // The expendable pods come after every relocatable one, and which list this pod
 // came from is the caller's business rather than a detail of the ordering: the

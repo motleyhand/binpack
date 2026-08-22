@@ -1450,3 +1450,41 @@ func TestThePreflightErrorDoesNotDependOnHowTheClusterWasListed(t *testing.T) {
 		}
 	}
 }
+
+// TestChosenCandidateDoesNotDependOnInputOrder is the same defect one level
+// up: the candidate ordering is least-loaded-first, and a homogeneous pool
+// running one workload — the modal binpack cluster — ties routinely.
+//
+// A tie broken by list order means `explain` names one node and the controller
+// drains another, so the command whose whole purpose is to preview a run
+// previews a different one. It also means an operator cannot use `explain`
+// after the fact to explain what the controller did.
+func TestChosenCandidateDoesNotDependOnInputOrder(t *testing.T) {
+	a := inPool("a")
+	b := inPool("b")
+	spare := inPool("spare")
+	pods := []*corev1.Pod{
+		mother.Pod("default", "on-a", mother.OnNode("a"), mother.Requests("100m", "512Mi")),
+		mother.Pod("default", "on-b", mother.OnNode("b"), mother.Requests("100m", "512Mi")),
+		mother.Pod("default", "on-spare", mother.OnNode("spare"), mother.Requests("100m", "1Gi")),
+	}
+
+	for _, nodes := range [][]*corev1.Node{
+		{a, b, spare},
+		{b, a, spare},
+		{spare, b, a},
+	} {
+		listed := []string{nodes[0].Name, nodes[1].Name, nodes[2].Name}
+		d := engine.Decide(cluster(nodes, pods), config())
+
+		if d.Action != engine.Drain {
+			t.Fatalf("listed %v: expected a drain, got none: %s", listed, d.Reason)
+		}
+		// a and b carry identical workloads, so the choice between them is
+		// arbitrary — but it has to be the same arbitrary choice every time,
+		// and the name is the only key both frontends see identically.
+		if d.Node.Name != "a" {
+			t.Errorf("listed %v: drained %s, want a", listed, d.Node.Name)
+		}
+	}
+}

@@ -1,9 +1,10 @@
 package engine
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
-	"sort"
+	"slices"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -67,11 +68,11 @@ type Simulation struct {
 // Simulate asks whether every pod that would need to leave candidate could be
 // placed elsewhere.
 //
-// It is a first-fit-decreasing packing: relocatable pods are tried largest
-// first, onto the fullest node that still accepts them. That is a heuristic,
-// so it can fail to find a packing that exists — but it never claims one that
-// does not, which is the direction that matters. A missed consolidation costs
-// nothing; a wrong one costs a scale-up.
+// It is a first-fit-decreasing packing: relocatable pods are tried hardest to
+// place first, onto the fullest node that still accepts them. That is a
+// heuristic, so it can fail to find a packing that exists — but it never claims
+// one that does not, which is the direction that matters. A missed
+// consolidation costs nothing; a wrong one costs a scale-up.
 //
 // Every placement decision is delegated to internal/fit, so the simulation
 // composes answers that have been checked against the real scheduler rather
@@ -165,9 +166,40 @@ func Simulate(
 		remaining[node.Name] = free
 	}
 
-	// Largest first. A big pod placed late is a big pod with nowhere to go.
-	sort.SliceStable(toPlace, func(i, j int) bool {
-		return memoryOf(toPlace[i]) > memoryOf(toPlace[j])
+	// Hardest first, and the order is total.
+	//
+	// A pod with few homes placed late is a pod with none, so the packing
+	// tries the awkward ones while there is still room to be awkward in. That
+	// is also the order the executor evicts in — sim.Relocated is this slice —
+	// which is why the key has to mean difficulty rather than size: a drain
+	// abandoned halfway has wasted every eviction before the one that failed.
+	//
+	// The tie-break is not decoration. Without it the comparator is a partial
+	// order and the sort hands ties back to the input slice, which the
+	// controller fills from a watch-backed cache — Go map iteration order,
+	// different between two calls in the same process — and `explain` fills
+	// from a live client, ordered by storage key. Which of two equal pods goes
+	// first is arbitrary; that both frontends make the same arbitrary choice
+	// is the whole of what makes `explain` a preview of `run`.
+	largest := largestFree(remaining)
+	hardness := make(map[*corev1.Pod]float64, len(toPlace))
+	for _, pod := range toPlace {
+		hardness[pod] = difficultyOf(pod, largest)
+	}
+	slices.SortFunc(toPlace, func(a, b *corev1.Pod) int {
+		return cmp.Or(
+			cmp.Compare(hardness[b], hardness[a]),
+			// A replacement carries the running pod's ObjectMeta, so this
+			// names the object an operator can find.
+			cmp.Compare(podRef(a), podRef(b)),
+		)
+	})
+
+	// Expendable pods need no destination, so nothing ranks them — but they
+	// are still evicted one at a time, in this order, and a list order is not
+	// an order. Sorted for the same reason as the packing above.
+	slices.SortFunc(sim.Evicted, func(a, b *corev1.Pod) int {
+		return cmp.Compare(podRef(a), podRef(b))
 	})
 
 	for _, pod := range toPlace {
@@ -234,8 +266,15 @@ func place(
 
 	ordered := make([]*corev1.Node, len(destinations))
 	copy(ordered, destinations)
-	sort.SliceStable(ordered, func(i, j int) bool {
-		return freeMemory(remaining[ordered[i].Name]) < freeMemory(remaining[ordered[j].Name])
+	// Fullest first, then by name so the order is total. Two interchangeable
+	// nodes in one pool tie here constantly, and a tie settled by list order
+	// is a placement that differs between the controller and `explain`, and
+	// between one evaluation and the next.
+	slices.SortFunc(ordered, func(a, b *corev1.Node) int {
+		return cmp.Or(
+			cmp.Compare(freeMemory(remaining[a.Name]), freeMemory(remaining[b.Name])),
+			cmp.Compare(a.Name, b.Name),
+		)
 	})
 
 	refusals := make(map[string]string, len(ordered))
@@ -294,7 +333,14 @@ func checkHeadroom(
 				NoTemplate: true,
 			}
 		}
-		if largest == nil || memoryOf(next) > memoryOf(largest) {
+		// Total, like the two orderings above: a Deployment's replicas are
+		// the same size as each other, so this maximum ties as a matter of
+		// course, and a maximum settled by list order probes one shape
+		// through the controller and another through `explain`.
+		if largest == nil || cmp.Or(
+			cmp.Compare(memoryOf(next), memoryOf(largest)),
+			cmp.Compare(podRef(pod), podRef(largestRunning)),
+		) > 0 {
 			largest, largestRunning = next, pod
 		}
 	}
@@ -397,11 +443,13 @@ func indexPodsByNode(pods []*corev1.Pod) map[string][]*corev1.Pod {
 	return byNode
 }
 
-// memoryOf is the ordering key for packing. Memory is chosen because it is
-// almost always the binding constraint, and because first-fit-decreasing needs
-// a single dimension to sort on. Correctness does not depend on the choice:
-// fit.CanFit checks every resource regardless, so a poor ordering costs a
-// missed packing, never an invalid one.
+// memoryOf sizes a pod in the one dimension that is almost always the binding
+// constraint. It is what [workloadOn] totals to rank nodes, and what the
+// reserve maximises to choose the shape it holds room for.
+//
+// The packing uses [difficultyOf] instead: "largest" has no meaning across
+// dimensions, and choosing one privileges whichever cluster happens to be
+// bound by it.
 func memoryOf(pod *corev1.Pod) int64 {
 	requests := fit.EffectiveRequests(pod)
 	mem := requests[corev1.ResourceMemory]
@@ -411,6 +459,83 @@ func memoryOf(pod *corev1.Pod) int64 {
 func freeMemory(remaining corev1.ResourceList) int64 {
 	mem := remaining[corev1.ResourceMemory]
 	return mem.Value()
+}
+
+// difficultyOf ranks a pod by how hard it will be to place: the largest share
+// of any one resource it needs of the largest hole that exists in that
+// resource anywhere among the destinations.
+//
+// First-fit-decreasing needs one number per pod, and memory was it. But a
+// 7-core pod requesting 100Mi then sorted below every 2Gi web pod on the node,
+// so on a CPU-, GPU- or pod-slot-bound cluster the hardest placement was tried
+// last — in the packing, where it is the one likeliest to find nothing left,
+// and in the eviction order read off the result, where its failure is the one
+// that wastes every eviction before it.
+//
+// Normalising against the largest hole is what makes the number comparable
+// across resources: it answers "how much of the best chance this pod has does
+// it need", so a request no single destination can hold scores above one, and
+// an extended resource nothing advertises scores infinite. Correctness still
+// does not depend on the choice — fit.CanFit checks every resource regardless,
+// so a poor ordering costs a missed packing, never an invalid one.
+//
+// The pod slot is left out, and it is the one exclusion here. `pods` is not a
+// demand a workload makes: fit.EffectiveRequests synthesises exactly one for
+// every pod, so the subtraction loop consumes a slot at all. Being identical
+// for every candidate it can never rank two of them — and on a node near its
+// cap its share approaches one and outgrows every real demand, at which point a
+// maximum over it hides every dimension that can rank. The result was a
+// packing that fell through to names on precisely the clusters where the order
+// matters most: with one slot left on each of a wide and a narrow destination,
+// an alphabetically earlier small pod took the wide node and stranded the
+// CPU-heavy one that had nowhere else to go. The cap itself is untouched —
+// fit.CanFit still checks `pods` like any other resource, so what changed is
+// the order pods are offered in and never whether one fits.
+//
+// Only this one. A workload genuinely requesting the same amount of something
+// on every pod — one GPU each, say — is a fact about the cluster, and pods that
+// really are equally constrained by it should rank equally.
+//
+// A float, because this ranks and nobody acts on the number. The name
+// tie-break at the call site is what makes the order total, so a rounding
+// coincidence costs a swap rather than a stable answer. Dividing by a hole of
+// zero is deliberate and needs no guard: a resource no destination advertises
+// yields +Inf, which sorts the pod first, which is exactly where a pod nothing
+// can hold belongs.
+func difficultyOf(pod *corev1.Pod, largest map[corev1.ResourceName]float64) float64 {
+	worst := 0.0
+	for name, request := range fit.EffectiveRequests(pod) {
+		if name == corev1.ResourcePods {
+			continue
+		}
+		want := request.AsApproximateFloat64()
+		if want <= 0 {
+			continue
+		}
+		if share := want / largest[name]; share > worst {
+			worst = share
+		}
+	}
+	return worst
+}
+
+// largestFree is the biggest hole in each resource anywhere among the
+// destinations — the denominator [difficultyOf] normalises against.
+//
+// The maximum rather than the sum, and for the same reason feasibility is a
+// simulation rather than a subtraction: three nodes with a core free each do
+// not hold a three-core pod. A denominator that added them up would rank that
+// pod easy at precisely the moment it is impossible.
+func largestFree(remaining map[string]corev1.ResourceList) map[corev1.ResourceName]float64 {
+	largest := make(map[corev1.ResourceName]float64)
+	for _, free := range remaining {
+		for name, quantity := range free {
+			if room := quantity.AsApproximateFloat64(); room > largest[name] {
+				largest[name] = room
+			}
+		}
+	}
+	return largest
 }
 
 // OwnerRef identifies a pod's controller, and so the template its replacement

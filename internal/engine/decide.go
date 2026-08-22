@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"cmp"
 	"fmt"
 	"maps"
 	"slices"
@@ -521,8 +522,16 @@ func assess(s Snapshot, cfg Config) ([]NodeAssessment, int) {
 	// Least loaded first. Not a filter — every eligible node is tried in
 	// turn — but a node doing less work is cheaper to empty and likelier to
 	// succeed, so it is worth trying first.
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return workloadOn(s, candidates[i].Node) < workloadOn(s, candidates[j].Node)
+	//
+	// Then by name, so the order is total. A homogeneous pool running one
+	// workload — the modal binpack cluster — ties here on every evaluation,
+	// and a tie broken by list order is the controller draining one node while
+	// `explain` names another, from the same cluster state.
+	slices.SortFunc(candidates, func(a, b *NodeAssessment) int {
+		return cmp.Or(
+			cmp.Compare(workloadOn(s, a.Node), workloadOn(s, b.Node)),
+			cmp.Compare(a.Node.Name, b.Node.Name),
+		)
 	})
 
 	// Every candidate is assessed, not just those up to the first success.
