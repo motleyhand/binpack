@@ -136,7 +136,38 @@ type Autoscaler struct {
 	// Running is false when no autoscaler could be found. binpack refuses to
 	// act at all in that case: draining a node nothing will reap is strictly
 	// worse than doing nothing.
+	//
+	// The verdict, summarising the three fields below it. Those say what was
+	// observed; this says what binpack made of it, computed once where the
+	// document is read so that no surface can reach a different answer.
 	Running bool
+
+	// StatusFound reports whether the status object existed at all, and
+	// ObservedStatus carries the autoscalerStatus binpack read from it —
+	// empty when there was no value to read.
+	//
+	// Kept because the refusal has to name what was seen. Four different
+	// observations reached one sentence, "no cluster-autoscaler is running",
+	// and binpack had established that in exactly one of them: the object
+	// missing, the object present but empty, and an autoscaler reporting
+	// Initializing are all consistent with an autoscaler that is running
+	// perfectly well. binpack's own how-to already says the absence is a
+	// hypothesis rather than a finding; the tool said otherwise.
+	StatusFound    bool
+	ObservedStatus string
+
+	// HealthStatus is clusterWide.health.status: Healthy or Unhealthy.
+	//
+	// A separate question from autoscalerStatus, which is Running for every
+	// autoscaler past start-up and therefore says nothing about whether it is
+	// doing anything. When more than --ok-total-unready-count nodes and more
+	// than --max-total-unready-percentage of the cluster are NotReady, the
+	// autoscaler logs "Cluster is not ready for autoscaling" and returns
+	// before any scale-up or scale-down — while still refreshing the probe
+	// time, so both of binpack's other guards pass. Empty where the document
+	// carried no health status: an autoscaler that said nothing about the
+	// cluster's health has not said it is unhealthy.
+	HealthStatus string
 
 	// LastScaleUp is when the cluster last grew. Mirrors the autoscaler's own
 	// scale-down-delay-after-add, and needs no persistence because the
@@ -153,6 +184,22 @@ type Autoscaler struct {
 	// be one.
 	LastProbe time.Time
 
+	// EarliestProbe is the oldest scan time binpack has seen this autoscaler
+	// publish, and WatchedScaleUp the LastScaleUp it published at the end of
+	// a scale-up binpack watched happen. Both are memory, filled in by the
+	// controller across evaluations; zero where there is none, which is what
+	// a one-shot command sees.
+	//
+	// They exist because LastScaleUp cannot be believed on its own. The
+	// autoscaler keeps the previous condition in process memory, so a fresh
+	// process finds every condition changed and stamps each transition with
+	// its first scan's probe time — publishing a scale-up that did not
+	// happen. Deciding from a single document cannot tell that stamp from a
+	// real one; deciding from two can, because the phantom is pinned to the
+	// generation's first scan and a real transition is not. See trustScaleUp.
+	EarliestProbe  time.Time
+	WatchedScaleUp time.Time
+
 	// ScaleDownStatus is what the autoscaler reports about its own
 	// scale-down search — "NoCandidates" being the state binpack exists to
 	// resolve. Informational: it is reported, never acted on.
@@ -161,16 +208,29 @@ type Autoscaler struct {
 	Groups []NodeGroup
 }
 
+// HealthUnhealthy is what the autoscaler publishes in
+// clusterWide.health.status when it has stopped scaling. Matched exactly
+// rather than by "not Healthy": a value binpack does not recognise is not a
+// statement that the cluster is unwell, and refusing on one would turn every
+// future addition to somebody else's vocabulary into an outage.
+const HealthUnhealthy = "Unhealthy"
+
 // Live reports whether there is an autoscaler that would actually remove a
-// drained node, and why not when there is not.
+// drained node, and — when there is not — which refusal this is and why.
 //
 // One function so that what binpack decides and what explain prints cannot
 // disagree — an earlier version had the renderer read Running directly and
 // announce a healthy autoscaler above a decision refusing to act because it
 // was not.
-func (a Autoscaler) Live(now time.Time) (bool, string) {
+//
+// The code is a decision code rather than a skip code. Every one of these
+// refusals is about the cluster, not about a node, and the one caller that
+// needs a per-node code has its own answer for that: revalidation reports
+// SkipNotAutoscaled whichever of these fired, because to a drain in flight
+// they are one fact — nothing is going to finish it.
+func (a Autoscaler) Live(now time.Time) (live bool, code, why string) {
 	if !a.Running {
-		return false, "no cluster-autoscaler is running, so a drained node would never be removed"
+		return false, CodeNoAutoscaler, a.absence()
 	}
 
 	// A status ConfigMap outlives the autoscaler that wrote it and keeps
@@ -179,15 +239,69 @@ func (a Autoscaler) Live(now time.Time) (bool, string) {
 	// of life counts as absent life: a document with no probe time at all is
 	// one binpack cannot vouch for.
 	if a.LastProbe.IsZero() {
-		return false, "the cluster-autoscaler status carries no probe time, so binpack cannot tell whether it is alive"
+		return false, CodeNoAutoscaler,
+			"the cluster-autoscaler status carries no probe time, so binpack cannot tell whether it is alive"
 	}
 	if since := now.Sub(a.LastProbe); since > MaxStatusAge {
-		return false, fmt.Sprintf(
+		return false, CodeNoAutoscaler, fmt.Sprintf(
 			"the cluster-autoscaler last reported %s ago, so it is not running; a drained node would never be removed",
 			since.Round(time.Second))
 	}
 
-	return true, ""
+	// Last, because a document too stale to vouch for is too stale to quote.
+	// An autoscaler that has given up on the cluster is running, scanning and
+	// reporting Running — and doing nothing, scale-up and scale-down alike.
+	// Draining then evicts real workload during an incident and leaves the
+	// node for removalTimeout to abandon.
+	if a.HealthStatus == HealthUnhealthy {
+		return false, CodeAutoscalerUnhealthy,
+			"the cluster-autoscaler reports the cluster as unhealthy, so it has stopped scaling " +
+				"and would not remove a drained node"
+	}
+
+	return true, "", ""
+}
+
+// PreflightRefused reports whether a decision was reached by [Autoscaler.Live]
+// alone, before any node was assessed.
+//
+// A predicate rather than a comparison against one code, because there is more
+// than one and there was not always. `binpack explain` restores the node table
+// on this branch — a reader pointed at a cluster binpack will not act on still
+// needs to see that it read their cluster — and that restoration was keyed on
+// the single code that existed when it was written. A second refusal would
+// have reintroduced the empty preview silently, which is exactly how the first
+// one got there.
+func PreflightRefused(code string) bool {
+	return code == CodeNoAutoscaler || code == CodeAutoscalerUnhealthy
+}
+
+// absence words the refusal for a status document that did not say Running.
+//
+// Four observations reach here and they are different facts. Saying "no
+// cluster-autoscaler is running" about all four asserts something binpack
+// established in one of them, and hands the reader a fix — check that
+// autoscaling is enabled, check the ConfigMap is being written — that is
+// already satisfied in the other three.
+//
+// The two empty cases are deliberately one sentence rather than two. A
+// ConfigMap with no status key and a status document with no autoscalerStatus
+// differ in where the emptiness is, not in what the operator can do about it:
+// binpack read the object and found no status in it.
+func (a Autoscaler) absence() string {
+	switch {
+	case !a.StatusFound:
+		return "no cluster-autoscaler status was found where binpack looked, so nothing is " +
+			"known that would remove a drained node; a missing status object is not proof " +
+			"that no autoscaler is running"
+	case a.ObservedStatus == "":
+		return "the cluster-autoscaler status carries no autoscalerStatus, so binpack cannot " +
+			"tell whether an autoscaler is running"
+	default:
+		return fmt.Sprintf(
+			"the cluster-autoscaler reports autoscalerStatus: %s rather than Running, so it "+
+				"would not remove a drained node", a.ObservedStatus)
+	}
 }
 
 // NodeGroup is one autoscaling pool, as the autoscaler reports it. Pools it
@@ -304,6 +418,20 @@ func (c Config) policyFor(names ...string) Policy {
 // reading the same configuration.
 const NoDrainToMeasureFrom = "a completed drain leaves nothing in the cluster to measure from"
 
+// NoAutoscalerHistory is why a one-shot command can reach a different answer
+// about cooldown.afterScaleUp than the controller would.
+//
+// The autoscaler restamps its scale-up transition on every restart, so the
+// timestamp is only believable next to what binpack has already seen that
+// process publish — and a command that reads the cluster once has seen
+// nothing. It falls back to the single-document reading, which credits the
+// stamp; the running controller, holding the earlier observations, may not.
+// Disclosed for the same reason NoDrainToMeasureFrom is: a verdict that
+// depends on memory this process does not have should say so rather than be
+// read as the deployed binpack's answer. See trustScaleUp.
+const NoAutoscalerHistory = "the autoscaler restamps its scale-up time when it restarts, " +
+	"and telling that apart takes observations only the running controller has"
+
 // CooldownAfterDrain names the first place a non-zero cooldown.afterDrain is
 // configured, if there is one.
 //
@@ -395,6 +523,13 @@ const (
 	// it rather than deciding afresh.
 	CodeDraining     = "draining"
 	CodeNoAutoscaler = "no-autoscaler"
+	// CodeAutoscalerUnhealthy: the autoscaler is alive and reporting, and
+	// reports the cluster as unhealthy — so it has stopped scaling in both
+	// directions and would not remove a node however empty it became. Its own
+	// code because it is not the same observation as no-autoscaler: the
+	// component is there, the operator can see it running, and the cluster is
+	// the thing that is wrong.
+	CodeAutoscalerUnhealthy = "autoscaler-unhealthy"
 	// CodeNoCandidates: every node was ruled out before any simulation ran.
 	CodeNoCandidates = "no-candidates"
 	// CodeNoneFeasible: nodes were simulated and none could be emptied.
@@ -464,8 +599,8 @@ func (a NodeAssessment) Verdict() string {
 // planning a multi-node consolidation against a cluster that is changing
 // underneath the plan.
 func Decide(s Snapshot, cfg Config) Decision {
-	if live, why := s.Autoscaler.Live(s.Now); !live {
-		return Decision{Code: CodeNoAutoscaler, Reason: why}
+	if live, code, why := s.Autoscaler.Live(s.Now); !live {
+		return Decision{Code: code, Reason: why}
 	}
 
 	assessments, chosen := assess(s, cfg)
@@ -643,9 +778,12 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 	// Checked here as well as per-node: an autoscaler that has died mid-drain
 	// means nothing will ever remove this node, so continuing to empty it
 	// would strand the cordon.
-	if live, why := s.Autoscaler.Live(s.Now); !live {
+	if live, _, why := s.Autoscaler.Live(s.Now); !live {
 		a := NodeAssessment{Node: node, Group: cfg.GroupOf(node),
 			Pool: node.Labels[cfg.PoolNameLabel]}
+		// One skip code for every way the answer is no, and the code is what
+		// the executor reads to decide whether a hand-over to the autoscaler
+		// can still complete. That question has one answer here: it cannot.
 		a.Skipped, a.SkipCode, a.SkipReason = true, SkipNotAutoscaled, why
 		return a
 	}
@@ -750,7 +888,7 @@ func cooling(s Snapshot, policy Policy) (code, reason string, cooling bool) {
 
 	// Draining straight after the cluster grew is how oscillation starts, and
 	// the autoscaler pauses its own scale-down then anyway.
-	if d := policy.CooldownAfterScaleUp; d > 0 && !s.Autoscaler.LastScaleUp.IsZero() {
+	if d := policy.CooldownAfterScaleUp; d > 0 && trustScaleUp(s.Autoscaler) {
 		if since := s.Now.Sub(s.Autoscaler.LastScaleUp); since < d {
 			return SkipCooldownAfterScaleUp, fmt.Sprintf(
 				"the cluster scaled up %s ago; waiting %s before considering a drain",
@@ -767,6 +905,50 @@ func cooling(s Snapshot, policy Policy) (code, reason string, cooling bool) {
 	}
 
 	return "", "", false
+}
+
+// trustScaleUp reports whether LastScaleUp records the cluster growing rather
+// than the autoscaler starting up.
+//
+// The autoscaler keeps the previous status in process memory and seeds it
+// empty, so its first scan after a restart finds every cluster-wide condition
+// changed and stamps each transition with that scan's own probe time. Nothing
+// in the document distinguishes that from a genuine transition, and a managed
+// control plane restarts the autoscaler for its own reasons — an upgrade, an
+// OOMKill, a leader-election handover — so binpack announced a scale-up that
+// had not happened and stood the whole cluster down for the cooldown. An
+// autoscaler restarting more often than the cooldown meant binpack never acted
+// at all, while telling the operator the cluster kept growing.
+//
+// Two observations settle what one cannot. The phantom stamp is pinned to the
+// generation's first scan, so it can never be older than the earliest scan
+// binpack has seen that process publish; a transition binpack watched go
+// through InProgress is a scale-up it saw with its own eyes. Either is enough.
+//
+// What is left is a scale-up binpack neither preceded nor witnessed, which
+// goes untrusted — the cooldown does not apply where it should have. That
+// direction is the cheap one: the cooldown is a preference rather than a
+// soundness check, the drain it permits is re-asked in full by everything that
+// is, and ScaleUpInProgress covers the window the operator most cares about.
+// The other direction costs a stand-down of the whole cluster for a scale-up
+// that never occurred.
+//
+// Both memories are zero for a one-shot command, where there is no earlier
+// observation to compare against; the rule then degrades to the single-document
+// reading — trusted unless the transition is this very scan — which is the most
+// the document alone supports.
+func trustScaleUp(a Autoscaler) bool {
+	if a.LastScaleUp.IsZero() {
+		return false
+	}
+	if !a.WatchedScaleUp.IsZero() && a.LastScaleUp.Equal(a.WatchedScaleUp) {
+		return true
+	}
+	earliest := a.EarliestProbe
+	if earliest.IsZero() {
+		earliest = a.LastProbe
+	}
+	return a.LastScaleUp.Before(earliest)
 }
 
 // eligible splits nodes into those worth simulating and those ruled out, with

@@ -88,7 +88,7 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 				return err
 			}
 			snapshot, err := collect.Snapshot(cmd.Context(), client, time.Now(),
-				cfg.Discovery.AutoscalerNamespace)
+				statusRef(cfg))
 			if err != nil {
 				return err
 			}
@@ -104,7 +104,7 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 			}
 
 			opts.configSource = source
-			opts.autoscalerNamespace = cfg.Discovery.AutoscalerNamespace
+			opts.autoscalerStatus = statusRef(cfg)
 			findings := engine.Diagnose(snapshot, resolved)
 			if err := renderDiagnose(opts, findings); err != nil {
 				return err
@@ -286,7 +286,7 @@ func renderDiagnoseText(opts *options, findings []engine.Finding) error {
 		p("\n" + blockingClassFooter)
 	}
 	if noAutoscaler {
-		p("\n%s", noAutoscalerFooter(opts.autoscalerNamespace))
+		p("\n%s", noAutoscalerFooter(opts.autoscalerStatus))
 	}
 
 	return errors.Join(errs...)
@@ -326,24 +326,24 @@ const blockingClassFooter = "blocking findings hold a node open until the object
 // --namespace to whatever namespace you install it into. So the object binpack
 // actually read is named: it is the difference between a claim about the
 // cluster and a claim the reader can check in one command.
-func noAutoscalerFooter(namespace string) string {
+func noAutoscalerFooter(status collect.StatusRef) string {
 	// On its own line rather than inside a sentence: a namespace is up to 63
 	// characters, and every wrapping in this report is hand-made. It also puts
 	// the thing to go and look at where it can be copied.
 	where := "no-autoscaler is the exception: it is not about an object. binpack learns it\n" +
 		"from one object alone, and this is the one it read:\n\n  " +
-		namespace + "/" + collect.StatusConfigMapName + "\n\n"
-	if namespace == "" {
+		status.String() + "\n\n"
+	if status.Namespace == "" || status.Name == "" {
 		where = "no-autoscaler is the exception: it is not about an object. binpack learns it\n" +
 			"from the cluster-autoscaler's own status ConfigMap alone.\n\n"
 	}
 	return where +
-		"An autoscaler publishing its status into another namespace, or one running with\n" +
-		"status reporting turned off, looks the same from here — set\n" +
-		"discovery.autoscalerNamespace if yours runs elsewhere. Check which you have\n" +
-		"before deciding what the rest of this report is worth: if one is running, fixing\n" +
-		"a blocker above can still free a node, and if none is, nothing above will until\n" +
-		"one does.\n"
+		"An autoscaler publishing into another namespace or under another name, or one\n" +
+		"running with status reporting turned off, looks the same from here — set\n" +
+		"discovery.autoscalerNamespace and discovery.autoscalerStatusName if yours\n" +
+		"publishes elsewhere. Check which you have before deciding what the rest of this\n" +
+		"report is worth: if one is running, fixing a blocker above can still free a\n" +
+		"node, and if none is, nothing above will until one does.\n"
 }
 
 // classFooterSpeaksFor reports whether the sentence above is a sentence about

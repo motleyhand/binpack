@@ -796,3 +796,57 @@ func TestTheAbandonedDrainFixNamesEveryMarkerBinpackWrote(t *testing.T) {
 		}
 	}
 }
+
+func TestTheNoAutoscalerFindingDoesNotContradictItsOwnDetail(t *testing.T) {
+	// The detail is Live's sentence, and the summary was a fixed claim above
+	// it — so a document with no probe time printed "no cluster-autoscaler is
+	// running" over "binpack cannot tell whether it is alive", which is one
+	// report saying both that it knows and that it does not. Five
+	// observations reach this finding and the summary has to hold for all of
+	// them, because only the detail knows which one this was.
+	for _, tc := range []struct {
+		name       string
+		autoscaler engine.Autoscaler
+		detail     string
+	}{
+		{"nothing where binpack looked", engine.Autoscaler{}, "no cluster-autoscaler status"},
+		{
+			name:       "the object is there and empty",
+			autoscaler: engine.Autoscaler{StatusFound: true},
+			detail:     "carries no autoscalerStatus",
+		},
+		{
+			name:       "a status the autoscaler named itself",
+			autoscaler: engine.Autoscaler{StatusFound: true, ObservedStatus: "Initializing"},
+			detail:     "Initializing",
+		},
+		{
+			name:       "running, with no probe time",
+			autoscaler: engine.Autoscaler{StatusFound: true, ObservedStatus: "Running", Running: true},
+			detail:     "no probe time",
+		},
+		{
+			name: "running, reporting the cluster unhealthy",
+			autoscaler: engine.Autoscaler{
+				StatusFound: true, ObservedStatus: "Running", Running: true,
+				LastProbe: now.Add(-10 * time.Second), HealthStatus: engine.HealthUnhealthy,
+			},
+			detail: "unhealthy",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := cluster([]*corev1.Node{inPool("a")}, nil)
+			s.Autoscaler = tc.autoscaler
+
+			f := only(t, engine.Diagnose(s, config()), engine.FindingNoAutoscaler)
+
+			if !strings.Contains(f.Detail, tc.detail) {
+				t.Errorf("detail should name what was observed (%q), got: %s", tc.detail, f.Detail)
+			}
+			if strings.Contains(f.Summary, "no cluster-autoscaler is running") {
+				t.Errorf("the summary asserts something binpack established in none of these "+
+					"cases from one read:\n  %s\n  %s", f.Summary, f.Detail)
+			}
+		})
+	}
+}

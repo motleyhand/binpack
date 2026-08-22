@@ -27,15 +27,27 @@ var now = time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
 // would be agreeing about the wrong thing.
 const statusNamespace = "kube-system"
 
+// statusThere is that location as Snapshot takes it, with the name the
+// autoscaler uses unless it was told otherwise.
+var statusThere = collect.StatusRef{
+	Namespace: statusNamespace,
+	Name:      collect.StatusConfigMapName,
+}
+
 func statusConfigMap(document string) *corev1.ConfigMap {
-	return statusConfigMapIn(statusNamespace, document)
+	return statusConfigMapAt(statusThere, document)
 }
 
 func statusConfigMapIn(namespace, document string) *corev1.ConfigMap {
+	return statusConfigMapAt(
+		collect.StatusRef{Namespace: namespace, Name: collect.StatusConfigMapName}, document)
+}
+
+func statusConfigMapAt(at collect.StatusRef, document string) *corev1.ConfigMap {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: namespace,
-			Name:      collect.StatusConfigMapName,
+			Namespace: at.Namespace,
+			Name:      at.Name,
 		},
 		Data: map[string]string{"status": document},
 	}
@@ -55,7 +67,7 @@ func TestSnapshotReadsEveryKindTheEngineNeeds(t *testing.T) {
 		statusConfigMap(observed),
 	)
 
-	s, err := collect.Snapshot(context.Background(), r, now, statusNamespace)
+	s, err := collect.Snapshot(context.Background(), r, now, statusThere)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -90,7 +102,7 @@ func TestSnapshotReadsPodsInEveryNamespace(t *testing.T) {
 		statusConfigMap(observed),
 	)
 
-	s, err := collect.Snapshot(context.Background(), r, now, statusNamespace)
+	s, err := collect.Snapshot(context.Background(), r, now, statusThere)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -107,7 +119,7 @@ func TestSnapshotTreatsAMissingAutoscalerAsADiagnosisNotAFailure(t *testing.T) {
 	// No status ConfigMap at all. binpack should be able to say "nothing here
 	// will remove a drained node" clearly, rather than exiting with an error
 	// that gives the reader nothing to act on.
-	s, err := collect.Snapshot(context.Background(), reader(mother.SmallNode("a")), now, statusNamespace)
+	s, err := collect.Snapshot(context.Background(), reader(mother.SmallNode("a")), now, statusThere)
 	if err != nil {
 		t.Fatalf("a missing autoscaler should not be an error: %v", err)
 	}
@@ -115,7 +127,7 @@ func TestSnapshotTreatsAMissingAutoscalerAsADiagnosisNotAFailure(t *testing.T) {
 	if s.Autoscaler.Running {
 		t.Error("reported a running autoscaler with no status ConfigMap")
 	}
-	if live, why := s.Autoscaler.Live(now); live || why == "" {
+	if live, _, why := s.Autoscaler.Live(now); live || why == "" {
 		t.Errorf("Live() = %v, %q; want not live, with a reason", live, why)
 	}
 	if len(s.Nodes) != 1 {
@@ -130,12 +142,37 @@ func TestSnapshotTreatsAStatusConfigMapWithNoStatusKeyTheSameWay(t *testing.T) {
 	empty := statusConfigMap("")
 	delete(empty.Data, "status")
 
-	s, err := collect.Snapshot(context.Background(), reader(mother.SmallNode("a"), empty), now, statusNamespace)
+	s, err := collect.Snapshot(context.Background(), reader(mother.SmallNode("a"), empty), now, statusThere)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
 	if s.Autoscaler.Running {
 		t.Error("reported a running autoscaler from a ConfigMap with no status")
+	}
+	// And it is told apart from the object not being there at all. Both mean
+	// binpack will not act; only one of them is consistent with there being no
+	// autoscaler, and the refusal has to be able to say which it saw.
+	if !s.Autoscaler.StatusFound {
+		t.Error("a ConfigMap binpack read and found empty is reported as one it never found")
+	}
+}
+
+func TestSnapshotNamesTheObjectAndTheVersionForAPre130Status(t *testing.T) {
+	// A cluster on cluster-autoscaler 1.29 or older is one binpack cannot work
+	// with at all, and what the operator used to get was a YAML parser
+	// complaining about line 4 of a document they did not write — naming
+	// neither the component, nor the version, nor the object.
+	_, err := collect.Snapshot(context.Background(),
+		reader(statusConfigMap(legacy)), now, statusThere)
+
+	if err == nil {
+		t.Fatal("the pre-1.30 free-text status is not something binpack can read")
+	}
+	if !strings.Contains(err.Error(), "cluster-autoscaler 1.30") {
+		t.Errorf("the error does not say what binpack needs: %v", err)
+	}
+	if !strings.Contains(err.Error(), statusThere.String()) {
+		t.Errorf("the error does not say which object it read: %v", err)
 	}
 }
 
@@ -144,7 +181,7 @@ func TestSnapshotFailsLoudlyOnAnUnparseableStatus(t *testing.T) {
 	// binpack cannot read is a change in somebody else's schema, and guessing
 	// at it is how a confidently wrong decision gets made.
 	_, err := collect.Snapshot(context.Background(),
-		reader(statusConfigMap("\tnot: [valid")), now, statusNamespace)
+		reader(statusConfigMap("\tnot: [valid")), now, statusThere)
 
 	if err == nil {
 		t.Fatal("an unparseable autoscaler status was accepted")
@@ -158,7 +195,7 @@ func TestPodsOnSelectsByNode(t *testing.T) {
 		mother.Pod("default", "here", mother.OnNode("a")),
 		mother.Pod("default", "there", mother.OnNode("b")),
 		mother.Pod("default", "unscheduled"),
-	), now, statusNamespace)
+	), now, statusThere)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -214,7 +251,7 @@ func TestSnapshotReadsATemplateForEveryOwningKind(t *testing.T) {
 		statusConfigMap(observed),
 	)
 
-	s, err := collect.Snapshot(context.Background(), r, now, statusNamespace)
+	s, err := collect.Snapshot(context.Background(), r, now, statusThere)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -261,7 +298,7 @@ func TestTemplatesAreKeyedByNamespaceSoNamesCanRepeat(t *testing.T) {
 		statusConfigMap(observed),
 	)
 
-	s, err := collect.Snapshot(context.Background(), r, now, statusNamespace)
+	s, err := collect.Snapshot(context.Background(), r, now, statusThere)
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -288,7 +325,8 @@ func TestSnapshotReadsTheStatusFromTheNamespaceItIsGiven(t *testing.T) {
 	// fine is worse than saying nothing.
 	r := reader(mother.SmallNode("a"), statusConfigMapIn("autoscaler", observed))
 
-	s, err := collect.Snapshot(context.Background(), r, now, "autoscaler")
+	s, err := collect.Snapshot(context.Background(), r, now,
+		collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName})
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -316,7 +354,8 @@ func TestSnapshotReadsNoNamespaceButTheOneItIsGiven(t *testing.T) {
 		statusConfigMapIn("default", "autoscalerStatus: Unhealthy\n"),
 		statusConfigMapIn("autoscaler", observed))
 
-	s, err := collect.Snapshot(context.Background(), r, now, "default")
+	s, err := collect.Snapshot(context.Background(), r, now,
+		collect.StatusRef{Namespace: "default", Name: collect.StatusConfigMapName})
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -326,19 +365,54 @@ func TestSnapshotReadsNoNamespaceButTheOneItIsGiven(t *testing.T) {
 	}
 }
 
-func TestSnapshotRefusesToLookInNoNamespaceAtAll(t *testing.T) {
-	// An empty namespace is a caller that lost the configured value, not a
-	// cluster without an autoscaler — but a Get for a namespaced object with
-	// no namespace simply finds nothing, so the two are indistinguishable
-	// downstream. That is exactly the bug this parameter exists to fix, so it
-	// fails here rather than being reported as a healthy autoscaler's absence.
-	_, err := collect.Snapshot(context.Background(),
-		reader(statusConfigMap(observed)), now, "")
+func TestSnapshotRefusesToLookNowhereAtAll(t *testing.T) {
+	// An empty namespace or name is a caller that lost the configured value,
+	// not a cluster without an autoscaler — but a Get for a namespaced object
+	// with no namespace simply finds nothing, and a name selector matching
+	// nothing finds nothing too, so both are indistinguishable downstream.
+	// That is exactly the bug these parameters exist to fix, so it fails here
+	// rather than being reported as a healthy autoscaler's absence.
+	for _, tc := range []struct {
+		name string
+		at   collect.StatusRef
+		want string
+	}{
+		{"no namespace", collect.StatusRef{Name: collect.StatusConfigMapName}, "namespace"},
+		{"no name", collect.StatusRef{Namespace: statusNamespace}, "name"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := collect.Snapshot(context.Background(),
+				reader(statusConfigMap(observed)), now, tc.at)
 
-	if err == nil {
-		t.Fatal("an empty namespace was read as a cluster with no autoscaler")
+			if err == nil {
+				t.Fatalf("%+v was read as a cluster with no autoscaler", tc.at)
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("the error does not say what is missing: %v", err)
+			}
+		})
 	}
-	if !strings.Contains(err.Error(), "namespace") {
-		t.Errorf("the error does not say what is missing: %v", err)
+}
+
+func TestAutoscalerHonoursConfiguredLocation(t *testing.T) {
+	// Both halves of where the status lives are autoscaler flags: --namespace
+	// and --status-config-map-name. binpack reads the namespace it is told to
+	// read; the name was a constant, so an autoscaler that renamed its status
+	// object was reported as no autoscaler at all — a claim about the
+	// operator's cluster that binpack had not established, on a cluster where
+	// it would otherwise have worked.
+	r := reader(
+		mother.SmallNode("a"),
+		statusConfigMapAt(collect.StatusRef{Namespace: "cluster-autoscaler", Name: "my-ca-status"}, observed),
+	)
+
+	s, err := collect.Snapshot(context.Background(), r, now,
+		collect.StatusRef{Namespace: "cluster-autoscaler", Name: "my-ca-status"})
+	if err != nil {
+		t.Fatalf("Snapshot: %v", err)
+	}
+
+	if !s.Autoscaler.Running {
+		t.Error("binpack looked where it was told and found a running autoscaler; it should say so")
 	}
 }

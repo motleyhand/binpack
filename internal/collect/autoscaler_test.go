@@ -1,10 +1,12 @@
 package collect_test
 
 import (
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/motleyhand/binpack/internal/collect"
+	"github.com/motleyhand/binpack/internal/engine"
 )
 
 // observed is the status document from a real DOKS cluster.
@@ -164,5 +166,91 @@ func TestUnknownFieldsAreIgnored(t *testing.T) {
 	}
 	if !got.Running {
 		t.Error("the rest of the document should still be read")
+	}
+}
+
+// legacy is what cluster-autoscaler 1.29 and earlier publish: the free text
+// ClusterAutoscalerStatus.GetReadableString() renders, wrapped in a header
+// line, rather than the structured document introduced in 1.30. The
+// continuation lines carry colons at arbitrary indentation, so it is not YAML
+// and never was.
+const legacy = `Cluster-autoscaler status at 2026-08-19 09:03:11.123456789 +0000 UTC:
+Cluster-wide:
+  Health:      Healthy (ready=3 unready=0 notStarted=0 longNotStarted=0 registered=3 longUnregistered=0)
+               LastProbeTime:      2026-08-19 09:03:11.123456789 +0000 UTC
+               LastTransitionTime: 2026-08-19 08:00:00.000000000 +0000 UTC
+  ScaleUp:     NoActivity (ready=3 registered=3)
+               LastProbeTime:      2026-08-19 09:03:11.123456789 +0000 UTC
+               LastTransitionTime: 2026-08-19 08:00:00.000000000 +0000 UTC
+  ScaleDown:   NoCandidates (candidates=0)
+               LastProbeTime:      2026-08-19 09:03:11.123456789 +0000 UTC
+               LastTransitionTime: 2026-08-19 08:00:00.000000000 +0000 UTC
+`
+
+func TestParseAutoscalerStatusNamesThePre130Format(t *testing.T) {
+	// ADR-0004's whole mechanism is the structured status document, and it
+	// arrived in cluster-autoscaler 1.30. Below that binpack cannot work at
+	// all — but what the operator saw was a YAML parser complaining about a
+	// line of a document they did not write, naming neither the object nor
+	// the component, on a cluster where binpack is simply not applicable.
+	_, err := collect.ParseAutoscalerStatus(legacy)
+	if err == nil {
+		t.Fatal("the pre-1.30 text format is not something binpack can read")
+	}
+	if !strings.Contains(err.Error(), "cluster-autoscaler 1.30") {
+		t.Errorf("the error should name the version binpack needs, got: %v", err)
+	}
+}
+
+func TestParseKeepsWhatTheStatusSaidAboutItself(t *testing.T) {
+	// The observed status and the cluster's health were both read and both
+	// thrown away — the first reduced to a bool, the second parsed into a
+	// struct nothing looked at. So every refusal had to be worded from the
+	// bool alone, and the one refusal that turns on health could not be made
+	// at all.
+	got, err := collect.ParseAutoscalerStatus(observed)
+	if err != nil {
+		t.Fatalf("parsing: %v", err)
+	}
+
+	if !got.StatusFound {
+		t.Error("a parsed document is one binpack found")
+	}
+	if got.ObservedStatus != "Running" {
+		t.Errorf("ObservedStatus = %q, want the literal value the document carried", got.ObservedStatus)
+	}
+	if got.HealthStatus != "Healthy" {
+		t.Errorf("HealthStatus = %q, want what clusterWide.health.status said", got.HealthStatus)
+	}
+}
+
+func TestParseReadsAnUnhealthyCluster(t *testing.T) {
+	// The combination that passes every other guard: autoscalerStatus is
+	// Running because the process is past start-up, the probe time is fresh
+	// because it scans regardless — and it has stopped scaling in both
+	// directions until the cluster recovers.
+	got, err := collect.ParseAutoscalerStatus(
+		"autoscalerStatus: Running\nclusterWide:\n  health:\n    status: Unhealthy\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !got.Running {
+		t.Error("the autoscaler is running; it is the cluster that is unwell")
+	}
+	if got.HealthStatus != engine.HealthUnhealthy {
+		t.Errorf("HealthStatus = %q, want %q", got.HealthStatus, engine.HealthUnhealthy)
+	}
+}
+
+func TestParseNamesTheStatusItSawWhenItIsNotRunning(t *testing.T) {
+	got, err := collect.ParseAutoscalerStatus("autoscalerStatus: Initializing\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Running {
+		t.Error("anything other than Running means binpack must not act")
+	}
+	if _, _, why := got.Live(time.Now()); !strings.Contains(why, "Initializing") {
+		t.Errorf("the refusal does not name the status the autoscaler published: %s", why)
 	}
 }

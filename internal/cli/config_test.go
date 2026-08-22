@@ -141,4 +141,20 @@ func TestConfigValidateSaysWhereTheAutoscalerStatusIsRead(t *testing.T) {
 	if !strings.Contains(out, "autoscaler") || strings.Contains(out, "kube-system") {
 		t.Errorf("the summary does not report the configured namespace:\n%s", out)
 	}
+
+	// And the other half of the location, which is configuration too. A
+	// summary that prints the default name whatever was set sends an operator
+	// to `kubectl describe` an object binpack is not reading — the same defect
+	// as the namespace, on the field beside it.
+	out, err = runWithStdin(t, "discovery:\n  autoscalerStatusName: my-ca-status\n",
+		"config", "validate")
+	if err != nil {
+		t.Fatalf("config validate: %v", err)
+	}
+	if !strings.Contains(out, "my-ca-status") {
+		t.Errorf("the summary does not report the configured status object name:\n%s", out)
+	}
+	if strings.Contains(out, "cluster-autoscaler-status") {
+		t.Errorf("the summary prints the default name over the configured one:\n%s", out)
+	}
 }

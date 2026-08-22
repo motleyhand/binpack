@@ -225,7 +225,7 @@ func liveGroups(a Autoscaler) []NodeGroup {
 // every hand-labelled cluster take exactly the path they took before, and the
 // derivation cannot change what any working cluster does.
 func resolveMapping(s Snapshot, cfg Config) PoolMapping {
-	if live, _ := s.Autoscaler.Live(s.Now); !live || len(s.Nodes) == 0 {
+	if live, _, _ := s.Autoscaler.Live(s.Now); !live || len(s.Nodes) == 0 {
 		return PoolMapping{}
 	}
 	groups := liveGroups(s.Autoscaler)
@@ -565,7 +565,7 @@ func checkNodeGroupLabel(s Snapshot, cfg Config) error {
 	// content is what the nodes do carry, and an empty list of that is a
 	// sentence about a cluster binpack cannot see rather than one it has
 	// diagnosed.
-	if live, _ := s.Autoscaler.Live(s.Now); !live || len(s.Nodes) == 0 {
+	if live, _, _ := s.Autoscaler.Live(s.Now); !live || len(s.Nodes) == 0 {
 		return nil
 	}
 	// Nothing published has a node in it, so nothing could have matched and
@@ -664,7 +664,7 @@ func checkStatedJoin(s Snapshot, cfg Config) error {
 	if len(cfg.NodeGroups) == 0 {
 		return nil
 	}
-	if live, _ := s.Autoscaler.Live(s.Now); !live {
+	if live, _, _ := s.Autoscaler.Live(s.Now); !live {
 		return nil
 	}
 

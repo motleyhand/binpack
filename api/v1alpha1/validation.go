@@ -84,6 +84,15 @@ func (c *Config) Validate() error {
 	if ns := c.Discovery.AutoscalerNamespace; ns != "" {
 		errs = append(errs, namespaceErrors("discovery.autoscalerNamespace", ns)...)
 	}
+	// And the object's name, for the same reason and by the same rule: a
+	// ConfigMap name is a DNS subdomain, so anything that is not one names an
+	// object that cannot exist.
+	if name := c.Discovery.AutoscalerStatusName; name != "" {
+		for _, why := range validation.IsDNS1123Subdomain(name) {
+			errs = append(errs, fmt.Errorf(
+				"discovery.autoscalerStatusName: %q is not a valid ConfigMap name: %s", name, why))
+		}
+	}
 	errs = append(errs, validateNodeGroups(c.Discovery.NodeGroups)...)
 
 	errs = append(errs, c.Policy.validate("policy")...)

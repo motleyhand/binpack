@@ -49,7 +49,7 @@ type Reader = client.Reader
 // Nothing is transformed on the way through: the engine works on API types, so
 // this lists objects and hands them over. The only interpretation is the
 // autoscaler's status document, which is YAML inside a ConfigMap.
-func Snapshot(ctx context.Context, reader Reader, now time.Time, autoscalerNamespace string) (engine.Snapshot, error) {
+func Snapshot(ctx context.Context, reader Reader, now time.Time, status StatusRef) (engine.Snapshot, error) {
 	s := engine.Snapshot{Now: now}
 
 	var nodes corev1.NodeList
@@ -81,7 +81,7 @@ func Snapshot(ctx context.Context, reader Reader, now time.Time, autoscalerNames
 		return s, err
 	}
 
-	if s.Autoscaler, err = autoscaler(ctx, reader, autoscalerNamespace); err != nil {
+	if s.Autoscaler, err = autoscaler(ctx, reader, status); err != nil {
 		return s, err
 	}
 
@@ -145,45 +145,57 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 	return out, nil
 }
 
-// autoscaler reads the cluster-autoscaler's published status from the
-// namespace the operator says it runs in.
+// autoscaler reads the cluster-autoscaler's published status from the one
+// place the operator says it is published.
 //
 // A missing ConfigMap yields a not-running autoscaler rather than an error.
 // That is a diagnosis, not a failure: binpack should report "nothing here will
-// remove a drained node" clearly rather than exiting with a stack trace.
+// remove a drained node" clearly rather than exiting with a stack trace. What
+// it must not do is state that as a cluster fact, so the two ways of finding
+// nothing are told apart on the way out — the object was not there, or it was
+// there and said nothing. See [engine.Autoscaler.Live].
 //
-// An empty namespace is the one thing here that is not a diagnosis. It means a
-// caller lost the configured value, and a Get for a namespaced object without
-// a namespace finds nothing — so it would arrive downstream wearing the same
-// clothes as a cluster that genuinely has no autoscaler, which is precisely
-// the confident-and-wrong report this parameter exists to end.
-func autoscaler(ctx context.Context, reader Reader, namespace string) (engine.Autoscaler, error) {
-	if namespace == "" {
+// An empty namespace or name is the one thing here that is not a diagnosis. It
+// means a caller lost the configured value, and a Get for a namespaced object
+// without a namespace finds nothing — so it would arrive downstream wearing
+// the same clothes as a cluster that genuinely has no autoscaler, which is
+// precisely the confident-and-wrong report these parameters exist to end.
+func autoscaler(ctx context.Context, reader Reader, status StatusRef) (engine.Autoscaler, error) {
+	switch {
+	case status.Namespace == "":
 		return engine.Autoscaler{}, fmt.Errorf(
-			"no namespace to read %s from: set discovery.autoscalerNamespace",
-			StatusConfigMapName)
+			"no namespace to read the cluster-autoscaler status from: set discovery.autoscalerNamespace")
+	case status.Name == "":
+		return engine.Autoscaler{}, fmt.Errorf(
+			"no name to read the cluster-autoscaler status by: set discovery.autoscalerStatusName")
 	}
 
 	var cm corev1.ConfigMap
 	err := reader.Get(ctx, client.ObjectKey{
-		Namespace: namespace,
-		Name:      StatusConfigMapName,
+		Namespace: status.Namespace,
+		Name:      status.Name,
 	}, &cm)
 
 	switch {
 	case apierrors.IsNotFound(err):
 		return engine.Autoscaler{}, nil
 	case err != nil:
-		return engine.Autoscaler{}, fmt.Errorf("reading %s/%s: %w",
-			namespace, StatusConfigMapName, err)
+		return engine.Autoscaler{}, fmt.Errorf("reading %s: %w", status, err)
 	}
 
 	document, ok := cm.Data[statusKey]
 	if !ok {
-		return engine.Autoscaler{}, nil
+		// The object exists, so binpack has read the operator's cluster and
+		// found the autoscaler's own status empty. Distinct from not finding
+		// the object, and the refusal says which.
+		return engine.Autoscaler{StatusFound: true}, nil
 	}
 
-	return ParseAutoscalerStatus(document)
+	a, err := ParseAutoscalerStatus(document)
+	if err != nil {
+		return engine.Autoscaler{}, fmt.Errorf("reading %s: %w", status, err)
+	}
+	return a, nil
 }
 
 // PodsOn returns the pods assigned to a node, for rendering.

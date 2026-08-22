@@ -11,6 +11,9 @@ import (
 
 	"github.com/spf13/cobra"
 	ctrl "sigs.k8s.io/controller-runtime"
+
+	"github.com/motleyhand/binpack/api/v1alpha1"
+	"github.com/motleyhand/binpack/internal/collect"
 )
 
 // Execute runs binpack under a context a signal cancels.
@@ -85,15 +88,16 @@ type options struct {
 	// nothing else in the output reveals which one it answered.
 	configSource string
 
-	// autoscalerNamespace is where this configuration says the
-	// cluster-autoscaler publishes its status, and therefore the one object
-	// every verdict about the autoscaler rests on. Carried for the same reason
-	// as the two above: it says what the answer is an answer about. "no
-	// cluster-autoscaler is running" is a claim binpack makes from a single
-	// Get, and without naming where that Get went the reader has no way to
-	// tell a cluster with no autoscaler from a binpack pointed at the wrong
-	// namespace.
-	autoscalerNamespace string
+	// autoscalerStatus is where this configuration says the cluster-autoscaler
+	// publishes its status, and therefore the one object every verdict about
+	// the autoscaler rests on. Carried for the same reason as the two above:
+	// it says what the answer is an answer about. A refusal to act on the
+	// autoscaler's account is a claim binpack makes from a single Get, and
+	// without naming where that Get went the reader has no way to tell a
+	// cluster with no autoscaler from a binpack pointed somewhere else.
+	//
+	// Both halves, because both are configurable and either can be wrong.
+	autoscalerStatus collect.StatusRef
 
 	// dryRun is that configuration's mode, and it belongs beside the source
 	// for the same reason: both say what the verdict is a verdict about. It is
@@ -137,4 +141,17 @@ func NewRootCommand(out io.Writer) *cobra.Command {
 	)
 
 	return cmd
+}
+
+// statusRef is where this configuration says the cluster-autoscaler publishes
+// its status.
+//
+// One function so that the object binpack reads and the object it names in a
+// report cannot come apart — the whole point of naming it is that the reader
+// can go and look at the same one.
+func statusRef(cfg *v1alpha1.Config) collect.StatusRef {
+	return collect.StatusRef{
+		Namespace: cfg.Discovery.AutoscalerNamespace,
+		Name:      cfg.Discovery.AutoscalerStatusName,
+	}
 }
