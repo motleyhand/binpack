@@ -753,7 +753,7 @@ names exactly, and where a provider's own labels do not, the operator applies on
 GCE was the remainder: the identifier is a full instance-group URL and no label can hold it. The
 answer is that a label does not have to hold the whole identifier, because a provider builds the
 identifier out of the pool name — so the instance group's *name* is inside the URL even though the
-URL cannot be a label value, and binpack joins on that where the join resolves the whole cluster
+URL cannot be a label value, and binpack joins on that where the join claims every published pool
 unambiguously. `discovery.nodeGroups` covers what is left, which is a pool name the provider
 truncated or never used.
 

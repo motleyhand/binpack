@@ -96,7 +96,8 @@ prevent, and it deserves the same treatment.
 ### The derivation, and what makes it safe
 
 The answer to ADR-0012's objection is not a better substring rule. It is that **nothing resolves
-unless the whole cluster resolves**, which converts "a silent change of scope" into a refusal:
+unless every published pool is claimed at once**, which converts "a silent change of scope" into a
+refusal:
 
 1. Take a candidate label key K, and partition the nodes by their value of K.
 2. Require the number of partitions to equal the number of published groups with a ready node.
@@ -108,6 +109,38 @@ unless the whole cluster resolves**, which converts "a silent change of scope" i
 Add a pool and the partition count no longer matches, so binpack refuses rather than quietly
 managing fewer nodes than it did yesterday — which is precisely the property ADR-0012 asked for.
 The derivation is re-run every evaluation and never cached, so there is no state to go stale.
+
+### What this does not claim, and why not
+
+**The claim is about pools, not about nodes.** A node that carries no value for the chosen label
+is left in no pool; it does not make the derivation fail. That distinction is load-bearing in both
+directions, and stating it loosely — "the whole cluster resolves" — invites the tightening it must
+not have:
+
+- **Requiring every node to carry the label would refuse ordinary clusters.** Most hold nodes in
+  no autoscaling pool at all: a self-managed box, a pool the autoscaler was never told about, a
+  control-plane node on a self-hosted cluster. None carries a provider's pool label, and none is
+  evidence about any pool. Refusing them would trade a working derivation for exactly the
+  preflight failure ADR-0012 exists to make rare.
+- **Leaving them out under-scopes rather than over-scopes.** A node the mapping omits is never a
+  drain candidate, and no arithmetic depends on it: the floors binpack enforces come from
+  `minSize` and the group's reported size in the autoscaler's own status, never from counting
+  nodes. It is still a destination for pods leaving other nodes, as any node outside a managed
+  pool is.
+- **The size window is where this is loosest, and deliberately so.** With `ready 2, target 3` and
+  three nodes in the snapshot, a label two of them carry resolves. From the snapshot alone that
+  shape is indistinguishable from two pool nodes plus one node in no pool — which is the common
+  reading and the correct one — and refusing it would mean refusing every cluster that has a
+  static node while any pool is scaling. The window is only wider than a point when the autoscaler
+  itself reports a discrepancy between what is ready and what it has asked for, which is what
+  makes it evidence rather than slack.
+
+**And the hole no label-based join can close.** A node hand-labelled with a pool's own name is
+counted as being in that pool. binpack cannot tell otherwise, and neither can ADR-0012's equality
+join — applying a pool's identifier to a node outside it defeats that one just as completely.
+Closing it needs an authoritative membership list, which means a cloud API, which ADR-0004 rules
+out. What the size window costs here is bounded by the same `|ready - target|` that buys the
+scale-event tolerance, and it is a widening of a hole that already exists rather than a new one.
 
 **The refusal is not the end of the road**, because refusing is only acceptable if it hands the
 operator something. `engine.ResolvePools` returns the near misses with the reason each was turned
@@ -241,8 +274,8 @@ GCE, where equality could never have worked.
 about the simulation, the eviction arithmetic or the PDB accounting changes, and a node in the
 wrong pool would still have to be shown drainable before anything happened to it. What it decides
 is scope, and a wrong answer would apply one pool's floor to another pool's nodes. Hence: it
-refuses rather than guessing, it resolves the whole cluster or none of it, and it reports what it
-did.
+refuses rather than guessing, it claims every published pool or none of them, and it reports what
+it did.
 
 **A cluster that binpack refuses today may resolve tomorrow, and vice versa.** Adding a pool whose
 nodes carry no matching label turns a derived mapping into a refusal — loudly, at preflight, on

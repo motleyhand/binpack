@@ -20,8 +20,10 @@ import (
 // cluster-autoscaler publishes. ADR-0013 amends that: where nothing matches
 // outright, binpack may derive the join instead, because every major provider
 // generates the identifier *from* the pool name and so contains it. Deriving
-// is only safe if it resolves the whole cluster or nothing, which is what
-// almost every test below is checking.
+// is only safe if it claims every published pool at once or none of them,
+// which is what almost every test below is checking. Note what that does not
+// say: a node in no pool is left in no pool rather than making the whole
+// derivation fail — see TestNodesOutsideEveryPoolDoNotStopTheDerivation.
 
 // pool is one autoscaling pool as a test states it: the identifier the
 // autoscaler publishes, and the label value the provider puts on its nodes.
@@ -730,5 +732,210 @@ func TestAStatedJoinMayNameAPoolScaledToZero(t *testing.T) {
 
 	if _, err := engine.ResolvePools(s, cfg); err != nil {
 		t.Errorf("a stated join naming an empty but published pool was rejected:\n%v", err)
+	}
+}
+
+// TestAnOverrideNamedByAnyLabelTheJoinReadsTakesEffect is the half of
+// TestAPoolOverrideMayNameTheLabelValueUnderADerivedJoin that asks the
+// question through the decision rather than through the accessor.
+//
+// The accessor being right proves nothing about the three places that do not
+// use it. Until a join could be derived, a node's group *was* its label value,
+// so `PolicyFor(a.Group, a.Pool)` and a lookup by label value were the same
+// call; deriving splits them, and `eligibility` — which is where
+// `enabled: false` is read — took the half without the label value. An
+// operator switching a pool off by the name on their nodes would have been
+// told the configuration was valid and watched binpack go on considering that
+// pool drainable, which is the exact failure ADR-0012's override check exists
+// to prevent.
+//
+// Both names, because preflight accepts both: the label the join reads, and
+// the one `discovery.nodeGroupIDLabel` configures. Accepting a name at
+// validation and ignoring it at resolution is worse than refusing it.
+func TestAnOverrideNamedByAnyLabelTheJoinReadsTakesEffect(t *testing.T) {
+	build := func() engine.Snapshot {
+		s := derivable("eks.amazonaws.com/nodegroup", []pool{
+			{id: "eks-workers-a2c1d3e4", value: "workers", nodes: 2}})
+		// Also carrying the configured key, holding something no published
+		// group answers to — so the join is still derived, and the two keys
+		// are two different strings.
+		for _, node := range s.Nodes {
+			node.Labels["doks.digitalocean.com/node-pool-id"] = "the-configured-name"
+		}
+		return s
+	}
+
+	for _, name := range []string{
+		"eks-workers-a2c1d3e4", // the identifier the autoscaler publishes
+		"workers",              // the value of the label the join reads
+		"the-configured-name",  // the value of discovery.nodeGroupIDLabel
+	} {
+		t.Run(name, func(t *testing.T) {
+			s := build()
+			cfg := config()
+			cfg.ByPool = map[string]engine.Policy{name: {Enabled: false}}
+
+			resolved, err := engine.ResolvePools(s, cfg)
+			if err != nil {
+				t.Fatalf("preflight rejected an override naming a pool that is there:\n%v", err)
+			}
+			for _, a := range engine.Assess(s, resolved) {
+				if a.SkipCode != engine.SkipPoolDisabled {
+					t.Errorf("%s was assessed %q, so an override written as %q did not "+
+						"reach the decision", a.Node.Name, a.SkipCode, name)
+				}
+			}
+		})
+	}
+}
+
+// TestNodesOutsideEveryPoolDoNotStopTheDerivation is the case that rules out
+// the obvious tightening of the rule above — "refuse unless every node
+// carries the candidate key".
+//
+// Most clusters have nodes in no autoscaling pool at all: a self-managed box,
+// a pool the autoscaler was never told about, a control-plane node on a
+// self-hosted cluster. None of them carries a provider's pool label, and none
+// of them is evidence of anything. A rule requiring every node to contribute
+// a value would refuse every one of those clusters — and it would refuse them
+// in favour of the state ADR-0012 exists to end, since the fallback is a
+// preflight failure on a cluster whose pools are perfectly derivable.
+//
+// What the derivation claims is narrower than "every node resolves", and this
+// is the test that says which: every published pool is claimed by exactly one
+// label value. A node outside all of them stays outside all of them.
+func TestNodesOutsideEveryPoolDoNotStopTheDerivation(t *testing.T) {
+	s := derivable("eks.amazonaws.com/nodegroup", []pool{
+		{id: "eks-workers-a2c1d3e4", value: "workers", nodes: 3}},
+		mother.Node("static-0"), mother.Node("static-1"))
+
+	cfg, err := engine.ResolvePools(s, config())
+	if err != nil {
+		t.Fatalf("preflight refused a cluster with two nodes outside every pool:\n%v", err)
+	}
+	if got := cfg.Mapping.Key; got != "eks.amazonaws.com/nodegroup" {
+		t.Fatalf("derived the join from %q", got)
+	}
+	for _, node := range s.Nodes {
+		want := "eks-workers-a2c1d3e4"
+		if strings.HasPrefix(node.Name, "static-") {
+			want = ""
+		}
+		if got := cfg.GroupOf(node); got != want {
+			t.Errorf("%s is in group %q, want %q", node.Name, got, want)
+		}
+	}
+}
+
+// TestAPoolMidScaleUpResolvesFromTheNodesThatCarryTheLabel pins what the size
+// window does when the extra node is not the pool's.
+//
+// With `ready 2, target 3` the window is [2,3], so a label two nodes carry
+// resolves even though the snapshot holds three. That is deliberate and it is
+// the right answer for the shape it describes — an autoscaler that wants a
+// third node beside two pool nodes and one node that is in no pool — which is
+// indistinguishable, from the snapshot alone, from a pool node whose labels
+// have not landed yet. Erring the other way is a refusal on every cluster
+// that has a static node while any pool is scaling.
+//
+// What that costs is stated rather than hidden: the third node is left in no
+// pool, so it is never a drain candidate. Under-scoping is the safe
+// direction — the floors binpack enforces come from the autoscaler's own
+// status, not from counting nodes, so a node outside the mapping changes no
+// arithmetic. See ADR-0013.
+func TestAPoolMidScaleUpResolvesFromTheNodesThatCarryTheLabel(t *testing.T) {
+	s := derivable("eks.amazonaws.com/nodegroup", []pool{
+		{id: "eks-workers-a2c1d3e4", value: "workers", nodes: 2, ready: 2, target: 3}},
+		mother.Node("not-in-any-pool"))
+
+	cfg, err := engine.ResolvePools(s, config())
+	if err != nil {
+		t.Fatalf("preflight refused a pool that is scaling up:\n%v", err)
+	}
+	if got := cfg.GroupOf(s.Nodes[len(s.Nodes)-1]); got != "" {
+		t.Errorf("the node carrying no pool label was put in group %q", got)
+	}
+	for _, a := range engine.Assess(s, cfg) {
+		if a.Node.Name == "not-in-any-pool" {
+			if a.SkipCode != engine.SkipNotAutoscaled {
+				t.Errorf("a node in no pool was assessed %q, so the derivation widened "+
+					"scope rather than narrowing it", a.SkipCode)
+			}
+			continue
+		}
+		if a.SkipCode == engine.SkipNotAutoscaled {
+			t.Errorf("%s carries the label the join reads and is outside every pool",
+				a.Node.Name)
+		}
+	}
+}
+
+// TestAnOverrideNamedByALabelReachesTheDrainBoundsToo covers the two policy
+// readings [engine.Assess] does not exercise.
+//
+// `enabled: false` is read in `eligibility`, and asserting through Assess
+// pins that one. Everything else in a pool's policy — the blast-radius cap
+// among them — is read in `drainable`, which selection and revalidation each
+// call with a policy they resolve themselves. Both were resolving it from the
+// node's *group*, which stopped being its label value the moment a join could
+// be derived, so an override written as `maxPodsPerDrain` on a pool named the
+// way an operator sees it was honoured in one place and not the other two.
+//
+// One override, three readings, one expected answer. A sabotage pass over
+// either call site turns this red.
+func TestAnOverrideNamedByALabelReachesTheDrainBoundsToo(t *testing.T) {
+	s := derivable("eks.amazonaws.com/nodegroup", []pool{
+		{id: "eks-workers-a2c1d3e4", value: "workers", nodes: 3}})
+	// Two pods on one node, and a cap of one: the node is drainable on every
+	// other count and the blast-radius guard is the only thing that can stop
+	// it.
+	crowded := s.Nodes[0].Name
+	s.Pods = append(s.Pods,
+		mother.Pod("default", "one", mother.OnNode(crowded)),
+		mother.Pod("default", "two", mother.OnNode(crowded)))
+	s.Templates = mother.Templates(s.Pods...)
+
+	cfg := config()
+	cfg.ByPool = map[string]engine.Policy{"workers": {
+		Enabled:         true,
+		Sim:             engine.SimConfig{ExpendablePriorityCutoff: cutoff},
+		Evict:           engine.DefaultEvictConfig(),
+		MaxPodsPerDrain: 1,
+	}}
+	resolved, err := engine.ResolvePools(s, cfg)
+	if err != nil {
+		t.Fatalf("preflight rejected an override naming a pool that is there:\n%v", err)
+	}
+
+	// Selection: the crowded node must be ruled out by the cap.
+	var seen bool
+	for _, a := range engine.Decide(s, resolved).Assessments {
+		if a.Node.Name != crowded {
+			continue
+		}
+		seen = true
+		if a.SkipCode != engine.SkipTooManyPods {
+			t.Errorf("selection assessed %s as %q, so the override's cap did not reach "+
+				"the policy it decides on", crowded, a.SkipCode)
+		}
+	}
+	if !seen {
+		t.Fatalf("%s was not assessed at all, so this asserts nothing", crowded)
+	}
+
+	// Revalidation asks the same question of one named node, through its own
+	// policy lookup, and the two must not disagree about the same drain.
+	//
+	// Marked and cordoned but not committed: nothing has been evicted yet, so
+	// the cap still applies. Once a drain is committed it deliberately does
+	// not — a node half emptied is not abandoned over a blast-radius bound —
+	// which is why this fixture stops short of the awaiting marker.
+	s.Nodes[0].Spec.Unschedulable = true
+	s.Nodes[0].Annotations = map[string]string{
+		engine.AnnotationDrainStarted: now.Add(-time.Minute).Format(time.RFC3339)}
+
+	if got := engine.Revalidate(s, crowded, resolved); got.SkipCode != engine.SkipTooManyPods {
+		t.Errorf("revalidation assessed %s as %q, so the override's cap did not reach the "+
+			"policy it re-asks with", crowded, got.SkipCode)
 	}
 }

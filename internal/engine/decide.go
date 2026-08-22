@@ -276,8 +276,12 @@ type Config struct {
 	ByPool  map[string]Policy
 }
 
-// PolicyFor resolves the policy for a pool, matching on either identifier.
-func (c Config) PolicyFor(names ...string) Policy {
+// policyFor resolves the policy for a pool, matching on any of its names.
+//
+// Unexported, and reached only through [Config.PolicyForNode]: which names a
+// node answers to is the question that went wrong once, so there is one
+// answer to it rather than one per caller.
+func (c Config) policyFor(names ...string) Policy {
 	for _, name := range names {
 		if name == "" {
 			continue
@@ -558,7 +562,7 @@ func assess(s Snapshot, cfg Config) ([]NodeAssessment, int) {
 		a := candidates[i]
 		// Never committed: this is the decision, and nothing has been evicted
 		// on the strength of it yet.
-		if drainable(s, a, cfg.PolicyFor(a.Group, a.Pool), false) && chosen < 0 {
+		if drainable(s, a, cfg.PolicyForNode(a.Node), false) && chosen < 0 {
 			chosen = len(assessments)
 		}
 		assessments = append(assessments, *a)
@@ -653,7 +657,7 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 
 	// The same question eligibility asked above, through the same reading, so
 	// the two halves of the drain cannot disagree about whether it has begun.
-	drainable(s, &a, cfg.PolicyFor(a.Group, a.Pool), committedDrain(node))
+	drainable(s, &a, cfg.PolicyForNode(node), committedDrain(node))
 	return a
 }
 
@@ -823,7 +827,7 @@ func eligibility(
 		Pool:  node.Labels[cfg.PoolNameLabel],
 	}
 
-	policy := cfg.PolicyFor(a.Group, a.Pool)
+	policy := cfg.PolicyForNode(node)
 	group, managed := groups[a.Group]
 	coolCode, cooldown, cooling := cooling(s, policy)
 

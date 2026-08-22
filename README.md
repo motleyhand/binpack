@@ -53,8 +53,8 @@ autoscaler binpack refuses to act, so it has nothing to offer a `kind` or `minik
 VM Scale Set name on Azure — not the pool name you picked in a console. DigitalOcean's
 `doks.digitalocean.com/node-pool-id` carries that identifier outright and is the default.
 Elsewhere binpack works the match out from the pool label your provider already applies, because
-the identifier is generated from the same name; it does that only when the whole cluster resolves
-unambiguously, reports the label it used, and refuses rather than guessing. Where it refuses, you
+the identifier is generated from the same name; it does that only when every published pool
+resolves at once and unambiguously, reports the label it used, and refuses rather than guessing. Where it refuses, you
 can point `discovery.nodeGroupIDLabel` at a label of your own or state the mapping directly. See
 [`discovery.nodeGroupIDLabel`](docs/reference/configuration.md#discoverynodegroupidlabel),
 [ADR-0012](docs/design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) and

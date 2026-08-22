@@ -51,7 +51,7 @@ const (
 
 	// MappedByName is derived: a label whose values the identifiers were
 	// generated from. Attempted only when neither of the above matched
-	// anything, and refused unless it resolves the whole cluster.
+	// anything, and refused unless it claims every published pool at once.
 	MappedByName
 )
 
@@ -141,17 +141,27 @@ func (c Config) mappingKey() string {
 	return c.NodeGroupIDLabel
 }
 
-// PolicyForNode resolves the policy governing one node's pool.
+// PolicyForNode resolves the policy governing one node's pool, and is the
+// only way to do that. Nothing else may resolve a node's policy: three call
+// sites once passed `(a.Group, a.Pool)` instead, which was the same call until
+// a derived join made a node's group and its label value two different
+// strings, and then silently stopped honouring an override named after the
+// label — including `enabled: false`, which is the one an operator most
+// expects to be obeyed.
 //
-// Three names, because a `pools` entry may be written as any of them and an
+// Four names, because a `pools` entry may be written as any of them and an
 // operator should not have to know which one binpack matches on: the
 // identifier the autoscaler publishes, the value of whichever label the join
-// reads, and the human-readable pool name. Where the join is equality the
-// first two are the same string, which is what this did before there was a
-// second kind of join.
+// reads, the value of the label `discovery.nodeGroupIDLabel` configures, and
+// the human-readable pool name. [ResolvePools] accepts all four when it
+// validates an override, and accepting a name there while ignoring it here is
+// worse than refusing it.
+//
+// Where the join is plain equality the middle two are the same string and this
+// is the two-name lookup it has always been.
 func (c Config) PolicyForNode(node *corev1.Node) Policy {
-	return c.PolicyFor(c.GroupOf(node), node.Labels[c.mappingKey()],
-		node.Labels[c.PoolNameLabel])
+	return c.policyFor(c.GroupOf(node), node.Labels[c.mappingKey()],
+		node.Labels[c.NodeGroupIDLabel], node.Labels[c.PoolNameLabel])
 }
 
 // PoolNames maps each autoscaling group's identifier to the human-readable
@@ -288,10 +298,26 @@ func (m PoolMapping) groupOf(node *corev1.Node) string {
 // has to partition the nodes into exactly as many groups as the autoscaler
 // publishes, at sizes those pools could plausibly have, matched onto them
 // one-to-one in exactly one way — and every key that manages it has to agree
-// about every node. Nothing resolves unless the whole cluster resolves, so
-// the failure mode is a refusal rather than a silent change of scope. That is
-// the objection ADR-0012 raised against inferring the join, and it is what
-// this answers.
+// about every node. Nothing resolves unless *every published pool* is claimed
+// at once, so the failure mode is a refusal rather than a silent change of
+// scope. That is the objection ADR-0012 raised against inferring the join, and
+// it is what this answers.
+//
+// The claim is about pools and not about nodes, and the difference is not
+// pedantry. Most clusters hold nodes in no autoscaling pool at all — a
+// self-managed box, a pool the autoscaler was never told about — and none of
+// them carries a provider's pool label. Requiring every node to contribute a
+// value would refuse those clusters outright, in favour of the silent
+// mismatch ADR-0012 exists to end. So a node outside every pool stays outside
+// every pool, which under-scopes rather than over-scopes: the floors binpack
+// enforces come from the autoscaler's own status and not from counting nodes,
+// so a node the mapping omits is one binpack never drains and no arithmetic
+// depends on.
+//
+// What that leaves unguarded, said plainly: a node hand-labelled with a
+// pool's own name is counted as being in that pool. No label-based join can
+// tell otherwise — ADR-0012's equality join has exactly the same hole — and
+// closing it needs a cloud API, which ADR-0004 rules out.
 func derive(s Snapshot, groups []NodeGroup) PoolMapping {
 	out := PoolMapping{Source: MappedNothing}
 

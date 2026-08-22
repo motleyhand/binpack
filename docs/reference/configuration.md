@@ -177,9 +177,11 @@ label they put on your nodes holds a string that is inside it:
 | GKE node pool | `cloud.google.com/gke-nodepool` | `default-pool` | `…/instanceGroups/my-cluster-default-pool-a0c72690-grp` |
 
 Where no label's value *is* an identifier, binpack looks for one whose values name the pools, and
-uses it only if the whole cluster resolves: the label's values must correspond one-to-one with the
-pools the autoscaler publishes, at sizes those pools could have, in exactly one way — and if
-several labels manage it they must agree about every node. Anything less and it refuses rather
+uses it only if every pool resolves at once: the label's values must correspond one-to-one with
+the pools the autoscaler publishes, at sizes those pools could have, in exactly one way — and if
+several labels manage it they must agree about every node. Nodes in no autoscaling pool are
+expected and do not prevent this; they simply stay outside every pool, and binpack never drains
+them. Anything less and it refuses rather
 than guessing, because a mapping that is wrong applies one pool's floor to another pool's nodes.
 `binpack explain` prints the label it matched on whenever the mapping was derived.
 
