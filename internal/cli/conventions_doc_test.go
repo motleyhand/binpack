@@ -96,7 +96,7 @@ func conventionsTable(t *testing.T) string {
 
 	var rows []string
 	inSection := false
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if strings.HasPrefix(line, "## ") {
 			inSection = line == conventionsHeading
 			continue

@@ -45,11 +45,11 @@ func TestTheReferenceDocumentsNothingThatDoesNotExist(t *testing.T) {
 		known[d.Code] = true
 	}
 
-	for _, line := range strings.Split(string(data), "\n") {
+	for line := range strings.SplitSeq(string(data), "\n") {
 		if !strings.HasPrefix(line, "### `") {
 			continue
 		}
-		code := strings.SplitN(strings.TrimPrefix(line, "### `"), "`", 2)[0]
+		code, _, _ := strings.Cut(strings.TrimPrefix(line, "### `"), "`")
 		if !known[code] {
 			t.Errorf("the reference documents %q, which binpack cannot report — "+
 				"renamed or removed without updating the document", code)

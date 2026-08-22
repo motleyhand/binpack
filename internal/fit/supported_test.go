@@ -410,10 +410,10 @@ var irrelevantToScheduling = map[string]string{
 // once per dependency bump; the cost of not doing it is one silent acceptance
 // per release that happens to add a scheduling-relevant field.
 func TestPodSpecFieldsAreAccountedFor(t *testing.T) {
-	spec := reflect.TypeOf(corev1.PodSpec{})
+	spec := reflect.TypeFor[corev1.PodSpec]()
 
-	for i := range spec.NumField() {
-		name := spec.Field(i).Name
+	for field := range spec.Fields() {
+		name := field.Name
 		_, known := modelled[name]
 		_, inert := irrelevantToScheduling[name]
 

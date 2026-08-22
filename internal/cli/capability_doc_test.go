@@ -175,7 +175,7 @@ var notGranted = regexp.MustCompile(`(?i)not yet|unused|not needed|never granted
 func rulePairs(doc string) map[string]bool {
 	pairs := map[string]bool{}
 	var groups, resources []string
-	for _, line := range strings.Split(doc, "\n") {
+	for line := range strings.SplitSeq(doc, "\n") {
 		line = strings.TrimSpace(line)
 		line = strings.TrimPrefix(line, "- ")
 		switch {
@@ -209,7 +209,7 @@ func bracketed(line string) []string {
 		return nil
 	}
 	var out []string
-	for _, item := range strings.Split(line[open+1:shut], ",") {
+	for item := range strings.SplitSeq(line[open+1:shut], ",") {
 		if item = strings.TrimSpace(item); item != "" {
 			out = append(out, item)
 		}

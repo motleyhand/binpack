@@ -5,7 +5,7 @@ easy to trust.
 
 ## Getting started
 
-Requires Go 1.25 or newer and [golangci-lint](https://golangci-lint.run) v2.
+Requires Go 1.26 or newer and [golangci-lint](https://golangci-lint.run) v2.
 
 ```bash
 make check      # lint, test, build, smoke test — what CI runs

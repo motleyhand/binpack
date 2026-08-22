@@ -56,8 +56,7 @@ func (e *ExitError) Error() string { return e.Message }
 // ExitCodeFor is the status a failed Execute should exit with. Anything that
 // is not an [ExitError] is an ordinary failure, and stays 1.
 func ExitCodeFor(err error) int {
-	var exit *ExitError
-	if errors.As(err, &exit) {
+	if exit, ok := errors.AsType[*ExitError](err); ok {
 		return exit.Code
 	}
 	return 1

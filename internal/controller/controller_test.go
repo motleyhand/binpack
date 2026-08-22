@@ -1944,7 +1944,7 @@ func TestAFailureThatClearsIsNotCountedTowardsTheNext(t *testing.T) {
 	ev.opts.DryRun, ev.opts.Once = false, false
 	failing := breaking(ev, apierrors.NewServiceUnavailable("etcd leader changed"))
 
-	for i := 0; i < 4*maxConsecutiveFailures; i++ {
+	for i := range 4 * maxConsecutiveFailures {
 		*failing = i%2 == 0
 		if err := ev.evaluate(context.Background()); err != nil {
 			t.Fatalf("round %d stopped the controller over a cluster that keeps recovering: %v",

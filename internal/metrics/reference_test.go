@@ -60,7 +60,7 @@ func TestTheReferenceDocumentsNoMetricThatDoesNotExist(t *testing.T) {
 	}
 
 	doc := referenceText(t)
-	for _, field := range strings.Split(doc, "`") {
+	for field := range strings.SplitSeq(doc, "`") {
 		// The bare prefix appears in prose; it is not a metric name.
 		if !strings.HasPrefix(field, "binpack_") || field == "binpack_" {
 			continue

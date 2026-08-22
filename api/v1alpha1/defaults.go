@@ -38,7 +38,7 @@ func (c *Config) SetDefaults() {
 		c.Interval = NewDuration(DefaultInterval)
 	}
 	if c.DryRun == nil {
-		c.DryRun = boolPtr(DefaultDryRun)
+		c.DryRun = new(DefaultDryRun)
 	}
 	if c.Discovery.NodeGroupIDLabel == "" {
 		c.Discovery.NodeGroupIDLabel = DefaultNodeGroupIDLabel
@@ -166,5 +166,3 @@ func matchesAny(name string, candidates []string) bool {
 	}
 	return false
 }
-
-func boolPtr(b bool) *bool { return &b }

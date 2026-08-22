@@ -42,10 +42,7 @@ import (
 func Backoff(node *corev1.Node, now time.Time, policy Policy) (attempts int, until time.Time) {
 	attempts = priorAttempts(node) + 1
 
-	wait := policy.BackoffInitial
-	if wait > policy.BackoffMax {
-		wait = policy.BackoffMax
-	}
+	wait := min(policy.BackoffInitial, policy.BackoffMax)
 	for i := 1; i < attempts && wait < policy.BackoffMax; i++ {
 		// Clamped before the doubling rather than after it. time.Duration is
 		// int64 nanoseconds and runs out a little past 292 years, so a pair of

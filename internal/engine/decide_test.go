@@ -1034,7 +1034,7 @@ func TestTheSummaryDoesNotDependOnHowTheClusterWasListed(t *testing.T) {
 	if !strings.Contains(stable, "2 of 4") {
 		t.Fatalf("neither tied code covers the nodes it should, got: %s", stable)
 	}
-	for i := 0; i < 32; i++ {
+	for range 32 {
 		if again := engine.Decide(tied, cfg).Reason; again != stable {
 			t.Fatalf("the same cluster summarised two ways:\n%s\n%s", stable, again)
 		}
@@ -1232,7 +1232,7 @@ func TestALabelThatMatchesNoNodeIsReportedAsSuch(t *testing.T) {
 // substrings, so an assertion about a sentence is not satisfied by two
 // unrelated ones.
 func sameLine(text string, want ...string) bool {
-	for _, line := range strings.Split(text, "\n") {
+	for line := range strings.SplitSeq(text, "\n") {
 		found := true
 		for _, w := range want {
 			found = found && strings.Contains(line, w)

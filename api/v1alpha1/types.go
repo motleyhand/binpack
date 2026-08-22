@@ -37,10 +37,10 @@ type Config struct {
 	// Discovery locates node pools and their bounds. binpack reads these
 	// from the cluster-autoscaler's own status rather than a cloud API, so
 	// only the label keys that map nodes to pools are configurable.
-	Discovery Discovery `json:"discovery,omitempty"`
+	Discovery Discovery `json:"discovery"`
 
 	// Policy applies to every discovered pool that has no override.
-	Policy Policy `json:"policy,omitempty"`
+	Policy Policy `json:"policy"`
 
 	// Pools overrides Policy for individual discovered pools. Pools are
 	// never declared here — they are discovered — so an entry naming a pool
@@ -115,11 +115,11 @@ type Policy struct {
 	// rolling binpack out to one pool at a time.
 	Enabled *bool `json:"enabled,omitempty"`
 
-	Feasibility Feasibility `json:"feasibility,omitempty"`
-	Drain       Drain       `json:"drain,omitempty"`
-	Backoff     Backoff     `json:"backoff,omitempty"`
-	Cooldown    Cooldown    `json:"cooldown,omitempty"`
-	Exclusions  Exclusions  `json:"exclusions,omitempty"`
+	Feasibility Feasibility `json:"feasibility"`
+	Drain       Drain       `json:"drain"`
+	Backoff     Backoff     `json:"backoff"`
+	Cooldown    Cooldown    `json:"cooldown"`
+	Exclusions  Exclusions  `json:"exclusions"`
 }
 
 // PoolOverride adjusts Policy for one discovered pool.
