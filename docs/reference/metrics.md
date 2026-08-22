@@ -12,8 +12,9 @@ Three things, in order of usefulness.
 
 ### `binpack_last_evaluation_timestamp_seconds` going stale
 
-A binpack that has stopped deciding looks exactly like one with nothing to do: no drains, no
-events, no errors. This is the series that tells them apart.
+A binpack that has stopped deciding looks much like one with nothing to do: no drains, no errors,
+and — once the `NoNodeChosen` Events on the nodes have aged out of the API server — nothing there
+either. This is the series that tells them apart without waiting.
 
 ```promql
 time() - binpack_last_evaluation_timestamp_seconds > 600
