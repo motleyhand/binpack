@@ -262,6 +262,14 @@ func TestBackoffHonoursTheConfiguredMax(t *testing.T) {
 		{"a cap above the default",
 			drain.Policy{BackoffInitial: 30 * time.Minute, BackoffMax: 72 * time.Hour},
 			"9", 72 * time.Hour},
+		// Validation refuses a max shorter than the initial, so a resolved
+		// policy never carries this pair — but the cap is the bound the caller
+		// asked for, and answering with something longer than it because the
+		// doubling never ran would be the one direction that costs a node
+		// availability it was promised.
+		{"a cap shorter than the initial",
+			drain.Policy{BackoffInitial: time.Hour, BackoffMax: time.Minute},
+			"", time.Minute},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			node := mother.SmallNode("a", mother.NodeAnnotations(
@@ -271,6 +279,45 @@ func TestBackoffHonoursTheConfiguredMax(t *testing.T) {
 
 			if got := until.Sub(now); got != tc.wait {
 				t.Errorf("wait: got %s, want the configured %s", got, tc.wait)
+			}
+		})
+	}
+}
+
+func TestBackoffDoesNotOverflowAHugeConfiguredBound(t *testing.T) {
+	// time.Duration is int64 nanoseconds, so it runs out a little past 292
+	// years — and validation bounds these two by "positive" and "max is not
+	// shorter than initial", nothing else. A pair well inside what the type
+	// can hold can still double past the end of it.
+	//
+	// The wrap is the worst answer available rather than a merely wrong one:
+	// it goes negative, so backoff-until lands in the *past* and the node that
+	// just failed is a candidate again on the next evaluation — with fewer
+	// pods than before, so the ordering puts it first. That is precisely the
+	// thing this function exists to prevent, reached through a configuration
+	// binpack accepted and printed back.
+	policy := drain.Policy{
+		BackoffInitial: 2_000_000 * time.Hour,
+		BackoffMax:     2_500_000 * time.Hour,
+	}
+
+	// Several counts, because the overflow does not stay put: once wait is
+	// negative it is below the cap again, so the loop keeps doubling and where
+	// it lands depends on how many attempts are recorded.
+	for _, recorded := range []string{"1", "2", "5", "99"} {
+		t.Run("after "+recorded, func(t *testing.T) {
+			node := mother.SmallNode("a", mother.NodeAnnotations(
+				map[string]string{engine.AnnotationDrainAttempts: recorded}))
+
+			_, until := drain.Backoff(node, now, policy)
+
+			if !until.After(now) {
+				t.Errorf("backoff-until is %s, which is not after %s: the node whose "+
+					"drain just failed is a candidate again immediately", until, now)
+			}
+			if got := until.Sub(now); got > policy.BackoffMax {
+				t.Errorf("wait: got %s, want at most the configured %s",
+					got, policy.BackoffMax)
 			}
 		})
 	}

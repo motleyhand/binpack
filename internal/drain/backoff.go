@@ -43,11 +43,24 @@ func Backoff(node *corev1.Node, now time.Time, policy Policy) (attempts int, unt
 	attempts = priorAttempts(node) + 1
 
 	wait := policy.BackoffInitial
-	for i := 1; i < attempts && wait < policy.BackoffMax; i++ {
-		wait *= 2
-	}
 	if wait > policy.BackoffMax {
 		wait = policy.BackoffMax
+	}
+	for i := 1; i < attempts && wait < policy.BackoffMax; i++ {
+		// Clamped before the doubling rather than after it. time.Duration is
+		// int64 nanoseconds and runs out a little past 292 years, so a pair of
+		// bounds well inside the type can still double past the end of it —
+		// and it wraps rather than saturating. Capping afterwards therefore
+		// compares against a negative number, lets it through, and puts
+		// backoff-until in the past: the node whose drain just failed becomes
+		// a candidate again immediately, with fewer pods than before, which is
+		// the exact outcome this function exists to prevent. Halving the cap
+		// cannot overflow, and nothing below it can.
+		if wait > policy.BackoffMax/2 {
+			wait = policy.BackoffMax
+			break
+		}
+		wait *= 2
 	}
 
 	return attempts, now.Add(wait)
