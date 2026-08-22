@@ -14,10 +14,15 @@ may have something to add. Start here.
 kubectl get pdb -A
 ```
 
-Any row showing `ALLOWED DISRUPTIONS: 0` prevents its node from ever being drained. The usual
-cause is a `minAvailable: 1` PDB on a Deployment scaled to one replica — common in staging,
-demo and review environments, where the replica count was tuned per environment and the PDB
-template was not.
+A row showing `ALLOWED DISRUPTIONS: 0` is worth looking at, though it is not on its own proof
+that anything is held open: a budget that selects no pods reports zero as well and pins nothing.
+`binpack diagnose` tells the two apart, or `kubectl get pdb -n NS NAME -o
+jsonpath='{.status.expectedPods}'` does it one budget at a time — zero there means the selector
+matches nothing.
+
+Where the budget does select pods, the usual cause is a `minAvailable: 1` PDB on a Deployment
+scaled to one replica — common in staging, demo and review environments, where the replica count
+was tuned per environment and the PDB template was not.
 
 In non-production namespaces, delete the PDB. In production, run at least two replicas. Either
 way, the pattern as it stands protects nothing and costs a node.

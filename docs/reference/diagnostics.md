@@ -31,7 +31,7 @@ what to grep for, alert on, and link to.
 
 | Severity | Meaning |
 |---|---|
-| `blocking` | The eviction API itself refuses. No setting of binpack's or the autoscaler's changes the outcome — the pods cannot be evicted at all, so their nodes cannot be removed by anything, including `kubectl drain` |
+| `blocking` | The node stays open until the object itself changes — a budget rewritten, a controller added, a manifest removed. Nothing binpack or the cluster-autoscaler can be configured to do clears one. `no-autoscaler` is the exception, and is described on its own below |
 | `warning` | The cluster-autoscaler declining by policy, or a condition that resolves itself. One annotation, one budget, or one recovered replica changes it |
 | `info` | The cluster working as intended. Reported so a question already answered does not have to be asked again |
 
@@ -215,8 +215,34 @@ Nothing will do that: not binpack, and not the cluster-autoscaler, for the same 
 that an owner reference with `controller` unset does not count — those exist for garbage
 collection, and nothing is responsible for replacing the pod.
 
-**Fix.** Give the pod a controller — a Deployment or a Job — or accept that its node cannot be
-drained while it is there.
+`kubectl drain --force` is not bound by this and will delete the pod. The eviction API is not
+either: it deletes a bare pod without complaint. The refusal is binpack's and the autoscaler's
+own policy, not the API's.
+
+**Fix.** Give the pod a controller that will recreate it: a Deployment, or — for work that ends
+— a Job. A Job needs one qualification, because it is the one controller kind that stops
+recreating:
+
+```yaml
+spec:
+  backoffLimit: 6
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+  template:
+    spec:
+      restartPolicy: Never   # Kubernetes permits podFailurePolicy only with this
+```
+
+An eviction adds the `DisruptionTarget` condition to the pod, and the Job controller counts a
+deleted pod as a failure. Once `.status.failed` passes `.spec.backoffLimit` the Job is
+terminally `Failed` and creates nothing — and `backoffLimit: 0` is the ordinary setting for a
+migration, a Helm hook or a one-shot CI Job. The `Ignore` rule above is what stops a disruption
+spending that budget.
+
+Otherwise, accept that the node cannot be drained while the pod is there.
 
 ### `local-storage` — warning
 
@@ -302,8 +328,10 @@ mysteriously cordoned node nobody dares touch.
 
 ### `node-in-backoff` — info
 
-binpack failed to drain the node and is waiting before trying again. The detail carries the
-recorded reason.
+binpack failed to drain the node and is waiting before trying again. The detail carries when the
+wait ends, how many drains of this node have failed, and the recorded reason — the attempt count
+being the number the backoff doubling is computed from, and what tells a first failure from a
+seventh. It is omitted when nothing is recorded, which is not the same as none.
 
 **Fix.** It will retry on its own. The recorded reason is what to fix if it keeps failing.
 

@@ -5,6 +5,7 @@ import (
 	"maps"
 	"slices"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -918,9 +919,33 @@ func backoffReason(node *corev1.Node) string {
 	reason := node.Annotations[AnnotationLastFailure]
 	until := node.Annotations[AnnotationBackoffUntil]
 	if reason == "" {
-		return "in backoff until " + until
+		return "in backoff until " + until + attemptClause(node)
 	}
-	return fmt.Sprintf("in backoff until %s after: %s", until, reason)
+	return fmt.Sprintf("in backoff until %s%s after: %s", until, attemptClause(node), reason)
+}
+
+// attemptClause names how many drains of this node have failed, or says
+// nothing if the count is not recorded.
+//
+// It is the number the doubling is computed from and the only thing telling a
+// first failure from a seventh, so an alert on binpack_drain_attempts_max —
+// which has no node label, on the grounds that diagnose names the node — sends
+// an operator to a surface that names every node in backoff and no depths.
+//
+// Silent rather than "0 attempts" when the annotation is missing or
+// unreadable: an absent count is no answer, and a clause claiming none would
+// be a wrong one. Tolerant in the same direction as the writer's own reader in
+// internal/drain, for the same reason — anyone with node access can write this
+// annotation, and misreading it should cost a clause, not a number.
+func attemptClause(node *corev1.Node) string {
+	n, err := strconv.Atoi(node.Annotations[AnnotationDrainAttempts])
+	if err != nil || n < 1 {
+		return ""
+	}
+	if n == 1 {
+		return " after 1 attempt"
+	}
+	return fmt.Sprintf(" after %d attempts", n)
 }
 
 // workloadOn measures how much real work a node is doing, for ordering.
@@ -956,23 +981,41 @@ func displayPool(a NodeAssessment) string {
 	return a.Group
 }
 
-// commonestSkip returns the most frequent skip reason, so a cluster where
-// nothing was eligible still explains itself rather than shrugging.
-func commonestSkip(assessments []NodeAssessment) (string, int) {
+// commonestSkip returns the code that ruled out the most nodes, one of those
+// nodes' reasons to say it in, and how many nodes it covers — so a cluster
+// where nothing was eligible still explains itself rather than shrugging.
+//
+// Counted by code and not by the rendered sentence, which is the same
+// distinction SkipCode exists for everywhere else. Five of the reasons
+// interpolate per-node data — a backoff expiry, a pod reference, a pool's size
+// — so a mode over sentences gives each of their nodes a bucket of its own:
+// four nodes behind one wall then lose to any two that happen to share a
+// string, and a cluster where every node hit the same wall reads as one node's
+// sentence rather than as unanimous.
+//
+// The reason returned is therefore one node's, and the count is what carries
+// the claim about the cluster. Ties break on the code so the answer does not
+// depend on map iteration order.
+func commonestSkip(assessments []NodeAssessment) (reason string, n int) {
 	counts := make(map[string]int)
 	for _, a := range assessments {
 		if a.Skipped {
-			counts[a.SkipReason]++
+			counts[a.SkipCode]++
 		}
 	}
 	var best string
 	var bestN int
-	for reason, n := range counts {
-		if n > bestN || (n == bestN && reason < best) {
-			best, bestN = reason, n
+	for code, n := range counts {
+		if n > bestN || (n == bestN && code < best) {
+			best, bestN = code, n
 		}
 	}
-	return best, bestN
+	for _, a := range assessments {
+		if a.Skipped && a.SkipCode == best {
+			return a.SkipReason, bestN
+		}
+	}
+	return "", 0
 }
 
 // summarise turns a set of rejections into one sentence. "Nothing to do" is
@@ -1009,10 +1052,11 @@ func summarise(assessments []NodeAssessment) string {
 
 	if considered == 0 {
 		if reason, n := commonestSkip(assessments); reason != "" {
-			if n == len(assessments) {
-				return fmt.Sprintf("no node was eligible: %s", reason)
-			}
-			return fmt.Sprintf("no node was eligible; most commonly: %s", reason)
+			// The count rather than "most commonly", which says neither how
+			// many nor out of how many — and cannot tell a wall every node hit
+			// from one that two of forty did.
+			return fmt.Sprintf("no node was eligible; %d of %d: %s",
+				n, len(assessments), reason)
 		}
 		return "no node was eligible to consider"
 	}

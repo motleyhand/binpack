@@ -218,13 +218,20 @@ func renderDiagnoseText(opts *options, findings []engine.Finding) error {
 		return errors.Join(errs...)
 	}
 
-	var blocking, warning int
+	var blocking, warning, spokenFor int
+	var noAutoscaler bool
 	for _, f := range findings {
 		switch f.Severity {
 		case engine.Blocking:
 			blocking++
+			if classFooterSpeaksFor(f.Code) {
+				spokenFor++
+			}
 		case engine.Warning:
 			warning++
+		}
+		if f.Code == engine.FindingNoAutoscaler {
+			noAutoscaler = true
 		}
 	}
 
@@ -265,12 +272,54 @@ func renderDiagnoseText(opts *options, findings []engine.Finding) error {
 
 	p("%d blocking, %d warning, %d informational\n",
 		blocking, warning, len(findings)-blocking-warning)
-	if blocking > 0 {
-		p("\nblocking findings are the eviction API refusing outright: no setting of binpack's\n")
-		p("or the autoscaler's changes them. Clearing those may be enough on its own.\n")
+	// Counted together above, because the counts line and --fail-on are about
+	// severity; closed over separately here, because the two closing lines are
+	// about what a finding is.
+	if spokenFor > 0 {
+		p("\n" + blockingClassFooter)
+	}
+	if noAutoscaler {
+		p("\n" + noAutoscalerFooter)
 	}
 
 	return errors.Join(errs...)
+}
+
+// blockingClassFooter is the report's closing sentence about the blocking
+// findings in it.
+//
+// It used to say the eviction API was refusing and that no setting changed the
+// outcome, which was false of half the codes the command can print and printed
+// a few lines under the fixes that disprove it. The eviction API deletes a bare
+// pod without complaint — binpack and the autoscaler decline by their own
+// policy — and `kubectl drain --force` clears one. What the class does have in
+// common is where the answer is: on the object.
+const blockingClassFooter = "blocking findings hold a node open until the object itself changes — a budget\n" +
+	"rewritten, a controller added, a manifest removed. Clearing them may be enough on\n" +
+	"its own.\n"
+
+// noAutoscalerFooter is the closing line for the one blocking code the
+// sentence above is not about.
+//
+// Deliberately does not assert that nothing is removing nodes: binpack reads
+// the autoscaler's own status ConfigMap, and an autoscaler running with status
+// reporting turned off is indistinguishable from none at all. Saying which is
+// which is the reader's cluster to know, not this report's.
+const noAutoscalerFooter = "no-autoscaler is the exception: it is not about an object, and until it clears,\n" +
+	"acting on the rest of this report frees no node. binpack reads the\n" +
+	"cluster-autoscaler's own status ConfigMap, so an autoscaler running with status\n" +
+	"reporting turned off looks the same from here.\n"
+
+// classFooterSpeaksFor reports whether the sentence above is a sentence about
+// this code.
+//
+// no-autoscaler is blocking — nothing removes a node without an autoscaler,
+// which is as blocking as it gets — but it is a precondition rather than
+// anything true of an object, and its remedy is a cluster setting. It gets its
+// own closing line rather than the class definition being stretched until it
+// covers both, which would leave the definition describing neither.
+func classFooterSpeaksFor(code string) bool {
+	return code != engine.FindingNoAutoscaler
 }
 
 func allFreeNothing(group []engine.Finding) bool {

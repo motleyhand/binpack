@@ -319,3 +319,151 @@ func TestDiagnoseRejectsAnUnknownFailOnBeforeReadingTheCluster(t *testing.T) {
 		t.Errorf("exit = %d for a bad flag, want 1: it is a usage error, not a verdict", code)
 	}
 }
+
+// findingFor builds one instance of a catalogued diagnosis, so a test can ask
+// what the report says about a code without knowing what produces it.
+func findingFor(d engine.Diagnosis) engine.Finding {
+	return engine.Finding{Diagnosis: d, Subject: "subject", Detail: "detail"}
+}
+
+// TestTheBlockingFooterIsTrueOfEveryBlockingCode holds the report's closing
+// sentence to the codes it is closing over.
+//
+// It is the last thing printed and, in a CI log, often the only part read —
+// and it asserted of the whole class something false of half the codes the
+// command can emit, a few lines under the fixes that disprove it. The eviction
+// API does not refuse a bare pod; it deletes it, and binpack and the
+// autoscaler decline by their own policy. `no-autoscaler` involves no eviction
+// and no pod at all, and its remedy is the one kind of change the sentence
+// said would not help.
+//
+// Severities are not what is wrong and do not move: they are a property of the
+// code and `--fail-on` depends on them. What moves is the claim made about
+// them, so this asks of each code whether the claim now holds.
+func TestTheBlockingFooterIsTrueOfEveryBlockingCode(t *testing.T) {
+	// Remedies that change something other than the object a finding is
+	// about. The class sentence promises the object is where to look, so a
+	// code the sentence speaks for cannot have its answer here.
+	settingsRatherThanObjects := []string{
+		"autoscaling is enabled",   // whether an autoscaler runs at all
+		"enable autoscaling",       // whether it manages this pool
+		"lower the pool's minimum", // the pool's configured bounds
+	}
+	names := func(fix string) string {
+		for _, phrase := range settingsRatherThanObjects {
+			if strings.Contains(fix, phrase) {
+				return phrase
+			}
+		}
+		return ""
+	}
+
+	// Obligation proper: every code the class sentence speaks for clears by a
+	// change to its own subject.
+	var spokenFor []engine.Diagnosis
+	for _, d := range engine.Diagnoses() {
+		if d.Severity != engine.Blocking || !classFooterSpeaksFor(d.Code) {
+			continue
+		}
+		spokenFor = append(spokenFor, d)
+		if phrase := names(d.Fix); phrase != "" {
+			t.Errorf("%s is blocking and the class sentence speaks for it, but its fix is "+
+				"%q — a setting, not the object. Either the sentence is wrong about it or "+
+				"it needs its own closing line", d.Code, phrase)
+		}
+	}
+	if len(spokenFor) == 0 {
+		t.Fatal("no blocking code is spoken for, so the loop above asserts nothing")
+	}
+
+	// The class sentence itself, in the report rather than in the constant:
+	// what an operator meets is the output. The claims below are spelled out
+	// literally and the two footers are matched by their constants, which is
+	// the right way round — an absence is about that exact text, a falsehood
+	// is about the words.
+	var blocking []engine.Finding
+	for _, d := range spokenFor {
+		blocking = append(blocking, findingFor(d))
+	}
+	out := closingOf(t, renderFindings(t, outputText, blocking))
+	// The other direction of the split: the exception's line is about the
+	// exception, so a report without it must not carry it. Without this the
+	// closing could be true of every code by saying everything about all of
+	// them, which is the failure the split was made to avoid.
+	if strings.Contains(out, noAutoscalerFooter) {
+		t.Errorf("a report with no no-autoscaler finding still closes by talking about "+
+			"one:\n%s", out)
+	}
+	for _, claim := range []string{"eviction API refusing", "no setting"} {
+		if strings.Contains(out, claim) {
+			t.Errorf("the footer still claims %q, which is false of a bare pod: the eviction "+
+				"API deletes one without complaint, and the refusal is binpack's own:\n%s",
+				claim, out)
+		}
+	}
+
+	// `no-autoscaler` is blocking — nothing removes a node without an
+	// autoscaler — and is a precondition rather than something about an
+	// object, so it gets its own line instead of the class definition being
+	// stretched to cover it.
+	if classFooterSpeaksFor(engine.FindingNoAutoscaler) {
+		t.Error("the class sentence speaks for no-autoscaler, whose remedy is a cluster " +
+			"setting and whose subject is no object at all")
+	}
+	var noAutoscaler engine.Diagnosis
+	for _, d := range engine.Diagnoses() {
+		if d.Code == engine.FindingNoAutoscaler {
+			noAutoscaler = d
+		}
+	}
+	// Read from the counts line down, because every finding's own summary is
+	// printed above it: an assertion over the whole report would be answered
+	// by the group body and never reach the closing line at all.
+	alone := closingOf(t, renderFindings(t, outputText, []engine.Finding{findingFor(noAutoscaler)}))
+	if strings.Contains(alone, blockingClassFooter) {
+		t.Errorf("a report whose only blocking finding is no-autoscaler still closes with "+
+			"the class sentence:\n%s", alone)
+	}
+	if !strings.Contains(alone, "cluster-autoscaler") {
+		t.Errorf("a report whose only blocking finding is no-autoscaler closes without "+
+			"mentioning the autoscaler, so the code the class sentence does not speak "+
+			"for is spoken for by nothing:\n%s", alone)
+	}
+
+	// And the guard's own negative case, twice over: the phrase list has to
+	// bite something, and it has to bite it only inside the class. Both
+	// remedies below really are settings — one turns autoscaling on for a
+	// pool, the other changes the pool's bounds — and neither is blocking, so
+	// neither is the class sentence's business.
+	for _, code := range []string{engine.FindingPoolNotAutoscaled, engine.FindingPoolAtMinimum} {
+		var found bool
+		for _, d := range engine.Diagnoses() {
+			if d.Code != code {
+				continue
+			}
+			found = true
+			if names(d.Fix) == "" {
+				t.Errorf("%s's fix no longer names a setting, so the phrase list above has "+
+					"gone stale and the loop it guards passes vacuously", code)
+			}
+			if d.Severity == engine.Blocking {
+				t.Errorf("%s is now blocking, so it is the class sentence's business "+
+					"after all", code)
+			}
+		}
+		if !found {
+			t.Errorf("%s is gone; the negative case needs a replacement", code)
+		}
+	}
+}
+
+// closingOf returns what the report says after its counts line, which is where
+// the sentences about a whole class live.
+func closingOf(t *testing.T, out string) string {
+	t.Helper()
+	_, closing, found := strings.Cut(out, "informational\n")
+	if !found {
+		t.Fatalf("no counts line to read the closing sentences from:\n%s", out)
+	}
+	return closing
+}

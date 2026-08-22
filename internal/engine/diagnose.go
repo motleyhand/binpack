@@ -174,8 +174,19 @@ var diagnoses = map[string]Diagnosis{
 		Severity: Blocking,
 		Summary: "these pods have no controller, so evicting one would delete it permanently " +
 			"and nothing will try",
-		Fix: "give the pod a controller — a Deployment or a Job — or accept that its node " +
-			"cannot be drained while it is there.",
+		// A Job is named with its caveat rather than dropped, because it is
+		// the right answer for work that ends and the wrong one bare: an
+		// eviction stamps DisruptionTarget and the Job controller counts a
+		// deleted pod as a failure, so a Job at its backoffLimit — 0 for the
+		// migrations and chart hooks this advice reaches — replaces nothing.
+		// Recommending it unqualified would send the reader from one pod
+		// nothing recreates to another.
+		Fix: "give the pod a controller that will recreate it: a Deployment, or — for work " +
+			"that ends — a Job carrying podFailurePolicy: [{action: Ignore, onPodConditions: " +
+			"[{type: DisruptionTarget}]}], which Kubernetes permits only alongside " +
+			"restartPolicy: Never. Without that policy an eviction spends the Job's failure " +
+			"budget, and a Job that runs out creates no replacement. Otherwise accept that " +
+			"the node cannot be drained while the pod is there.",
 	},
 	BlockedMirrorPod: {
 		Severity: Blocking,
@@ -707,9 +718,12 @@ func diagnoseNodes(s Snapshot) []Finding {
 		if err != nil || !s.Now.Before(until) {
 			continue
 		}
+		// The attempt count, in the same words the skip reason uses: explain
+		// reads one and diagnose the other, and the operator meeting both is
+		// the same person reading about the same node.
 		findings = append(findings, finding(FindingNodeInBackoff, node.Name,
-			fmt.Sprintf("until %s, after: %s", until.Format(time.RFC3339),
-				node.Annotations[AnnotationLastFailure])))
+			fmt.Sprintf("until %s%s, after: %s", until.Format(time.RFC3339),
+				attemptClause(node), node.Annotations[AnnotationLastFailure])))
 	}
 
 	return findings

@@ -56,8 +56,14 @@ The most common single cause, and a one-line check:
 kubectl get pdb -A
 ```
 
-Any row with `ALLOWED DISRUPTIONS: 0` is pinning its node. If the workload has one replica, it
-is pinned permanently — see
+A row with `ALLOWED DISRUPTIONS: 0` is where to look next, not the answer by itself: a budget
+that selects no pods reports zero too, and pins nothing. Settle which you have with
+`kubectl get pdb -n NS NAME -o jsonpath='{.status.expectedPods}'` — zero means the selector
+matches nothing — or with `binpack diagnose`, which separates them as `pdb-zero-disruptions` and
+`pdb-selects-nothing` across the cluster.
+
+Where the budget does select pods and the workload has one replica, its node is pinned
+permanently — see
 [the PodDisruptionBudget that costs you money](../explanation/the-poddisruptionbudget-that-costs-money.md).
 
 ## 3. Read the events the autoscaler leaks

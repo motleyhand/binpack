@@ -194,3 +194,37 @@ binpack evicts one pod at a time and waits for each replacement to be scheduled 
 the next, so a wrong prediction costs one eviction rather than all of them, and shows up as an
 abandoned drain naming the pod that could not be placed. It makes a scale-up unlikely and
 immediately detectable. It cannot make one impossible.
+
+### Batch work
+
+binpack's guard against destroying a pod is that something will recreate it: a pod with a
+controlling owner is safe to move, one without is refused outright. A Job pod passes that guard
+and is relocated like any other — but the Job controller is the one kind that stops recreating.
+
+An eviction adds the `DisruptionTarget` condition to the pod, and the Job controller counts a
+deleted pod as a failure. Once `.status.failed` passes `.spec.backoffLimit` the Job is terminally
+`Failed` and starts nothing, so the work is lost rather than moved. `backoffLimit: 0` is the
+ordinary setting for a database migration, a Helm `pre-upgrade` hook or a one-shot CI Job. The
+commoner and milder version is a Job with budget left: the work is redone from the beginning.
+
+binpack cannot see any of this. It reads a Job's pod template to predict what a replacement would
+request, and not its status, so it has no way to know how much failure budget is left. Nor is
+this worse than what a node upgrade or a spot reclaim does to the same Job. It is a cost the
+simulation does not weigh, which makes it yours to weigh.
+
+The upstream remedy makes the Job drain-safe against every disruption, not only binpack's:
+
+```yaml
+spec:
+  podFailurePolicy:
+    rules:
+      - action: Ignore
+        onPodConditions:
+          - type: DisruptionTarget
+  template:
+    spec:
+      restartPolicy: Never   # Kubernetes permits podFailurePolicy only with this
+```
+
+With that rule the disruption does not count against the Job's backoff budget, so a replacement
+pod starts instead of the Job failing.
