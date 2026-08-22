@@ -21,8 +21,9 @@ type SimConfig struct {
 	ExpendablePriorityCutoff int32
 
 	// ReserveForLargestPod requires that, after the drain, some node still
-	// has room for a pod the size of the largest relocatable pod in the
-	// cluster.
+	// has room for a pod of every maximal shape among the relocatable pods
+	// running in the cluster. See [checkHeadroom] for why that is not "the
+	// largest pod".
 	ReserveForLargestPod bool
 }
 
@@ -227,7 +228,7 @@ func Simulate(
 	}
 
 	if cfg.ReserveForLargestPod {
-		if blocked := checkHeadroom(pods, templates, destinations, remaining, residents, cfg); blocked != nil {
+		if blocked := checkHeadroom(pods, templates, destinations, remaining, cfg); blocked != nil {
 			sim.Blocked = blocked
 			return sim
 		}
@@ -289,33 +290,144 @@ func place(
 }
 
 // checkHeadroom enforces ReserveForLargestPod: after the drain, some node must
-// still be able to take a pod the size of the largest relocatable one running
-// in the cluster.
+// still be able to take a pod of every shape the cluster's relocatable
+// workloads would be recreated at.
 //
 // This exists instead of a percentage of headroom. A percentage is blind to
 // absolute capacity — the objection binpack raises against the descheduler —
 // and the risk being guarded against is not "the cluster is full" but "the
 // next pod that restarts cannot be placed", which is a question about bytes.
+//
+// "The largest pod" is the shape that question wants and it does not exist.
+// Across more than one resource there is no maximum, only maximal elements: a
+// 7-core pod requesting 2Gi and a 500m pod requesting 24Gi are both largest,
+// each in its own dimension, and neither one's placement says anything about
+// the other's. Keyed on memory alone this reserved room for the second and
+// approved a drain leaving nowhere for the first — a cluster bound by CPU, by
+// a GPU or by the pod cap got a margin measured in the dimension that was not
+// running out, while the operator was told they had the guard. So the check
+// asks about every shape on the Pareto frontier of relocatable replacements,
+// and one has to be found room for all of them.
 func checkHeadroom(
 	pods []*corev1.Pod,
 	templates map[OwnerRef]*corev1.PodTemplateSpec,
 	destinations []*corev1.Node,
 	remaining map[string]corev1.ResourceList,
-	residents map[string][]*corev1.Pod,
 	cfg SimConfig,
 ) *Blocked {
-	// Sized as replacements, like every other placement question: this asks
-	// whether a pod of that shape could be *created* somewhere, and a pod
-	// resized downward in place would otherwise understate the margin by
-	// exactly the amount that matters.
-	//
-	// A pod whose template cannot be read blocks the proof rather than being
-	// skipped. It may be the largest replacement in the cluster, and the
-	// reserve is a lower bound on space that must remain: under-estimating it
-	// approves a drain that should have been refused, which is a wrong answer
-	// and not a missed one. Skipping had that backwards.
-	var largest, largestRunning *corev1.Pod
+	shapes, blocked := relocatableShapes(pods, templates, cfg)
+	if blocked != nil {
+		return blocked
+	}
+
+	for _, shape := range maximalShapes(shapes) {
+		// Asked about a pod of that *shape*, not about that pod. The reserve
+		// is a margin — "leave room for something as big as your biggest
+		// workload" — and was never a claim that one specific pod must be
+		// placeable.
+		//
+		// The difference is not academic. A StatefulSet's claim makes its pod
+		// unmodellable to fit, so asking about the pod itself refuses every
+		// destination on every cluster with a PVC-backed StatefulSet, turning
+		// the default reserve into "never drain anything" — and reporting it
+		// as "no room", which is not what happened.
+		//
+		// Size still comes from the real replacement, so nothing is
+		// under-estimated: only the constraints that make a specific pod
+		// unplaceable are dropped. Built here rather than in the scan because
+		// a probe costs an allocation per container, and the frontier has
+		// already discarded all but a handful of the shapes that reached it.
+		probe := sizeProbe(shape.replacement)
+
+		// What was observed, rather than what it would mean. Every destination
+		// refusing is not the same as the cluster being full: three of them may
+		// be cordoned.
+		refusals := make(map[string]string, len(destinations))
+		accepted := false
+		for _, node := range destinations {
+			// Neither an anti-affinity index nor the destination's residents,
+			// and that is the point of both arguments being nil rather than
+			// merely convenient. Both carry the same thing — some *other*
+			// pod's required anti-affinity, evaluated against this one's
+			// identity — and identity is what a probe deliberately has none
+			// of. Handed either, one zone-scoped term matching the biggest
+			// workload in the cluster vetoes the margin on every node in the
+			// zone, and one per-node singleton with hard self-anti-affinity
+			// vetoes it on every node it runs on. Both report it as "no room",
+			// which is the failure the probe exists to avoid, and both are
+			// questions the reserve is not asking.
+			ok, reason := fit.CanFit(probe, node, remaining[node.Name], nil, nil)
+			if ok {
+				accepted = true
+				break
+			}
+			refusals[node.Name] = headroomRefusal(reason, shape.running)
+		}
+		if !accepted {
+			return &Blocked{
+				Pod:     shape.running,
+				PerNode: refusals,
+				Summary: fmt.Sprintf(
+					"no destination would accept a pod the size of %s/%s, which nothing "+
+						"relocatable in the cluster is larger than in every resource",
+					shape.running.Namespace, shape.running.Name),
+			}
+		}
+	}
+	return nil
+}
+
+// headroomShape is one relocatable replacement's resource shape, together with
+// the pod it was read from so that a refusal names an object an operator can go
+// and look at.
+type headroomShape struct {
+	// running is the pod in the cluster, not the replacement: a replacement
+	// carries the running pod's ObjectMeta but exists nowhere.
+	running *corev1.Pod
+	// replacement is the pod its controller would create, which [sizeProbe]
+	// reduces to a probe once the frontier has decided this shape is worth
+	// asking about.
+	replacement *corev1.Pod
+	// requests is what a probe of it would ask for, read once because the
+	// frontier compares every shape against every other. Reading it from the
+	// replacement rather than from the probe is the same number: sizeProbe
+	// keeps exactly the fields resource.PodRequests looks at, which is what
+	// TestTheProbeCarriesEverySourceOfSize is there to hold it to.
+	requests corev1.ResourceList
+}
+
+// relocatableShapes collects one entry per distinct replacement shape among the
+// relocatable pods running in the cluster.
+//
+// Sized as replacements, like every other placement question: this asks whether
+// a pod of that shape could be *created* somewhere, and a pod resized downward
+// in place would otherwise understate the margin by exactly the amount that
+// matters.
+//
+// A pod whose template cannot be read blocks the proof rather than being
+// skipped. Its shape may be one nothing has room for, and the reserve is a
+// lower bound on space that must remain: under-estimating it approves a drain
+// that should have been refused, which is a wrong answer and not a missed one.
+// Skipping had that backwards.
+//
+// Unbound pods are skipped, which every sibling loop already does —
+// indexPodsByNode has the guard, and diagnose writes the reason out. A pod the
+// scheduler has never placed consumes nothing on any node and is not a pod that
+// will restart, so admitting one to the reserve let a single replica with a
+// memory typo in its template refuse every drain in the cluster for ever, and
+// report it as "no room". The documented promise says *running* in the cluster;
+// this is the code agreeing with it.
+func relocatableShapes(
+	pods []*corev1.Pod,
+	templates map[OwnerRef]*corev1.PodTemplateSpec,
+	cfg SimConfig,
+) ([]headroomShape, *Blocked) {
+	shapes := make([]headroomShape, 0, len(pods))
+	seen := make(map[OwnerRef]int, len(pods))
 	for _, pod := range pods {
+		if pod.Spec.NodeName == "" {
+			continue
+		}
 		if !Occupies(pod) || Classify(pod, cfg.ExpendablePriorityCutoff) != Relocatable {
 			continue
 		}
@@ -325,7 +437,7 @@ func checkHeadroom(
 		// size to reserve for.
 		next, ok := sizedReplacement(pod, templates)
 		if !ok {
-			return &Blocked{
+			return nil, &Blocked{
 				Pod: pod,
 				Summary: fmt.Sprintf(
 					"%s/%s has no readable controller template, so binpack cannot tell how much "+
@@ -333,63 +445,171 @@ func checkHeadroom(
 				NoTemplate: true,
 			}
 		}
-		// Total, like the two orderings above: a Deployment's replicas are
-		// the same size as each other, so this maximum ties as a matter of
-		// course, and a maximum settled by list order probes one shape
-		// through the controller and another through `explain`.
-		if largest == nil || cmp.Or(
-			cmp.Compare(memoryOf(next), memoryOf(largest)),
-			cmp.Compare(podRef(pod), podRef(largestRunning)),
-		) > 0 {
-			largest, largestRunning = next, pod
+		shape := headroomShape{
+			running: pod, replacement: next, requests: fit.EffectiveRequests(next),
+		}
+
+		// A workload's replicas are the same shape as each other, and on a real
+		// cluster that is most of the list: collapsing them here is what keeps
+		// the frontier below quadratic in *pods* rather than in workloads.
+		//
+		// Checked rather than assumed, which is the whole reason the key is not
+		// the owner reference on its own. sizedReplacement raises each
+		// replica's requests to what that replica is actually running, so a
+		// replica an in-place resize or an admission webhook has touched is
+		// genuinely a different shape from its siblings — and keeping an
+		// arbitrary one of a group that is not really uniform would reserve for
+		// the smaller and lose exactly the margin this check exists to hold.
+		// Owned, always: sizedReplacement has already refused a pod with no
+		// controller to read a template from.
+		ref, _ := ControllerOf(pod)
+		if at, ok := seen[ref]; ok && sameShape(shapes[at], shape) {
+			// The lowest name of the group, not the first one listed, because
+			// this is the pod a refusal will name.
+			if podRef(shape.running) < podRef(shapes[at].running) {
+				shapes[at] = shape
+			}
+			continue
+		}
+		seen[ref] = len(shapes)
+		shapes = append(shapes, shape)
+	}
+	// Total, like every other ordering in the engine. Two workloads of the same
+	// shape tie in the frontier below, which keeps one of them and names it in
+	// a refusal — and a tie settled by list order names one pod through the
+	// controller, whose snapshot comes from a watch-backed cache in Go map
+	// order, and another through `explain`, whose comes from a live client in
+	// storage-key order.
+	slices.SortFunc(shapes, func(a, b headroomShape) int {
+		return cmp.Compare(podRef(a.running), podRef(b.running))
+	})
+	return shapes, nil
+}
+
+// maximalShapes reduces the cluster's relocatable shapes to the ones worth
+// probing: those no other shape is at least as large as in every resource.
+//
+// Proving room for a shape proves room for everything it dominates, so the
+// frontier is the whole of what the reserve has to ask, and it is a handful of
+// shapes on a cluster with a handful of workload sizes: anything smaller than
+// something else in every dimension collapses into it. That matters, because
+// each survivor costs one sweep of the destinations and [assess] simulates every
+// candidate node rather than stopping at the first that works.
+//
+// Quadratic, and in the number of shapes rather than of pods, which is what
+// [relocatableShapes] having already collapsed each workload's replicas buys.
+// Left quadratic because the input is workload-sized: a sort by any one
+// resource does not order a frontier, so the alternatives are a divide and
+// conquer whose crossover point is far above any cluster this runs on.
+func maximalShapes(shapes []headroomShape) []headroomShape {
+	out := make([]headroomShape, 0, len(shapes))
+	for i, shape := range shapes {
+		dominated := false
+		for j, other := range shapes {
+			if i != j && dominates(other, shape) {
+				dominated = true
+				break
+			}
+		}
+		if !dominated {
+			out = append(out, shape)
 		}
 	}
-	if largest == nil {
-		return nil
+	return out
+}
+
+// dominates reports whether room for a is room for b as well.
+//
+// True when a asks for at least as much of everything b asks for. The claim it
+// licenses is about what fit will answer, so it holds only because a probe is
+// built from a fixed field list and carries nothing else that fit reads: of
+// those, tolerations are the one field that is not a quantity, and they have to
+// match exactly. Tolerations are permissions rather than demands, so a bigger
+// pod tolerating less is not a harder pod to place — it is a different question
+// — and comparing the two would be comparing a maximum with a minimum. Grouping
+// by equality costs a missed collapse where one workload's tolerations are a
+// superset of another's, which is a probe binpack does not skip rather than an
+// answer it gets wrong.
+//
+// The pod slot takes part and can never decide anything, which is the whole
+// difference between a frontier and the maximum [difficultyOf] deliberately
+// hides it from. fit.EffectiveRequests synthesises `pods: 1` for every pod, so
+// under a maximum that share grows to outweigh every real demand as a node
+// fills and censors the dimensions that can rank. Under domination an axis
+// every shape ties on is inert: it never blocks a domination, because equal
+// satisfies "at least as much", and it never establishes one, because equal is
+// not strictly more. Excluding it would change no answer and would invite the
+// reader to think the reserve does not hold a slot — it does, and it must:
+// fit.CanFit checks `pods` against what is left like any other resource, so a
+// destination at its kubelet cap refuses the probe however much memory it has.
+//
+// Ties are broken by name, and that clause is a dedupe rather than a decision:
+// equal shapes give equal answers, and [relocatableShapes] has already put them
+// in name order, so which one a refusal names is settled with or without it.
+// What it settles is how many sweeps run. Without it neither of two equal
+// shapes is strictly larger, so neither dominates, so both survive — and a
+// Deployment's replicas are equal shapes, which is most of the cluster.
+func dominates(a, b headroomShape) bool {
+	if !sameTolerations(a, b) {
+		return false
 	}
 
-	// Asked about a pod of that *shape*, not about that pod. The reserve is a
-	// margin — "leave room for something as big as your biggest workload" —
-	// and was never a claim that one specific pod must be placeable.
-	//
-	// The difference is not academic. A StatefulSet's claim makes its pod
-	// unmodellable to fit, so asking about the pod itself refuses every
-	// destination on every cluster with a PVC-backed StatefulSet, turning the
-	// default reserve into "never drain anything" — and reporting it as "no
-	// room", which is not what happened.
-	//
-	// Size still comes from the real replacement, so nothing is
-	// under-estimated: only the constraints that make a specific pod
-	// unplaceable are dropped.
-	probe := sizeProbe(largest)
-
-	// No anti-affinity index, and that is the point of the parameter being
-	// absent rather than nil at the call site. sizeProbe rebuilds the spec to
-	// hold only size but copies ObjectMeta wholesale, so the probe still
-	// carries the largest workload's labels and namespace — and an index keyed
-	// on those reads it as that workload. One zone-scoped term matching the
-	// biggest thing in the cluster would then veto the margin on every node in
-	// the zone and report it as "no room", which is the failure this whole
-	// function's probe exists to avoid.
-	refusals := make(map[string]string, len(destinations))
-	for _, node := range destinations {
-		ok, reason := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name], nil)
-		if ok {
-			return nil
+	strictly := false
+	for name, want := range b.requests {
+		// A zero request is not a demand, and fit skips it for the same
+		// reason: a node that does not advertise the resource still satisfies
+		// asking for none of it.
+		if want.IsZero() {
+			continue
 		}
-		refusals[node.Name] = headroomRefusal(reason)
+		have, present := a.requests[name]
+		if !present || have.Cmp(want) < 0 {
+			return false
+		}
+		if have.Cmp(want) > 0 {
+			strictly = true
+		}
 	}
+	// A resource a needs and b does not makes a strictly larger, which is what
+	// keeps a GPU shape on the frontier beside a memory-heavier one.
+	for name, have := range a.requests {
+		if _, present := b.requests[name]; !present && !have.IsZero() {
+			strictly = true
+		}
+	}
+	if strictly {
+		return true
+	}
+	return podRef(a.running) < podRef(b.running)
+}
 
-	// What was observed, rather than what it would mean. Every destination
-	// refusing is not the same as the cluster being full: three of them may
-	// be cordoned.
-	return &Blocked{
-		Pod:     largestRunning,
-		PerNode: refusals,
-		Summary: fmt.Sprintf(
-			"no destination would accept a pod the size of %s/%s, the largest in the cluster",
-			largestRunning.Namespace, largestRunning.Name),
+// sameShape reports whether two replacements would produce the same probe, as
+// far as anything fit reads is concerned.
+//
+// Only ever asked of two replicas of one workload, where it is nearly always
+// true. It exists so that "nearly" is not "always": see [relocatableShapes].
+func sameShape(a, b headroomShape) bool {
+	if len(a.requests) != len(b.requests) || !sameTolerations(a, b) {
+		return false
 	}
+	for name, want := range a.requests {
+		have, present := b.requests[name]
+		if !present || have.Cmp(want) != 0 {
+			return false
+		}
+	}
+	return true
+}
+
+// sameTolerations compares the one field of a probe that is not a quantity.
+//
+// Order-sensitive, because a semantic comparison of two lists as sets is more
+// machinery than the answer is worth: two workloads listing the same
+// tolerations in a different order are a collapse binpack does not make, which
+// costs a probe rather than an answer.
+func sameTolerations(a, b headroomShape) bool {
+	return equality.Semantic.DeepEqual(
+		a.replacement.Spec.Tolerations, b.replacement.Spec.Tolerations)
 }
 
 // headroomRefusal says why one destination would not take the probe.
@@ -400,16 +620,16 @@ func checkHeadroom(
 // something an operator can act on — reported as "no room" it becomes a
 // capacity claim about a node with tens of gigabytes free, and none of the
 // responses that invites (raise the pool maximum, add a node, turn the reserve
-// off) touches the thing that actually refused. It is also what makes a
-// cluster whose spare capacity sits in a tainted pool undiagnosable: the probe
-// carries no tolerations by construction, so it refuses there for ever.
+// off) touches the thing that actually refused.
 //
 // The shortfall is the one message that is not enough by itself. fit says
 // which resource ran out; the reserve has to add how much of it was being
-// asked for, because that is the whole of what this check is about.
-func headroomRefusal(r fit.Reason) string {
+// asked for, because that is the whole of what this check is about — and it
+// names the pod, because there is more than one shape being asked about and
+// "the largest" would not say which.
+func headroomRefusal(r fit.Reason, running *corev1.Pod) string {
 	if r.Code == fit.ReasonInsufficient {
-		return r.Message + " for a pod the size of the largest relocatable one"
+		return r.Message + " for a pod the size of " + podRef(running)
 	}
 	return r.Message
 }
@@ -444,12 +664,16 @@ func indexPodsByNode(pods []*corev1.Pod) map[string][]*corev1.Pod {
 }
 
 // memoryOf sizes a pod in the one dimension that is almost always the binding
-// constraint. It is what [workloadOn] totals to rank nodes, and what the
-// reserve maximises to choose the shape it holds room for.
+// constraint. It is what [workloadOn] totals to rank nodes, and its only
+// caller now.
 //
-// The packing uses [difficultyOf] instead: "largest" has no meaning across
-// dimensions, and choosing one privileges whichever cluster happens to be
-// bound by it.
+// Neither of the two questions about *pods* uses it any more, and for the same
+// reason: "largest" has no meaning across dimensions, so choosing one
+// privileges whichever cluster happens to be bound by it. The packing ranks by
+// [difficultyOf] and the reserve asks about a frontier rather than a maximum.
+// Ordering nodes is the case that survives, because a node is being compared
+// against other nodes of much the same shape and nothing is claimed about the
+// answer beyond which one to try first.
 func memoryOf(pod *corev1.Pod) int64 {
 	requests := fit.EffectiveRequests(pod)
 	mem := requests[corev1.ResourceMemory]
@@ -832,7 +1056,8 @@ func hardSpread(cs []corev1.TopologySpreadConstraint) []corev1.TopologySpreadCon
 	return out
 }
 
-// sizeProbe is a pod carrying the resource shape of another and nothing else.
+// sizeProbe is a pod carrying the resource shape of another, and the
+// permissions it would be placed with, and nothing else.
 //
 // Rebuilt field by field rather than copied and stripped, because the question
 // is which fields *contribute to size* and everything else is a liability. A
@@ -845,6 +1070,35 @@ func hardSpread(cs []corev1.TopologySpreadConstraint) []corev1.TopologySpreadCon
 // containers, the init-container peak, native sidecars kept running (hence
 // their restart policy), RuntimeClass overhead, and pod-level requests where
 // the cluster has them.
+//
+// Tolerations are kept, and they are the exception the rule needed. A
+// toleration is a *permission*, not a constraint: dropping one cannot make the
+// probe fit where the real replacement would not, only make it refusable by
+// taints the replacement tolerates. So the probe was strictly harder to place
+// than the pod it stood for wherever taints exist at all, and a cluster whose
+// spare capacity sits in a tainted pool — a batch pool, a GPU pool, an ARM
+// pool, a wholly tainted single-pool cluster — failed the reserve for ever and
+// was told "no room" about nodes that were empty.
+//
+// ObjectMeta is rebuilt too, and for the same reason as the spec: labels are
+// not size. Copied wholesale, they let a *resident's* required anti-affinity
+// select the probe as the workload it was taken from, so a workload running
+// one hard-anti-affine replica per node — the ordinary way to get per-node
+// placement without a DaemonSet — refused the margin on every node it ran on.
+// Namespace and name stay because a refusal has to name something an operator
+// can look at.
+//
+// That failure is closed twice over, at two different levels, and deliberately:
+// [checkHeadroom] hands fit no residents and no domain index, so it does not
+// ask the identity question, and this drops the labels, so the probe carries no
+// answer to it. Either alone is enough today, which means neither is
+// individually observable and a mutation sweep will report both as surviving —
+// equivalent mutants rather than gaps. They are kept because they fail
+// differently under change: the call site is what a reader weighing "should the
+// reserve see residents?" will find and reason about, and this is what stops a
+// future check that reads labels from quietly reopening the same door. This is
+// the fourth route to "one workload blocks every drain" that the probe was
+// built to close; the pattern has earned two locks.
 func sizeProbe(pod *corev1.Pod) *corev1.Pod {
 	shape := func(cs []corev1.Container, keepRestartPolicy bool) []corev1.Container {
 		out := make([]corev1.Container, 0, len(cs))
@@ -859,7 +1113,7 @@ func sizeProbe(pod *corev1.Pod) *corev1.Pod {
 	}
 
 	return &corev1.Pod{
-		ObjectMeta: *pod.ObjectMeta.DeepCopy(),
+		ObjectMeta: metav1.ObjectMeta{Namespace: pod.Namespace, Name: pod.Name},
 		Spec: corev1.PodSpec{
 			Containers: shape(pod.Spec.Containers, false),
 			// A native sidecar is an init container with an Always restart
@@ -868,6 +1122,7 @@ func sizeProbe(pod *corev1.Pod) *corev1.Pod {
 			InitContainers: shape(pod.Spec.InitContainers, true),
 			Overhead:       pod.Spec.Overhead.DeepCopy(),
 			Resources:      pod.Spec.Resources.DeepCopy(),
+			Tolerations:    slices.Clone(pod.Spec.Tolerations),
 		},
 	}
 }

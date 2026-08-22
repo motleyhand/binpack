@@ -207,12 +207,26 @@ priority below this cutoff — that breaks warm-capacity replenishment entirely.
 ### `policy.feasibility.reserveForLargestPod`
 
 When `true`, a drain is only considered feasible if, afterwards, some schedulable node still has
-room for a pod the size of the largest relocatable pod running in the cluster.
+room for a pod of every *maximal* shape among the relocatable pods running in the cluster.
+
+Not "the largest pod", because across more than one resource a cluster does not have one. A pod
+asking for 7 cores and 2Gi and a pod asking for 500m and 24Gi are each the largest, in their own
+dimension, and finding room for either says nothing about the other. The maximal shapes are the
+ones no other relocatable pod is at least as large as in *every* resource — a handful even on a
+large cluster, since a workload's replicas are one shape and anything smaller in every dimension
+than something else is covered by it. Each one has to have a destination, or the drain is
+refused. Pods the scheduler has never placed do not count towards it: the promise is about the
+pods running.
 
 This exists instead of a percentage of headroom. A percentage is blind to absolute capacity —
 the same objection binpack raises against the descheduler — and the risk being guarded against
 is not "the cluster is full" but "the next pod that restarts cannot be placed", which is a
 question about bytes.
+
+When a drain is refused for this reason, `binpack explain` names the pod whose shape had nowhere
+to go and what each node said. That pod may not be the one you would expect: if the cluster is
+bound by CPU, by a GPU pool or by the kubelet pod cap rather than by memory, the shape that runs
+out of room is the one maximal in *that* resource.
 
 Set it to `false` to pack as tightly as the arithmetic allows. Expect the cluster to scale up
 sooner after any restart.

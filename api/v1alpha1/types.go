@@ -114,8 +114,14 @@ type Feasibility struct {
 	ExpendablePriorityCutoff *int32 `json:"expendablePriorityCutoff,omitempty"`
 
 	// ReserveForLargestPod requires that, after a drain, some schedulable
-	// node still has room for a pod the size of the largest relocatable pod
-	// running in the cluster.
+	// node still has room for a pod of every maximal shape among the
+	// relocatable pods running in the cluster.
+	//
+	// Not "the largest pod": across more than one resource a cluster does not
+	// have one, only maximal ones. A 7-core pod and a 24Gi pod are each the
+	// largest in their own dimension, and room for either says nothing about
+	// the other, so the check asks about every shape no other relocatable pod
+	// is at least as large as in every resource.
 	//
 	// This replaces a percentage of headroom deliberately. A percentage is
 	// blind to absolute capacity — the same objection binpack raises against

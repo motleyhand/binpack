@@ -273,7 +273,7 @@ func TestReserveForLargestPod(t *testing.T) {
 		t.Fatal("packing the cluster to the last byte leaves nowhere for the next pod that restarts")
 	}
 	if reserved.Blocked == nil || reserved.Blocked.Pod.Name != "moving" {
-		t.Errorf("the headroom refusal should name the largest relocatable pod, got %+v", reserved.Blocked)
+		t.Errorf("the headroom refusal should name the shape that had nowhere to go, got %+v", reserved.Blocked)
 	}
 }
 
@@ -1106,8 +1106,8 @@ func TestANodeTheAutoscalerIsRemovingIsNotADestination(t *testing.T) {
 // TestHeadroomNamesWhyEachDestinationRefused is the difference between an
 // operator raising a pool maximum and an operator removing a taint.
 //
-// The reserve probes every destination with a pod the size of the largest
-// relocatable one, and fit answers with the wall each node hit — cordoned, not
+// The reserve probes every destination with a pod of each maximal relocatable
+// shape, and fit answers with the wall each node hit — cordoned, not
 // Ready, tainted, or genuinely short. Reporting all four as "no room" is a
 // capacity claim about a node with 64Gi free, and none of the responses it
 // invites touches the thing that actually refused.
@@ -1138,18 +1138,20 @@ func TestHeadroomNamesWhyEachDestinationRefused(t *testing.T) {
 	// The other direction, and the one a wholesale switch to fit's message
 	// would lose: a genuine shortfall has to keep saying what was being asked
 	// for. "insufficient memory" alone leaves the reader without the size,
-	// which is the number the reserve is about.
+	// which is the number the reserve is about. It names the pod rather than
+	// saying "the largest", because the reserve asks about every maximal shape
+	// in the cluster and there is generally more than one.
 	short := sim.Blocked.PerNode["tight"]
 	if !strings.Contains(short, "memory") {
 		t.Errorf("tight refused with %q, want the resource it ran out of", short)
 	}
-	if !strings.Contains(short, "largest") {
-		t.Errorf("tight refused with %q, want the size the reserve was asking about", short)
+	if !strings.Contains(short, "default/moving") {
+		t.Errorf("tight refused with %q, want the shape the reserve was asking about", short)
 	}
 	// And only there. A node that refused for a taint refused whatever size
 	// was being asked for, so pinning the reserve's question onto its sentence
 	// would put a capacity claim back on a node with 64Gi free.
-	if strings.Contains(sim.Blocked.PerNode["roomy"], "largest") {
+	if strings.Contains(sim.Blocked.PerNode["roomy"], "a pod the size of") {
 		t.Errorf("roomy refused with %q, which reads as a shortfall and is not one",
 			sim.Blocked.PerNode["roomy"])
 	}
@@ -1352,10 +1354,12 @@ func TestTheReservedShapeDoesNotDependOnInputOrder(t *testing.T) {
 
 	small := mother.Pod("default", "small",
 		mother.OnNode("candidate"), mother.Requests("100m", "1Gi"))
-	// Equal memory, opposite CPU. Whichever of the two is picked as "largest"
-	// decides the verdict — after the drain no node has room for an 8-core
-	// replacement and every node has room for a 100m one — and memory alone
-	// cannot separate them.
+	// Equal memory, opposite CPU: after the drain no node has room for an
+	// 8-core replacement and every node has room for a 100m one, and memory
+	// alone cannot separate them. Under a memory-keyed maximum which of the two
+	// won decided the verdict; the frontier settles it instead, since the wide
+	// one is at least as large in every resource. Either way the answer must
+	// not turn on how the pods were listed, which is what this asserts.
 	wide := mother.Pod("default", "wide-one",
 		mother.OnNode("host-a"), mother.Requests("8", "4Gi"))
 	narrow := mother.Pod("default", "narrow-one",
@@ -1369,21 +1373,34 @@ func TestTheReservedShapeDoesNotDependOnInputOrder(t *testing.T) {
 	cfg.ReserveForLargestPod = true
 
 	// Both orders must agree; which verdict they agree on is the reserve's own
-	// question and not this test's.
+	// question and not this test's. The reported shape has to agree too: the
+	// reserve asks about a frontier rather than a maximum, so both the frontier
+	// and the one member of it a refusal names have to be order-independent,
+	// and an Event naming a different pod on each evaluation of an unchanged
+	// cluster is the same defect wearing a smaller hat.
 	var want *bool
+	var named string
 	for _, pods := range [][]*corev1.Pod{
 		{small, filler, wide, narrow},
 		{small, filler, narrow, wide},
 	} {
 		sim := engine.Simulate([]*corev1.Node{candidate, hostA, hostB}, pods,
 			mother.Templates(pods...), candidate, cfg)
+		blamed := ""
+		if sim.Blocked != nil && sim.Blocked.Pod != nil {
+			blamed = sim.Blocked.Pod.Name
+		}
 		if want == nil {
-			want = &sim.Feasible
+			want, named = &sim.Feasible, blamed
 			continue
 		}
 		if sim.Feasible != *want {
 			t.Errorf("Feasible = %t, want %t — the same two pods, listed the other way round",
 				sim.Feasible, *want)
+		}
+		if blamed != named {
+			t.Errorf("blocked on %q, want %q — the same two pods, listed the other way round",
+				blamed, named)
 		}
 	}
 }
@@ -1492,5 +1509,336 @@ func TestEquallyEmptyDestinationsAreTriedInNameOrder(t *testing.T) {
 	}
 	if got := sim.Relocated[0].Node.Name; got != "alpha" {
 		t.Errorf("placed on %s, want alpha — the tie is arbitrary, but it must be fixed", got)
+	}
+}
+
+// TestTheReserveIsNotJustAboutMemory holds the CPU landscape fixed and varies
+// one unrelated pod's memory request.
+//
+// The reserve probes with a full resource shape but *chose* that shape by
+// memory alone, so the check was multi-dimensional and the choice of what to
+// check was not. The two clusters below differ in exactly one number — how
+// much memory default/thin asks for — and that number has no bearing on
+// whether a seven-core replacement can be placed anywhere. In both, no
+// destination has seven free cores after the drain, so binpack must refuse
+// both. Keyed on memory it refuses the first and approves the second, which is
+// the defect stated as a pair: the same CPU landscape, two different answers.
+func TestTheReserveIsNotJustAboutMemory(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// The only difference between the two clusters.
+		thinMemory string
+	}{
+		{"control", "1Gi"},
+		{"experiment", "24Gi"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := wideNode("candidate", "8", "32Gi")
+			dest := wideNode("dest", "8", "32Gi")
+			other := wideNode("other", "8", "32Gi")
+
+			small := mother.Pod("default", "small",
+				mother.OnNode("candidate"), mother.Requests("100m", "1Gi"))
+			// The CPU-largest pod in the cluster, and the one whose
+			// replacement has nowhere to go once the drain is done.
+			fatCPU := mother.Pod("default", "fat-cpu",
+				mother.OnNode("dest"), mother.Requests("7", "2Gi"))
+			// Present so that the *other* destination has no seven free cores
+			// either. Without it the reserve is satisfiable and the pair
+			// demonstrates nothing.
+			filler := mother.Pod("default", "filler",
+				mother.OnNode("other"), mother.Requests("7", "1Gi"))
+			thin := mother.Pod("default", "thin",
+				mother.OnNode("other"), mother.Requests("500m", tc.thinMemory))
+
+			pods := []*corev1.Pod{small, fatCPU, filler, thin}
+
+			cfg := defaultCfg()
+			cfg.ReserveForLargestPod = true
+
+			sim := engine.Simulate([]*corev1.Node{candidate, dest, other}, pods,
+				mother.Templates(pods...), candidate, cfg)
+
+			if sim.Feasible {
+				t.Fatalf("approved a drain leaving no node able to hold a seven-core replacement " +
+					"of default/fat-cpu, because a memory-larger pod exists elsewhere")
+			}
+			if got := sim.Blocked.Pod.Name; got != "fat-cpu" {
+				t.Errorf("blocked on %s, want fat-cpu — the shape that has nowhere to go", got)
+			}
+		})
+	}
+}
+
+// TestHeadroomProbeKeepsTolerations covers the one field the probe is wrong to
+// drop.
+//
+// sizeProbe rebuilds the spec so that only size reaches fit, and tolerations
+// went with the constraints. But a toleration is a *permission*: dropping one
+// cannot make the probe fit somewhere the real replacement would not, it can
+// only make it refusable by taints the replacement tolerates. A cluster whose
+// spare capacity sits in a tainted pool then fails the reserve for ever, and
+// says "no room" about a node that is empty.
+func TestHeadroomProbeKeepsTolerations(t *testing.T) {
+	candidate := sized("candidate", "32Gi")
+	spare := sized("spare", "32Gi", mother.Tainted("workload", "batch", corev1.TaintEffectNoSchedule))
+
+	web := mother.Pod("default", "web", mother.OnNode("candidate"),
+		mother.Requests("100m", "1Gi"),
+		mother.Tolerating("workload", corev1.TaintEffectNoSchedule))
+	pods := []*corev1.Pod{web}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, spare}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if !sim.Feasible {
+		t.Errorf("the pod itself moves to spare and tolerates its taint, but the reserve "+
+			"refused a probe of its own shape on the same node: %s", sim.Blocked.Summary)
+	}
+}
+
+// TestReserveIgnoresPodsTheSchedulerNeverPlaced keeps the reserve to the pods
+// the documentation says it is about: the ones running.
+//
+// The scan reads the whole snapshot with no node-name guard, while every
+// sibling loop has one — indexPodsByNode skips unbound pods, and diagnose
+// writes the reason down. So a Pending pod could set the reserve while never
+// consuming any capacity, and one replica with a memory typo in its template
+// stops consolidation on the whole cluster until a human deletes it. The
+// reserve guards against a pod that restarts; a pod that has never been placed
+// is not one that will.
+func TestReserveIgnoresPodsTheSchedulerNeverPlaced(t *testing.T) {
+	candidate := sized("candidate", "8Gi")
+	destination := sized("destination", "32Gi")
+
+	small := mother.Pod("default", "small",
+		mother.OnNode("candidate"), mother.Requests("100m", "128Mi"))
+	// Unschedulable everywhere and permanently so: no node in any pool has
+	// 500Gi. Nothing in the cluster resolves it.
+	typo := mother.Pod("default", "typo",
+		mother.Pending(), mother.Requests("100m", "500Gi"))
+	pods := []*corev1.Pod{small, typo}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if !sim.Feasible {
+		t.Errorf("a Pending pod nothing can schedule set the reserve, so no node is ever "+
+			"drainable: %s", sim.Blocked.Summary)
+	}
+}
+
+// TestHeadroomIsAboutShapeNotIdentity closes the node-local half of the
+// identity question.
+//
+// TestTheReserveAsksAboutSizeNotAboutIdentity covers the cluster-wide index,
+// which checkHeadroom answers by passing none. This is the half that arrives
+// through the destination's own residents, and no call-site argument switches
+// it off: sizeProbe copies ObjectMeta wholesale, so the probe carries the
+// largest workload's labels, and a resident's required anti-affinity selecting
+// those labels reads the probe as that workload.
+//
+// One replica per node with hard self-anti-affinity is the ordinary way to get
+// per-node placement without a DaemonSet, so this is not an exotic cluster —
+// and being memory-heavy is what makes such a workload the one the reserve
+// picks.
+func TestHeadroomIsAboutShapeNotIdentity(t *testing.T) {
+	candidate := sized("candidate", "8Gi")
+	hostA := sized("host-a", "32Gi")
+	hostB := sized("host-b", "32Gi")
+
+	// The largest relocatable shape in the cluster, one replica per
+	// destination, each rejecting its own kind on the node it sits on.
+	cache := func(name, node string) *corev1.Pod {
+		return mother.Pod("default", name, mother.OnNode(node),
+			mother.PodLabels(map[string]string{"app": "cache"}),
+			mother.WithRequiredAntiAffinity("app", "cache"),
+			mother.Requests("100m", "4Gi"))
+	}
+	cacheA, cacheB := cache("cache-a", "host-a"), cache("cache-b", "host-b")
+	// The pod actually being relocated, which no term selects.
+	small := mother.Pod("default", "small",
+		mother.OnNode("candidate"), mother.Requests("100m", "128Mi"))
+	pods := []*corev1.Pod{cacheA, cacheB, small}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, hostA, hostB}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if !sim.Feasible {
+		t.Errorf("both destinations have 28Gi free, and the reserve refused them because the "+
+			"probe inherited the labels their residents declare anti-affinity to: %s",
+			sim.Blocked.Summary)
+	}
+}
+
+// TestTheReserveHoldsAPodSlotToo pins the half of the pod-cap question that is
+// the opposite of the packing's.
+//
+// fit.EffectiveRequests synthesises `pods: 1` into every pod's requests, and
+// [difficultyOf] excludes it because a demand every candidate makes equally can
+// never rank two of them. The reserve is the other question about the same
+// number: a slot is real capacity, a destination at its kubelet cap has none
+// left however much memory it shows, and a margin that did not hold one would
+// promise room for a pod that cannot be admitted. So `pods` is reserved like
+// any other resource — and it is also inert in the frontier's domination test,
+// since every shape asks for exactly one.
+func TestTheReserveHoldsAPodSlotToo(t *testing.T) {
+	candidate := wideNode("candidate", "16", "16Gi")
+	// Two slots, one already spent: the relocated pod takes the second and the
+	// reserve then has nowhere to put a third, with 14Gi still free.
+	destination := cappedNode("destination", "16", "16Gi", 2)
+
+	moving := mother.Pod("default", "moving",
+		mother.OnNode("candidate"), mother.Requests("100m", "1Gi"))
+	resident := mother.Pod("default", "resident",
+		mother.OnNode("destination"), mother.Requests("100m", "1Gi"))
+	pods := []*corev1.Pod{moving, resident}
+	nodes := []*corev1.Node{candidate, destination}
+
+	if sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate,
+		defaultCfg()); !sim.Feasible {
+		t.Fatalf("setup: the pod itself fits the last free slot, blocked: %s", sim.Blocked.Summary)
+	}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, cfg)
+
+	if sim.Feasible {
+		t.Fatal("reserved room on a node with no pod slot left, so the pod it promised " +
+			"room for could not be admitted there")
+	}
+	if got := sim.Blocked.PerNode["destination"]; !strings.Contains(got, "insufficient pods") {
+		t.Errorf("destination refused with %q, want the pod cap — it has 14Gi free and "+
+			"nothing about it is short of memory", got)
+	}
+}
+
+// TestTheReserveNamesTheSameShapeWhicheverWayThePodsAreListed covers the half
+// of order-independence that appears only once the reserve asks about a
+// frontier.
+//
+// TestTheReservedShapeDoesNotDependOnInputOrder pins the verdict, and with a
+// single maximum that was the whole of the answer. A frontier has more than one
+// member, so a cluster can fail two of them and which one the refusal names is
+// a second choice — made once per evaluation, appearing in an Event, in
+// `explain` and in the logs. The controller fills its pod list from a
+// watch-backed cache in Go map order and `explain` from a live client in
+// storage-key order, so a frontier left at list position tells the two
+// frontends different stories about an unchanged cluster.
+func TestTheReserveNamesTheSameShapeWhicheverWayThePodsAreListed(t *testing.T) {
+	moving := mother.Pod("default", "moving",
+		mother.OnNode("candidate"), mother.Requests("100m", "1Gi"))
+
+	// Two maximal shapes, neither larger than the other in every resource, and
+	// after the drain neither has anywhere to go: dest is too small for both
+	// and busy has taken the relocated pod's last gigabyte. Which of the two a
+	// refusal names is the frontier's own choice.
+	aCPU := mother.Pod("default", "a-cpu", mother.OnNode("busy"), mother.Requests("7", "1Gi"))
+	zMem := mother.Pod("default", "z-mem", mother.OnNode("busy"), mother.Requests("100m", "30Gi"))
+
+	// One shape, two replicas of one workload, so the choice is made by the
+	// collapse rather than by the frontier — a different line of code reached
+	// by the same question.
+	replica := func(name string) *corev1.Pod {
+		return mother.Pod("default", name, mother.OnNode("busy"),
+			mother.ControlledBy("ReplicaSet", "web"), mother.Requests("100m", "30Gi"))
+	}
+	webA, webB := replica("web-a"), replica("web-b")
+
+	for _, tc := range []struct {
+		name     string
+		listings [][]*corev1.Pod
+	}{
+		{"two maximal shapes", [][]*corev1.Pod{
+			{moving, aCPU, zMem},
+			{moving, zMem, aCPU},
+		}},
+		{"two replicas of one workload", [][]*corev1.Pod{
+			{moving, webA, webB},
+			{moving, webB, webA},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			candidate := wideNode("candidate", "16", "16Gi")
+			dest := wideNode("dest", "2", "4Gi")
+			busy := wideNode("busy", "16", "32Gi")
+
+			cfg := defaultCfg()
+			cfg.ReserveForLargestPod = true
+
+			named := ""
+			for _, pods := range tc.listings {
+				sim := engine.Simulate([]*corev1.Node{candidate, dest, busy}, pods,
+					mother.Templates(pods...), candidate, cfg)
+				if sim.Feasible {
+					t.Fatal("setup: nothing has room for these shapes after the drain, " +
+						"so the reserve must refuse")
+				}
+				if named == "" {
+					named = sim.Blocked.Pod.Name
+					continue
+				}
+				if got := sim.Blocked.Pod.Name; got != named {
+					t.Errorf("blocked on %q, want %q — the same pods, listed the other way round",
+						got, named)
+				}
+			}
+		})
+	}
+}
+
+// TestTwoReplicasOfOneWorkloadCanBeDifferentShapes holds the reserve's replica
+// collapse to checking rather than assuming.
+//
+// Collapsing a workload's replicas to one shape is what keeps the frontier
+// cheap, and "one workload, one shape" is true of almost every pair. The
+// exceptions are the ones this whole file is about: a replica resized in place,
+// or one an admission webhook has added to, is bigger than its siblings and its
+// replacement will be bigger too. Keyed on the owner reference alone the
+// collapse keeps an arbitrary replica of the group, and reserving for the
+// smaller of two is losing exactly the margin the check exists to hold.
+func TestTwoReplicasOfOneWorkloadCanBeDifferentShapes(t *testing.T) {
+	candidate := sized("candidate", "8Gi")
+	// 6Gi, holding 4Gi of replicas: after the drain takes another 128Mi there
+	// is room for a 1Gi replacement and not for a 3Gi one.
+	destination := sized("destination", "6Gi")
+
+	moving := mother.Pod("default", "moving",
+		mother.OnNode("candidate"), mother.Requests("100m", "128Mi"))
+	// One ReplicaSet, two replicas, and the second is running larger than its
+	// template — an in-place resize upward, or a sidecar injected into it.
+	// Named so that the lower name is the smaller shape, which is what makes an
+	// owner-keyed collapse pick the wrong one rather than get lucky.
+	webA := mother.Pod("default", "web-a", mother.OnNode("destination"),
+		mother.ControlledBy("ReplicaSet", "web"), mother.Requests("100m", "1Gi"))
+	webB := mother.Pod("default", "web-b", mother.OnNode("destination"),
+		mother.ControlledBy("ReplicaSet", "web"), mother.Requests("100m", "3Gi"))
+	pods := []*corev1.Pod{moving, webA, webB}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, webA, mother.Requests("100m", "1Gi"))
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		templates, candidate, cfg)
+
+	if sim.Feasible {
+		t.Fatal("reserved room for the smaller of two replicas of one ReplicaSet, " +
+			"leaving 1.9Gi where the larger replica's replacement asks for 3Gi")
+	}
+	if got := sim.Blocked.Pod.Name; got != "web-b" {
+		t.Errorf("blocked on %s, want web-b — the replica whose replacement is the larger", got)
 	}
 }

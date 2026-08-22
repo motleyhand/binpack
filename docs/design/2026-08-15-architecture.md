@@ -639,9 +639,17 @@ pools: []                             # per-pool overrides of the above
 **Headroom is not a percentage.** An earlier draft had `headroomPercent: 10`, which is exactly
 the reasoning this design rejects elsewhere: on a 4GB node it reserves around 136MB, and on an
 8GB node twice that, for no principled reason. `reserveForLargestPod` states the actual
-requirement instead — after a drain, some node must still hold a pod the size of the largest
-relocatable one — because the risk is not "the cluster is full" but "the next pod that restarts
-cannot be placed", and that is a question about bytes.
+requirement instead — after a drain, some node must still be able to hold a pod of every maximal
+shape among the relocatable pods running — because the risk is not "the cluster is full" but "the
+next pod that restarts cannot be placed", and that is a question about bytes.
+
+**And not about one pod.** An earlier version of this asked about "the largest relocatable pod",
+keyed on memory, which is a maximum over a set that has none: across resources there are only
+maximal elements, and a 7-core pod and a 24Gi pod are each largest in their own dimension. Keyed
+on memory the reserve was computed for whichever pod happened to win that one dimension, so a
+cluster bound by CPU, by a GPU or by the pod cap got a margin measured in the resource that was
+not running out. The check asks about the Pareto frontier of relocatable shapes instead, and the
+refusal names which shape had nowhere to go.
 
 ## Command surface
 
