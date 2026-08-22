@@ -81,7 +81,20 @@ Normal  WouldDrain  4m  binpack  binpack would drain this node: all 2 of its
 A standing decision aggregates into one Event with a count rather than one per minute, so this
 stays readable over days.
 
-The logs carry the same decision plus the cluster-wide reason when there is nothing to do:
+An evaluation that chose no node says so as well, on every node it looked at — so whichever node
+you describe, there is an answer:
+
+```
+Normal  NoNodeChosen  2m  binpack  binpack evaluated the cluster and chose no node to drain:
+                                   3 node(s) considered, none whose workload fits elsewhere.
+                                   This is the cluster's answer, written on every node binpack
+                                   looked at; `binpack explain` gives this node's own reason
+```
+
+That one is the cluster's answer rather than the node's, and it is the same sentence on each node.
+For why *this* node was not chosen, `binpack explain` prints the arithmetic per node.
+
+The logs carry the same decisions:
 
 ```bash
 kubectl -n binpack-system logs -l app.kubernetes.io/name=binpack -f

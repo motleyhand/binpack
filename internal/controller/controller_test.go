@@ -97,7 +97,12 @@ func inPool(name string, opts ...mother.NodeOption) *corev1.Node {
 		mother.InPool(poolName, poolID)}, opts...)...)
 }
 
-func statusConfigMap() client.Object {
+func statusConfigMap() client.Object { return statusConfigMapProbedAt(time.Now()) }
+
+// statusConfigMapProbedAt is the autoscaler's status document with its
+// liveness probe at a chosen moment, so a test can describe an autoscaler that
+// has stopped reporting as well as one that has not.
+func statusConfigMapProbedAt(probed time.Time) client.Object {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: collect.StatusConfigMapNamespace,
@@ -109,7 +114,7 @@ time: ` + time.Now().UTC().Format("2006-01-02 15:04:05.000000000 -0700 MST") + `
 clusterWide:
   health:
     status: Healthy
-    lastProbeTime: "` + time.Now().UTC().Format(time.RFC3339) + `"
+    lastProbeTime: "` + probed.UTC().Format(time.RFC3339) + `"
   scaleDown:
     status: NoCandidates
 nodeGroups:
@@ -250,12 +255,235 @@ func TestEvaluateSaysSomethingWhenThereIsNothingToDo(t *testing.T) {
 		t.Fatalf("evaluate: %v", err)
 	}
 
-	if len(rec.events) != 0 {
-		t.Errorf("got %d events with no decision to report", len(rec.events))
-	}
+	// The event half of the same refusal is TestARefusalIsVisibleOnTheNode's.
+	// This one is about the log line, which is what a controller that has gone
+	// quiet cannot produce.
 	if !log.contains("nothing to do") {
 		t.Errorf("said nothing at all:\n%s", strings.Join(log.lines, "\n"))
 	}
+}
+
+func TestARefusalIsVisibleOnTheNode(t *testing.T) {
+	// The chart's install notes send a new operator to `kubectl describe node`
+	// for what binpack decided, and a refusal is the first decision they will
+	// meet: a cluster with nothing to consolidate is the ordinary steady state
+	// binpack is installed onto. Without an event the node they describe says
+	// nothing at all, and a binpack that looked and refused is indistinguishable
+	// from one that never ran.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		inPool("a"),
+		mother.Pod("default", "web", mother.OnNode("a")),
+		statusConfigMap(),
+	)
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	if len(rec.events) == 0 {
+		t.Fatal("binpack refused and wrote nothing on the node")
+	}
+
+	// Taken from the engine rather than written out here, so the note cannot
+	// drift away from the sentence the decision actually carried.
+	want := decisionAt(t, ev, time.Now()).Reason
+	got := rec.events[0]
+	if !strings.Contains(got.note, want) {
+		t.Errorf("note does not carry the decision's reason %q: %s", want, got.note)
+	}
+	if got.reason != ReasonNoNodeChosen || got.action != ActionConsolidate {
+		t.Errorf("reason/action = %s/%s, want %s/%s",
+			got.reason, got.action, ReasonNoNodeChosen, ActionConsolidate)
+	}
+	if got.eventType != corev1.EventTypeNormal {
+		t.Errorf("type = %s: a refusal binpack made deliberately is not a warning", got.eventType)
+	}
+}
+
+// decisionAt re-asks the engine what this evaluator's cluster decides at a
+// given moment, so a test can assert against the decision rather than a copy of
+// it — and can ask the same question twice, minutes apart.
+func decisionAt(t *testing.T, ev *evaluator, when time.Time) engine.Decision {
+	t.Helper()
+
+	s, err := collect.Snapshot(context.Background(), ev.reader, when)
+	if err != nil {
+		t.Fatalf("collecting the snapshot the decision was made from: %v", err)
+	}
+	return engine.Decide(s, ev.opts.Engine)
+}
+
+func TestARefusalIsVisibleOnEveryNodeAnOperatorMightDescribe(t *testing.T) {
+	// The operator chooses which node to describe and binpack cannot know
+	// which, so the refusal goes on all of them. One node carrying it and the
+	// rest silent would make `kubectl describe node` answer or stay quiet
+	// depending on a choice the reader makes at random.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		inPool("a", mother.Cordoned()),
+		inPool("b", mother.Cordoned()),
+		inPool("c", mother.Cordoned()),
+		statusConfigMap(),
+	)
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	on := map[string]string{}
+	for _, e := range rec.events {
+		node, ok := e.object.(*corev1.Node)
+		if !ok {
+			t.Fatalf("event was recorded against %T, not a node", e.object)
+		}
+		on[node.Name] = e.note
+	}
+	for _, name := range []string{"a", "b", "c"} {
+		if _, ok := on[name]; !ok {
+			t.Errorf("node %s carries nothing, so describing it answers nothing", name)
+		}
+	}
+	// One sentence, not three: the answer is the cluster's, so a reader
+	// comparing two nodes must not find two different claims.
+	if len(on) > 1 {
+		for name, note := range on {
+			if note != on["a"] {
+				t.Errorf("node %s says something different:\n%s\n%s", name, on["a"], note)
+			}
+		}
+	}
+}
+
+func TestARefusalReadsTheSameOnEveryEvaluation(t *testing.T) {
+	// The events.k8s.io aggregation key covers the object, the action and the
+	// reason, and not the note — verified against client-go v0.36.3,
+	// tools/events/event_broadcaster.go getKey. So a note that moved while the
+	// decision held would not open a second event; it would leave the first
+	// sentence on the node under a timestamp saying it was written a minute
+	// ago, which is worse than saying nothing.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		inPool("a"),
+		mother.Pod("default", "web", mother.OnNode("a")),
+		statusConfigMap(),
+	)
+
+	// The note is this sentence and nothing else. Spelled out rather than
+	// rebuilt the way refusalNote builds it, because the property being
+	// asserted is that nothing outside the decision reaches the note — a
+	// clock, a counter, a per-node detail — and a test that composed it the
+	// same way the code does would carry any of them along with it and agree.
+	// Two renderings a moment apart cannot see a clock at all: RFC3339 is
+	// second-granular and both would read the same second.
+	d := decisionAt(t, ev, time.Now())
+	want := "binpack evaluated the cluster and chose no node to drain: " + d.Reason +
+		". This is the cluster's answer, written on every node binpack looked at; " +
+		"`binpack explain` gives this node's own reason"
+	if got := refusalNote(d); got != want {
+		t.Errorf("the note carries something the decision did not:\n got %s\nwant %s", got, want)
+	}
+
+	// And minutes apart on a cluster that has not changed. This is the half
+	// that sees a reason counting elapsed time into itself, which three of the
+	// engine's sentences do.
+	now := time.Now()
+	first := refusalNote(decisionAt(t, ev, now))
+	later := refusalNote(decisionAt(t, ev, now.Add(2*time.Minute)))
+	if first != later {
+		t.Errorf("the note moved while the decision held:\n%s\n%s", first, later)
+	}
+
+	// And it reads the same whether binpack is acting or only deciding.
+	// Nothing happens either way, so a mode in the note would split one series
+	// into two and tell the reader nothing.
+	deciding := refusalNotes(t, ev, rec)
+	ev.opts.DryRun = false
+	acting := refusalNotes(t, ev, rec)
+	if len(deciding) == 0 || len(acting) == 0 {
+		t.Fatalf("got %d notes deciding and %d acting, want a refusal in both",
+			len(deciding), len(acting))
+	}
+	if deciding[0] != acting[0] {
+		t.Errorf("the note depends on the mode, splitting one series in two:\n%s\n%s",
+			deciding[0], acting[0])
+	}
+}
+
+func TestADrainInProgressIsNotReportedAsChoosingNothing(t *testing.T) {
+	// A drain in progress reaches the refusal branch — no action, nothing
+	// chosen this evaluation — and is not a refusal: the node is named, it
+	// already carries the event saying what would happen to it, and "binpack
+	// chose no node" written beside that would contradict it.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		drainingNode("a"), inPool("b"), inPool("c"), statusConfigMap())
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+
+	for _, e := range rec.events {
+		if e.reason == ReasonNoNodeChosen {
+			t.Errorf("said binpack chose no node while it is draining one: %s", e.note)
+		}
+	}
+	// Asserted so this cannot pass by nothing having been written at all.
+	if !recorded(rec, ReasonWouldAdvanceDrain) {
+		t.Fatalf("the drain in progress went unreported: %+v", rec.events)
+	}
+}
+
+func TestADeadAutoscalerIsNotReportedOnEveryNode(t *testing.T) {
+	// binpack refuses here before it has looked at a single node, so there is
+	// no node the answer is about — and the sentence it would carry is the one
+	// in the vocabulary that counts up on its own. Both halves are asserted,
+	// because a guard that is merely tidy is one the next change removes.
+	// `binpack_autoscaler_up` is what this condition has instead, and the
+	// metrics reference already ranks it second of the three things to alert
+	// on.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec,
+		inPool("a"), inPool("b"),
+		statusConfigMapProbedAt(time.Now().Add(-30*time.Minute)),
+	)
+
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	if len(rec.events) != 0 {
+		t.Errorf("got %d events for a refusal reached before any node was looked at: %s",
+			len(rec.events), rec.events[0].note)
+	}
+
+	now := time.Now()
+	if first, later := decisionAt(t, ev, now).Reason,
+		decisionAt(t, ev, now.Add(2*time.Minute)).Reason; first == later {
+		t.Errorf("expected the dead-autoscaler reason to count up, got %q twice", first)
+	}
+}
+
+// refusalNotes runs one evaluation and returns the notes it wrote, clearing
+// the recorder first so a second call reports only its own.
+func refusalNotes(t *testing.T, ev *evaluator, rec *fakeRecorder) []string {
+	t.Helper()
+
+	rec.events = nil
+	if err := ev.evaluate(context.Background()); err != nil {
+		t.Fatalf("evaluate: %v", err)
+	}
+	var notes []string
+	for _, e := range rec.events {
+		if e.reason == ReasonNoNodeChosen {
+			notes = append(notes, e.note)
+		}
+	}
+	return notes
 }
 
 func TestDryRunChangesNothingAtAll(t *testing.T) {
@@ -728,6 +956,62 @@ func TestOnceWritesItsEventBeforeTheProcessExits(t *testing.T) {
 	if got.GenerateName != "" {
 		t.Errorf("generateName %q: the API server validates it as a subdomain in its own right",
 			got.GenerateName)
+	}
+}
+
+func TestOnceWritesARefusalOnEveryNodeBeforeTheProcessExits(t *testing.T) {
+	// A CronJob invocation that refuses used to be indistinguishable from one
+	// that never ran: it wrote a log line into a pod that then disappeared. The
+	// events are now the whole of what such a run leaves behind, and this is
+	// the path with no aggregation to fall back on, so each has to be a
+	// distinct object the API server will accept.
+	objects := []client.Object{
+		inPool("a", mother.Cordoned()),
+		inPool("b", mother.Cordoned()),
+		statusConfigMap(),
+	}
+	c := fake.NewClientBuilder().WithObjects(objects...).Build()
+
+	var log captured
+	ev := &evaluator{
+		reader: c,
+		writer: c,
+		reporter: directReporter{
+			writer:   c,
+			instance: "binpack-test",
+			// Fixed, which is what makes the names worth asserting: they are
+			// distinct because the node is in them, not because the clock
+			// moved between two writes.
+			now: func() time.Time { return time.Unix(0, 0).UTC() },
+		},
+		opts: Options{Engine: withDrainBounds(config()), DryRun: true, Once: true},
+		log:  log.logger(),
+		stop: func() {},
+	}
+
+	if err := ev.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
+
+	var written eventsv1.EventList
+	if err := c.List(context.Background(), &written); err != nil {
+		t.Fatalf("listing events: %v", err)
+	}
+	if len(written.Items) != 2 {
+		t.Fatalf("got %d events written, want one per node", len(written.Items))
+	}
+	for _, got := range written.Items {
+		if got.Reason != ReasonNoNodeChosen {
+			t.Errorf("event on %s has reason %s, want %s",
+				got.Regarding.Name, got.Reason, ReasonNoNodeChosen)
+		}
+		if problems := validation.IsDNS1123Subdomain(got.Name); len(problems) > 0 {
+			t.Errorf("event name %q would be rejected: %v", got.Name, problems)
+		}
+	}
+	if written.Items[0].Name == written.Items[1].Name {
+		t.Errorf("both events are called %q, so the second write is a conflict",
+			written.Items[0].Name)
 	}
 }
 

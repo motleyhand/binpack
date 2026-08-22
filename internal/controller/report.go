@@ -36,6 +36,11 @@ const (
 	// which is why it carries what advancing it would do.
 	ReasonWouldAdvanceDrain = "WouldAdvanceDrain"
 
+	// ReasonNoNodeChosen is an evaluation that considered the cluster and
+	// picked nothing. It is the only one of these that is not about a
+	// particular node, and the note says so: see ADR-0011.
+	ReasonNoNodeChosen = "NoNodeChosen"
+
 	// ReasonDrained and ReasonDrainAbandoned are how a drain ended. Both are
 	// worth an event: the first is what binpack exists to do, and the second
 	// carries the sentence saying what stopped it.
@@ -66,7 +71,7 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 			"nodesSkipped", len(d.Assessments)-considered,
 			"nodes", len(s.Nodes),
 			"pods", len(s.Pods))
-		return nil
+		return e.reportRefusal(ctx, d)
 	}
 
 	chosen := chosenAssessment(d)
@@ -82,10 +87,12 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 		"dryRun", e.opts.DryRun)
 
 	// The note is kept stable for a given cluster state on purpose. The event
-	// recorder aggregates repeats of an identical (object, reason, note) into
-	// one Event carrying a count and a first and last timestamp, so a decision
-	// that holds for an hour reads as one line saying so rather than sixty
-	// saying the same thing.
+	// recorder aggregates repeats into one Event carrying a count and a first
+	// and last timestamp, so a decision that holds for an hour reads as one
+	// line saying so rather than sixty saying the same thing — and the note is
+	// not part of what it compares, so a note that moved would not open a
+	// second Event but leave the first sentence under a fresh timestamp. See
+	// [refusalNote], which has the upstream citation.
 	// The note is chosen by mode, not decorated with it. An event reading
 	// "No action taken — dry run" while pods are being evicted is worse than
 	// no event at all: it is the one surface a cluster user reliably has, and
@@ -107,6 +114,77 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 		return fmt.Errorf("recording the decision on %s: %w", d.Node.Name, err)
 	}
 	return nil
+}
+
+// reportRefusal records an evaluation that chose no node, on the nodes it was
+// made about.
+//
+// The log line above is not enough on its own. On a managed control plane
+// `kubectl describe node` is the one surface a cluster user reliably has, and
+// the chart's install notes send a new operator straight to it — so a refusal
+// that reaches only the log is a decision they are told to look for and cannot
+// find. A cluster with nothing to consolidate is the ordinary steady state, so
+// this is the first thing binpack has to say to most installs. See ADR-0011.
+//
+// Every assessed node rather than one of them, because the operator chooses
+// which node to describe and binpack cannot know which. The note says whose
+// answer it is for the same reason: it is the cluster's, not the node's.
+func (e *evaluator) reportRefusal(ctx context.Context, d engine.Decision) error {
+	// A decision naming a node is not a refusal. A drain in progress reaches
+	// here too — no action, nothing chosen this evaluation — but the node is
+	// named, and in dry run it already carries the event [evaluator.frozen]
+	// wrote for it. A second one saying binpack chose no node would contradict
+	// it on the node it is about.
+	if d.Node != nil {
+		return nil
+	}
+
+	// The nodes the decision assessed, and not every node in the snapshot.
+	// Where the two differ, binpack never got as far as looking: without a
+	// live autoscaler it declines to evaluate rather than evaluating and
+	// refusing, so there are no assessments and this writes nothing. That is
+	// right twice over — there is no node the answer is about, and the
+	// sentence it would carry is the one in the vocabulary that counts up on
+	// its own, which this surface cannot hold (see [refusalNote]). What that
+	// condition has instead is binpack_autoscaler_up, which the metrics
+	// reference already ranks second of the three things to alert on.
+	note := refusalNote(d)
+	for i := range d.Assessments {
+		node := d.Assessments[i].Node
+		// Returned rather than logged, as the chosen-node report does and for
+		// the same reason: whether a lost report matters depends on whether
+		// anything will try again, which the caller knows. A failure part-way
+		// leaves some nodes carrying the event and some not, which the next
+		// evaluation repairs by writing all of them again.
+		if err := e.reporter.emit(ctx, node, ReasonNoNodeChosen, ActionConsolidate, note); err != nil {
+			return fmt.Errorf("recording the decision on %s: %w", node.Name, err)
+		}
+	}
+	return nil
+}
+
+// refusalNote is what a node says about an evaluation that chose nothing.
+//
+// Built from the decision and nothing else, and it must stay that way. The
+// events.k8s.io aggregation key covers the type, action, reason, reporting
+// controller and instance, and the object the event is about — and not the
+// note (k8s.io/client-go@v0.36.3, tools/events/event_broadcaster.go, getKey). So the second and later events of a
+// series only bump a count and a timestamp, and the note the API server keeps
+// is the one the first event carried. A note that varied while the decision
+// held would therefore not produce a second event; it would produce one event
+// showing a stale sentence under a timestamp saying "a minute ago", which is
+// worse than showing nothing. Anything that moves belongs in the log line
+// above, in the metrics, or in `binpack explain`.
+//
+// One note for both modes, deliberately. The drain events distinguish dry run
+// from acting because what happens differs; here nothing happens either way,
+// so a mode in the note would split one series into two and tell the reader
+// nothing.
+func refusalNote(d engine.Decision) string {
+	return fmt.Sprintf(
+		"binpack evaluated the cluster and chose no node to drain: %s. This is the "+
+			"cluster's answer, written on every node binpack looked at; "+
+			"`binpack explain` gives this node's own reason", d.Reason)
 }
 
 func relocationSummary(pods int) string {

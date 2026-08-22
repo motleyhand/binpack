@@ -109,6 +109,7 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0008](docs/design/adr-0008-engine-uses-api-types.md) | Why the engine uses Kubernetes API types directly, and what the purity rule was really protecting |
 | [ADR-0009](docs/design/adr-0009-revalidation-asks-soundness-not-preference.md) | Revalidation re-asks soundness, not preference *(soundness list narrowed by ADR-0010)* |
 | [ADR-0010](docs/design/adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md) | Why a scale-up stops a drain that has not started, and not one that has |
+| [ADR-0011](docs/design/adr-0011-a-refusal-is-a-decision-and-earns-an-event.md) | Why a decision to drain nothing earns an Event, and which nodes it goes on |
 
 ## Design principles
 

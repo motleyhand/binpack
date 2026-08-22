@@ -656,7 +656,12 @@ user's own repository.
 
 The controller emits a Kubernetes Event on the Node for every decision, so `kubectl describe
 node` explains why a node was or was not drained without access to binpack's logs. This
-deliberately mirrors how the autoscaler's own decisions surface on a managed control plane.
+deliberately mirrors how the autoscaler's own decisions surface on a managed control plane. A
+decision to drain lands on the node chosen; a decision to drain nothing lands on every node the
+evaluation assessed, because the operator chooses which node to describe. The one decision that
+reaches no node is the refusal to act without a live cluster-autoscaler, which is made before any
+node is assessed and which `binpack_autoscaler_up` reports instead. See
+[ADR-0011](adr-0011-a-refusal-is-a-decision-and-earns-an-event.md).
 
 Prometheus metrics (prefix `binpack_`) cover decisions by outcome code, nodes by verdict and by
 skip code, per-pool node counts against discovered bounds, autoscaler liveness, and evaluation
