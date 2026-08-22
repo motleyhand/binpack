@@ -5,8 +5,11 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"maps"
 	"os"
+	"slices"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -53,14 +56,19 @@ func newExplainCommand(opts *options) *cobra.Command {
 				return err
 			}
 
-			if err := engine.CheckPools(snapshot, engineConfig(cfg)); err != nil {
+			// One resolution, and everything below decides against it. How
+			// nodes join to pools is worked out from the cluster, so the
+			// configuration alone describes a different — smaller — set of
+			// pools than the one preflight just validated.
+			resolved, err := engine.ResolvePools(snapshot, engineConfig(cfg))
+			if err != nil {
 				return err
 			}
 
 			opts.configSource = source
 			opts.dryRun = cfg.Settings().DryRun
 			opts.autoscalerNamespace = cfg.Discovery.AutoscalerNamespace
-			return renderExplain(opts, snapshot, explainOutcome(snapshot, engineConfig(cfg)))
+			return renderExplain(opts, snapshot, explainOutcome(snapshot, resolved))
 		},
 	}
 
@@ -83,7 +91,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 // operator is most likely to be investigating. This one is derived from the
 // marker on the node, which is where the drain actually lives.
 func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
-	out := explainOutput{Decision: engine.Decide(s, cfg)}
+	out := explainOutput{Decision: engine.Decide(s, cfg), Config: cfg}
 	out.Nodes = out.Decision.Assessments
 
 	// Decide refuses before assessing anything when no autoscaler is running,
@@ -152,6 +160,12 @@ func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
 // explainOutput is what the renderers are given.
 type explainOutput struct {
 	Decision engine.Decision
+	// Config is the configuration the decision was made under, resolved
+	// against this cluster. Carried rather than re-derived because the join
+	// between nodes and pools is part of it and is worked out per snapshot:
+	// the report has to name the configuration that produced the verdict, not
+	// the one the file describes.
+	Config engine.Config
 	// Nodes is what explain says about each node. Normally the decision's own
 	// assessments; when [engine.Decide] returned before making any, what the
 	// same pass reports on its own — see [explainOutcome].
@@ -209,13 +223,16 @@ func restConfigFor(kubeconfig, kubecontext string) (*rest.Config, error) {
 	return restCfg, nil
 }
 
-// readerFor is how the command reaches the cluster, as a variable so a test
-// can run the command rather than only its renderer.
+// readerFor is how a command reaches the cluster, as a variable so a test can
+// run the command rather than only its renderer.
 //
 // The wiring between the configuration and the report has no other cover:
 // which settings reach the output — and so which binpack the answer is about —
 // is decided in RunE and nowhere else, and every renderer test starts from an
-// options value it built itself.
+// options value it built itself. Since the join between nodes and pools is
+// resolved there too, that wiring now decides which nodes the answer is about
+// as well, which is why `diagnose` reads through this rather than calling
+// [clientFor] itself.
 var readerFor = clientFor
 
 // clientFor builds a direct, uncached reader.
@@ -293,6 +310,7 @@ func engineConfig(cfg *v1alpha1.Config) engine.Config {
 	out := engine.Config{
 		NodeGroupIDLabel: cfg.Discovery.NodeGroupIDLabel,
 		PoolNameLabel:    cfg.Discovery.PoolNameLabel,
+		NodeGroups:       cfg.NodeGroupJoin(),
 		Default:          enginePolicy(cfg.PolicyFor()),
 		ByPool:           map[string]engine.Policy{},
 	}
@@ -333,6 +351,12 @@ type explainView struct {
 			Ready int    `json:"ready"`
 		} `json:"pools"`
 	} `json:"autoscaler"`
+	// Pools is how nodes were joined to those pools. Reported as data because
+	// it decides *scope* — which nodes binpack considers its own — and on most
+	// clusters binpack now works that out rather than being told it. A
+	// consumer that cannot tell a derived scope from a configured one cannot
+	// tell a change of scope from a change of cluster.
+	Pools poolsView `json:"pools"`
 	// Config names where the configuration came from. Reported so a verdict
 	// can be checked against the settings that produced it — a command run
 	// without -f answers about built-in defaults, which is a different
@@ -357,6 +381,21 @@ type explainView struct {
 	// nothing because no autoscaler is running.
 	Drain *drainReport `json:"drain,omitempty"`
 	Nodes []nodeReport `json:"nodes"`
+}
+
+// poolsView is the join, for machines.
+type poolsView struct {
+	// Source is the MappingSource sentence: short, and the thing to branch on.
+	Source string `json:"source"`
+	// Label is the node label the join reads.
+	Label string `json:"label"`
+	// Groups translates that label's values into published identifiers, and is
+	// absent where the value is the identifier — there is nothing to say.
+	Groups map[string]string `json:"groups,omitempty"`
+	// AlsoAgreed are the other labels that would have produced the same join.
+	// On a single-pool cluster there are usually several, and an operator who
+	// cannot see that the choice was forced reads it as arbitrary.
+	AlsoAgreed []string `json:"alsoAgreed,omitempty"`
 }
 
 type nodeReport struct {
@@ -416,6 +455,16 @@ func buildView(s engine.Snapshot, out explainOutput) explainView {
 			Max   int    `json:"max"`
 			Ready int    `json:"ready"`
 		}{g.ID, g.MinSize, g.MaxSize, g.Ready})
+	}
+
+	v.Pools = poolsView{
+		Source:     out.Config.Mapping.Source.String(),
+		Label:      out.Config.Mapping.Key,
+		Groups:     out.Config.Mapping.Groups,
+		AlsoAgreed: out.Config.Mapping.AlsoAgreed,
+	}
+	if v.Pools.Label == "" {
+		v.Pools.Label = out.Config.NodeGroupIDLabel
 	}
 
 	v.Action = d.Action.String()
@@ -544,6 +593,7 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 		if len(v.Autoscaler.Pools) == 0 {
 			p("  no autoscaling pools reported\n")
 		}
+		writeJoin(p, v.Pools)
 	}
 
 	// The answer, above the node table as well as below it. On a cluster where
@@ -722,4 +772,30 @@ func sortedKeys(m map[string]string) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// writeJoin says how nodes were matched to those pools, and says nothing at
+// all where the join is the one the configuration describes.
+//
+// Which nodes binpack considers its own is the most consequential thing it
+// decides before deciding anything, and on most clusters it now works that
+// out rather than being told. Printing it every run would bury it; printing
+// it only when there is something to disclose is what makes it readable —
+// and the derivation refusing prints far more than this, in the preflight
+// error, so silence here never means the question went unanswered.
+func writeJoin(p func(string, ...any), v poolsView) {
+	if len(v.Groups) == 0 {
+		return
+	}
+	p("  pools matched by %s, %s\n", v.Label, v.Source)
+	for _, value := range slices.Sorted(maps.Keys(v.Groups)) {
+		p("    %s=%s is %s\n", v.Label, value, v.Groups[value])
+	}
+	if len(v.AlsoAgreed) > 0 {
+		// So that the choice of key does not read as arbitrary. On a
+		// single-pool cluster several labels usually resolve it identically,
+		// and an operator seeing only one named cannot tell whether another
+		// would have given a different answer.
+		p("    %s also produce this mapping\n", strings.Join(v.AlsoAgreed, ", "))
+	}
 }

@@ -162,6 +162,10 @@ func writeConfigSummary(opts *options, cfg *v1alpha1.Config) error {
 	p("\n")
 	p("pool label: %s\n", cfg.Discovery.PoolNameLabel)
 	p("group label: %s\n", cfg.Discovery.NodeGroupIDLabel)
+	for _, join := range cfg.Discovery.NodeGroups {
+		p("  %s=%s is node group %s\n", cfg.Discovery.NodeGroupIDLabel,
+			join.LabelValue, join.Group)
+	}
 	// Where binpack will look for the autoscaler, said before it has looked.
 	// A wrong label key above fails preflight loudly; a wrong namespace here
 	// produces a confident report that no cluster-autoscaler is running, and

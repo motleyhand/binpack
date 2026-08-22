@@ -41,6 +41,9 @@ discovery:
   # The namespace the cluster-autoscaler publishes its status ConfigMap into,
   # which is the namespace it runs in.
   autoscalerNamespace: kube-system
+  # Membership stated outright, for clusters where binpack cannot work it out.
+  # Bounds are never stated here: they come from the status ConfigMap.
+  nodeGroups: []
 
 # Applies to every discovered pool that has no override.
 policy:
@@ -111,6 +114,12 @@ binpack matches nodes to entries in the `cluster-autoscaler-status` ConfigMap th
 which is how it learns which pools autoscale and what their minimum and maximum sizes are —
 without any cloud provider credentials.
 
+**Where no value matches outright, binpack works the mapping out for itself**, so on EKS, AKS and
+most GKE clusters there is nothing to set here at all. Read
+[`discovery.nodeGroups`](#discoverynodegroups) for what it does, what it refuses to do, and how to
+state the mapping by hand where it declines. The rest of this section is about the value match,
+which is tried first and is what DOKS uses.
+
 The match is on the *value*, and the value has to be the cloud provider's own identifier for the
 group — an Auto Scaling group name on AWS, a VM Scale Set name on Azure, a node pool ID on
 DigitalOcean, a full instance group URL on GCE. That identifier is what the autoscaler writes
@@ -138,17 +147,72 @@ and set `discovery.nodeGroupIDLabel: binpack.motleyhand.com/node-group`. binpack
 that label — it reads whichever key you point it at, and the key under its own API group is
 suggested only because a provider cannot start writing to it underneath you.
 
-Where the identifier is not a legal label value there is no mapping to express. GCE is the
-known case: the autoscaler identifies a managed instance group by its full API URL, and a
-Kubernetes label value is capped at 63 characters and may not contain `/` or `:`.
-[ADR-0012](../design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) records what
-that means and what was considered instead.
+Where the identifier is not a legal label value there is no mapping to express *this way*. GCE is
+the known case: the autoscaler identifies a managed instance group by its full API URL, and a
+Kubernetes label value is capped at 63 characters and may not contain `/` or `:`. The derivation
+below reaches it anyway, because the instance group's *name* is inside that URL.
+[ADR-0012](../design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) records why the
+value match is the primary one, and
+[ADR-0013](../design/adr-0013-deriving-the-pool-mapping-from-the-names-identifiers-are-built-from.md)
+what was added beside it.
 
-If no node carries a value any published group answers to, **preflight fails** — on `explain`,
-`diagnose` and `run` alike, exit status 1 — naming the key it looked for, the groups the
-autoscaler published and the labels your nodes do carry. It used to report every node as "not
-part of an autoscaling pool" instead, which reads as a fact about the cluster rather than as the
-misconfiguration it is.
+If no node carries a value any published group answers to **and nothing can be derived**,
+**preflight fails** — on `explain`, `diagnose` and `run` alike, exit status 1 — naming the key it
+looked for, the groups the autoscaler published, the labels your nodes do carry, and any label
+that came close to resolving the cluster together with what was wrong with it. It used to report
+every node as "not part of an autoscaling pool" instead, which reads as a fact about the cluster
+rather than as the misconfiguration it is.
+
+### `discovery.nodeGroups`
+
+Usually nothing. Set it only where binpack tells you it could not work the mapping out.
+
+Cloud providers *generate* the identifier they publish from the pool name you chose, so the pool
+label they put on your nodes holds a string that is inside it:
+
+| | node label | its value | published identifier |
+|---|---|---|---|
+| EKS managed node group | `eks.amazonaws.com/nodegroup` | `workers` | `eks-workers-a8c75f2f-…` |
+| AKS agent pool | `kubernetes.azure.com/agentpool` | `nodepool1` | `aks-nodepool1-33555069-vmss` |
+| GKE node pool | `cloud.google.com/gke-nodepool` | `default-pool` | `…/instanceGroups/my-cluster-default-pool-a0c72690-grp` |
+
+Where no label's value *is* an identifier, binpack looks for one whose values name the pools, and
+uses it only if every pool resolves at once: the label's values must correspond one-to-one with
+the pools the autoscaler publishes, at sizes those pools could have, in exactly one way — and if
+several labels manage it they must agree about every node. Nodes in no autoscaling pool are
+expected and do not prevent this; they simply stay outside every pool, and binpack never drains
+them. Anything less and it refuses rather
+than guessing, because a mapping that is wrong applies one pool's floor to another pool's nodes.
+`binpack explain` prints the label it matched on whenever the mapping was derived.
+
+The two ways that leaves you setting this field:
+
+- **The identifier is not built from the pool name.** A self-managed Auto Scaling group you named
+  yourself, for instance.
+- **The provider truncated the name.** GKE shortens long cluster and node pool names when it
+  builds the instance group's, so a pool named `nap-n1-standard-1-1kwag2qv` can appear as
+  `…-nap-n1-standard--b4fcc348-grp`, with nothing left to match on.
+
+Then state the mapping. `kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml`
+prints the identifiers; `kubectl get nodes --show-labels` prints what your nodes carry:
+
+```yaml
+discovery:
+  nodeGroupIDLabel: cloud.google.com/gke-nodepool
+  nodeGroups:
+    - labelValue: nap-n1-standard-1-1kwag2qv
+      group: https://www.googleapis.com/compute/v1/projects/p/zones/z/instanceGroups/c-nap-n1-standard--b4fcc348-grp
+```
+
+`labelValue` is what your nodes carry under `discovery.nodeGroupIDLabel`; `group` is the
+identifier the autoscaler publishes. **This states membership only** — minimum and maximum sizes
+still come from the status ConfigMap, so there is no second number to keep in step with the
+console. Entries are additive: a value you do not name still matches by equality, so you can state
+one pool and leave the rest alone.
+
+`group` must name a node group the autoscaler publishes, or **preflight fails** and prints the
+ones it does publish. A pool scaled to zero still counts, so an empty pool is fine; a typo is not,
+because an entry that matches nothing is silently no entry at all.
 
 ### `discovery.poolNameLabel`
 

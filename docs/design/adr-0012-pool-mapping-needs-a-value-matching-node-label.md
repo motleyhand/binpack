@@ -1,6 +1,14 @@
 # ADR-0012: Mapping a node to its pool needs a label whose value is the autoscaler's identifier
 
-- **Status:** accepted. Supersedes the resolution order in
+- **Status:** accepted, and **amended by
+  [ADR-0013](adr-0013-deriving-the-pool-mapping-from-the-names-identifiers-are-built-from.md)**.
+  The requirement below stands unchanged — a node must be joinable to the identifier the
+  cluster-autoscaler publishes, and pool bounds come from that autoscaler and nowhere else. What
+  ADR-0013 changes is the Decision's "There is no second mode": binpack may now derive the join
+  from a label whose values the identifiers were built from, and an operator may state it
+  outright with `discovery.nodeGroups`. Neither restates a pool bound, so nothing in the
+  Alternatives below is reopened. The text here is kept as it stood.
+- Supersedes the resolution order in
   [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md): its step 2, "**Configured.** Otherwise,
   fall back to pool membership by label and operator-stated minimums", was never implemented and
   is withdrawn rather than deferred. ADR-0004's decision — take nothing from a cloud API — stands
@@ -89,6 +97,11 @@ provider's label, and not by one an operator applies.
 
 ## Decision
 
+> **Amended.** ADR-0013 adds two further ways to establish the same join and keeps this one
+> first: `discovery.nodeGroups` states it outright, and where nothing matches binpack derives it
+> from a label whose values the published identifiers were generated from. "No configuration that
+> states pool **bounds**" still holds and is the half that mattered.
+
 **binpack has one way to map a node to a pool: a node label whose value equals the identifier the
 cluster-autoscaler publishes.** There is no second mode, and no configuration that states pool
 membership or bounds. `discovery.nodeGroupIDLabel` names the key; the value is the cluster's to
@@ -151,6 +164,12 @@ coincidence on one evaluation is a key that stops matching when a pool is added,
 would be a silent change of scope rather than a refusal. What binpack matches on should be
 something someone chose.
 
+> **Revisited by ADR-0013**, which answers this objection rather than dismissing it. Inference is
+> allowed only when it resolves *every* published pool at once, so adding a pool makes the
+> derivation fail the check and binpack refuse — the change of scope this paragraph is about
+> becomes the refusal it asks for. The rejection was right about a rule that matches keys one at
+> a time.
+
 **Leave it as documentation.** The reference already promised that a mismatch "fails loudly
 rather than guessing", so an argument was available that only the documentation was wrong.
 Rejected: the promise was the correct design and the code was the part that was missing.
@@ -183,7 +202,8 @@ into a loud one is only an improvement if the message ends the problem where it 
 command binpack prints and the command the reference gives are checked against a single shared
 literal.
 
-**GCE has no answer, and this ADR says so rather than implying one.** ADR-0004 deferred optional
+**GCE has no answer, and this ADR says so rather than implying one.** *(ADR-0013 gives it one: the
+instance group's name is a substring of the URL even though no label can hold the URL itself.)* ADR-0004 deferred optional
 cloud API integration on the grounds that "no such provider has been identified yet". One has.
 That does not decide the question — the deferral stands — but the architecture document's open
 question can stop suggesting a fallback that would not have helped, because a configured pool

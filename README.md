@@ -48,14 +48,17 @@ kubectl get configmap cluster-autoscaler-status -A
 Whichever namespace that names is the one to set as `discovery.autoscalerNamespace`. Without an
 autoscaler binpack refuses to act, so it has nothing to offer a `kind` or `minikube` cluster.
 
-**It also needs one node label** whose *value* is the autoscaler's own identifier for that node's
-pool — the thing it writes into `nodeGroups[].name`, which is an Auto Scaling group name on AWS
-and a VM Scale Set name on Azure, not the pool name you picked in a console. DigitalOcean's
-`doks.digitalocean.com/node-pool-id` carries it and is the default; elsewhere you may have to
-apply a label yourself and point `discovery.nodeGroupIDLabel` at it. binpack refuses to start
-rather than silently finding no pools, and says which label it looked for. See
-[`discovery.nodeGroupIDLabel`](docs/reference/configuration.md#discoverynodegroupidlabel) and
-[ADR-0012](docs/design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md).
+**It also needs to match each node to its pool**, and what the autoscaler publishes in
+`nodeGroups[].name` is its cloud provider's own identifier — an Auto Scaling group name on AWS, a
+VM Scale Set name on Azure — not the pool name you picked in a console. DigitalOcean's
+`doks.digitalocean.com/node-pool-id` carries that identifier outright and is the default.
+Elsewhere binpack works the match out from the pool label your provider already applies, because
+the identifier is generated from the same name; it does that only when every published pool
+resolves at once and unambiguously, reports the label it used, and refuses rather than guessing. Where it refuses, you
+can point `discovery.nodeGroupIDLabel` at a label of your own or state the mapping directly. See
+[`discovery.nodeGroupIDLabel`](docs/reference/configuration.md#discoverynodegroupidlabel),
+[ADR-0012](docs/design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) and
+[ADR-0013](docs/design/adr-0013-deriving-the-pool-mapping-from-the-names-identifiers-are-built-from.md).
 
 **Before installing anything**, work through the
 [quick wins](docs/how-to/quick-wins-before-installing-binpack.md). Several of them recover more
@@ -130,7 +133,8 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0009](docs/design/adr-0009-revalidation-asks-soundness-not-preference.md) | Revalidation re-asks soundness, not preference *(soundness list narrowed by ADR-0010)* |
 | [ADR-0010](docs/design/adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md) | Why a scale-up stops a drain that has not started, and not one that has |
 | [ADR-0011](docs/design/adr-0011-a-refusal-is-a-decision-and-earns-an-event.md) | Why a decision to drain nothing earns an Event, and which nodes it goes on |
-| [ADR-0012](docs/design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) | Why mapping a node to its pool needs a label whose value is the autoscaler's own identifier, and what that costs per provider |
+| [ADR-0012](docs/design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) | Why mapping a node to its pool needs a label whose value is the autoscaler's own identifier, and what that costs per provider *(second resolution mode added by ADR-0013)* |
+| [ADR-0013](docs/design/adr-0013-deriving-the-pool-mapping-from-the-names-identifiers-are-built-from.md) | Deriving that mapping from the pool names the identifiers are built from, and what makes a substring match safe enough to act on |
 
 ## Design principles
 

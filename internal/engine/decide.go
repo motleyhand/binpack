@@ -7,7 +7,6 @@ import (
 	"slices"
 	"sort"
 	"strconv"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -258,12 +257,31 @@ type Config struct {
 	NodeGroupIDLabel string
 	PoolNameLabel    string
 
+	// NodeGroups states outright which identifier a NodeGroupIDLabel value
+	// belongs to, for clusters where the identifier is neither a legal label
+	// value nor built from anything a label carries. Membership only: pool
+	// bounds still come from the status ConfigMap, because a minimum stated
+	// here and enforced by the autoscaler is two numbers that can disagree.
+	// A value absent from it still matches by equality.
+	NodeGroups map[string]string
+
+	// Mapping is how nodes join to the pools the autoscaler publishes, filled
+	// in by [ResolvePools] from the snapshot rather than configured. The zero
+	// value is the equality join ADR-0012 describes, so a Config nothing
+	// resolved still decides — it just sees fewer pools. Read it through
+	// [Config.GroupOf].
+	Mapping PoolMapping
+
 	Default Policy
 	ByPool  map[string]Policy
 }
 
-// PolicyFor resolves the policy for a pool, matching on either identifier.
-func (c Config) PolicyFor(names ...string) Policy {
+// policyFor resolves the policy for a pool, matching on any of its names.
+//
+// Unexported, and reached only through [Config.PolicyForNode]: which names a
+// node answers to is the question that went wrong once, so there is one
+// answer to it rather than one per caller.
+func (c Config) policyFor(names ...string) Policy {
 	for _, name := range names {
 		if name == "" {
 			continue
@@ -544,7 +562,7 @@ func assess(s Snapshot, cfg Config) ([]NodeAssessment, int) {
 		a := candidates[i]
 		// Never committed: this is the decision, and nothing has been evicted
 		// on the strength of it yet.
-		if drainable(s, a, cfg.PolicyFor(a.Group, a.Pool), false) && chosen < 0 {
+		if drainable(s, a, cfg.PolicyForNode(a.Node), false) && chosen < 0 {
 			chosen = len(assessments)
 		}
 		assessments = append(assessments, *a)
@@ -626,7 +644,7 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 	// means nothing will ever remove this node, so continuing to empty it
 	// would strand the cordon.
 	if live, why := s.Autoscaler.Live(s.Now); !live {
-		a := NodeAssessment{Node: node, Group: node.Labels[cfg.NodeGroupIDLabel],
+		a := NodeAssessment{Node: node, Group: cfg.GroupOf(node),
 			Pool: node.Labels[cfg.PoolNameLabel]}
 		a.Skipped, a.SkipCode, a.SkipReason = true, SkipNotAutoscaled, why
 		return a
@@ -639,7 +657,7 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 
 	// The same question eligibility asked above, through the same reading, so
 	// the two halves of the drain cannot disagree about whether it has begun.
-	drainable(s, &a, cfg.PolicyFor(a.Group, a.Pool), committedDrain(node))
+	drainable(s, &a, cfg.PolicyForNode(node), committedDrain(node))
 	return a
 }
 
@@ -805,11 +823,11 @@ func eligibility(
 ) NodeAssessment {
 	a := NodeAssessment{
 		Node:  node,
-		Group: node.Labels[cfg.NodeGroupIDLabel],
+		Group: cfg.GroupOf(node),
 		Pool:  node.Labels[cfg.PoolNameLabel],
 	}
 
-	policy := cfg.PolicyFor(a.Group, a.Pool)
+	policy := cfg.PolicyForNode(node)
 	group, managed := groups[a.Group]
 	coolCode, cooldown, cooling := cooling(s, policy)
 
@@ -904,7 +922,7 @@ func protectedNamespaces(s Snapshot, cfg Config) map[string]string {
 		if !known {
 			continue
 		}
-		policy := cfg.PolicyFor(node.Labels[cfg.NodeGroupIDLabel], node.Labels[cfg.PoolNameLabel])
+		policy := cfg.PolicyForNode(node)
 		for _, ns := range policy.ExcludedNamespaces {
 			if pod.Namespace != ns {
 				continue
@@ -1098,180 +1116,4 @@ func summarise(assessments []NodeAssessment) string {
 	default:
 		return fmt.Sprintf("%d node(s) considered, none whose workload fits elsewhere", considered)
 	}
-}
-
-// PoolNames maps each autoscaling group's identifier to the human-readable
-// pool name its nodes carry.
-//
-// The two names come from different places: the identifier from the
-// cluster-autoscaler's status, the readable name from a node label. Anything
-// shown to a person wants the second — nobody recognises a provider UUID on a
-// dashboard or in an alert — and anything matching against the autoscaler
-// wants the first.
-//
-// A pool with no nodes has nothing to take a name from and is absent here, so
-// callers fall back to the identifier.
-func PoolNames(s Snapshot, cfg Config) map[string]string {
-	names := map[string]string{}
-	for _, node := range s.Nodes {
-		id := node.Labels[cfg.NodeGroupIDLabel]
-		name := node.Labels[cfg.PoolNameLabel]
-		if id != "" && name != "" {
-			names[id] = name
-		}
-	}
-	return names
-}
-
-// NodeGroupLabelSuggestion is the label binpack recommends where nothing a
-// provider already writes carries the autoscaler's identifier for a pool.
-//
-// Under binpack's own API group deliberately: a key in a provider's namespace
-// is one the provider may start writing itself, and a value it then overwrites
-// is a mapping that breaks with no configuration having changed.
-const NodeGroupLabelSuggestion = "binpack.motleyhand.com/node-group"
-
-// checkNodeGroupLabel rejects a cluster where the configured label maps no node
-// to any pool the autoscaler reports.
-//
-// binpack matches a node to a pool through one label, and the match is on that
-// label's *value*: `nodeGroups[].name` in the status ConfigMap is the cloud
-// provider's own identifier for the group, so a node has to carry that
-// identifier. Where none does, every node falls out of scope and binpack
-// reports "not part of an autoscaling pool" about a cluster of nothing but
-// autoscaled nodes — printed directly beneath its own list of healthy pools,
-// with a count from the summary making the wrong answer sound more certain.
-// Nothing about that state tells an operator which of the two halves is wrong.
-// `diagnose` goes quiet in one particular way too: every node is static, so
-// every finding diagnoseWorkloads groups frees nothing and `--fail-on` skips
-// it. Budget and pool findings are unaffected, which is narrower than it
-// first reads — see ADR-0012.
-//
-// Refused only on positive evidence, because refusing is the expensive
-// direction. All three conditions carry their weight: a status document
-// nothing is updating says nothing about the cluster now, and Live already
-// names that as the problem; a group with no ready node has nothing to carry
-// its identifier and is not evidence of anything; and one node matching is
-// proof the mapping works, so a cluster halfway through being relabelled goes
-// on running.
-func checkNodeGroupLabel(s Snapshot, cfg Config) error {
-	// With no nodes there is no evidence and nothing to report: the error's
-	// content is what the nodes do carry, and an empty list of that is a
-	// sentence about a cluster binpack cannot see rather than one it has
-	// diagnosed.
-	if live, _ := s.Autoscaler.Live(s.Now); !live || len(s.Nodes) == 0 {
-		return nil
-	}
-
-	var published []string
-	ids, populated := map[string]bool{}, false
-	for _, g := range s.Autoscaler.Groups {
-		// A group the status names with an empty string would be matched by
-		// every unlabelled node, which turns this check off without failing
-		// it. `name` is omitempty upstream, so the value is representable.
-		if g.ID == "" {
-			continue
-		}
-		published = append(published, g.ID)
-		ids[g.ID] = true
-		populated = populated || g.Ready > 0
-	}
-	// Nothing published has a node in it, so nothing could have matched and
-	// there is no evidence either way. It also leaves `published` non-empty
-	// wherever this returns an error, which the remedy below relies on.
-	if !populated {
-		return nil
-	}
-
-	keys := map[string]bool{}
-	for _, node := range s.Nodes {
-		if ids[node.Labels[cfg.NodeGroupIDLabel]] {
-			return nil
-		}
-		for key := range node.Labels {
-			keys[key] = true
-		}
-	}
-
-	// Both lists sorted, for the reason the summary sentence needed one:
-	// collect.Snapshot appends nodes in the order the API server listed them
-	// and sorts nothing, and the group order is the status document's. An
-	// unchanged cluster would otherwise word its refusal differently on every
-	// run, and a refusal nobody can diff against the last one is one nobody
-	// can tell they have already read.
-	sort.Strings(published)
-	present := slices.Sorted(maps.Keys(keys))
-
-	return fmt.Errorf(
-		"no node carries a pool identifier the cluster-autoscaler recognises, so binpack\n"+
-			"can see no autoscaling pool at all;\n"+
-			"discovery.nodeGroupIDLabel is %q, and a node belongs to a pool\n"+
-			"when that label's value equals a group name the autoscaler publishes\n"+
-			"  the autoscaler publishes: %s\n"+
-			"  the nodes carry the labels: %s\n"+
-			"if one of those labels already holds a group name, set discovery.nodeGroupIDLabel\n"+
-			"to it; otherwise label each pool's nodes yourself and set it to that:\n"+
-			"  kubectl label nodes <node>... %s=%s",
-		cfg.NodeGroupIDLabel,
-		strings.Join(published, ", "),
-		strings.Join(present, ", "),
-		NodeGroupLabelSuggestion, published[0])
-}
-
-// CheckPools is the preflight every frontend runs before it decides anything:
-// it rejects a configuration whose pools binpack will not be able to resolve.
-//
-// Two ways that happens, and the label comes first because an override naming
-// a pool is downstream of there being any pool at all. See
-// [checkNodeGroupLabel] for the mapping, and below for the overrides.
-//
-// Pools are discovered, never declared, so an override adjusts something that
-// exists. A misspelt name otherwise installs an unreachable map entry and its
-// nodes quietly take the default policy — which is actively dangerous for
-// `enabled: false`, where an operator believes they have switched a pool off
-// and binpack goes on considering it drainable.
-//
-// Checked against the resolved configuration rather than the document, so what
-// is validated is what the engine will actually consult. Every frontend calls
-// it: a configuration `explain` refuses must not be one `run` accepts, and the
-// controller is the one that will eventually act on it.
-func CheckPools(s Snapshot, cfg Config) error {
-	if err := checkNodeGroupLabel(s, cfg); err != nil {
-		return err
-	}
-	if len(cfg.ByPool) == 0 {
-		return nil
-	}
-
-	known := map[string]bool{}
-	for _, g := range s.Autoscaler.Groups {
-		known[g.ID] = true
-	}
-	for _, node := range s.Nodes {
-		if name := node.Labels[cfg.PoolNameLabel]; name != "" {
-			known[name] = true
-		}
-		if id := node.Labels[cfg.NodeGroupIDLabel]; id != "" {
-			known[id] = true
-		}
-	}
-
-	var unknown []string
-	for name := range cfg.ByPool {
-		if !known[name] {
-			unknown = append(unknown, name)
-		}
-	}
-	if len(unknown) == 0 {
-		return nil
-	}
-
-	// Sorted: the names come from a map, and an error that reorders itself
-	// between runs is one nobody can diff or match against a log.
-	sort.Strings(unknown)
-	return fmt.Errorf(
-		"configuration overrides pools that do not exist in this cluster: %s\n"+
-			"pools are discovered, not declared, so an override must name one that is there;\n"+
-			"check for a typo, or remove the entry if the pool is gone",
-		strings.Join(unknown, ", "))
 }

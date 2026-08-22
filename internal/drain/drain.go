@@ -158,7 +158,7 @@ func PolicyFor(cfg engine.Config, s engine.Snapshot, name string) Policy {
 		if node.Name != name {
 			continue
 		}
-		p := cfg.PolicyFor(node.Labels[cfg.NodeGroupIDLabel], node.Labels[cfg.PoolNameLabel])
+		p := cfg.PolicyForNode(node)
 		return policyFrom(p)
 	}
 	return policyFrom(cfg.Default)

@@ -355,7 +355,7 @@ func diagnosePools(s Snapshot, cfg Config) []Finding {
 	counts := map[string]int{}
 	var order []string
 	for _, node := range s.Nodes {
-		id := node.Labels[cfg.NodeGroupIDLabel]
+		id := cfg.GroupOf(node)
 		if id == "" || managed[id] {
 			continue
 		}
@@ -580,7 +580,7 @@ func staticNodes(s Snapshot, cfg Config) map[string]bool {
 
 	out := map[string]bool{}
 	for _, node := range s.Nodes {
-		if !managed[node.Labels[cfg.NodeGroupIDLabel]] {
+		if !managed[cfg.GroupOf(node)] {
 			out[node.Name] = true
 		}
 	}

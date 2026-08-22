@@ -621,6 +621,16 @@ func (e *evaluator) attempt(ctx context.Context) error {
 		return fmt.Errorf("reading the cluster: %w", err)
 	}
 
+	// How nodes join to pools is derived from this snapshot, not configured:
+	// on EKS, GKE and AKS no label carries the identifier the autoscaler
+	// publishes, so binpack works it out from the labels the nodes do carry.
+	// Every use below reads `cfg` rather than e.opts.Engine — the process-wide
+	// configuration knows the label keys and nothing about this cluster, and
+	// deciding against it would decide about fewer pools than were validated.
+	//
+	// The error is held until below step 0, for the reason given there.
+	cfg, poolErr := engine.ResolvePools(snapshot, e.opts.Engine)
+
 	// Step 0 of the drain protocol: resume before deciding.
 	//
 	// A drain can legitimately outlast many intervals, and without this every
@@ -629,9 +639,9 @@ func (e *evaluator) attempt(ctx context.Context) error {
 	if node := e.drainInProgress(snapshot); node != "" {
 		if !e.opts.DryRun {
 			metrics.Observe(snapshot, engine.Decision{Code: engine.CodeDraining,
-				Reason: "a drain is in progress on " + node}, e.opts.Engine,
+				Reason: "a drain is in progress on " + node}, cfg,
 				time.Since(started).Seconds())
-			return e.advance(ctx, snapshot, node)
+			return e.advance(ctx, snapshot, cfg, node)
 		}
 		// Said, and then carried on past — because in dry run this drain never
 		// moves. Step 0 pre-empts a new decision so that a drain outlasting
@@ -645,7 +655,7 @@ func (e *evaluator) attempt(ctx context.Context) error {
 		// Nothing is written on the way through. Deciding costs a simulation
 		// and the gate below stops before the executor, as it does on every
 		// other dry-run pass.
-		if err := e.frozen(ctx, snapshot, node); err != nil {
+		if err := e.frozen(ctx, snapshot, cfg, node); err != nil {
 			if e.opts.Once {
 				// Nothing will retry, and unlike the decision below there is
 				// no second chance within this run either: a frozen drain
@@ -680,8 +690,8 @@ func (e *evaluator) attempt(ctx context.Context) error {
 	// node for. Resuming is bounded by the drain ending, so the configuration
 	// is judged on the tick after that, and `explain` and `diagnose` say so
 	// immediately either way.
-	if err := engine.CheckPools(snapshot, e.opts.Engine); err != nil {
-		return unretryable{err}
+	if poolErr != nil {
+		return unretryable{poolErr}
 	}
 
 	// Filled in by the controller rather than read from the cluster: it is the
@@ -689,8 +699,8 @@ func (e *evaluator) attempt(ctx context.Context) error {
 	// completed drain deletes the node that would have recorded it.
 	snapshot.LastDrain = e.lastDrain
 
-	decision := engine.Decide(snapshot, e.opts.Engine)
-	metrics.Observe(snapshot, decision, e.opts.Engine, time.Since(started).Seconds())
+	decision := engine.Decide(snapshot, cfg)
+	metrics.Observe(snapshot, decision, cfg, time.Since(started).Seconds())
 
 	if err := e.report(ctx, snapshot, decision); err != nil {
 		if e.opts.Once {
@@ -786,8 +796,8 @@ func present(s engine.Snapshot, name string) bool {
 // Nothing here writes or advances anything, so the event is the whole output of
 // the evaluation — and in a one-shot run it is the only durable record there
 // is, since the logs go with the process.
-func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) error {
-	a := engine.Revalidate(s, name, e.opts.Engine)
+func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, cfg engine.Config, name string) error {
+	a := engine.Revalidate(s, name, cfg)
 	if a.SkipCode == engine.SkipGone {
 		// The autoscaler finished a drain that started before dry run was
 		// switched on. Nothing is stranded, and forgetting the node is what
@@ -798,7 +808,7 @@ func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) 
 	}
 
 	would := drain.WouldHappen(a, drain.Assess(
-		drain.State{Node: a.Node, Pods: drain.PodsOn(s, name), Now: s.Now}, drain.PolicyFor(e.opts.Engine, s, name)))
+		drain.State{Node: a.Node, Pods: drain.PodsOn(s, name), Now: s.Now}, drain.PolicyFor(cfg, s, name)))
 
 	e.log.Info("a drain is in progress but dryRun is set; leaving it alone",
 		"node", name, "wouldHappen", would)
@@ -816,8 +826,8 @@ func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, name string) 
 
 // advance moves an in-progress drain on by one step. Only ever reached when
 // binpack is acting; a dry run reports through [evaluator.frozen] instead.
-func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, name string) error {
-	step, err := executor.Advance(ctx, e.writer, s, name, e.opts.Engine, drain.PolicyFor(e.opts.Engine, s, name))
+func (e *evaluator) advance(ctx context.Context, s engine.Snapshot, cfg engine.Config, name string) error {
+	step, err := executor.Advance(ctx, e.writer, s, name, cfg, drain.PolicyFor(cfg, s, name))
 	if err != nil {
 		return fmt.Errorf("advancing the drain of %s: %w", name, err)
 	}

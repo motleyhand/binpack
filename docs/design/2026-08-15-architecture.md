@@ -141,10 +141,15 @@ Before any evaluation, on every command:
    [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md).
 2. **Which node groups autoscale, and what are their bounds?** Discovered from the same
    ConfigMap, through a node label whose *value* is the identifier it publishes — see
-   `discovery.nodeGroupIDLabel`. Where no node carries such a value, binpack fails preflight
-   rather than reporting a cluster of autoscaled nodes as unmanaged; there is no second
-   resolution mode, and [ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md)
-   records why not.
+   `discovery.nodeGroupIDLabel`. Where no node carries such a value, binpack derives the match
+   instead, from a label whose values the identifiers were generated from, and only where that
+   resolves every published pool at once; `discovery.nodeGroups` states it outright where even
+   that cannot. Where none of the three works, binpack fails preflight rather than reporting a
+   cluster of autoscaled nodes as unmanaged. **Bounds have one source in every case**, which is
+   the autoscaler's own status: [ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md)
+   records why a node has to be joinable to the identifier at all, and
+   [ADR-0013](adr-0013-deriving-the-pool-mapping-from-the-names-identifiers-are-built-from.md)
+   how the join is established.
 
 `explain` and `diagnose` report preflight failures rather than exiting silently: "no
 cluster-autoscaler found" is itself a useful diagnosis.
@@ -614,6 +619,7 @@ dryRun: true                          # safe by default; acting is opt-in
 discovery:
   nodeGroupIDLabel: doks.digitalocean.com/node-pool-id
   poolNameLabel: doks.digitalocean.com/node-pool
+  nodeGroups: []                      # membership stated outright; bounds never are
 
 policy:                               # applies to every discovered pool
   enabled: true
@@ -739,13 +745,17 @@ Each of steps 4 onward gets its own specification before implementation.
 
 ## Open questions
 
-**How should nodes map to node groups where no label can carry the identifier?** DOKS provides
-`doks.digitalocean.com/node-pool-id`, whose values match the autoscaler's node group names
-exactly. Where a provider's own labels do not, the operator applies one — `nodeGroupIDLabel`
-names any key, so this works wherever the identifier is a legal label value.
-[ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md) settles that much and
-leaves the remainder open: on GCE the identifier is a full instance-group URL and no label can
-hold it, so those clusters need something this design does not have.
+**~~How should nodes map to node groups where no label can carry the identifier?~~** *Closed by
+[ADR-0013](adr-0013-deriving-the-pool-mapping-from-the-names-identifiers-are-built-from.md).* DOKS
+provides `doks.digitalocean.com/node-pool-id`, whose values match the autoscaler's node group
+names exactly, and where a provider's own labels do not, the operator applies one —
+`nodeGroupIDLabel` names any key, so that works wherever the identifier is a legal label value.
+GCE was the remainder: the identifier is a full instance-group URL and no label can hold it. The
+answer is that a label does not have to hold the whole identifier, because a provider builds the
+identifier out of the pool name — so the instance group's *name* is inside the URL even though the
+URL cannot be a label value, and binpack joins on that where the join claims every published pool
+unambiguously. `discovery.nodeGroups` covers what is left, which is a pool name the provider
+truncated or never used.
 
 **Should node sizing be recommended?** Per-node kubelet and system reservations are roughly
 fixed, so larger nodes waste proportionally less — a 4GB node loses 15–17 percent to
