@@ -966,30 +966,77 @@ func TestTheSummaryCountsSkipsByCodeNotBySentence(t *testing.T) {
 	}
 }
 
-// TestTheSummaryDoesNotDependOnMapOrder pins the half of counting by code that
-// the tables above cannot reach.
+// TestTheSummaryDoesNotDependOnHowTheClusterWasListed pins the half of
+// counting by code that the tables above cannot reach: the sentence must be a
+// function of the cluster and of nothing else.
 //
-// Which of two equally common codes is named is arbitrary and deliberately not
-// asserted; that the same cluster gives the same answer twice is not. The
-// counting is a map, so dropping the tie-break would leave a sentence that
-// changes between evaluations with nothing in the cluster changing — and the
-// operator reading it comparing two log lines that disagree.
-func TestTheSummaryDoesNotDependOnMapOrder(t *testing.T) {
-	nodes := []*corev1.Node{
+// Two things that are not the cluster can reach it. The counting is a map, so
+// without a tie-break two equally common codes swap places between
+// evaluations. And the reason is one node's, so without an order the
+// representative is whichever node came first — which is whatever
+// `reader.List` returned, since collect.Snapshot appends nodes in list order
+// and sorts nothing. Either one produces a `reason` log line that changes with
+// nothing in the cluster changing, which is the defect this PR is about
+// wearing a different hat.
+//
+// Which of two tied codes wins is arbitrary and deliberately not asserted.
+// That the same cluster answers the same way is.
+func TestTheSummaryDoesNotDependOnHowTheClusterWasListed(t *testing.T) {
+	// Distinct expiries, so every backoff node renders a different sentence
+	// and only the choice between them can vary.
+	backoff := []*corev1.Node{
 		backingOff("a", now.Add(time.Hour), ""),
 		backingOff("b", now.Add(45*time.Minute), ""),
-		inPool("c", mother.Cordoned()),
-		inPool("d", mother.Cordoned()),
+		backingOff("c", now.Add(30*time.Minute), ""),
 	}
-	s, cfg := cluster(nodes, nil), config()
+	cordoned := []*corev1.Node{inPool("d", mother.Cordoned()), inPool("e", mother.Cordoned())}
+	cfg := config()
 
-	first := engine.Decide(s, cfg).Reason
-	if !strings.Contains(first, "2 of 4") {
-		t.Fatalf("neither tied code covers the nodes it should, got: %s", first)
+	orders := map[string][]*corev1.Node{
+		"as listed":            {backoff[0], backoff[1], backoff[2], cordoned[0], cordoned[1]},
+		"reversed":             {cordoned[1], cordoned[0], backoff[2], backoff[1], backoff[0]},
+		"interleaved":          {cordoned[0], backoff[2], cordoned[1], backoff[0], backoff[1]},
+		"modal node not first": {cordoned[0], cordoned[1], backoff[1], backoff[2], backoff[0]},
+	}
+
+	var first, firstName string
+	for name, nodes := range orders {
+		reason := engine.Decide(cluster(nodes, nil), cfg).Reason
+		if !strings.Contains(reason, "3 of 5") {
+			t.Fatalf("%s: the modal code does not cover the nodes it should, got: %s",
+				name, reason)
+		}
+		if first == "" {
+			first, firstName = reason, name
+			continue
+		}
+		if reason != first {
+			t.Errorf("the same cluster summarised two ways, by list order alone:\n"+
+				"%s: %s\n%s: %s", firstName, first, name, reason)
+		}
+	}
+
+	// Which representative, not only that it is stable. Ordering by the
+	// sentence instead of by the node would also be deterministic and would
+	// pass everything above — and for backoff expiries the smallest string is
+	// node c at 12:30, the node closest to recovering and the least
+	// representative of the three. Node a's is the answer that comes from an
+	// identity rather than from a spelling.
+	if !strings.Contains(first, now.Add(time.Hour).Format(time.RFC3339)) {
+		t.Errorf("the representative is not the winning code's first node by name, so it "+
+			"was chosen by how its sentence reads: %s", first)
+	}
+
+	// And the map half, which needs repetition rather than reordering: two
+	// codes covering the same number of nodes must not swap between runs.
+	tied := cluster([]*corev1.Node{backoff[0], backoff[1], cordoned[0], cordoned[1]}, nil)
+	stable := engine.Decide(tied, cfg).Reason
+	if !strings.Contains(stable, "2 of 4") {
+		t.Fatalf("neither tied code covers the nodes it should, got: %s", stable)
 	}
 	for i := 0; i < 32; i++ {
-		if again := engine.Decide(s, cfg).Reason; again != first {
-			t.Fatalf("the same cluster summarised two ways:\n%s\n%s", first, again)
+		if again := engine.Decide(tied, cfg).Reason; again != stable {
+			t.Fatalf("the same cluster summarised two ways:\n%s\n%s", stable, again)
 		}
 	}
 }

@@ -430,6 +430,24 @@ func TestTheBlockingFooterIsTrueOfEveryBlockingCode(t *testing.T) {
 			"for is spoken for by nothing:\n%s", alone)
 	}
 
+	// The closing line must not assert what binpack cannot observe. It says
+	// itself, in its next breath, that an autoscaler with status reporting
+	// turned off looks identical from here — and in that case a running
+	// autoscaler will remove a node once a budget above is fixed. An
+	// unconditional "acting on the rest frees no node" therefore tells an
+	// operator to ignore a remedy that works, in exactly the case the line
+	// warns them about.
+	for _, unconditional := range []string{
+		"until it clears, acting on the rest of this report frees no node",
+		"the rest of this report frees no node",
+	} {
+		if strings.Contains(noAutoscalerFooter, unconditional) {
+			t.Errorf("the no-autoscaler closing line says %q with no condition, which is "+
+				"false when an autoscaler is running and only its status reporting is off — "+
+				"the case the line's own next sentence raises", unconditional)
+		}
+	}
+
 	// And the guard's own negative case, twice over: the phrase list has to
 	// bite something, and it has to bite it only inside the class. Both
 	// remedies below really are settings — one turns autoscaling on for a

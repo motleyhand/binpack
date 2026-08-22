@@ -994,8 +994,19 @@ func displayPool(a NodeAssessment) string {
 // sentence rather than as unanimous.
 //
 // The reason returned is therefore one node's, and the count is what carries
-// the claim about the cluster. Ties break on the code so the answer does not
-// depend on map iteration order.
+// the claim about the cluster.
+//
+// Both choices it makes are ordered, because neither input is. Ties break on
+// the code, so the answer does not depend on map iteration order; and the
+// representative is the winning code's first node *by name*, so it does not
+// depend on the order the nodes were listed in — collect.Snapshot appends them
+// as the API returned them and sorts nothing. Either would give a `reason` log
+// line that changes with nothing in the cluster changing, which is the defect
+// this function was rewritten to fix wearing a different hat.
+//
+// By name rather than by the reason's own spelling: sorting the sentences
+// picks one for how it reads, and for backoff expiries the smallest string is
+// the node closest to recovering — the least representative of the set.
 func commonestSkip(assessments []NodeAssessment) (reason string, n int) {
 	counts := make(map[string]int)
 	for _, a := range assessments {
@@ -1010,12 +1021,20 @@ func commonestSkip(assessments []NodeAssessment) (reason string, n int) {
 			best, bestN = code, n
 		}
 	}
-	for _, a := range assessments {
-		if a.Skipped && a.SkipCode == best {
-			return a.SkipReason, bestN
+
+	var first *NodeAssessment
+	for i, a := range assessments {
+		if !a.Skipped || a.SkipCode != best {
+			continue
+		}
+		if first == nil || a.Node.Name < first.Node.Name {
+			first = &assessments[i]
 		}
 	}
-	return "", 0
+	if first == nil {
+		return "", 0
+	}
+	return first.SkipReason, bestN
 }
 
 // summarise turns a set of rejections into one sentence. "Nothing to do" is

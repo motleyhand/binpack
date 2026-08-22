@@ -242,7 +242,9 @@ terminally `Failed` and creates nothing — and `backoffLimit: 0` is the ordinar
 migration, a Helm hook or a one-shot CI Job. The `Ignore` rule above is what stops a disruption
 spending that budget.
 
-Otherwise, accept that the node cannot be drained while the pod is there.
+Otherwise, accept that the node cannot be drained while the pod is there. The
+`cluster-autoscaler.kubernetes.io/safe-to-evict=true` annotation does override this, and means
+what it says: the pod is deleted and nothing brings it back.
 
 ### `local-storage` — warning
 

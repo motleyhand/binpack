@@ -301,14 +301,21 @@ const blockingClassFooter = "blocking findings hold a node open until the object
 // noAutoscalerFooter is the closing line for the one blocking code the
 // sentence above is not about.
 //
-// Deliberately does not assert that nothing is removing nodes: binpack reads
-// the autoscaler's own status ConfigMap, and an autoscaler running with status
-// reporting turned off is indistinguishable from none at all. Saying which is
-// which is the reader's cluster to know, not this report's.
-const noAutoscalerFooter = "no-autoscaler is the exception: it is not about an object, and until it clears,\n" +
-	"acting on the rest of this report frees no node. binpack reads the\n" +
-	"cluster-autoscaler's own status ConfigMap, so an autoscaler running with status\n" +
-	"reporting turned off looks the same from here.\n"
+// Every claim here is conditioned on something the reader can check, because
+// binpack cannot check it: this finding comes from the autoscaler's own status
+// ConfigMap, and an autoscaler running with status reporting turned off is
+// indistinguishable from none at all. A first version said flatly that acting
+// on the rest of the report frees no node until this clears, which is false in
+// exactly that case — the budget above gets fixed and the running autoscaler
+// removes the node — so the sentence sent operators past a remedy that works,
+// under a caveat two lines later saying it might. The condition and the caveat
+// have to be the same sentence.
+const noAutoscalerFooter = "no-autoscaler is the exception: it is not about an object, and binpack learns it\n" +
+	"only from the cluster-autoscaler's own status ConfigMap — an autoscaler running\n" +
+	"with status reporting turned off looks the same from here. Check which you have\n" +
+	"before deciding what the rest of this report is worth: if one is running, fixing\n" +
+	"a blocker above can still free a node, and if none is, nothing above will until\n" +
+	"one does.\n"
 
 // classFooterSpeaksFor reports whether the sentence above is a sentence about
 // this code.

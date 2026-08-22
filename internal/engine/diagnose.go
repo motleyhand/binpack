@@ -186,7 +186,9 @@ var diagnoses = map[string]Diagnosis{
 			"[{type: DisruptionTarget}]}], which Kubernetes permits only alongside " +
 			"restartPolicy: Never. Without that policy an eviction spends the Job's failure " +
 			"budget, and a Job that runs out creates no replacement. Otherwise accept that " +
-			"the node cannot be drained while the pod is there.",
+			"the node cannot be drained while the pod is there. The autoscaler's " +
+			"safe-to-evict=true annotation does override this, and means what it says: the " +
+			"pod is deleted and nothing brings it back.",
 	},
 	BlockedMirrorPod: {
 		Severity: Blocking,
