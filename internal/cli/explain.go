@@ -47,7 +47,8 @@ func newExplainCommand(opts *options) *cobra.Command {
 				return err
 			}
 
-			snapshot, err := collect.Snapshot(cmd.Context(), client, time.Now())
+			snapshot, err := collect.Snapshot(cmd.Context(), client, time.Now(),
+				cfg.Discovery.AutoscalerNamespace)
 			if err != nil {
 				return err
 			}
@@ -58,6 +59,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 
 			opts.configSource = source
 			opts.dryRun = cfg.Settings().DryRun
+			opts.autoscalerNamespace = cfg.Discovery.AutoscalerNamespace
 			return renderExplain(opts, snapshot, explainOutcome(snapshot, engineConfig(cfg)))
 		},
 	}
@@ -516,7 +518,17 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 
 	p("\ncluster-autoscaler: ")
 	if !live {
-		p("unavailable\n")
+		p("unavailable")
+		// The evidence, named. Everything binpack knows about the autoscaler
+		// comes from this one object, and an operator whose autoscaler is
+		// demonstrably running needs to see that binpack looked somewhere
+		// else — which is far likelier than their autoscaler being gone.
+		// Printed only here: on a cluster where the answer is yes, the object
+		// binpack read to find that out answers nothing.
+		if opts.autoscalerNamespace != "" {
+			p(" — read %s/%s", opts.autoscalerNamespace, collect.StatusConfigMapName)
+		}
+		p("\n")
 	} else {
 		p("running")
 		if s.Autoscaler.ScaleDownStatus != "" {

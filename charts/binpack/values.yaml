@@ -41,9 +41,25 @@ config:
   dryRun: true
   interval: 1m0s
 
+  discovery:
+    # Where the cluster-autoscaler publishes its status ConfigMap: the
+    # namespace it runs in, which is what it was started with --namespace.
+    # The upstream cluster-autoscaler chart sets that to whatever namespace
+    # you install it into, so this is kube-system on many clusters and not on
+    # many others. Check yours with:
+    #
+    #   kubectl get configmap cluster-autoscaler-status -A
+    #
+    # binpack reads this namespace and no other, and the Role granting it that
+    # read is created here — so changing this moves the Role with it. Point it
+    # at the wrong namespace and binpack reports that no cluster-autoscaler is
+    # running, which looks exactly like a cluster that has none.
+    autoscalerNamespace: kube-system
+
 rbac:
-  # The ClusterRole, the kube-system Role for the autoscaler's status, and the
-  # bindings. Turn off only if you manage RBAC separately.
+  # The ClusterRole, the Role for the autoscaler's status in
+  # config.discovery.autoscalerNamespace, and the bindings. Turn off only if
+  # you manage RBAC separately.
   create: true
   # Grant the verbs binpack needs to act: patching nodes, and creating pod
   # evictions. Required when config.dryRun is false, and refused by the chart

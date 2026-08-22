@@ -100,10 +100,17 @@ worse than doing nothing. The check is deliberately strict — a status ConfigMa
 autoscaler that wrote it and keeps reporting `Running` indefinitely, so binpack also requires a
 recent probe time.
 
-**Fix.** Check that cluster autoscaling is enabled for the cluster, and that
-`kube-system/cluster-autoscaler-status` is being updated. When there is no autoscaler, the pool
-checks are skipped entirely: every pool is absent from a status document that does not exist,
-and reporting each one would bury the single answer that matters.
+**Fix.** Check that cluster autoscaling is enabled for the cluster, that the
+`cluster-autoscaler-status` ConfigMap is being updated, and that `discovery.autoscalerNamespace`
+names the namespace the autoscaler runs in. The report's closing line names the object binpack
+read, because two healthy clusters look identical to one with no autoscaler from where binpack
+is standing: an autoscaler publishing into a namespace binpack was not pointed at, and one
+running with status reporting turned off. `kubectl get configmap cluster-autoscaler-status -A`
+tells the two apart.
+
+When there is no autoscaler, the pool checks are skipped entirely: every pool is absent from a
+status document that does not exist, and reporting each one would bury the single answer that
+matters.
 
 ### `autoscaler-no-candidates` — info
 

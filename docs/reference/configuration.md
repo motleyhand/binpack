@@ -38,6 +38,9 @@ discovery:
   # The node label holding a human-readable pool name, so that `pools` entries
   # below can be written as "pool-4g" rather than a UUID.
   poolNameLabel: doks.digitalocean.com/node-pool
+  # The namespace the cluster-autoscaler publishes its status ConfigMap into,
+  # which is the namespace it runs in.
+  autoscalerNamespace: kube-system
 
 # Applies to every discovered pool that has no override.
 policy:
@@ -119,7 +122,7 @@ DOKS. Whether a label your provider applies carries them on your cluster is a qu
 read-only commands answer:
 
 ```bash
-kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+kubectl -n <discovery.autoscalerNamespace> get configmap cluster-autoscaler-status -o yaml
 kubectl get nodes --show-labels
 ```
 
@@ -151,6 +154,34 @@ misconfiguration it is.
 
 Purely for readability: it lets `pools` entries below be written as `pool-4g` rather than a UUID.
 A `pools` entry matches on either identifier.
+
+### `discovery.autoscalerNamespace`
+
+Where the cluster-autoscaler publishes its `cluster-autoscaler-status` ConfigMap. That is the
+namespace the autoscaler runs in — it is what its own `--namespace` flag says, and the upstream
+Helm chart sets that flag to whatever namespace you install it into.
+
+Defaults to `kube-system`, which is a common answer rather than the only one. Find yours:
+
+```bash
+kubectl get configmap cluster-autoscaler-status -A
+```
+
+**Two things move with this setting.** binpack reads this namespace and no other, and the Helm
+chart creates binpack's Role for reading that ConfigMap in it — so if you manage RBAC yourself,
+the Role has to move too, or every read is a 403. See the
+[RBAC reference](rbac.md).
+
+Pointed at the wrong namespace, binpack reports that no cluster-autoscaler is running and
+refuses to act, which is indistinguishable from a cluster that genuinely has none. `binpack
+explain` and `binpack diagnose` both name the object they read, so the output says which
+namespace was consulted.
+
+There is deliberately no search across namespaces. A status ConfigMap outlives the autoscaler
+that wrote it, so a cluster can hold a stale one beside the live one, and nothing about either
+object says which is which — a search would have to guess, and a wrong guess here produces a
+confident answer about the wrong autoscaler. See
+[ADR-0004](../design/adr-0004-provider-agnostic-no-cloud-api.md).
 
 ### `policy.enabled`
 

@@ -115,3 +115,30 @@ func TestConfigValidateMissingFile(t *testing.T) {
 		t.Errorf("error should name the file, got: %v", err)
 	}
 }
+
+// TestConfigValidateSaysWhereTheAutoscalerStatusIsRead is the read-only
+// command that answers "where will binpack look?" before anything has looked.
+//
+// It matters more than the two label keys beside it. A wrong label key fails
+// preflight loudly; a wrong namespace produces a confident report that no
+// cluster-autoscaler is running, which reads as a fact about the cluster. The
+// summary prints resolved values, so this also shows an operator who set
+// nothing which namespace the default picked for them.
+func TestConfigValidateSaysWhereTheAutoscalerStatusIsRead(t *testing.T) {
+	out, err := runWithStdin(t, "", "config", "validate")
+	if err != nil {
+		t.Fatalf("empty configuration should be valid: %v", err)
+	}
+	if !strings.Contains(out, "kube-system") {
+		t.Errorf("the summary does not say where the autoscaler's status is read from:\n%s", out)
+	}
+
+	out, err = runWithStdin(t, "discovery:\n  autoscalerNamespace: autoscaler\n",
+		"config", "validate")
+	if err != nil {
+		t.Fatalf("config validate: %v", err)
+	}
+	if !strings.Contains(out, "autoscaler") || strings.Contains(out, "kube-system") {
+		t.Errorf("the summary does not report the configured namespace:\n%s", out)
+	}
+}

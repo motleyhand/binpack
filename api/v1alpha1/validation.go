@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"time"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // minInterval bounds how often binpack may evaluate. Below this the cost of
@@ -18,7 +20,21 @@ const minInterval = 10 * time.Second
 var labelKeyRE = regexp.MustCompile(
 	`^([a-z0-9]([-a-z0-9]*[a-z0-9])?\.)*[a-z0-9]([-a-z0-9]*[a-z0-9])?/?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
 
-var namespaceRE = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+// namespaceErrors reports why a string is not a namespace name, if it is not.
+//
+// A namespace name is a DNS-1123 label, and this asks the API server's own
+// helper rather than restating the rule. What used to be here was a regexp
+// matching the character rule alone, which is the half of the spec a
+// hand-rolled copy keeps; the 63-character limit is the half it loses, and
+// nothing goes wrong until a namespace binpack cannot read looks exactly like
+// a namespace that is empty.
+func namespaceErrors(path, ns string) []error {
+	var errs []error
+	for _, why := range validation.IsDNS1123Label(ns) {
+		errs = append(errs, fmt.Errorf("%s: %q is not a valid namespace name: %s", path, ns, why))
+	}
+	return errs
+}
 
 // Validate reports every problem it finds rather than the first, so a
 // misconfigured file can be fixed in one pass instead of several.
@@ -44,6 +60,13 @@ func (c *Config) Validate() error {
 	if c.Discovery.PoolNameLabel != "" && !labelKeyRE.MatchString(c.Discovery.PoolNameLabel) {
 		errs = append(errs, fmt.Errorf("discovery.poolNameLabel: %q is not a valid label key",
 			c.Discovery.PoolNameLabel))
+	}
+	// A namespace no object can live in is worth refusing where somebody is
+	// still watching. Left to runtime it surfaces as "no cluster-autoscaler is
+	// running", which reads as a fact about the cluster rather than a typo in
+	// the document that produced it.
+	if ns := c.Discovery.AutoscalerNamespace; ns != "" {
+		errs = append(errs, namespaceErrors("discovery.autoscalerNamespace", ns)...)
 	}
 
 	errs = append(errs, c.Policy.validate("policy")...)
@@ -146,10 +169,8 @@ func (p Policy) validate(path string) []error {
 
 	if p.Exclusions.Namespaces != nil {
 		for i, ns := range *p.Exclusions.Namespaces {
-			if !namespaceRE.MatchString(ns) {
-				errs = append(errs, fmt.Errorf("%s.exclusions.namespaces[%d]: %q is not a valid namespace name",
-					path, i, ns))
-			}
+			errs = append(errs, namespaceErrors(
+				fmt.Sprintf("%s.exclusions.namespaces[%d]", path, i), ns)...)
 		}
 	}
 

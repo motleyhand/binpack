@@ -37,10 +37,16 @@ deliberately, on any platform. [ADR-0005](docs/design/adr-0005-why-not-a-karpent
 sets out the comparison honestly, including why binpack exists at all given that Karpenter's
 consolidation is a superset of it.
 
-**Either way, binpack needs a cluster-autoscaler** publishing
-`kube-system/cluster-autoscaler-status` — it drains a node, and the autoscaler is what removes
-it. `kubectl get configmap cluster-autoscaler-status -n kube-system` says whether yours does.
-Without one binpack refuses to act, so it has nothing to offer a `kind` or `minikube` cluster.
+**Either way, binpack needs a cluster-autoscaler** publishing a `cluster-autoscaler-status`
+ConfigMap — it drains a node, and the autoscaler is what removes it. The autoscaler writes that
+object into the namespace it runs in, which is often but not always `kube-system`:
+
+```bash
+kubectl get configmap cluster-autoscaler-status -A
+```
+
+Whichever namespace that names is the one to set as `discovery.autoscalerNamespace`. Without an
+autoscaler binpack refuses to act, so it has nothing to offer a `kind` or `minikube` cluster.
 
 **It also needs one node label** whose *value* is the autoscaler's own identifier for that node's
 pool — the thing it writes into `nodeGroups[].name`, which is an Auto Scaling group name on AWS

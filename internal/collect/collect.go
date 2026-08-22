@@ -40,7 +40,7 @@ type Reader = client.Reader
 // Nothing is transformed on the way through: the engine works on API types, so
 // this lists objects and hands them over. The only interpretation is the
 // autoscaler's status document, which is YAML inside a ConfigMap.
-func Snapshot(ctx context.Context, reader Reader, now time.Time) (engine.Snapshot, error) {
+func Snapshot(ctx context.Context, reader Reader, now time.Time, autoscalerNamespace string) (engine.Snapshot, error) {
 	s := engine.Snapshot{Now: now}
 
 	var nodes corev1.NodeList
@@ -72,7 +72,7 @@ func Snapshot(ctx context.Context, reader Reader, now time.Time) (engine.Snapsho
 		return s, err
 	}
 
-	if s.Autoscaler, err = autoscaler(ctx, reader); err != nil {
+	if s.Autoscaler, err = autoscaler(ctx, reader, autoscalerNamespace); err != nil {
 		return s, err
 	}
 
@@ -136,15 +136,28 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 	return out, nil
 }
 
-// autoscaler reads the cluster-autoscaler's published status.
+// autoscaler reads the cluster-autoscaler's published status from the
+// namespace the operator says it runs in.
 //
 // A missing ConfigMap yields a not-running autoscaler rather than an error.
 // That is a diagnosis, not a failure: binpack should report "nothing here will
 // remove a drained node" clearly rather than exiting with a stack trace.
-func autoscaler(ctx context.Context, reader Reader) (engine.Autoscaler, error) {
+//
+// An empty namespace is the one thing here that is not a diagnosis. It means a
+// caller lost the configured value, and a Get for a namespaced object without
+// a namespace finds nothing — so it would arrive downstream wearing the same
+// clothes as a cluster that genuinely has no autoscaler, which is precisely
+// the confident-and-wrong report this parameter exists to end.
+func autoscaler(ctx context.Context, reader Reader, namespace string) (engine.Autoscaler, error) {
+	if namespace == "" {
+		return engine.Autoscaler{}, fmt.Errorf(
+			"no namespace to read %s from: set discovery.autoscalerNamespace",
+			StatusConfigMapName)
+	}
+
 	var cm corev1.ConfigMap
 	err := reader.Get(ctx, client.ObjectKey{
-		Namespace: StatusConfigMapNamespace,
+		Namespace: namespace,
 		Name:      StatusConfigMapName,
 	}, &cm)
 
@@ -153,7 +166,7 @@ func autoscaler(ctx context.Context, reader Reader) (engine.Autoscaler, error) {
 		return engine.Autoscaler{}, nil
 	case err != nil:
 		return engine.Autoscaler{}, fmt.Errorf("reading %s/%s: %w",
-			StatusConfigMapNamespace, StatusConfigMapName, err)
+			namespace, StatusConfigMapName, err)
 	}
 
 	document, ok := cm.Data[statusKey]

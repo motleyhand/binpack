@@ -19,12 +19,17 @@ background on *why* each of these matters, see
 ## 1. Ask the autoscaler directly
 
 The most useful object in the cluster, and the least known. The cluster-autoscaler writes its
-status into `kube-system`, and this works even on a managed control plane where its pods and
-logs are invisible to you:
+status into the namespace it runs in, and reading it works even on a managed control plane where
+its pods and logs are invisible to you:
 
 ```bash
-kubectl -n kube-system get configmap cluster-autoscaler-status -o jsonpath='{.data.status}'
+kubectl get configmap cluster-autoscaler-status -A
+kubectl -n <that namespace> get configmap cluster-autoscaler-status -o jsonpath='{.data.status}'
 ```
+
+`kube-system` is the common answer and not the only one — the autoscaler's own Helm chart sets
+its `--namespace` to whatever namespace you install it into. Whichever the first command names
+is also what binpack's `discovery.autoscalerNamespace` has to be set to.
 
 You get, in the autoscaler's own words:
 

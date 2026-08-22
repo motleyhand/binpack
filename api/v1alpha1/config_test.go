@@ -33,6 +33,13 @@ func TestEmptyConfigIsValidAndSafe(t *testing.T) {
 	if cfg.Discovery.NodeGroupIDLabel != DefaultNodeGroupIDLabel {
 		t.Errorf("nodeGroupIDLabel = %q", cfg.Discovery.NodeGroupIDLabel)
 	}
+	// kube-system is where most clusters run the autoscaler, and an empty
+	// value is not a namespace anything can be read from — so the default has
+	// to be a name, not the absence of one.
+	if cfg.Discovery.AutoscalerNamespace != DefaultAutoscalerNamespace {
+		t.Errorf("autoscalerNamespace = %q, want %q",
+			cfg.Discovery.AutoscalerNamespace, DefaultAutoscalerNamespace)
+	}
 
 	p := cfg.PolicyFor("any-pool")
 	if !p.Enabled {
@@ -216,6 +223,33 @@ func TestValidation(t *testing.T) {
 			name:    "invalid label key",
 			yaml:    "discovery:\n  poolNameLabel: \"has spaces\"",
 			wantErr: "not a valid label key",
+		},
+		{
+			// A namespace binpack cannot read is worth rejecting where
+			// somebody is still watching: the runtime symptom is a report
+			// that no cluster-autoscaler is running, which reads as a fact
+			// about the cluster rather than about a typo.
+			name:    "invalid autoscaler namespace",
+			yaml:    "discovery:\n  autoscalerNamespace: Kube_System",
+			wantErr: "not a valid namespace",
+		},
+		{
+			// A namespace name is a DNS-1123 label, and the length rule is
+			// half of that spec. Kubernetes has no such namespace to find, so
+			// the Get returns NotFound and binpack reports a cluster with no
+			// cluster-autoscaler — the same confident falsehood the field
+			// exists to end, reached by a different route.
+			name:    "autoscaler namespace longer than a DNS label",
+			yaml:    "discovery:\n  autoscalerNamespace: " + strings.Repeat("a", 64),
+			wantErr: "not a valid namespace",
+		},
+		{
+			// The same helper, and the same gap: this list has always been
+			// checked by a regexp that matched the characters and not the
+			// length.
+			name:    "excluded namespace longer than a DNS label",
+			yaml:    "policy:\n  exclusions:\n    namespaces: [" + strings.Repeat("a", 64) + "]",
+			wantErr: "not a valid namespace",
 		},
 	}
 

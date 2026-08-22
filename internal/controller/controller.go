@@ -113,6 +113,12 @@ type Options struct {
 	Engine     engine.Config
 	Log        logr.Logger
 
+	// AutoscalerNamespace is where the cluster-autoscaler publishes its status
+	// ConfigMap. It scopes the watch-backed cache as well as the read, so a
+	// value that disagrees with the deployment's RBAC fails the cache's very
+	// first list rather than one evaluation at a time.
+	AutoscalerNamespace string
+
 	// Interval is how often the cluster is evaluated.
 	Interval time.Duration
 
@@ -187,6 +193,18 @@ func Run(ctx context.Context, opts Options) error {
 			where, d, engine.NoDrainToMeasureFrom)
 	}
 
+	// Nowhere to read the autoscaler's status is a wiring mistake, and worse
+	// than it looks: cache.Options reads the empty string as AllNamespaces, so
+	// the ConfigMap cache binpack narrows on purpose would watch and hold
+	// every ConfigMap in the cluster instead of one. Refused here so it is
+	// reported as the configuration problem it is, rather than as a cluster
+	// with no cluster-autoscaler in it.
+	if opts.AutoscalerNamespace == "" {
+		return errors.New(
+			"no namespace to read the cluster-autoscaler's status from: set " +
+				"discovery.autoscalerNamespace to the namespace the autoscaler runs in")
+	}
+
 	mgr, err := manager.New(opts.RestConfig, managerOptions(opts))
 	if err != nil {
 		return fmt.Errorf("creating the manager: %w", err)
@@ -247,7 +265,7 @@ func outcome(managerErr, evaluationErr error) error {
 func managerOptions(opts Options) manager.Options {
 	out := manager.Options{
 		Logger: opts.Log,
-		Cache:  cacheOptions(),
+		Cache:  cacheOptions(opts.AutoscalerNamespace),
 		// Nothing here serves traffic or answers webhooks, so leaving these
 		// off in Once mode is not a reduced mode of operation — it is the
 		// absence of servers a process about to exit would never be scraped
@@ -343,12 +361,17 @@ func orDefault(d, fallback time.Duration) *time.Duration {
 // On a busy cluster that is hundreds of megabytes of Helm release data and
 // certificate bundles, held permanently, by a tool whose entire purpose is to
 // reduce what the cluster costs.
-func cacheOptions() cache.Options {
+//
+// The namespace is the operator's, not a constant, and this is the second
+// place it has to arrive: a cache scoped to one namespace while the reads go
+// to another returns nothing at all, and the controller would report an
+// absent cluster-autoscaler with no error anywhere to say why.
+func cacheOptions(autoscalerNamespace string) cache.Options {
 	return cache.Options{
 		ByObject: map[client.Object]cache.ByObject{
 			&corev1.ConfigMap{}: {
 				Namespaces: map[string]cache.Config{
-					collect.StatusConfigMapNamespace: {
+					autoscalerNamespace: {
 						FieldSelector: fields.OneTermEqualSelector(
 							"metadata.name", collect.StatusConfigMapName),
 					},
@@ -587,7 +610,7 @@ func shuttingDown(ctx context.Context) bool { return ctx.Err() != nil }
 func (e *evaluator) attempt(ctx context.Context) error {
 	started := time.Now()
 
-	snapshot, err := collect.Snapshot(ctx, e.reader, started)
+	snapshot, err := collect.Snapshot(ctx, e.reader, started, e.opts.AutoscalerNamespace)
 	if err != nil {
 		// Counted rather than returned on sight. A read that fails every tick
 		// is a broken deployment — bad RBAC, most likely — and a controller

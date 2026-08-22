@@ -270,3 +270,106 @@ func firstGroup(re *regexp.Regexp, s string) string {
 	}
 	return ""
 }
+
+// The Role granting the autoscaler's status must be bound where binpack will
+// look for it.
+//
+// This is the half of a configurable namespace that installs cleanly and then
+// does not work. binpack reads `discovery.autoscalerNamespace`; the Role is
+// namespaced, and RBAC in the wrong namespace produces a 403 on the very first
+// read — which the controller counts as a failed evaluation and the one-shot
+// commands report as a failure to read the cluster. Neither says "your Role is
+// in kube-system and your autoscaler is not".
+//
+// So the two must come from one value. Asserted against the chart's text
+// because `helm lint` cannot see it either: to Helm, the config is an opaque
+// string and the Role's namespace is a different key entirely.
+func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
+	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+
+	// Every object named for the autoscaler's status: the Role and the
+	// RoleBinding, both namespaced, and both wrong in the same way if either
+	// is pinned.
+	var found int
+	for _, doc := range strings.Split(string(chart), "\n---\n") {
+		if !strings.Contains(doc, "-autoscaler-status") {
+			continue
+		}
+		found++
+		for _, line := range strings.Split(doc, "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "namespace:") {
+				continue
+			}
+			value := strings.TrimSpace(strings.TrimPrefix(line, "namespace:"))
+			// The ServiceAccount subject is in the release's namespace and
+			// has nothing to do with where the autoscaler runs.
+			if strings.Contains(value, ".Release.Namespace") {
+				continue
+			}
+			if !strings.Contains(value, "autoscalerNamespace") {
+				t.Errorf("the autoscaler-status objects are bound to %s, which does not "+
+					"move with discovery.autoscalerNamespace: binpack would read a "+
+					"namespace it has no Role in and 403 on every evaluation", value)
+			}
+			// Quoted, because `metadata.namespace` is a string and a bare
+			// namespace name is not necessarily a YAML string. `true`, `false`
+			// and `123` are all legal DNS-1123 labels and therefore legal
+			// namespace names, and rendered unquoted they come back out of the
+			// YAML as a bool or an int: `kubectl apply` says "cannot unmarshal
+			// bool into Go struct field ObjectMeta.metadata.namespace of type
+			// string" and rejects these two objects while installing the other
+			// seven. That is the install-cleanly-then-403 shape again, reached
+			// through Helm rather than through RBAC.
+			if !strings.Contains(value, "quote") && !strings.HasPrefix(value, `"`) {
+				t.Errorf("the autoscaler-status namespace is rendered unquoted (%s), so a "+
+					"namespace named `true` or `123` renders as a bool or an int and the "+
+					"API server refuses the object", value)
+			}
+		}
+	}
+	if found != 2 {
+		t.Fatalf("found %d autoscaler-status objects, want the Role and its RoleBinding; "+
+			"this test asserts nothing if it cannot find them", found)
+	}
+}
+
+// The chart's default namespace and the binary's must be the same one.
+//
+// They are two defaults for one question — the chart renders a config document
+// and the binary fills in what the document omits — and a disagreement between
+// them is invisible until the day somebody deletes the line from their values.
+func TestTheChartAndTheBinaryDefaultToTheSameAutoscalerNamespace(t *testing.T) {
+	values, err := os.ReadFile("../../charts/binpack/values.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's values: %v", err)
+	}
+	block, ok := section(string(values), "config:")
+	if !ok {
+		t.Fatal("the chart has no config: block to render")
+	}
+	cfg, err := v1alpha1.Load([]byte(
+		"apiVersion: binpack.motleyhand.com/v1alpha1\nkind: BinpackConfig\n" + block))
+	if err != nil {
+		t.Fatalf("the chart's default configuration is one binpack rejects: %v", err)
+	}
+
+	if cfg.Discovery.AutoscalerNamespace != v1alpha1.DefaultAutoscalerNamespace {
+		t.Errorf("the chart installs with autoscalerNamespace %q and the binary defaults "+
+			"to %q", cfg.Discovery.AutoscalerNamespace, v1alpha1.DefaultAutoscalerNamespace)
+	}
+
+	// And that the field is visible in the file operators actually read. It
+	// is not an ordinary tunable: the Role's namespace is derived from it, so
+	// somebody whose autoscaler is not in kube-system has to change it and
+	// cannot discover that from a document it is absent from. Defaulting
+	// would otherwise hide it completely, since an omitted field renders no
+	// line into the ConfigMap either.
+	if !strings.Contains(block, "autoscalerNamespace") {
+		t.Error("the chart's config: block does not mention autoscalerNamespace, so " +
+			"nothing an operator reads says binpack looks in one namespace or which")
+	}
+}

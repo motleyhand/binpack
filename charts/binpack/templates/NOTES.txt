@@ -28,6 +28,18 @@ progress is then left exactly as it is, cordoned and marked, rather than being
 advanced or undone.
 {{- end }}
 
+binpack reads the cluster-autoscaler's status from one object, and its Role for
+reading it is bound in that namespace:
+
+  {{ include "binpack.autoscalerNamespace" . }}/cluster-autoscaler-status
+
+The autoscaler publishes into the namespace it runs in, so if yours is somewhere
+else binpack will report that none is running and refuse to act. Check where:
+
+  kubectl get configmap cluster-autoscaler-status -A
+
+then helm upgrade with config.discovery.autoscalerNamespace set to that namespace.
+
 Before trusting it, ask what is stopping this cluster shrinking today:
 
   kubectl -n {{ .Release.Namespace }} exec deploy/{{ include "binpack.fullname" . }} -- binpack diagnose

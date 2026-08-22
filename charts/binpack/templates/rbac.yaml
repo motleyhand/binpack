@@ -63,8 +63,8 @@ subjects:
     name: {{ include "binpack.serviceAccountName" . }}
     namespace: {{ .Release.Namespace }}
 ---
-# The cluster-autoscaler's status, scoped to kube-system rather than restricted
-# by resourceNames.
+# The cluster-autoscaler's status, scoped to the namespace it publishes into
+# rather than restricted by resourceNames.
 #
 # resourceNames restricts a request by the name in its path, and list and watch
 # requests carry none — so a ClusterRole naming cluster-autoscaler-status would
@@ -72,11 +72,18 @@ subjects:
 # the controller, whose cache issues a list followed by a watch. Narrowing by
 # namespace is the restriction that actually holds. binpack still reads only
 # the one object: its cache carries a field selector the API server applies.
+#
+# The namespace follows config.discovery.autoscalerNamespace, because that is
+# the namespace binpack will read. The autoscaler publishes into the namespace
+# it runs in, which its own chart sets to whatever you install it into, so
+# kube-system is a common answer rather than the only one — and a Role pinned
+# there while binpack reads elsewhere is an install that succeeds and then 403s
+# on every evaluation.
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "binpack.fullname" . }}-autoscaler-status
-  namespace: kube-system
+  namespace: {{ include "binpack.autoscalerNamespace" . | quote }}
   labels: {{- include "binpack.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
@@ -87,7 +94,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "binpack.fullname" . }}-autoscaler-status
-  namespace: kube-system
+  namespace: {{ include "binpack.autoscalerNamespace" . | quote }}
   labels: {{- include "binpack.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io

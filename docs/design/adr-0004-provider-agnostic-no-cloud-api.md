@@ -29,9 +29,9 @@ only permission is a Kubernetes RBAC role in the cluster it runs in.
 
 ### The autoscaler publishes its own configuration
 
-The cluster-autoscaler writes a `cluster-autoscaler-status` ConfigMap into `kube-system`. This
-is present and fully populated even on managed control planes where the autoscaler's pods and
-logs are invisible — verified on DigitalOcean Kubernetes:
+The cluster-autoscaler writes a `cluster-autoscaler-status` ConfigMap into the namespace it
+runs in. This is present and fully populated even on managed control planes where the
+autoscaler's pods and logs are invisible — verified on DigitalOcean Kubernetes:
 
 ```yaml
 autoscalerStatus: Running
@@ -61,6 +61,47 @@ lastTransitionTime` gives a precise cooldown reference, replacing an inference f
 creation timestamps. And `scaleDown.status: NoCandidates` is the autoscaler stating binpack's
 entire reason for existing in its own words — which makes it an excellent thing to surface in
 `diagnose`.
+
+### Which namespace that object is in
+
+Amended after the fact, and it was a real defect rather than an omission. The namespace was a
+constant, `kube-system`, on the strength of the cluster this was verified against.
+
+The autoscaler publishes into the namespace it was started with `--namespace`, which is the
+namespace it runs in, and the upstream Helm chart sets that flag to whatever namespace you
+install it into. So the constant is right on many clusters and wrong on many others — and it is
+wrong in the worst available direction. binpack found no object, concluded that no
+cluster-autoscaler was running, said so as a **blocking** diagnosis, and refused to act. Every
+sentence of that was false about a cluster running a healthy, reporting autoscaler in a
+namespace called `autoscaler`. A confident, blocking claim about a component that is
+demonstrably fine is worse than silence, because there is nothing to investigate: the tool has
+already answered.
+
+So the namespace is configuration — `discovery.autoscalerNamespace`, defaulting to
+`kube-system` — and it moves binpack's Role for reading that ConfigMap with it, since a Role in
+one namespace and a read in another is the same install failing at runtime instead.
+
+**Searching every namespace for the name was the alternative, and it is worse.** A status
+ConfigMap outlives the autoscaler that wrote it — that is why binpack checks `lastProbeTime` at
+all — so a cluster can hold a stale one beside the live one, and the cluster this was found on
+did: a `default/cluster-autoscaler-status` some 612 days old, alongside the live
+`autoscaler/cluster-autoscaler-status`. Nothing about either object says which is authoritative.
+A search would have to pick, and picking wrongly means answering confidently about an autoscaler
+that has not existed for two years — the same failure this ADR's freshness check exists to
+prevent, reintroduced by the lookup.
+
+Being told where to look also means binpack can say where it looked, which is what makes the
+refusal checkable: `explain` and `diagnose` both name the object they read, so an operator whose
+autoscaler is plainly running can see in one line that binpack was pointed somewhere else.
+
+This one is *upstream* of every other question about pools, which is why it was worth a fix of its
+own rather than a note. [ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md)'s
+preflight — the check that refuses to run when no node carries a value any published group answers
+to — requires "an autoscaler binpack can vouch for as live" before it says anything at all, and
+deliberately so: a status document binpack cannot vouch for says nothing about the cluster now. A
+namespace pointed at the wrong place fails that precondition, so the check that exists to name a
+labelling problem is silent on exactly the cluster where nothing else is working either. The
+namespace has to be right before any of the rest can be asked.
 
 ### Mapping nodes to node groups
 
