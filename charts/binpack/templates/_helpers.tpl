@@ -63,7 +63,14 @@ read, and nothing in the resulting failure says which of the two is wrong.
 
 Defaulted here as well as in the binary because a values file that clears the
 `config` block entirely still has to produce a Role somewhere.
+
+`toString` before `default`, because `default` treats false as empty and
+`false` is a legal DNS-1123 label and therefore a legal namespace name. Without
+it, `autoscalerNamespace: false` would silently grant the Role in kube-system
+while the ConfigMap told binpack to read `false`. Callers must `quote` the
+result for the same family of reasons: `metadata.namespace` is a string, and
+`true`, `false` and `123` all come back out of unquoted YAML as something else.
 */}}
 {{- define "binpack.autoscalerNamespace" -}}
-{{- default "kube-system" (dig "discovery" "autoscalerNamespace" "" .Values.config) -}}
+{{- default "kube-system" (toString (dig "discovery" "autoscalerNamespace" "" .Values.config)) -}}
 {{- end -}}

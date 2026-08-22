@@ -315,6 +315,20 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 					"move with discovery.autoscalerNamespace: binpack would read a "+
 					"namespace it has no Role in and 403 on every evaluation", value)
 			}
+			// Quoted, because `metadata.namespace` is a string and a bare
+			// namespace name is not necessarily a YAML string. `true`, `false`
+			// and `123` are all legal DNS-1123 labels and therefore legal
+			// namespace names, and rendered unquoted they come back out of the
+			// YAML as a bool or an int: `kubectl apply` says "cannot unmarshal
+			// bool into Go struct field ObjectMeta.metadata.namespace of type
+			// string" and rejects these two objects while installing the other
+			// seven. That is the install-cleanly-then-403 shape again, reached
+			// through Helm rather than through RBAC.
+			if !strings.Contains(value, "quote") && !strings.HasPrefix(value, `"`) {
+				t.Errorf("the autoscaler-status namespace is rendered unquoted (%s), so a "+
+					"namespace named `true` or `123` renders as a bool or an int and the "+
+					"API server refuses the object", value)
+			}
 		}
 	}
 	if found != 2 {

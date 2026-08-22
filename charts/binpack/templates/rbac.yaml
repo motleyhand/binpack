@@ -83,7 +83,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
   name: {{ include "binpack.fullname" . }}-autoscaler-status
-  namespace: {{ include "binpack.autoscalerNamespace" . }}
+  namespace: {{ include "binpack.autoscalerNamespace" . | quote }}
   labels: {{- include "binpack.labels" . | nindent 4 }}
 rules:
   - apiGroups: [""]
@@ -94,7 +94,7 @@ apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
   name: {{ include "binpack.fullname" . }}-autoscaler-status
-  namespace: {{ include "binpack.autoscalerNamespace" . }}
+  namespace: {{ include "binpack.autoscalerNamespace" . | quote }}
   labels: {{- include "binpack.labels" . | nindent 4 }}
 roleRef:
   apiGroup: rbac.authorization.k8s.io
