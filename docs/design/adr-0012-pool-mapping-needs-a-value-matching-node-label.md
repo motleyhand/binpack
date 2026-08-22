@@ -112,6 +112,17 @@ names.
 configured key, the groups the autoscaler published, and the label keys the nodes do carry, and
 ends with the command above. All three commands exit 1.
 
+In the controller the check runs *after* step 0 of the drain protocol, not before it. The failure
+is unretryable, which for a long-running process means exiting, and one tick into a drain that is
+the state every bound on `Advance` exists to make unreachable: the node is already cordoned with
+its pods evicted, the only thing that uncordons it is the next `Advance`, and there is no next
+anything. The mapping is read from labels, so it can break *during* a drain — a pool rebuilt under
+a new identifier, or an operator moving `nodeGroupIDLabel` onto a label they are still applying,
+which is the migration the error above asks for. Neither this check nor the pool-override one has
+anything to say about a drain already in flight, so neither is worth stranding a node for.
+Resuming is itself bounded by the drain ending, so the configuration is judged on the tick after
+that; a *new* drain still cannot start, because `Decide` runs below the check.
+
 The refusal is deliberately narrow, because refusing is the expensive direction. It requires all
 three of: an autoscaler binpack can vouch for as live, at least one published group with a ready
 node in it, and no node whose configured label holds a value any published group answers to. Drop

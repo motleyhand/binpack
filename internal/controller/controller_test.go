@@ -1135,6 +1135,133 @@ func TestEvaluateRefusesAnOverrideNamingAPoolThatIsNotThere(t *testing.T) {
 	}
 }
 
+// TestADrainInProgressIsResumedBeforeTheConfigurationIsJudged closes the
+// window where an unresolvable configuration strands a half-drained node.
+//
+// A preflight failure is unretryable: it ends the evaluation and, in the
+// controller, the process. That is right for a typo nobody will fix by waiting
+// — and catastrophic one tick into a drain, because the node is already
+// cordoned with its pods evicted and the only thing that ever uncordons it is
+// the next call to Advance. Ending the process there is the state ADR-0007 and
+// every bound on Advance exist to make unreachable: cordoned for ever, with
+// binpack no longer running.
+//
+// Reachable without anybody making a mistake. The node-group mapping is read
+// from labels, so it can break while a drain is in flight — a pool rebuilt
+// under a new identifier, or an operator moving nodeGroupIDLabel onto a label
+// they are still applying, which is the migration binpack's own error message
+// asks for. So step 0 runs first, unconditionally, and the configuration is
+// judged on the tick after the drain ends.
+func TestADrainInProgressIsResumedBeforeTheConfigurationIsJudged(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		break_ func(*engine.Config)
+	}{
+		{
+			// The mapping, which cluster state can break under a drain.
+			name:   "no node carries the configured node-group label",
+			break_: func(c *engine.Config) { c.NodeGroupIDLabel = "example.com/absent" },
+		},
+		{
+			// And the override check, which has always had this property and
+			// was never asked about it. Same call, same consequence.
+			name: "an override names a pool that is not there",
+			break_: func(c *engine.Config) {
+				c.ByPool = map[string]engine.Policy{"poool-4g": {Enabled: false}}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var log captured
+			rec := &fakeRecorder{}
+			ev := newEvaluator(t, &log, rec, drainingNode("a"), inPool("b"), statusConfigMap())
+			ev.opts.DryRun, ev.opts.Once = false, false
+			cfg := ev.opts.Engine
+			tc.break_(&cfg)
+			ev.opts.Engine = cfg
+
+			// Refused first, so the case is known to be one the preflight
+			// really rejects. Without this the test passes on a configuration
+			// binpack was perfectly happy with.
+			if err := engine.CheckPools(snapshotOf(t, ev), cfg); err == nil {
+				t.Fatal("this configuration passes preflight, so there is nothing to resume past")
+			}
+
+			// Asked of a controller rather than a one-shot run, because that
+			// is where the distinction lives: --once returns every failure,
+			// and only an unretryable one makes a long-running process exit.
+			// `failed` unwraps the marker before returning it, so a non-nil
+			// error here *is* the process ending — there is nothing else
+			// evaluate returns.
+			if err := ev.evaluate(context.Background()); err != nil {
+				t.Fatalf("the process is ending with a node cordoned and its pods gone: %v", err)
+			}
+			// The log rather than an event, because an ordinary step of a
+			// drain deliberately emits none: one eviction per evaluation
+			// would put an event on the node for every pod. These three are
+			// every arm of advance's switch, so any of them is step 0 having
+			// run and the node having been dealt with.
+			if !log.contains("drain advanced") && !log.contains("drain complete") &&
+				!log.contains("drain abandoned") {
+				t.Errorf("the drain was neither advanced nor ended, so nothing will ever "+
+					"uncordon the node; log: %v events: %+v", log.lines, rec.events)
+			}
+		})
+	}
+}
+
+// TestAnUnresolvableConfigurationStillEndsTheEvaluationWithNoDrainInFlight is
+// the other direction, and without it the test above is satisfied by deleting
+// the preflight.
+func TestAnUnresolvableConfigurationStillEndsTheEvaluationWithNoDrainInFlight(t *testing.T) {
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{}, inPool("a"), statusConfigMap())
+	ev.opts.DryRun, ev.opts.Once = false, false
+	cfg := ev.opts.Engine
+	cfg.NodeGroupIDLabel = "example.com/absent"
+	ev.opts.Engine = cfg
+
+	err := ev.evaluate(context.Background())
+
+	// Non-nil from a controller means the evaluation was unretryable: every
+	// other failure is counted and swallowed until the consecutive limit.
+	// Waiting does not relabel a cluster, and the evaluations spent waiting
+	// are ones where binpack considers no node at all.
+	if err == nil {
+		t.Fatal("a configuration no retry can fix was retried")
+	}
+	if !strings.Contains(err.Error(), "nodeGroupIDLabel") {
+		t.Errorf("the failure does not name the setting to change: %v", err)
+	}
+
+	// And nothing was cordoned on the way to that error. Resuming a drain
+	// under a configuration binpack cannot resolve is the concession the
+	// ordering makes; starting one is not. The placement has some latitude —
+	// below Decide only costs a wasted simulation, which was measured — but it
+	// has to stay above Begin, and a check below Begin leaves every other
+	// assertion in this file green while cordoning the node the error is
+	// about.
+	var n corev1.Node
+	if err := ev.reader.(client.Client).Get(
+		context.Background(), client.ObjectKey{Name: "a"}, &n); err != nil {
+		t.Fatalf("reading node a: %v", err)
+	}
+	if n.Spec.Unschedulable {
+		t.Error("a drain was started under a configuration binpack cannot resolve")
+	}
+}
+
+// snapshotOf reads the evaluator's own cluster, so a test asking whether a
+// configuration is refused asks it about the same objects evaluate will see.
+func snapshotOf(t *testing.T, ev *evaluator) engine.Snapshot {
+	t.Helper()
+	s, err := collect.Snapshot(context.Background(), ev.reader, time.Now())
+	if err != nil {
+		t.Fatalf("reading the cluster: %v", err)
+	}
+	return s
+}
+
 func TestEvaluateAcceptsAnOverrideNamingAPoolThatExists(t *testing.T) {
 	cfg := config()
 	cfg.ByPool = map[string]engine.Policy{poolName: {Enabled: false}}

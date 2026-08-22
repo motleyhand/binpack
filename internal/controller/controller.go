@@ -598,15 +598,6 @@ func (e *evaluator) attempt(ctx context.Context) error {
 		return fmt.Errorf("reading the cluster: %w", err)
 	}
 
-	// Before deciding, not at startup. A configuration naming a pool that is
-	// not there must not be accepted by `run` while `explain` refuses it —
-	// and of the three commands this is the one that will eventually act on
-	// it, so silently applying the default policy to a pool an operator
-	// believes they switched off is the failure that costs something.
-	if err := engine.CheckPools(snapshot, e.opts.Engine); err != nil {
-		return unretryable{err}
-	}
-
 	// Step 0 of the drain protocol: resume before deciding.
 	//
 	// A drain can legitimately outlast many intervals, and without this every
@@ -647,6 +638,27 @@ func (e *evaluator) attempt(ctx context.Context) error {
 			// surface, a crash loop takes the logs away too.
 			e.log.Error(err, "could not record what would happen to the drain", "node", node)
 		}
+	}
+
+	// Before deciding, and deliberately after step 0. A configuration naming a
+	// pool that is not there, or a node-group label matching no node, must not
+	// be accepted by `run` while `explain` refuses it — and of the three
+	// commands this is the one that will eventually act on it, so silently
+	// applying the default policy to a pool an operator believes they switched
+	// off is the failure that costs something.
+	//
+	// Below the resume, because this failure is unretryable and in a
+	// controller that means the process exits. One tick into a drain that is
+	// the state every bound on Advance exists to make unreachable: the node is
+	// already cordoned with its pods evicted, the only thing that uncordons it
+	// is the next Advance, and there is no next anything. Neither check is
+	// about the drain in flight — one is about a pool override, the other
+	// about a label — so neither has anything to say that is worth stranding a
+	// node for. Resuming is bounded by the drain ending, so the configuration
+	// is judged on the tick after that, and `explain` and `diagnose` say so
+	// immediately either way.
+	if err := engine.CheckPools(snapshot, e.opts.Engine); err != nil {
+		return unretryable{err}
 	}
 
 	// Filled in by the controller rather than read from the cluster: it is the
