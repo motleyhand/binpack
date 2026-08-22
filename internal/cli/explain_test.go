@@ -347,7 +347,7 @@ func TestEnginePolicyCarriesEveryResolvedPolicyField(t *testing.T) {
 	// twelfth field asserted by nothing is exactly what this test exists to
 	// prevent.
 	const carried = 11
-	if n := reflect.TypeOf(v1alpha1.PoolPolicy{}).NumField(); n != carried {
+	if n := reflect.TypeFor[v1alpha1.PoolPolicy]().NumField(); n != carried {
 		t.Fatalf("PoolPolicy has %d fields and this test asserts %d: "+
 			"carry the new one into engine.Policy and assert it here, or say "+
 			"here why it is not carried", n, carried)

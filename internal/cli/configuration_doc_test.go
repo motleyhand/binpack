@@ -269,7 +269,7 @@ func TestEveryDiscoveryFieldHasAReferenceSection(t *testing.T) {
 	}
 	complete, _, _ := strings.Cut(after, "\n## ")
 
-	fields := reflect.VisibleFields(reflect.TypeOf(v1alpha1.Discovery{}))
+	fields := reflect.VisibleFields(reflect.TypeFor[v1alpha1.Discovery]())
 	if len(fields) == 0 {
 		t.Fatal("Discovery has no fields, so this asserts nothing")
 	}

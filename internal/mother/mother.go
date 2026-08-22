@@ -12,6 +12,7 @@
 package mother
 
 import (
+	"maps"
 	"slices"
 	"time"
 
@@ -124,9 +125,7 @@ func NodeLabels(labels map[string]string) NodeOption {
 		if n.Labels == nil {
 			n.Labels = map[string]string{}
 		}
-		for k, v := range labels {
-			n.Labels[k] = v
-		}
+		maps.Copy(n.Labels, labels)
 	}
 }
 
@@ -136,9 +135,7 @@ func NodeAnnotations(annotations map[string]string) NodeOption {
 		if n.Annotations == nil {
 			n.Annotations = map[string]string{}
 		}
-		for k, v := range annotations {
-			n.Annotations[k] = v
-		}
+		maps.Copy(n.Annotations, annotations)
 	}
 }
 
@@ -178,7 +175,7 @@ func Pod(namespace, name string, opts ...PodOption) *corev1.Pod {
 				// it. A fixture without one would make a drain's wait for the
 				// replacement untestable, and untested.
 				{APIVersion: "apps/v1", Kind: "ReplicaSet", Name: name + "-rs",
-					UID: ownerUID(name + "-rs"), Controller: ptr(true)},
+					UID: ownerUID(name + "-rs"), Controller: new(true)},
 			},
 		},
 		Spec: corev1.PodSpec{
@@ -216,7 +213,7 @@ func DaemonSetPod(namespace, name string, opts ...PodOption) *corev1.Pod {
 	return Pod(namespace, name, append([]PodOption{
 		func(p *corev1.Pod) {
 			p.OwnerReferences = []metav1.OwnerReference{
-				{APIVersion: "apps/v1", Kind: "DaemonSet", Name: name, Controller: ptr(true)},
+				{APIVersion: "apps/v1", Kind: "DaemonSet", Name: name, Controller: new(true)},
 			}
 		},
 	}, opts...)...)
@@ -350,7 +347,7 @@ func ControlledBy(kind, name string) PodOption {
 	return func(p *corev1.Pod) {
 		p.OwnerReferences = []metav1.OwnerReference{{
 			APIVersion: "apps/v1", Kind: kind, Name: name,
-			UID: ownerUID(name), Controller: ptr(true),
+			UID: ownerUID(name), Controller: new(true),
 		}}
 	}
 }
@@ -583,7 +580,7 @@ func OwnedBy(kind, name string) PodOption {
 	return func(p *corev1.Pod) {
 		p.OwnerReferences = []metav1.OwnerReference{
 			{APIVersion: "example.com/v1", Kind: kind, Name: name,
-				UID: ownerUID(name), Controller: ptr(true)},
+				UID: ownerUID(name), Controller: new(true)},
 		}
 	}
 }
@@ -706,9 +703,7 @@ func PodLabels(labels map[string]string) PodOption {
 		if p.Labels == nil {
 			p.Labels = map[string]string{}
 		}
-		for k, v := range labels {
-			p.Labels[k] = v
-		}
+		maps.Copy(p.Labels, labels)
 	}
 }
 
@@ -729,7 +724,7 @@ func WithResourceClaim(name string) PodOption {
 	return func(p *corev1.Pod) {
 		p.Spec.ResourceClaims = append(p.Spec.ResourceClaims, corev1.PodResourceClaim{
 			Name:              name,
-			ResourceClaimName: ptr(name),
+			ResourceClaimName: new(name),
 		})
 	}
 }
@@ -758,7 +753,7 @@ func Gated(name string) PodOption {
 func WithRestartAllContainersRule() PodOption {
 	return func(p *corev1.Pod) {
 		c := &p.Spec.Containers[0]
-		c.RestartPolicy = ptr(corev1.ContainerRestartPolicyOnFailure)
+		c.RestartPolicy = new(corev1.ContainerRestartPolicyOnFailure)
 		c.RestartPolicyRules = append(c.RestartPolicyRules, corev1.ContainerRestartRule{
 			Action: corev1.ContainerRestartRuleActionRestartAllContainers,
 			ExitCodes: &corev1.ContainerRestartRuleOnExitCodes{
@@ -777,11 +772,9 @@ func WithRestartAllContainersRule() PodOption {
 // single-pod placement proved for it means nothing.
 func InSchedulingGroup(name string) PodOption {
 	return func(p *corev1.Pod) {
-		p.Spec.SchedulingGroup = &corev1.PodSchedulingGroup{PodGroupName: ptr(name)}
+		p.Spec.SchedulingGroup = &corev1.PodSchedulingGroup{PodGroupName: new(name)}
 	}
 }
-
-func ptr[T any](v T) *T { return &v }
 
 // Templates derives a controller template for each pod, matching the pod's own
 // spec and labels.

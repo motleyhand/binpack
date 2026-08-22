@@ -294,12 +294,12 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 	// RoleBinding, both namespaced, and both wrong in the same way if either
 	// is pinned.
 	var found int
-	for _, doc := range strings.Split(string(chart), "\n---\n") {
+	for doc := range strings.SplitSeq(string(chart), "\n---\n") {
 		if !strings.Contains(doc, "-autoscaler-status") {
 			continue
 		}
 		found++
-		for _, line := range strings.Split(doc, "\n") {
+		for line := range strings.SplitSeq(doc, "\n") {
 			line = strings.TrimSpace(line)
 			if !strings.HasPrefix(line, "namespace:") {
 				continue

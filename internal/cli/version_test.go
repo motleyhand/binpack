@@ -30,7 +30,7 @@ func TestVersionText(t *testing.T) {
 			t.Errorf("output missing %q:\n%s", want, out)
 		}
 	}
-	for _, line := range strings.Split(strings.TrimSpace(out), "\n") {
+	for line := range strings.SplitSeq(strings.TrimSpace(out), "\n") {
 		if strings.HasSuffix(line, ":") {
 			t.Errorf("field has empty value: %q", line)
 		}
