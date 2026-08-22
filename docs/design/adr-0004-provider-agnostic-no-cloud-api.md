@@ -1,6 +1,9 @@
 # ADR-0004: Discover pool bounds from the autoscaler, never from a cloud API
 
-- **Status:** accepted
+- **Status:** accepted. The resolution order in
+  [Mapping nodes to node groups](#mapping-nodes-to-node-groups) is **superseded by
+  [ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md)**: step 2 was never
+  built, and there is no configured mode. Everything else here stands.
 - **Date:** 2026-08-15
 
 ## Context
@@ -67,6 +70,14 @@ therefore needs a node label whose **value equals that name**.
 
 DOKS provides exactly this as `doks.digitalocean.com/node-pool-id`. Not every provider will.
 
+> **Superseded by [ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md).**
+> Step 2 below was published, reasoned about in the Costs section, repeated in the architecture
+> document — and never implemented. There is no configuration field that states a pool's
+> membership or its minimum, and `v1alpha1.Load` uses `UnmarshalStrict`, so a document trying to
+> is rejected outright. binpack has one resolution mode, not two: a node label whose value is the
+> autoscaler's own identifier for the group. The order is kept below as the record of what was
+> intended; read ADR-0012 for what binpack does.
+
 So the resolution order is:
 
 1. **Discovered.** If a configured `nodeGroupIDLabel` is present on nodes and its values match
@@ -93,6 +104,10 @@ So the resolution order is:
 
 ### Costs
 
+> **The mode this section costs out does not exist**; see the note above. What follows is kept
+> because the safeguard it argues for is real, load-bearing and unchanged — only its stated
+> justification narrows, to the second reason given at the end.
+
 In configured mode, the stated minimum can drift from reality — someone raises the pool minimum
 in a console and does not update binpack.
 
@@ -106,8 +121,9 @@ safeguard: **if a drained node still exists after a configured timeout, binpack 
 and records the drain as failed. A metric alone is not sufficient — the cluster must be left in
 a working state without human intervention.
 
-Discovered mode makes this failure mode largely theoretical, but the safeguard applies in both
-modes, because a drain can fail to produce a deletion for reasons beyond a stale minimum.
+Discovery makes this particular failure theoretical — the bounds come from the component that
+enforces them — but the safeguard stands on its own remaining justification, which is the
+sufficient one: a drain can fail to produce a deletion for reasons beyond a stale minimum.
 
 ### Not decided here
 

@@ -42,6 +42,15 @@ consolidation is a superset of it.
 it. `kubectl get configmap cluster-autoscaler-status -n kube-system` says whether yours does.
 Without one binpack refuses to act, so it has nothing to offer a `kind` or `minikube` cluster.
 
+**It also needs one node label** whose *value* is the autoscaler's own identifier for that node's
+pool — the thing it writes into `nodeGroups[].name`, which is an Auto Scaling group name on AWS
+and a VM Scale Set name on Azure, not the pool name you picked in a console. DigitalOcean's
+`doks.digitalocean.com/node-pool-id` carries it and is the default; elsewhere you may have to
+apply a label yourself and point `discovery.nodeGroupIDLabel` at it. binpack refuses to start
+rather than silently finding no pools, and says which label it looked for. See
+[`discovery.nodeGroupIDLabel`](docs/reference/configuration.md#discoverynodegroupidlabel) and
+[ADR-0012](docs/design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md).
+
 **Before installing anything**, work through the
 [quick wins](docs/how-to/quick-wins-before-installing-binpack.md). Several of them recover more
 capacity than binpack can, because they remove *permanent* blocks rather than optimising around
@@ -107,7 +116,7 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0001](docs/design/adr-0001-purpose-built-consolidation-controller.md) | Why a purpose-built controller, and every alternative that was tried and rejected |
 | [ADR-0002](docs/design/adr-0002-go-controller-runtime-no-crd.md) | Go and controller-runtime without a CRD; configuration as a versioned file |
 | [ADR-0003](docs/design/adr-0003-pure-decision-engine.md) | The decision engine as a pure function, and why that guarantees the CLI cannot lie *(mechanism superseded by ADR-0008)* |
-| [ADR-0004](docs/design/adr-0004-provider-agnostic-no-cloud-api.md) | Discovering pool bounds from the autoscaler itself; why binpack holds no cloud credentials |
+| [ADR-0004](docs/design/adr-0004-provider-agnostic-no-cloud-api.md) | Discovering pool bounds from the autoscaler itself; why binpack holds no cloud credentials *(resolution order superseded by ADR-0012)* |
 | [ADR-0005](docs/design/adr-0005-why-not-a-karpenter-doks-provider.md) | Karpenter compared honestly, and why this project exists anyway |
 | [ADR-0006](docs/design/adr-0006-scheduler-fidelity.md) | Borrowing the scheduler's own logic, and testing against the real one |
 | [ADR-0007](docs/design/adr-0007-drain-progress-not-deadlines.md) | Why drains are bounded by progress rather than deadlines, and why failures back off |
@@ -115,6 +124,7 @@ run against your own kubeconfig, and an in-cluster controller.
 | [ADR-0009](docs/design/adr-0009-revalidation-asks-soundness-not-preference.md) | Revalidation re-asks soundness, not preference *(soundness list narrowed by ADR-0010)* |
 | [ADR-0010](docs/design/adr-0010-a-scale-up-stops-a-drain-that-has-not-started.md) | Why a scale-up stops a drain that has not started, and not one that has |
 | [ADR-0011](docs/design/adr-0011-a-refusal-is-a-decision-and-earns-an-event.md) | Why a decision to drain nothing earns an Event, and which nodes it goes on |
+| [ADR-0012](docs/design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) | Why mapping a node to its pool needs a label whose value is the autoscaler's own identifier, and what that costs per provider |
 
 ## Design principles
 

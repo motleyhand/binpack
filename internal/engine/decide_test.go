@@ -1096,3 +1096,357 @@ func TestBackoffStateNamesTheAttemptCount(t *testing.T) {
 		})
 	}
 }
+
+// eksNodeGroupLabel is the label AWS puts on a managed node group's nodes.
+//
+// It stands in for every provider label that looks like the answer and is not:
+// its value is the EKS node group's name, while the identifier the
+// cluster-autoscaler publishes for the same nodes is the Auto Scaling group's.
+// The key is present, the values do not match, and binpack sees no pool at all.
+const eksNodeGroupLabel = "eks.amazonaws.com/nodegroup"
+
+// eksNode is a node from a cluster binpack was never pointed at correctly: it
+// carries a pool label, but not the one the configuration names.
+func eksNode(name string, opts ...mother.NodeOption) *corev1.Node {
+	return sized(name, "16Gi", append([]mother.NodeOption{
+		mother.NodeLabels(map[string]string{
+			eksNodeGroupLabel:        "workers",
+			"kubernetes.io/hostname": name,
+		}),
+	}, opts...)...)
+}
+
+// mismatched is the cluster the whole of this section is about: a live
+// autoscaler reporting two groups that have nodes in them, and not one node
+// carrying a value either group would recognise.
+func mismatched(nodes ...*corev1.Node) engine.Snapshot {
+	s := cluster(nodes, nil)
+	s.Autoscaler.Groups = []engine.NodeGroup{
+		{ID: "asg-b", MinSize: 1, MaxSize: 10, Ready: len(nodes)},
+		{ID: "asg-a", MinSize: 1, MaxSize: 10, Ready: len(nodes)},
+	}
+	return s
+}
+
+// TestALabelThatMatchesNoNodeIsReportedAsSuch is the preflight the reference
+// has promised since the first release and nothing implemented.
+//
+// binpack maps a node to a pool through one label, and the match is on the
+// label's *value*: `nodeGroups[].name` in the cluster-autoscaler's status is
+// the cloud provider's own identifier for the group, so a node has to carry
+// that identifier for discovery to work at all. Where it does not, every node
+// falls out of scope and binpack says "not part of an autoscaling pool" about
+// a cluster of nothing but autoscaled nodes — printed directly beneath its own
+// list of healthy pools, with the count from the summary making the wrong
+// answer sound more certain rather than less.
+//
+// So the error has to carry four things the operator cannot get anywhere else:
+// which setting is wrong, what it is set to, what the autoscaler actually
+// published, and what the nodes actually carry. And it has to carry the
+// remedy, because this check converts a cluster that ran badly into one that
+// does not run — a trade only worth making if the message ends the problem.
+func TestALabelThatMatchesNoNodeIsReportedAsSuch(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func() engine.Snapshot
+	}{
+		{
+			// The advertised first-run path everywhere but one provider: the
+			// chart's defaults against nodes carrying a pool label of their
+			// own, which looks like the answer and is not.
+			name: "no node carries the configured key at all",
+			build: func() engine.Snapshot {
+				return mismatched(eksNode("ip-10-0-1-11"), eksNode("ip-10-0-1-12"))
+			},
+		},
+		{
+			// The half a key-level check would let through, and the half the
+			// whole finding turns on: the key is exactly where it should be,
+			// and its value answers to no group the autoscaler published. A
+			// pool rebuilt under a new identifier reaches this, and so does a
+			// copied configuration.
+			name: "the key is there holding a value no group answers to",
+			build: func() engine.Snapshot {
+				return mismatched(
+					eksNode("ip-10-0-1-11", mother.NodeLabels(map[string]string{
+						"doks.digitalocean.com/node-pool-id": "a-pool-that-was-replaced",
+					})),
+					eksNode("ip-10-0-1-12"),
+				)
+			},
+		},
+		{
+			// `name` is omitempty upstream, so a group with no name at all is
+			// representable — and an unnamed group matches every unlabelled
+			// node, which would switch this check off rather than fail it.
+			name: "the status carries a group with no name beside a real one",
+			build: func() engine.Snapshot {
+				s := mismatched(eksNode("ip-10-0-1-11"), sized("unlabelled", "16Gi"))
+				s.Autoscaler.Groups = append(s.Autoscaler.Groups,
+					engine.NodeGroup{MinSize: 1, MaxSize: 10, Ready: 1})
+				return s
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, cfg := tc.build(), config()
+
+			err := engine.CheckPools(s, cfg)
+			if err == nil {
+				t.Fatal("a cluster where no node carries a recognised value passed preflight")
+			}
+
+			for what, want := range map[string]string{
+				"a group the autoscaler published": "asg-a",
+				"the other group it published":     "asg-b",
+				"the label key the nodes do carry": eksNodeGroupLabel,
+				"the remedy, as a command to run":  "kubectl label nodes",
+			} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("the error does not name %s (%q):\n%v", what, want, err)
+				}
+			}
+
+			// The setting and the value it holds, in one line rather than
+			// merely both somewhere in the message. Naming the setting is
+			// what the remedy needs; naming the value is what tells an
+			// operator whether they are looking at the default or at
+			// something they set. Separated, neither says which is which.
+			if !sameLine(err.Error(), "nodeGroupIDLabel", cfg.NodeGroupIDLabel) {
+				t.Errorf("the error does not say which key discovery.nodeGroupIDLabel "+
+					"currently names:\n%v", err)
+			}
+
+			// A template is not a remedy. The command has to carry a name the
+			// autoscaler actually published, or the operator is back at the
+			// ConfigMap working out what to substitute.
+			if !strings.Contains(err.Error(), engine.NodeGroupLabelSuggestion+"=asg-a") {
+				t.Errorf("the command binpack prints is not runnable as printed:\n%v", err)
+			}
+
+		})
+	}
+}
+
+// sameLine reports whether one line of text carries every one of the given
+// substrings, so an assertion about a sentence is not satisfied by two
+// unrelated ones.
+func sameLine(text string, want ...string) bool {
+	for _, line := range strings.Split(text, "\n") {
+		found := true
+		for _, w := range want {
+			found = found && strings.Contains(line, w)
+		}
+		if found {
+			return true
+		}
+	}
+	return false
+}
+
+// TestWithoutPreflightAMismatchReadsAsAFactAboutTheCluster is the state the
+// check above pre-empts, kept as its own test so that a fixture which stopped
+// reproducing it cannot leave the assertions on the message passing over a
+// cluster binpack would have been perfectly happy with.
+//
+// Every node is skipped as `not-autoscaled` — a code that means "the
+// autoscaler does not manage this node", said about a cluster of nothing but
+// autoscaled nodes. Nothing in it is a question, and nothing names the label.
+func TestWithoutPreflightAMismatchReadsAsAFactAboutTheCluster(t *testing.T) {
+	s := mismatched(eksNode("ip-10-0-1-11"), eksNode("ip-10-0-1-12"))
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatalf("a cluster binpack can map no node in produced a drain: %s", d.Reason)
+	}
+	if len(d.Assessments) != 2 {
+		t.Fatalf("expected both nodes to be assessed, got %d", len(d.Assessments))
+	}
+	for i := range d.Assessments {
+		if got := d.Assessments[i].SkipCode; got != engine.SkipNotAutoscaled {
+			t.Fatalf("%s is not out of scope, so this cluster no longer reproduces the "+
+				"silent failure preflight exists to catch: %s",
+				d.Assessments[i].Node.Name, got)
+		}
+	}
+	if strings.Contains(d.Reason, "nodeGroupIDLabel") {
+		t.Errorf("the summary names the configured label, so the mismatch is no longer "+
+			"silent and this test is asserting nothing: %s", d.Reason)
+	}
+}
+
+// TestPreflightAcceptsEveryClusterTheLabelCouldStillBeWorkingOn covers the
+// negative of each half of the condition separately, because refusing to run
+// is the expensive direction.
+//
+// binpack refuses only where it has positive evidence that the mapping is
+// broken: an autoscaler it can vouch for, groups with nodes in them, and no
+// node carrying a value any of those groups would answer to. Drop any one of
+// those and what is left is a question binpack cannot answer, not an answer of
+// "misconfigured" — and a preflight that stops a cluster over a question is a
+// worse failure than the silence it replaced.
+func TestPreflightAcceptsEveryClusterTheLabelCouldStillBeWorkingOn(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		build func() engine.Snapshot
+	}{
+		{
+			// The risk this check carries, and the case it must not fire on:
+			// an operator halfway through applying the label. One node
+			// matching is proof the mapping works, and the rest is arithmetic
+			// binpack does every run anyway.
+			name: "one node has been relabelled and the rest have not",
+			build: func() engine.Snapshot {
+				return mismatched(
+					eksNode("ip-10-0-1-11", mother.NodeLabels(map[string]string{
+						"doks.digitalocean.com/node-pool-id": "asg-a",
+					})),
+					eksNode("ip-10-0-1-12"),
+				)
+			},
+		},
+		{
+			// A pool scaled to zero has no node to carry its label, so no
+			// node can match and nothing is wrong. Refusing here would take
+			// binpack down over a pool that is merely empty — the same
+			// false positive TestCheckPoolsAcceptsAPoolKnownOnlyToTheAutoscaler
+			// guards on the other check.
+			name: "every reported group is scaled to zero",
+			build: func() engine.Snapshot {
+				s := mismatched(eksNode("ip-10-0-1-11"))
+				for i := range s.Autoscaler.Groups {
+					s.Autoscaler.Groups[i].Ready = 0
+				}
+				return s
+			},
+		},
+		{
+			// Nothing is published, so there is no value to match against.
+			// This is a cluster with no autoscaling at all, which binpack
+			// already reports as such.
+			name: "the autoscaler reports no groups",
+			build: func() engine.Snapshot {
+				s := mismatched(eksNode("ip-10-0-1-11"))
+				s.Autoscaler.Groups = nil
+				return s
+			},
+		},
+		{
+			// The groups came from a status document, and a status document
+			// nothing is updating says nothing about the cluster now. Live
+			// already refuses to act on it, and it names the real problem;
+			// a label error over the top of it would send the operator to
+			// relabel nodes over an autoscaler that has died.
+			name: "no autoscaler is running",
+			build: func() engine.Snapshot {
+				s := mismatched(eksNode("ip-10-0-1-11"))
+				s.Autoscaler.Running = false
+				return s
+			},
+		},
+		{
+			name: "the autoscaler status is stale",
+			build: func() engine.Snapshot {
+				s := mismatched(eksNode("ip-10-0-1-11"))
+				s.Autoscaler.LastProbe = now.Add(-24 * time.Hour)
+				return s
+			},
+		},
+		{
+			// There is nothing to report. The error's whole content is the
+			// keys the nodes carry, and with no nodes there are none — so it
+			// would name a configured key, a published group and an empty
+			// list, which is a sentence about a cluster binpack cannot see
+			// rather than one it has diagnosed.
+			name: "the cluster has no nodes at all",
+			build: func() engine.Snapshot {
+				s := mismatched()
+				// Ready set by hand: mismatched derives it from the node
+				// count, so leaving it would satisfy the scaled-to-zero
+				// branch too and this case would prove nothing about the
+				// one it is here for.
+				for i := range s.Autoscaler.Groups {
+					s.Autoscaler.Groups[i].Ready = 3
+				}
+				return s
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := engine.CheckPools(tc.build(), config()); err != nil {
+				t.Errorf("preflight refused a cluster it cannot show is misconfigured:\n%v", err)
+			}
+		})
+	}
+}
+
+// TestThePreflightErrorDoesNotDependOnHowTheClusterWasListed pins the same
+// property the summary needed, for the same reason.
+//
+// collect.Snapshot appends nodes in the order the API server listed them and
+// sorts nothing, and the group order is the status document's. Both reach this
+// error directly: it names every group and every label key it saw. Without an
+// order of its own it would reword itself between evaluations with nothing in
+// the cluster changing, which is the one thing an operator diffing two runs
+// cannot cope with.
+//
+// Re-running one snapshot cannot see this — it would only prove the function
+// is pure. The inputs have to be permuted.
+func TestThePreflightErrorDoesNotDependOnHowTheClusterWasListed(t *testing.T) {
+	// Distinct keys per node, so the key list is a genuine merge across nodes
+	// rather than one node's map repeated.
+	a := sized("a", "16Gi", mother.NodeLabels(map[string]string{
+		eksNodeGroupLabel: "workers", "kubernetes.io/hostname": "a"}))
+	b := sized("b", "16Gi", mother.NodeLabels(map[string]string{
+		"topology.kubernetes.io/zone": "eu-west-1a", "kubernetes.io/hostname": "b"}))
+	c := sized("c", "16Gi", mother.NodeLabels(map[string]string{
+		"node.kubernetes.io/instance-type": "m5.large"}))
+
+	groups := []engine.NodeGroup{
+		{ID: "asg-c", MinSize: 1, MaxSize: 10, Ready: 1},
+		{ID: "asg-a", MinSize: 1, MaxSize: 10, Ready: 1},
+		{ID: "asg-b", MinSize: 1, MaxSize: 10, Ready: 1},
+	}
+	orders := map[string]struct {
+		nodes  []*corev1.Node
+		groups []engine.NodeGroup
+	}{
+		"as listed":     {[]*corev1.Node{a, b, c}, groups},
+		"nodes rotated": {[]*corev1.Node{c, a, b}, groups},
+		"both reversed": {[]*corev1.Node{c, b, a}, []engine.NodeGroup{groups[2], groups[1], groups[0]}},
+		"interleaved":   {[]*corev1.Node{b, c, a}, []engine.NodeGroup{groups[1], groups[2], groups[0]}},
+	}
+
+	var first, firstName string
+	for name, order := range orders {
+		s := cluster(order.nodes, nil)
+		s.Autoscaler.Groups = order.groups
+
+		err := engine.CheckPools(s, config())
+		if err == nil {
+			t.Fatalf("%s: no node carries the configured label and preflight passed", name)
+		}
+		if first == "" {
+			first, firstName = err.Error(), name
+			continue
+		}
+		if err.Error() != first {
+			t.Errorf("the same cluster produced two errors, by list order alone:\n"+
+				"%s: %s\n%s: %s", firstName, first, name, err)
+		}
+	}
+
+	// Which order, not only that there is one. Written out rather than sorted
+	// here, so a test composing its expectation the way the code does cannot
+	// agree with whatever the code starts doing.
+	for what, want := range map[string]string{
+		"the published groups": "asg-a, asg-b, asg-c",
+		"the labels the nodes carry": "eks.amazonaws.com/nodegroup, kubernetes.io/hostname, " +
+			"node.kubernetes.io/instance-type, topology.kubernetes.io/zone",
+	} {
+		if !strings.Contains(first, want) {
+			t.Errorf("%s are not listed in sorted order (want %q):\n%s", what, want, first)
+		}
+	}
+}
