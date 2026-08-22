@@ -29,19 +29,26 @@ Fixed, and treated as public API from the first release:
 | Drain markers on a node | `binpack.motleyhand.com/drain-started`, `binpack.motleyhand.com/drain-progress`, `binpack.motleyhand.com/drain-pods-remaining`, `binpack.motleyhand.com/drain-awaiting` |
 | Backoff markers on a node | `binpack.motleyhand.com/drain-attempts`, `binpack.motleyhand.com/backoff-until`, `binpack.motleyhand.com/last-failure` |
 | Drain label on a node | `binpack.motleyhand.com/draining: "true"` |
+| Node-group label binpack suggests | `binpack.motleyhand.com/node-group` |
 | Metric prefix | `binpack_` |
 
 The opt-out annotation key is **not configurable**. A fixed key means one thing to document,
 one thing to search for, and no possibility of two clusters disagreeing about what protects a
 node.
 
-The list is exhaustive and a test keeps it that way: `TestEveryNodeKeyBinpackWritesIsInTheConventions`
-parses the constant block in `internal/engine/decide.go` and fails if a key binpack writes is
+The list is exhaustive and a test keeps it that way: `TestEveryNodeKeyBinpackDeclaresIsInTheConventions`
+parses the constant block in `internal/engine/decide.go` and fails if a key binpack declares is
 missing from the table above. It parses rather than enumerating by hand because the commit that
 adds a key and forgets this document is the same commit that would forget a hand-written list. It
 reads the table itself rather than the file, because several of these keys are named again in the
 prose below — and a check satisfied by a passing mention is one that stays green when a row is
 deleted, which is the only edit it exists to catch.
+
+Declares, not writes, and the difference has one member. `binpack.motleyhand.com/node-group` is
+the key binpack *recommends* where no label a provider already applies carries the autoscaler's
+identifier for a pool; binpack reads whichever key `discovery.nodeGroupIDLabel` names and writes
+none of them. It is public API on the same terms as the drain label: a key the documentation
+tells operators to apply is a key somebody has put in a GitOps repository.
 
 The label is here rather than only in the reference because operators are told to select on it —
 `kubectl get nodes -l binpack.motleyhand.com/draining=true` is the pre-uninstall check — and a
@@ -126,8 +133,11 @@ Before any evaluation, on every command:
    refuses to act and says why. Draining nodes that nothing will reap is strictly worse than
    doing nothing — see [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md).
 2. **Which node groups autoscale, and what are their bounds?** Discovered from the same
-   ConfigMap where the node group identifier can be mapped to a node label, configured
-   otherwise.
+   ConfigMap, through a node label whose *value* is the identifier it publishes — see
+   `discovery.nodeGroupIDLabel`. Where no node carries such a value, binpack fails preflight
+   rather than reporting a cluster of autoscaled nodes as unmanaged; there is no second
+   resolution mode, and [ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md)
+   records why not.
 
 `explain` and `diagnose` report preflight failures rather than exiting silently: "no
 cluster-autoscaler found" is itself a useful diagnosis.
@@ -722,10 +732,13 @@ Each of steps 4 onward gets its own specification before implementation.
 
 ## Open questions
 
-**How should nodes map to node groups where no identifier label exists?** DOKS provides
+**How should nodes map to node groups where no label can carry the identifier?** DOKS provides
 `doks.digitalocean.com/node-pool-id`, whose values match the autoscaler's node group names
-exactly. Other providers need investigating one at a time. Until then, those providers fall back
-to configured pool minimums.
+exactly. Where a provider's own labels do not, the operator applies one — `nodeGroupIDLabel`
+names any key, so this works wherever the identifier is a legal label value.
+[ADR-0012](adr-0012-pool-mapping-needs-a-value-matching-node-label.md) settles that much and
+leaves the remainder open: on GCE the identifier is a full instance-group URL and no label can
+hold it, so those clusters need something this design does not have.
 
 **Should node sizing be recommended?** Per-node kubelet and system reservations are roughly
 fixed, so larger nodes waste proportionally less — a 4GB node loses 15–17 percent to

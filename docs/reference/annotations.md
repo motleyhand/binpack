@@ -1,10 +1,13 @@
 # Annotations and labels
 
-binpack reads one annotation you set, and writes seven of its own, plus one label. All are on
-**nodes**; it annotates and labels no other kind of object.
+binpack reads one annotation you set, writes seven of its own, plus one label — and on clusters
+whose provider labels do not carry the autoscaler's pool identifier, reads a second label you
+apply. All are on **nodes**; it annotates and labels no other kind of object.
 
-The keys are fixed rather than configurable: one thing to document, one thing to grep for, and
-no possibility of two clusters disagreeing about what protects a node.
+The keys binpack writes are fixed rather than configurable: one thing to document, one thing to
+grep for, and no possibility of two clusters disagreeing about what protects a node. The one it
+reads for pool membership is the exception, and has to be — the key that works is whichever one
+your provider happens to put the identifier in.
 
 ## What you set
 
@@ -22,6 +25,27 @@ draining stops that drain and hands the node back. Remove it with a trailing hyp
 ```bash
 kubectl annotate node NODE binpack.motleyhand.com/skip-
 ```
+
+### `binpack.motleyhand.com/node-group`
+
+Only where discovery needs it. binpack maps a node to its autoscaling pool through the label
+named by `discovery.nodeGroupIDLabel`, and matches on that label's **value**: it has to be the
+identifier the cluster-autoscaler publishes in `nodeGroups[].name`, which is its cloud
+provider's own name for the group.
+
+Where no label your provider already applies carries that value, apply one — this is the key
+binpack suggests, because a key in a provider's own namespace is one the provider may start
+writing itself:
+
+```bash
+kubectl label nodes <node>... binpack.motleyhand.com/node-group=<group>
+```
+
+and set `discovery.nodeGroupIDLabel: binpack.motleyhand.com/node-group`. binpack never writes
+this label; it only reads whichever key the setting names. Where nothing maps, it refuses to
+run rather than reporting every node as unmanaged — see
+[`discovery.nodeGroupIDLabel`](configuration.md#discoverynodegroupidlabel) and
+[ADR-0012](../design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md).
 
 ## What binpack writes
 

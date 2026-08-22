@@ -112,16 +112,22 @@ func conventionsTable(t *testing.T) string {
 	return strings.Join(rows, "\n")
 }
 
-func TestEveryNodeKeyBinpackWritesIsInTheConventions(t *testing.T) {
+func TestEveryNodeKeyBinpackDeclaresIsInTheConventions(t *testing.T) {
 	// CLAUDE.md calls the architecture document the specification, and its
 	// Conventions table is headed "treated as public API from the first
-	// release". A key binpack writes on somebody's nodes and the spec does not
-	// promise is a promise nobody made, discovered by the next maintainer.
+	// release". A key binpack puts on somebody's nodes, or tells them to put
+	// there, and the spec does not promise is a promise nobody made,
+	// discovered by the next maintainer.
+	//
+	// Declares rather than writes: NodeGroupLabelSuggestion is a key binpack
+	// only ever reads, and only when the configuration names it — but it is
+	// the key the documentation tells operators to apply, which puts it in a
+	// GitOps repository just as surely as a key binpack wrote itself.
 	table := conventionsTable(t)
 
 	for name, key := range nodeKeys(t) {
 		if !strings.Contains(table, key) {
-			t.Errorf("engine.%s writes %s, which the Conventions table does not list", name, key)
+			t.Errorf("engine.%s declares %s, which the Conventions table does not list", name, key)
 		}
 	}
 }

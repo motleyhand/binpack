@@ -1114,7 +1114,107 @@ func PoolNames(s Snapshot, cfg Config) map[string]string {
 	return names
 }
 
-// CheckPools rejects per-pool overrides naming a pool that is not there.
+// NodeGroupLabelSuggestion is the label binpack recommends where nothing a
+// provider already writes carries the autoscaler's identifier for a pool.
+//
+// Under binpack's own API group deliberately: a key in a provider's namespace
+// is one the provider may start writing itself, and a value it then overwrites
+// is a mapping that breaks with no configuration having changed.
+const NodeGroupLabelSuggestion = "binpack.motleyhand.com/node-group"
+
+// checkNodeGroupLabel rejects a cluster where the configured label maps no node
+// to any pool the autoscaler reports.
+//
+// binpack matches a node to a pool through one label, and the match is on that
+// label's *value*: `nodeGroups[].name` in the status ConfigMap is the cloud
+// provider's own identifier for the group, so a node has to carry that
+// identifier. Where none does, every node falls out of scope and binpack
+// reports "not part of an autoscaling pool" about a cluster of nothing but
+// autoscaled nodes — printed directly beneath its own list of healthy pools,
+// with a count from the summary making the wrong answer sound more certain.
+// Nothing about that state tells an operator which of the two halves is wrong.
+// `diagnose` goes quiet in one particular way too: every node is static, so
+// every finding diagnoseWorkloads groups frees nothing and `--fail-on` skips
+// it. Budget and pool findings are unaffected, which is narrower than it
+// first reads — see ADR-0012.
+//
+// Refused only on positive evidence, because refusing is the expensive
+// direction. All three conditions carry their weight: a status document
+// nothing is updating says nothing about the cluster now, and Live already
+// names that as the problem; a group with no ready node has nothing to carry
+// its identifier and is not evidence of anything; and one node matching is
+// proof the mapping works, so a cluster halfway through being relabelled goes
+// on running.
+func checkNodeGroupLabel(s Snapshot, cfg Config) error {
+	// With no nodes there is no evidence and nothing to report: the error's
+	// content is what the nodes do carry, and an empty list of that is a
+	// sentence about a cluster binpack cannot see rather than one it has
+	// diagnosed.
+	if live, _ := s.Autoscaler.Live(s.Now); !live || len(s.Nodes) == 0 {
+		return nil
+	}
+
+	var published []string
+	ids, populated := map[string]bool{}, false
+	for _, g := range s.Autoscaler.Groups {
+		// A group the status names with an empty string would be matched by
+		// every unlabelled node, which turns this check off without failing
+		// it. `name` is omitempty upstream, so the value is representable.
+		if g.ID == "" {
+			continue
+		}
+		published = append(published, g.ID)
+		ids[g.ID] = true
+		populated = populated || g.Ready > 0
+	}
+	// Nothing published has a node in it, so nothing could have matched and
+	// there is no evidence either way. It also leaves `published` non-empty
+	// wherever this returns an error, which the remedy below relies on.
+	if !populated {
+		return nil
+	}
+
+	keys := map[string]bool{}
+	for _, node := range s.Nodes {
+		if ids[node.Labels[cfg.NodeGroupIDLabel]] {
+			return nil
+		}
+		for key := range node.Labels {
+			keys[key] = true
+		}
+	}
+
+	// Both lists sorted, for the reason the summary sentence needed one:
+	// collect.Snapshot appends nodes in the order the API server listed them
+	// and sorts nothing, and the group order is the status document's. An
+	// unchanged cluster would otherwise word its refusal differently on every
+	// run, and a refusal nobody can diff against the last one is one nobody
+	// can tell they have already read.
+	sort.Strings(published)
+	present := slices.Sorted(maps.Keys(keys))
+
+	return fmt.Errorf(
+		"no node carries a pool identifier the cluster-autoscaler recognises, so binpack\n"+
+			"can see no autoscaling pool at all;\n"+
+			"discovery.nodeGroupIDLabel is %q, and a node belongs to a pool\n"+
+			"when that label's value equals a group name the autoscaler publishes\n"+
+			"  the autoscaler publishes: %s\n"+
+			"  the nodes carry the labels: %s\n"+
+			"if one of those labels already holds a group name, set discovery.nodeGroupIDLabel\n"+
+			"to it; otherwise label each pool's nodes yourself and set it to that:\n"+
+			"  kubectl label nodes <node>... %s=%s",
+		cfg.NodeGroupIDLabel,
+		strings.Join(published, ", "),
+		strings.Join(present, ", "),
+		NodeGroupLabelSuggestion, published[0])
+}
+
+// CheckPools is the preflight every frontend runs before it decides anything:
+// it rejects a configuration whose pools binpack will not be able to resolve.
+//
+// Two ways that happens, and the label comes first because an override naming
+// a pool is downstream of there being any pool at all. See
+// [checkNodeGroupLabel] for the mapping, and below for the overrides.
 //
 // Pools are discovered, never declared, so an override adjusts something that
 // exists. A misspelt name otherwise installs an unreachable map entry and its
@@ -1127,6 +1227,9 @@ func PoolNames(s Snapshot, cfg Config) map[string]string {
 // it: a configuration `explain` refuses must not be one `run` accepts, and the
 // controller is the one that will eventually act on it.
 func CheckPools(s Snapshot, cfg Config) error {
+	if err := checkNodeGroupLabel(s, cfg); err != nil {
+		return err
+	}
 	if len(cfg.ByPool) == 0 {
 		return nil
 	}

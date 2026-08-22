@@ -1,8 +1,10 @@
 # Configuration reference
 
 binpack is configured by a YAML document mounted from a ConfigMap. **Every field is optional.**
-An empty document is valid and produces a working, safe configuration, because node pools and
-their bounds are discovered from the cluster-autoscaler rather than declared here.
+An empty document is valid, because node pools and their bounds are discovered from the
+cluster-autoscaler rather than declared here. Discovery rests on one node label, though, and the
+default is DigitalOcean's — see [`discovery.nodeGroupIDLabel`](#discoverynodegroupidlabel) for
+what to set elsewhere, and how to find out whether you need to.
 
 Check a document before applying it:
 
@@ -106,8 +108,44 @@ binpack matches nodes to entries in the `cluster-autoscaler-status` ConfigMap th
 which is how it learns which pools autoscale and what their minimum and maximum sizes are —
 without any cloud provider credentials.
 
-Defaults to DigitalOcean's. Other providers use a different key; if the values do not match the
-node group names in the status ConfigMap, preflight fails loudly rather than guessing.
+The match is on the *value*, and the value has to be the cloud provider's own identifier for the
+group — an Auto Scaling group name on AWS, a VM Scale Set name on Azure, a node pool ID on
+DigitalOcean, a full instance group URL on GCE. That identifier is what the autoscaler writes
+into `nodeGroups[].name`, so that is what a node has to carry. It is not, in general, the pool
+name you chose in a console.
+
+Defaults to `doks.digitalocean.com/node-pool-id`, whose values are exactly those identifiers on
+DOKS. Whether a label your provider applies carries them on your cluster is a question two
+read-only commands answer:
+
+```bash
+kubectl -n kube-system get configmap cluster-autoscaler-status -o yaml
+kubectl get nodes --show-labels
+```
+
+The first prints a `nodeGroups[].name` per pool. If a label already on your nodes holds one of
+those names as its value, set `discovery.nodeGroupIDLabel` to that key. If none does, apply a
+label yourself, one group at a time:
+
+```bash
+kubectl label nodes <node>... binpack.motleyhand.com/node-group=<group>
+```
+
+and set `discovery.nodeGroupIDLabel: binpack.motleyhand.com/node-group`. binpack never writes
+that label — it reads whichever key you point it at, and the key under its own API group is
+suggested only because a provider cannot start writing to it underneath you.
+
+Where the identifier is not a legal label value there is no mapping to express. GCE is the
+known case: the autoscaler identifies a managed instance group by its full API URL, and a
+Kubernetes label value is capped at 63 characters and may not contain `/` or `:`.
+[ADR-0012](../design/adr-0012-pool-mapping-needs-a-value-matching-node-label.md) records what
+that means and what was considered instead.
+
+If no node carries a value any published group answers to, **preflight fails** — on `explain`,
+`diagnose` and `run` alike, exit status 1 — naming the key it looked for, the groups the
+autoscaler published and the labels your nodes do carry. It used to report every node as "not
+part of an autoscaling pool" instead, which reads as a fact about the cluster rather than as the
+misconfiguration it is.
 
 ### `discovery.poolNameLabel`
 
