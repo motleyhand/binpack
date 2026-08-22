@@ -1100,3 +1100,111 @@ func TestANodeTheAutoscalerIsRemovingIsNotADestination(t *testing.T) {
 			sim.Relocated[0].Pod.Namespace, sim.Relocated[0].Pod.Name, sim.Relocated[0].Node.Name)
 	}
 }
+
+// TestHeadroomNamesWhyEachDestinationRefused is the difference between an
+// operator raising a pool maximum and an operator removing a taint.
+//
+// The reserve probes every destination with a pod the size of the largest
+// relocatable one, and fit answers with the wall each node hit — cordoned, not
+// Ready, tainted, or genuinely short. Reporting all four as "no room" is a
+// capacity claim about a node with 64Gi free, and none of the responses it
+// invites touches the thing that actually refused.
+func TestHeadroomNamesWhyEachDestinationRefused(t *testing.T) {
+	// The pod fits `tight` exactly, so the relocation succeeds and the
+	// refusal under test is the reserve's, not the placement's.
+	candidate := sized("candidate", "4Gi")
+	tight := sized("tight", "2Gi")
+	roomy := sized("roomy", "64Gi", mother.Tainted("gpu", "true", corev1.TaintEffectNoSchedule))
+
+	pods := []*corev1.Pod{
+		mother.Pod("default", "moving", mother.OnNode("candidate"), mother.Requests("100m", "2Gi")),
+	}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+	sim := engine.Simulate([]*corev1.Node{candidate, tight, roomy}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if sim.Feasible {
+		t.Fatal("packing the cluster to the last byte leaves nowhere for the next pod that restarts")
+	}
+	if got := sim.Blocked.PerNode["roomy"]; !strings.Contains(got, "gpu") {
+		t.Errorf("roomy refused with %q, want the taint that actually stopped it — "+
+			"it has 64Gi free and nothing about it is short of room", got)
+	}
+
+	// The other direction, and the one a wholesale switch to fit's message
+	// would lose: a genuine shortfall has to keep saying what was being asked
+	// for. "insufficient memory" alone leaves the reader without the size,
+	// which is the number the reserve is about.
+	short := sim.Blocked.PerNode["tight"]
+	if !strings.Contains(short, "memory") {
+		t.Errorf("tight refused with %q, want the resource it ran out of", short)
+	}
+	if !strings.Contains(short, "largest") {
+		t.Errorf("tight refused with %q, want the size the reserve was asking about", short)
+	}
+	// And only there. A node that refused for a taint refused whatever size
+	// was being asked for, so pinning the reserve's question onto its sentence
+	// would put a capacity claim back on a node with 64Gi free.
+	if strings.Contains(sim.Blocked.PerNode["roomy"], "largest") {
+		t.Errorf("roomy refused with %q, which reads as a shortfall and is not one",
+			sim.Blocked.PerNode["roomy"])
+	}
+}
+
+// TestAPodLevelRefusalIsNotReportedPerDestination is a wall binpack hit before
+// it looked at a single node, reported once per node.
+//
+// fit answers "this pod declares something binpack does not model" before any
+// node property is read, so storing that answer under every destination's name
+// asserts N node-specific walls that were never observed — under a verdict and
+// a summary the how-to guide primes an operator to read as capacity. The
+// cluster may have room to spare; binpack simply declined to model the pod.
+func TestAPodLevelRefusalIsNotReportedPerDestination(t *testing.T) {
+	candidate := sized("candidate", "4Gi")
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web", mother.OnNode("candidate"),
+			mother.Requests("100m", "128Mi"), mother.WithHostPort(8080)),
+	}
+	nodes := []*corev1.Node{candidate,
+		sized("dest-a", "64Gi"), sized("dest-b", "64Gi"), sized("dest-c", "64Gi")}
+
+	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("a pod binpack does not model cannot be shown to fit anywhere")
+	}
+	if len(sim.Blocked.PerNode) != 0 {
+		t.Errorf("PerNode = %v, want no per-destination refusals: "+
+			"no node was asked, and none of them refused", sim.Blocked.PerNode)
+	}
+	if !strings.Contains(sim.Blocked.Summary, "hostPort") {
+		t.Errorf("summary = %q, want the thing binpack does not model", sim.Blocked.Summary)
+	}
+}
+
+// TestAGenuineShortfallIsStillReportedPerDestination is the negative half of
+// the hoist above, and the half a condition placed one line too high takes
+// away silently.
+//
+// "Which wall did each node hit" is the question the refusal map exists to
+// answer, and it is answerable exactly when the walls are node properties.
+// Suppressing it for a pod binpack does not model must not suppress it for a
+// pod that simply does not fit.
+func TestAGenuineShortfallIsStillReportedPerDestination(t *testing.T) {
+	candidate := sized("candidate", "4Gi")
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web", mother.OnNode("candidate"), mother.Requests("100m", "4Gi")),
+	}
+	nodes := []*corev1.Node{candidate, sized("dest-a", "1Gi"), sized("dest-b", "1Gi")}
+
+	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("a 4Gi pod does not fit on a 1Gi node")
+	}
+	if len(sim.Blocked.PerNode) != 2 {
+		t.Errorf("PerNode = %v, want a reason for each destination that refused", sim.Blocked.PerNode)
+	}
+}

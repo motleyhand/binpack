@@ -16,8 +16,12 @@ binpack tells the operator, in three separate places, that what it decided is on
 - `binpack run --help`: "Decisions surface as Kubernetes Events on the node as well as in the log,
   because on a managed control plane `kubectl describe node` is the one place a cluster user can
   reliably look";
-- `values.yaml`, above `dryRun`: "a week of events on nodes tells you exactly what it would have
-  done".
+- `values.yaml`, above `dryRun`: "the events on nodes name the node binpack would drain and why".
+
+That third sentence has since been narrowed — it claimed a week of dry run showed what binpack
+would have done, and dry run performs none of binpack's own consolidation, so it shows a first
+choice repeated rather than a sequence. What it says about *where* a decision lands is unchanged,
+and that is the half this decision rests on.
 
 The justification is the load-bearing part, and it is the same one each time. On a managed control
 plane the autoscaler's logs are unreachable, and binpack's own may be too — a cluster user with

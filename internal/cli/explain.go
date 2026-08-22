@@ -33,7 +33,8 @@ func newExplainCommand(opts *options) *cobra.Command {
 		Long: "Reads the cluster and prints the decision binpack would reach, together with\n" +
 			"its reasoning for every node.\n\n" +
 			"Read-only: explain never cordons, evicts or writes anything. It runs the same\n" +
-			"decision function the controller runs, so what it prints is what would happen.",
+			"decision function the controller runs, and says where it cannot see what the\n" +
+			"controller sees.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg, source, err := loadConfigOrDefaults(path, cmd.InOrStdin())
@@ -41,7 +42,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 				return err
 			}
 
-			client, err := clientFor(kubeconfig, kubecontext)
+			client, err := readerFor(kubeconfig, kubecontext)
 			if err != nil {
 				return err
 			}
@@ -56,6 +57,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 			}
 
 			opts.configSource = source
+			opts.dryRun = cfg.Settings().DryRun
 			return renderExplain(opts, snapshot, explainOutcome(snapshot, engineConfig(cfg)))
 		},
 	}
@@ -67,8 +69,9 @@ func newExplainCommand(opts *options) *cobra.Command {
 	return cmd
 }
 
-// explainOutcome is everything explain reports: the decision, and — separately
-// — the drain already under way, if there is one.
+// explainOutcome is everything explain reports: the decision, the nodes it was
+// made about, the drain already under way if there is one, and what explain
+// could not evaluate.
 //
 // Separately, because they answer different questions and one of them can be
 // unavailable while the other is not. [engine.Decide] returns before assessing
@@ -79,6 +82,31 @@ func newExplainCommand(opts *options) *cobra.Command {
 // marker on the node, which is where the drain actually lives.
 func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
 	out := explainOutput{Decision: engine.Decide(s, cfg)}
+	out.Nodes = out.Decision.Assessments
+
+	// Decide refuses before assessing anything when no autoscaler is running,
+	// and that emptiness is right where it is — see [engine.Assess], which
+	// says what depends on it. It is wrong here: a reader pointing binpack at
+	// a cluster without an autoscaler got three sentences and no sign that it
+	// had read their cluster at all, which is what a broken binary looks like.
+	// The refusal is still the headline; what changes is that the arithmetic
+	// underneath it survives.
+	if out.Decision.Code == engine.CodeNoAutoscaler {
+		out.Nodes = engine.Assess(s, cfg)
+	}
+
+	// A control that governs the deployed binpack and that this process has no
+	// input for. Snapshot.LastDrain is filled in by the controller from its own
+	// memory — a completed drain deletes the node that would have recorded it —
+	// so the engine reads the zero value here and the cooldown branch never
+	// opens. Answering as though no drain had happened is what `run --once`
+	// refuses to start rather than do, on a strictly weaker version of the same
+	// condition, and explain has to at least say so.
+	if where, d, set := engine.CooldownAfterDrain(cfg); set {
+		out.NotEvaluated = append(out.NotEvaluated, fmt.Sprintf(
+			"cooldown.afterDrain (%s sets %s) is not visible to explain: %s",
+			where, d, engine.NoDrainToMeasureFrom))
+	}
 
 	name := engine.Marked(s)
 	if name == "" {
@@ -111,9 +139,9 @@ func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
 	// leave it unreachable whenever there is a single marker, which is the
 	// ordinary case, and would count a node already being drained towards
 	// binpack_drainable_nodes.
-	for i := range out.Decision.Assessments {
-		if out.Decision.Assessments[i].Node.Name == name {
-			out.Decision.Assessments[i] = a
+	for i := range out.Nodes {
+		if out.Nodes[i].Node.Name == name {
+			out.Nodes[i] = a
 		}
 	}
 	return out
@@ -122,9 +150,16 @@ func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
 // explainOutput is what the renderers are given.
 type explainOutput struct {
 	Decision engine.Decision
+	// Nodes is what explain says about each node. Normally the decision's own
+	// assessments; when [engine.Decide] returned before making any, what the
+	// same pass reports on its own — see [explainOutcome].
+	Nodes []engine.NodeAssessment
 	// Drain is the drain already under way, or nil. Never derived from the
 	// decision: see [explainOutcome].
 	Drain *drainReport
+	// NotEvaluated names controls explain cannot evaluate, in the sentences it
+	// prints for them.
+	NotEvaluated []string
 }
 
 // drainReport describes a drain in progress, in the words the controller uses
@@ -150,11 +185,36 @@ func restConfigFor(kubeconfig, kubecontext string) (*rest.Config, error) {
 	}
 
 	restCfg, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(rules, overrides).ClientConfig()
+	if clientcmd.IsEmptyConfig(err) {
+		// Replaced rather than wrapped, and this one only. client-go's
+		// ErrEmptyConfig suggests KUBERNETES_MASTER, which predates KUBECONFIG
+		// and which these loading rules never consult: the overrides above
+		// carry no ClusterDefaults, so setting it produces a byte-identical
+		// error. That is the first thing a stranger sees, and it sends them
+		// somewhere that cannot work — leaving them no way to tell a missing
+		// kubeconfig from a broken binary.
+		//
+		// Every other failure here reads well already (an unreachable server
+		// names the address it tried), so they keep the upstream text: one
+		// sentence about kubeconfigs in place of all of them would lose the
+		// diagnosis rather than improve it.
+		return nil, errors.New(
+			"no kubeconfig found: set KUBECONFIG, or pass --kubeconfig <path> and --context <name>")
+	}
 	if err != nil {
 		return nil, fmt.Errorf("building a Kubernetes client: %w", err)
 	}
 	return restCfg, nil
 }
+
+// readerFor is how the command reaches the cluster, as a variable so a test
+// can run the command rather than only its renderer.
+//
+// The wiring between the configuration and the report has no other cover:
+// which settings reach the output — and so which binpack the answer is about —
+// is decided in RunE and nowhere else, and every renderer test starts from an
+// options value it built itself.
+var readerFor = clientFor
 
 // clientFor builds a direct, uncached reader.
 //
@@ -276,7 +336,16 @@ type explainView struct {
 	// without -f answers about built-in defaults, which is a different
 	// question from what the deployed binpack will do.
 	Config string `json:"config"`
-	Action string `json:"action"`
+	// DryRun is that configuration's mode. The verdict below is a prediction
+	// under one value and a plan under the other, and this is the only thing
+	// in the report that says which.
+	DryRun bool `json:"dryRun"`
+	// NotEvaluated names controls that govern the deployed binpack and that
+	// explain cannot evaluate, in the sentences it prints for them. A preview
+	// that quietly answers as though a control were unset is a preview of a
+	// different binpack.
+	NotEvaluated []string `json:"notEvaluated,omitempty"`
+	Action       string   `json:"action"`
 	// Code names the outcome, from the engine's bounded set.
 	Code   string `json:"code"`
 	Node   string `json:"node,omitempty"`
@@ -304,6 +373,11 @@ type nodeReport struct {
 	Detail    string   `json:"detail,omitempty"`
 	Relocates int      `json:"relocates,omitempty"`
 	Blockers  []string `json:"blockers,omitempty"`
+	// Unmodelled marks a refusal binpack made because it could not read what
+	// the replacement would request, rather than because the cluster is full.
+	// Exactly the set binpack_nodes_unmodelled counts, and named the same way,
+	// because the how-to guide sends a reader here to look for the word.
+	Unmodelled bool `json:"unmodelled,omitempty"`
 	// Refusals maps each destination to why it would not take the pod that
 	// could not be placed. Without it, "nowhere to go" is unactionable: the
 	// useful question is always which wall each node hit.
@@ -312,9 +386,11 @@ type nodeReport struct {
 
 func renderExplain(opts *options, s engine.Snapshot, out explainOutput) error {
 	d := out.Decision
-	view := buildView(s, d)
+	view := buildView(s, out)
 	view.Config = opts.configSource
+	view.DryRun = opts.dryRun
 	view.Drain = out.Drain
+	view.NotEvaluated = out.NotEvaluated
 
 	if opts.output == outputJSON {
 		enc := json.NewEncoder(opts.out)
@@ -325,7 +401,8 @@ func renderExplain(opts *options, s engine.Snapshot, out explainOutput) error {
 	return writeExplainText(opts, s, d, view)
 }
 
-func buildView(s engine.Snapshot, d engine.Decision) explainView {
+func buildView(s engine.Snapshot, out explainOutput) explainView {
+	d := out.Decision
 	var v explainView
 	live, _ := s.Autoscaler.Live(s.Now)
 	v.Autoscaler.Running = live
@@ -346,7 +423,7 @@ func buildView(s engine.Snapshot, d engine.Decision) explainView {
 		v.Node = d.Node.Name
 	}
 
-	for _, a := range d.Assessments {
+	for _, a := range out.Nodes {
 		v.Nodes = append(v.Nodes, reportFor(a, d))
 	}
 	return v
@@ -374,18 +451,34 @@ func reportFor(a engine.NodeAssessment, d engine.Decision) nodeReport {
 		if a.Simulation.Blocked != nil {
 			r.Detail = a.Simulation.Blocked.Summary
 			r.Refusals = a.Simulation.Blocked.PerNode
+			r.Unmodelled = a.Simulation.Blocked.NoTemplate
 		}
 	default:
-		// Why this node is not being drained, which during a drain is a
-		// different sentence: nothing was chosen, so "another node was chosen
-		// first" would name a choice that was never made.
+		// Why this node is not being drained, which depends on what the
+		// evaluation concluded rather than on the node. During a drain
+		// nothing was chosen, so "another node was chosen first" would name
+		// a choice that was never made.
 		switch {
 		case r.Draining:
 			r.Detail = "its workload still fits elsewhere"
 		case d.Code == engine.CodeDraining:
 			r.Detail = "it could be drained, but a drain is already in progress"
-		case !a.Chosen:
+		case a.Chosen:
+			// The row the command exists for, and the only one in the table
+			// that used to carry no detail at all — which reads as a
+			// rendering fault rather than as a deliberate silence. The Event
+			// describing this same decision has always said how many pods
+			// move; this is that sentence, from that function.
+			if a.Simulation != nil {
+				r.Detail = engine.RelocationSummary(len(a.Simulation.Relocated))
+			}
+		case d.Node != nil:
 			r.Detail = "another node was chosen first"
+		default:
+			// Nothing was chosen and no drain is under way, so the reason is
+			// above the choice rather than about this node. The headline says
+			// which; saying it again on every row would bury it.
+			r.Detail = "it could be drained"
 		}
 		if a.Simulation != nil {
 			r.Relocates = len(a.Simulation.Relocated)
@@ -406,42 +499,47 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 	// skips it can still check the verdict against the settings; a reader who
 	// never sees it cannot.
 	if opts.configSource != "" {
-		p("config: %s\n\n", opts.configSource)
+		p("config: %s\n", opts.configSource)
+	}
+	// And the mode with it, because it decides what the verdict below is. A
+	// deployed binpack that reports and one that cordons reach the same
+	// decision and do entirely different things with it, and this command
+	// exists to answer about the deployed one.
+	p("dryRun: %t — %s\n", v.DryRun, dryRunMeans(v.DryRun))
+	for _, note := range v.NotEvaluated {
+		p("%s\n", note)
 	}
 
 	// The same liveness check Decide uses, so this line cannot contradict the
 	// decision printed below it.
 	live, why := s.Autoscaler.Live(s.Now)
 
-	p("cluster-autoscaler: ")
+	p("\ncluster-autoscaler: ")
 	if !live {
-		p("unavailable\n\n")
-		p("binpack will not act: %s\n", why)
-		// Still said, because this is the condition that ends a drain rather
-		// than one that merely stops a new one starting: revalidation refuses
-		// to continue through a dead autoscaler, so the next evaluation hands
-		// the node back. Returning here reported the dead autoscaler and
-		// nothing at all about the cordoned node somebody is looking at.
-		if v.Drain != nil {
-			p("\n")
-			writeDrain(p, v.Drain)
+		p("unavailable\n")
+	} else {
+		p("running")
+		if s.Autoscaler.ScaleDownStatus != "" {
+			// NoCandidates is the autoscaler stating binpack's reason for
+			// existing in its own words.
+			p(", scale-down: %s", s.Autoscaler.ScaleDownStatus)
 		}
-		return errors.Join(errs...)
-	}
-	p("running")
-	if s.Autoscaler.ScaleDownStatus != "" {
-		// NoCandidates is the autoscaler stating binpack's reason for
-		// existing in its own words.
-		p(", scale-down: %s", s.Autoscaler.ScaleDownStatus)
-	}
-	p("\n")
+		p("\n")
 
-	for _, pool := range v.Autoscaler.Pools {
-		p("  pool %s: %d ready (min %d, max %d)\n", pool.ID, pool.Ready, pool.Min, pool.Max)
+		for _, pool := range v.Autoscaler.Pools {
+			p("  pool %s: %d ready (min %d, max %d)\n", pool.ID, pool.Ready, pool.Min, pool.Max)
+		}
+		if len(v.Autoscaler.Pools) == 0 {
+			p("  no autoscaling pools reported\n")
+		}
 	}
-	if len(v.Autoscaler.Pools) == 0 {
-		p("  no autoscaling pools reported\n")
-	}
+
+	// The answer, above the node table as well as below it. On a cluster where
+	// nothing is feasible the table is a row per node plus a refusal list per
+	// row, and the one sentence that answers the question was printed after
+	// all of it — so `head` showed nothing useful and `less` meant paging past
+	// everything to reach it.
+	p("\n%s\n", headline(live, why, d))
 
 	p("\nnodes\n")
 	for _, r := range v.Nodes {
@@ -456,20 +554,126 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 		if r.Pool != "" {
 			name = fmt.Sprintf("%s (%s)", r.Name, r.Pool)
 		}
-		p("%s %-42s %-11s %s\n", marker, name, r.Verdict, r.Detail)
+		detail := r.Detail
+		// The word the metric and the how-to guide both use, on the line the
+		// reader was sent to look at. Not a fifth verdict: that column is a
+		// closed set shared with binpack_nodes, and this is a property of the
+		// refusal rather than a different outcome.
+		if r.Unmodelled {
+			detail = "unmodelled: " + detail
+		}
+		p("%s %-42s %-11s %s\n", marker, name, r.Verdict, detail)
 		for _, b := range r.Blockers {
 			p("    - %s\n", b)
 		}
-		for _, dest := range sortedKeys(r.Refusals) {
-			p("    - %s: %s\n", dest, r.Refusals[dest])
+		for _, line := range refusalLines(r.Refusals, maxRefusalLines) {
+			p("    - %s\n", line)
 		}
 	}
 
 	p("\n")
+	writeVerdict(p, live, why, d, v)
+
+	return errors.Join(errs...)
+}
+
+// maxRefusalLines is how many lines of per-destination refusal one node's row
+// may carry, the last of them a tail saying how many were left out.
+//
+// Three, and the number comes from arithmetic rather than taste: the report is
+// one such list per infeasible node, so at a hundred nodes with nothing left
+// to consolidate — the ordinary state of the cluster binpack is pointed at —
+// an uncapped list was ten thousand lines with the verdict on the last one.
+const maxRefusalLines = 3
+
+// refusalLines renders a node's per-destination refusals, capped.
+//
+// The tail is explicit and says where the rest are, because a list silently
+// truncated to its first entries reads as the whole list — and the destination
+// an operator came here about is exactly the one a silent cap would drop.
+// `--output json` carries every entry, uncapped, since a machine reading the
+// report has no trouble with the volume and no way to ask for more.
+func refusalLines(refusals map[string]string, limit int) []string {
+	names := sortedKeys(refusals)
+
+	out := make([]string, 0, min(len(names), limit))
+	for _, dest := range names {
+		if len(names) > limit && len(out) == limit-1 {
+			out = append(out, fmt.Sprintf(
+				"(and %d more destinations refused; --output json lists them all)",
+				len(names)-len(out)))
+			break
+		}
+		out = append(out, dest+": "+refusals[dest])
+	}
+	return out
+}
+
+// dryRunMeans says what the mode does, in the register `binpack config
+// validate` already uses for the same setting.
+func dryRunMeans(dryRun bool) string {
+	if dryRun {
+		return "binpack reports what it decides and changes nothing"
+	}
+	return "binpack acts on what it decides"
+}
+
+// headline is the answer in one line. See [writeVerdict], which says it again
+// with everything that follows from it.
+func headline(live bool, why string, d engine.Decision) string {
 	switch {
+	case !live:
+		return "binpack will not act: " + why
 	case d.Action == engine.Drain:
-		p("would drain %s\n", d.Node.Name)
-		p("(dry run: explain never changes anything)\n")
+		return "would drain " + d.Node.Name
+	case d.Code == engine.CodeDraining:
+		return "a drain is in progress on " + d.Node.Name
+	default:
+		return "nothing to do: " + d.Reason
+	}
+}
+
+// writeVerdict says what binpack would do, and what the deployed
+// configuration will do about it.
+func writeVerdict(p func(string, ...any), live bool, why string, d engine.Decision, v explainView) {
+	switch {
+	case !live:
+		p("binpack will not act: %s\n", why)
+		// Said rather than left to the node table above, which reads as a
+		// preview otherwise. Not "what it would decide if one were running"
+		// either, which would be a second wrong answer: the pools come from
+		// the same status document, so what binpack could determine without
+		// one is exactly what the rows say and no more.
+		p("the table above is what binpack could determine without one\n")
+		// Still said, because this is the condition that ends a drain rather
+		// than one that merely stops a new one starting: revalidation refuses
+		// to continue through a dead autoscaler, so the next evaluation hands
+		// the node back.
+		if v.Drain != nil {
+			p("\n")
+			writeDrain(p, v.Drain)
+		}
+
+	case d.Action == engine.Drain:
+		chosen := ""
+		for _, r := range v.Nodes {
+			if r.Chosen {
+				chosen = r.Detail
+			}
+		}
+		p("would drain %s: %s\n", d.Node.Name, chosen)
+		// The subject of every sentence here is the deployed binpack, which is
+		// what the parenthesis below used to be read as. "would drain node-a"
+		// followed by the words "dry run" is a statement about the deployment
+		// to anybody reading at speed, and it was a statement about the
+		// reading tool.
+		if v.DryRun {
+			p("the configuration sets dryRun: true, so binpack will report this decision and not act on it\n")
+		} else {
+			p("the configuration sets dryRun: false, so binpack will cordon %s and begin evicting\n",
+				d.Node.Name)
+		}
+		p("(explain itself never changes anything)\n")
 
 	case d.Code == engine.CodeDraining:
 		// Narrowed rather than lost. What binpack will do next is advance this
@@ -483,16 +687,14 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 	default:
 		p("nothing to do: %s\n", d.Reason)
 	}
-
-	return errors.Join(errs...)
 }
 
 // writeDrain says which node is being drained and what the two halves of the
 // question observed about it. Nothing when no drain is under way.
 //
-// It does not say where the node's row is, because one caller prints no node
-// table: without a live autoscaler the engine assesses nothing, and this is
-// still the moment to say a node is cordoned.
+// It does not say where the node's row is, because a reader may be looking at
+// a report whose table says nothing about this node: without a live
+// cluster-autoscaler every row is a node ruled out before it was simulated.
 func writeDrain(p func(string, ...any), r *drainReport) {
 	if r == nil {
 		return

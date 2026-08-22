@@ -22,9 +22,12 @@ config:
   # that drains nodes should be one you switched on, not one you inherited.
   #
   # Leave this true until `binpack explain` has told you something you agree
-  # with — the decisions are identical either way, so a week of events on nodes
-  # tells you exactly what it would have done. Setting it false also requires
-  # rbac.allowDraining: true; the chart refuses one without the other.
+  # with. Each evaluation reaches the identical decision either way, so the
+  # events on nodes name the node binpack would drain and why — but nothing is
+  # drained, so they cannot show you what happens after the first one.
+  #
+  # Setting it false also requires rbac.allowDraining: true; the chart refuses
+  # one without the other.
   #
   # See docs/how-to/let-binpack-drain-nodes.md.
   dryRun: true

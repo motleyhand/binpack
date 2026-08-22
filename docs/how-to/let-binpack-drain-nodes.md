@@ -3,8 +3,15 @@
 binpack ships in dry run: it decides everything and changes nothing. This is how to turn that
 off, and what to look at before you do.
 
-The decisions are identical either way. Dry run is not a reduced mode — it runs the whole
-procedure and stops at the point of acting, so what you see in dry run is what it will do.
+Each evaluation reaches the identical decision either way. Dry run is not a reduced mode — it
+runs the whole procedure and stops at the point of acting, so the node it names is the node it
+would drain, for the reason it gives.
+
+What it cannot show you is what follows. In this mode nothing is drained, so the cluster never
+consolidates: binpack goes on choosing a *first* node every interval, and the controls that
+govern a second one — `cooldown.afterDrain`, per-node backoff, and the rule that only one drain
+runs at a time — are unreachable, because each of them measures from a drain that never happened.
+Read a week of dry run as a blast radius, not as a plan.
 
 ## Before
 
@@ -14,9 +21,11 @@ procedure and stops at the point of acting, so what you see in dry run is what i
 kubectl get events --field-selector reason=WouldDrain -A --sort-by=.lastTimestamp
 ```
 
-Each one names a node and says why it was chosen. If binpack has never chosen a node, turning it
-on changes nothing, and [`binpack diagnose`](../reference/diagnostics.md) will tell you what is
-in the way.
+Each one names a node and says why it was chosen. Repeats of an unchanged decision aggregate into
+one Event carrying a count, so a week is usually a handful of rows rather than a list — and each
+row is a first choice, repeated, rather than a step in a sequence. If binpack has never chosen a
+node, turning it on changes nothing, and [`binpack diagnose`](../reference/diagnostics.md) will
+tell you what is in the way.
 
 ### Check what it is refusing, and why
 
@@ -28,9 +37,12 @@ binpack explain
 draining would be wrong. `blocked` means a PodDisruptionBudget would not allow the eviction, and
 is worth understanding before binpack starts requesting them.
 
-Pay particular attention to nodes reported as **unmodelled**. binpack refuses those rather than
-guessing, but they are also the places where your cluster does something binpack does not
-understand, and they are worth reading before it starts acting anywhere.
+Pay particular attention to the refusals binpack marks **unmodelled**, and to any detail ending
+`which binpack does not model`. Both mean the same thing — binpack declined to guess rather than
+finding a wall in your cluster — and they are the places where your cluster does something binpack
+does not understand, so they are worth reading before it starts acting anywhere. The first is
+counted by `binpack_nodes_unmodelled`, and [`binpack diagnose`](../reference/diagnostics.md)
+reports it per workload under `unreadable-template`, with the owning controller named.
 
 ### Decide what you do not want touched
 

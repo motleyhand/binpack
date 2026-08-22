@@ -97,8 +97,14 @@ informer cache ──►│             │       Config    ──►  └──
 
 The CLI path makes one-shot `List` calls. The controller path reads from controller-runtime's
 watch-backed cache. Both produce the same `Snapshot` — Kubernetes objects as returned, not
-translated — so the engine cannot tell them apart, which is what guarantees `explain` describes
-what `run` will do.
+translated — so the engine cannot tell them apart, which is what makes `explain` a preview of
+`run` rather than a second implementation of it.
+
+One field is the exception, and `explain` names it rather than answering as though it were not.
+`Snapshot.LastDrain` is the controller's own memory of when it last finished a drain — a
+completed drain deletes the node that would otherwise have recorded it — so a process that did
+not perform the drain reads zero, and the after-drain cooldown can never fire for it. That is
+the same condition `run --once` refuses to start on, and the two say it in one shared clause.
 
 The shared `Snapshot` is necessary but not sufficient, and the gap is worth naming because this
 project fell into it. A rule enforced *above* `Decide` is a rule only the caller holding it

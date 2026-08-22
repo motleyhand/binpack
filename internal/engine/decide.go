@@ -2,6 +2,8 @@ package engine
 
 import (
 	"fmt"
+	"maps"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -271,6 +273,34 @@ func (c Config) PolicyFor(names ...string) Policy {
 	return c.Default
 }
 
+// NoDrainToMeasureFrom is why an after-drain cooldown cannot be enforced by a
+// process that did not perform the drain.
+//
+// One clause with two readers. `run --once` refuses to start on it, and
+// `binpack explain` discloses it, because they are the same fact: a completed
+// drain deletes the node that would otherwise have recorded it, so the
+// timestamp lives in the running controller's memory and nowhere else. Two
+// accounts of one fact drift, and the operator meeting both is the same person
+// reading the same configuration.
+const NoDrainToMeasureFrom = "a completed drain leaves nothing in the cluster to measure from"
+
+// CooldownAfterDrain names the first place a non-zero cooldown.afterDrain is
+// configured, if there is one.
+//
+// The default policy first, then pools in name order, so the answer does not
+// depend on map iteration.
+func CooldownAfterDrain(cfg Config) (where string, d time.Duration, set bool) {
+	if d := cfg.Default.CooldownAfterDrain; d > 0 {
+		return "the default policy", d, true
+	}
+	for _, name := range slices.Sorted(maps.Keys(cfg.ByPool)) {
+		if d := cfg.ByPool[name].CooldownAfterDrain; d > 0 {
+			return "pool " + name, d, true
+		}
+	}
+	return "", 0, false
+}
+
 // Action is what binpack has decided to do.
 type Action int
 
@@ -418,30 +448,7 @@ func Decide(s Snapshot, cfg Config) Decision {
 		return Decision{Code: CodeNoAutoscaler, Reason: why}
 	}
 
-	candidates, assessments := eligible(s, cfg)
-
-	// Least loaded first. Not a filter — every eligible node is tried in
-	// turn — but a node doing less work is cheaper to empty and likelier to
-	// succeed, so it is worth trying first.
-	sort.SliceStable(candidates, func(i, j int) bool {
-		return workloadOn(s, candidates[i].Node) < workloadOn(s, candidates[j].Node)
-	})
-
-	// Every candidate is assessed, not just those up to the first success.
-	// Stopping early would be cheaper, but `explain` has to describe the whole
-	// cluster: a node missing from the assessments is a node an operator
-	// cannot ask about, and "why not that one?" is the question they will ask.
-	chosen := -1
-
-	for i := range candidates {
-		a := candidates[i]
-		// Never committed: this is the decision, and nothing has been evicted
-		// on the strength of it yet.
-		if drainable(s, a, cfg.PolicyFor(a.Group, a.Pool), false) && chosen < 0 {
-			chosen = len(assessments)
-		}
-		assessments = append(assessments, *a)
-	}
+	assessments, chosen := assess(s, cfg)
 
 	// Step 0 of the drain protocol: a drain already under way pre-empts a new
 	// decision, however good the candidate below it looks.
@@ -482,6 +489,58 @@ func Decide(s Snapshot, cfg Config) Decision {
 		Reason:      summarise(assessments),
 		Assessments: assessments,
 	}
+}
+
+// Assess is what [Decide] concluded about every node, without the decision.
+//
+// Exported for `binpack explain`, which has one path Decide cannot serve. With
+// no live cluster-autoscaler Decide refuses before assessing anything, and
+// that emptiness is load-bearing where it is: it is what stops a dead
+// autoscaler zeroing the node gauges over a cluster nobody looked at, and what
+// keeps a refusal off nodes the decision was never about. But a reader
+// pointing binpack at a cluster that has no autoscaler — kind, minikube, or a
+// managed cluster with autoscaling switched off — was shown five lines and no
+// evidence that binpack had read anything, which is indistinguishable from a
+// binary that does not work.
+//
+// So explain asks this instead and says plainly that nothing will act on it.
+// No node is marked Chosen: choosing is Decide's, and a choice reported by a
+// binpack that will not act is a plan nobody is going to carry out.
+func Assess(s Snapshot, cfg Config) []NodeAssessment {
+	assessments, _ := assess(s, cfg)
+	return assessments
+}
+
+// assess runs the eligibility pass over every node and simulates each
+// candidate, returning the assessments and the index of the first node that
+// could be drained, or -1.
+func assess(s Snapshot, cfg Config) ([]NodeAssessment, int) {
+	candidates, assessments := eligible(s, cfg)
+
+	// Least loaded first. Not a filter — every eligible node is tried in
+	// turn — but a node doing less work is cheaper to empty and likelier to
+	// succeed, so it is worth trying first.
+	sort.SliceStable(candidates, func(i, j int) bool {
+		return workloadOn(s, candidates[i].Node) < workloadOn(s, candidates[j].Node)
+	})
+
+	// Every candidate is assessed, not just those up to the first success.
+	// Stopping early would be cheaper, but `explain` has to describe the whole
+	// cluster: a node missing from the assessments is a node an operator
+	// cannot ask about, and "why not that one?" is the question they will ask.
+	chosen := -1
+
+	for i := range candidates {
+		a := candidates[i]
+		// Never committed: this is the decision, and nothing has been evicted
+		// on the strength of it yet.
+		if drainable(s, a, cfg.PolicyFor(a.Group, a.Pool), false) && chosen < 0 {
+			chosen = len(assessments)
+		}
+		assessments = append(assessments, *a)
+	}
+
+	return assessments, chosen
 }
 
 // drainable simulates a node and reports whether its pods could go elsewhere,
