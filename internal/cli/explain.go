@@ -253,6 +253,8 @@ func enginePolicy(p v1alpha1.PoolPolicy) engine.Policy {
 		CooldownAfterDrain:   p.CooldownAfterDrain,
 		StallTimeout:         p.StallTimeout,
 		RemovalTimeout:       p.RemovalTimeout,
+		BackoffInitial:       p.BackoffInitial,
+		BackoffMax:           p.BackoffMax,
 		ExcludedNamespaces:   p.ExcludedNamespaces,
 	}
 }

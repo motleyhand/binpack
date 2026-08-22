@@ -3,6 +3,7 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +11,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 
+	"github.com/motleyhand/binpack/api/v1alpha1"
+	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
 )
@@ -299,5 +302,124 @@ func TestExplainReportsADrainWhenTheAutoscalerHasGone(t *testing.T) {
 	}
 	if view.Drain == nil || view.Drain.Node != "node-a" {
 		t.Errorf("json drain = %+v, want the node being drained", view.Drain)
+	}
+}
+
+func TestEnginePolicyCarriesEveryResolvedPolicyField(t *testing.T) {
+	// enginePolicy is the only translation from a resolved configuration into
+	// what the engine and executor read, and every cluster command goes
+	// through it. A field it drops is one the schema accepts, the defaults
+	// fill in, validation enforces and `config validate` prints back — and
+	// that nothing acts on. The whole suite stays green either way, because
+	// the engine tests start from an already-built engine.Config and the
+	// config tests stop at the resolved PoolPolicy: this is the seam between
+	// them, and nothing else stands on it.
+	//
+	// Distinct values, so a field wired to its neighbour fails as loudly as
+	// one wired to nothing.
+	resolved := v1alpha1.PoolPolicy{
+		Enabled:                  true,
+		ExpendablePriorityCutoff: -7,
+		ReserveForLargestPod:     true,
+		MaxPodsPerDrain:          3,
+		StallTimeout:             11 * time.Minute,
+		RemovalTimeout:           17 * time.Minute,
+		BackoffInitial:           5 * time.Minute,
+		BackoffMax:               72 * time.Hour,
+		CooldownAfterScaleUp:     13 * time.Minute,
+		CooldownAfterDrain:       19 * time.Minute,
+		ExcludedNamespaces:       []string{"kube-system"},
+	}
+
+	// Counted from the struct, not taken on trust. Every field below is
+	// carried; nothing is deliberately dropped. engine.Policy.Evict is the
+	// one member with no counterpart here, and it comes from
+	// engine.DefaultEvictConfig() rather than from the configuration at all.
+	//
+	// A Fatal rather than an Error: once the counts disagree the assertions
+	// below are answering a question about a different struct, and a
+	// twelfth field asserted by nothing is exactly what this test exists to
+	// prevent.
+	const carried = 11
+	if n := reflect.TypeOf(v1alpha1.PoolPolicy{}).NumField(); n != carried {
+		t.Fatalf("PoolPolicy has %d fields and this test asserts %d: "+
+			"carry the new one into engine.Policy and assert it here, or say "+
+			"here why it is not carried", n, carried)
+	}
+
+	got := enginePolicy(resolved)
+
+	for _, tc := range []struct {
+		field     string
+		got, want any
+	}{
+		{"Enabled", got.Enabled, resolved.Enabled},
+		{"Sim.ExpendablePriorityCutoff", got.Sim.ExpendablePriorityCutoff, resolved.ExpendablePriorityCutoff},
+		{"Sim.ReserveForLargestPod", got.Sim.ReserveForLargestPod, resolved.ReserveForLargestPod},
+		{"MaxPodsPerDrain", got.MaxPodsPerDrain, resolved.MaxPodsPerDrain},
+		{"StallTimeout", got.StallTimeout, resolved.StallTimeout},
+		{"RemovalTimeout", got.RemovalTimeout, resolved.RemovalTimeout},
+		{"BackoffInitial", got.BackoffInitial, resolved.BackoffInitial},
+		{"BackoffMax", got.BackoffMax, resolved.BackoffMax},
+		{"CooldownAfterScaleUp", got.CooldownAfterScaleUp, resolved.CooldownAfterScaleUp},
+		{"CooldownAfterDrain", got.CooldownAfterDrain, resolved.CooldownAfterDrain},
+		{"ExcludedNamespaces", got.ExcludedNamespaces, resolved.ExcludedNamespaces},
+	} {
+		if !reflect.DeepEqual(tc.got, tc.want) {
+			t.Errorf("engine.Policy.%s: got %v, want the configured %v",
+				tc.field, tc.got, tc.want)
+		}
+	}
+
+	// The two booleans are indistinguishable by value while both are true, so
+	// a crossed pair reads as correct above. One case with them differing
+	// pins which is which.
+	crossed := enginePolicy(v1alpha1.PoolPolicy{Enabled: true})
+	if !crossed.Enabled || crossed.Sim.ReserveForLargestPod {
+		t.Errorf("the two booleans are crossed: Enabled=%v, ReserveForLargestPod=%v, want true and false",
+			crossed.Enabled, crossed.Sim.ReserveForLargestPod)
+	}
+}
+
+func TestAnUnconfiguredBackoffStillWaitsTheDocumentedDefault(t *testing.T) {
+	// The other direction of the same seam. Carrying the two fields through
+	// replaced a pair of constants in internal/drain with the defaults in
+	// api/v1alpha1, and the case with nothing configured is the one that used
+	// to be right by coincidence: the constants happened to equal the
+	// defaults, and nothing held them together.
+	//
+	// Literal durations rather than the Default* constants, because asserting
+	// a constant against itself passes however far the documented promise
+	// moves. These two are what docs/reference/configuration.md tells an
+	// operator they get when they set nothing.
+	//
+	// Through the whole route — enginePolicy, then drain.PolicyFor, then the
+	// arithmetic — because every one of those was a place the value could
+	// have stopped, and asserting the field alone would not notice.
+	node := explainNode("a")
+	policy := drain.PolicyFor(
+		engineConfig(new(v1alpha1.Config)),
+		explainCluster([]*corev1.Node{node}, nil),
+		node.Name)
+
+	for _, tc := range []struct {
+		name     string
+		attempts string
+		want     time.Duration
+	}{
+		{"the first failure", "", 30 * time.Minute},
+		{"the twentieth, long past the cap", "19", 24 * time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			failed := explainNode("a", mother.NodeAnnotations(
+				map[string]string{engine.AnnotationDrainAttempts: tc.attempts}))
+
+			_, until := drain.Backoff(failed, explainNow, policy)
+
+			if got := until.Sub(explainNow); got != tc.want {
+				t.Errorf("an unconfigured install waits %s after %s, want the documented %s",
+					got, tc.name, tc.want)
+			}
+		})
 	}
 }

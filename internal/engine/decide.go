@@ -235,12 +235,16 @@ type Policy struct {
 	CooldownAfterScaleUp time.Duration
 	CooldownAfterDrain   time.Duration
 
-	// StallTimeout and RemovalTimeout bound a drain in progress. The engine
-	// does not read them — it decides, and a drain is under way long after it
-	// has — but a policy resolved per pool has to carry them, or the executor
-	// would have to resolve pools a second time and could disagree.
+	// StallTimeout and RemovalTimeout bound a drain in progress.
+	// BackoffInitial and BackoffMax say how long a node is left alone after
+	// one fails. The engine reads none of the four — it decides, and all of
+	// them describe what happens long after it has — but a policy resolved
+	// per pool has to carry them, or the executor would have to resolve pools
+	// a second time and could disagree.
 	StallTimeout       time.Duration
 	RemovalTimeout     time.Duration
+	BackoffInitial     time.Duration
+	BackoffMax         time.Duration
 	ExcludedNamespaces []string
 }
 
