@@ -33,6 +33,24 @@ const (
 	DefaultCooldownAfterDrain   = 15 * time.Minute
 )
 
+// Defaults for the policy.autoscaler section, named for the cluster-autoscaler
+// flags they mirror rather than for the binpack settings they back, because
+// the whole point of the section is that each value is a claim about somebody
+// else's component and the next drift between the two should be greppable.
+// cluster-autoscaler config/flags/flags.go.
+//
+// DefaultBlockingSystemPodDistruptionTimeout is the one that is not true of
+// every autoscaler binpack supports: the grace it names arrived in
+// cluster-autoscaler 1.33, and before it a blocking system pod blocked for as
+// long as it was there. An hour is upstream's default at the version binpack
+// pins, and an operator running an older one says so with a zero — see
+// [Autoscaler.BlockingSystemPodDistruptionTimeout].
+const (
+	DefaultSkipNodesWithLocalStorage           = true
+	DefaultSkipNodesWithSystemPods             = true
+	DefaultBlockingSystemPodDistruptionTimeout = time.Hour
+)
+
 // Upstream defaults, mirrored so the derivation of a binpack default can be
 // stated as arithmetic rather than as a sentence. Not settings: nothing reads
 // these to decide anything, and changing one here changes nothing about the
@@ -136,13 +154,18 @@ func (c *Config) PolicyFor(names ...string) PoolPolicy {
 		Enabled:                  DefaultEnabled,
 		ExpendablePriorityCutoff: DefaultExpendableCutoff,
 		ReserveForLargestPod:     DefaultReserveForLargestPod,
-		MaxPodsPerDrain:          DefaultMaxPodsPerDrain,
-		StallTimeout:             DefaultStallTimeout,
-		RemovalTimeout:           DefaultRemovalTimeout,
-		BackoffInitial:           DefaultBackoffInitial,
-		BackoffMax:               DefaultBackoffMax,
-		CooldownAfterScaleUp:     DefaultCooldownAfterScaleUp,
-		CooldownAfterDrain:       DefaultCooldownAfterDrain,
+
+		SkipNodesWithLocalStorage:           DefaultSkipNodesWithLocalStorage,
+		SkipNodesWithSystemPods:             DefaultSkipNodesWithSystemPods,
+		BlockingSystemPodDistruptionTimeout: DefaultBlockingSystemPodDistruptionTimeout,
+
+		MaxPodsPerDrain:      DefaultMaxPodsPerDrain,
+		StallTimeout:         DefaultStallTimeout,
+		RemovalTimeout:       DefaultRemovalTimeout,
+		BackoffInitial:       DefaultBackoffInitial,
+		BackoffMax:           DefaultBackoffMax,
+		CooldownAfterScaleUp: DefaultCooldownAfterScaleUp,
+		CooldownAfterDrain:   DefaultCooldownAfterDrain,
 	}
 
 	p.apply(c.Policy)
@@ -166,6 +189,15 @@ func (p *PoolPolicy) apply(o Policy) {
 	}
 	if o.Feasibility.ReserveForLargestPod != nil {
 		p.ReserveForLargestPod = *o.Feasibility.ReserveForLargestPod
+	}
+	if o.Autoscaler.SkipNodesWithLocalStorage != nil {
+		p.SkipNodesWithLocalStorage = *o.Autoscaler.SkipNodesWithLocalStorage
+	}
+	if o.Autoscaler.SkipNodesWithSystemPods != nil {
+		p.SkipNodesWithSystemPods = *o.Autoscaler.SkipNodesWithSystemPods
+	}
+	if o.Autoscaler.BlockingSystemPodDistruptionTimeout != nil {
+		p.BlockingSystemPodDistruptionTimeout = o.Autoscaler.BlockingSystemPodDistruptionTimeout.Duration
 	}
 	if o.Drain.MaxPodsPerDrain != nil {
 		p.MaxPodsPerDrain = *o.Drain.MaxPodsPerDrain

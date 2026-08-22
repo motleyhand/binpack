@@ -221,16 +221,39 @@ var diagnoses = map[string]Diagnosis{
 		Severity: Warning,
 		Summary: "these pods use local storage, which the cluster-autoscaler will not disturb " +
 			"by default in case the contents matter",
-		Fix: "annotate the pod cluster-autoscaler.kubernetes.io/safe-to-evict=true when the " +
-			"volume holds nothing that must survive — a cache, a scratch directory, a rendered " +
-			"config. That is the common case and it is a one-line change.",
+		// The narrow annotation first, because it is the one the autoscaler's
+		// own FAQ recommends and the one that says only what is meant. The
+		// blanket safe-to-evict also waives the bare-pod and kube-system rules
+		// for the same pod, so an operator reaching for it to clear a scratch
+		// directory widens rather more than they were asked to — and would
+		// have no way of knowing.
+		Fix: "annotate the pod cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes " +
+			"with the names of the volumes whose contents need not survive, comma-separated — " +
+			"a cache, a scratch directory, a rendered config. It says exactly that and nothing " +
+			"more. cluster-autoscaler.kubernetes.io/safe-to-evict=true covers the whole pod " +
+			"instead, including the protections that have nothing to do with storage. Neither " +
+			"is needed for a tmpfs volume (emptyDir with medium: Memory), which is not local " +
+			"storage and is not reported here.",
 	},
 	BlockedSystemPod: {
 		Severity: Warning,
-		Summary: "these are kube-system pods with no PodDisruptionBudget, and the autoscaler " +
-			"will not remove a node running one",
-		Fix: "give the workload a PodDisruptionBudget. Per the autoscaler's own documentation " +
-			"a budget overrides its refusal to touch the node, and the budget then governs.",
+		Summary: "these are kube-system pods with no PodDisruptionBudget, and they are younger " +
+			"than the autoscaler's grace for one, so it will not remove a node running one yet",
+		// Two answers, and waiting is usually the right one: the grace runs
+		// from the pod's creation, so a pod reported here is one that has just
+		// started. Recommending a PodDisruptionBudget alone would ask for a
+		// real availability decision — on a managed platform, about a workload
+		// the operator may not even own — to clear a blockage that expires by
+		// itself within the hour.
+		Fix: "usually nothing. Since cluster-autoscaler 1.33 the block lifts once the pod is " +
+			"older than --blocking-system-pod-distruption-timeout (one hour by default), " +
+			"measured from when the pod was created, so a node reported here becomes a " +
+			"candidate on its own. Give the workload a PodDisruptionBudget if you want it " +
+			"moved sooner or protected properly: per the autoscaler's own documentation a " +
+			"budget overrides its refusal to touch the node, and the budget then governs. If " +
+			"your autoscaler is older than 1.33 it has no such grace — set " +
+			"policy.autoscaler.blockingSystemPodDistruptionTimeout to 0 so binpack stops " +
+			"expecting one.",
 	},
 	BlockedSafeToEvict: {
 		Severity: Info,
@@ -529,7 +552,7 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 		// is not reported: a budget overrides the autoscaler's refusal to touch
 		// such a node, and reporting it anyway would send an operator chasing a
 		// blocker they had already cleared.
-		if b := checkPod(pod, matched, policy.Evict); b != nil {
+		if b := checkPod(pod, matched, policy.Evict, s.Now); b != nil {
 			// Not the blocker's own message: that is written for `explain`,
 			// where a blocker stands alone and must explain itself. Here the
 			// diagnosis has already said what the condition is, so repeating it

@@ -56,6 +56,14 @@ policy:
     expendablePriorityCutoff: -10
     reserveForLargestPod: true
 
+  # What the cluster-autoscaler in this cluster is configured to do. binpack
+  # predicts it; it does not control it. Each of these mirrors an autoscaler
+  # flag, and the values below are that flag's own default.
+  autoscaler:
+    skipNodesWithLocalStorage: true
+    skipNodesWithSystemPods: true
+    blockingSystemPodDistruptionTimeout: 1h0m0s
+
   drain:
     maxPodsPerDrain: 0
     stallTimeout: 10m0s
@@ -288,6 +296,11 @@ line of a document you did not write.
 The Kubernetes version is a separate question. A cluster can run a recent Kubernetes with a
 pinned older autoscaler, which is what this floor is about.
 
+The floor is where binpack can read the autoscaler at all, and not a claim that every
+autoscaler above it behaves alike. One default assumes 1.33 or later — the grace under
+[`policy.autoscaler.blockingSystemPodDistruptionTimeout`](#policyautoscalerblockingsystempoddistruptiontimeout),
+which is a setting rather than an assumption for exactly that reason.
+
 ### `policy.enabled`
 
 `false` leaves a pool's nodes alone entirely — never a drain candidate, though its free capacity
@@ -335,6 +348,65 @@ out of room is the one maximal in *that* resource.
 
 Set it to `false` to pack as tightly as the arithmetic allows. Expect the cluster to scale up
 sooner after any restart.
+
+### `policy.autoscaler.skipNodesWithLocalStorage` and `policy.autoscaler.skipNodesWithSystemPods`
+
+These mirror the cluster-autoscaler's `--skip-nodes-with-local-storage` and
+`--skip-nodes-with-system-pods`, both of which default to `true` upstream.
+
+They describe someone else's component. Nothing here changes what binpack is willing to do — it
+changes what binpack expects the autoscaler to do once a node has been emptied, which is what
+decides whether emptying it was worth anything. Getting one wrong is not unsafe in either
+direction, but it is wasteful in both: too strict and binpack refuses nodes the autoscaler would
+have removed, too loose and it drains a node the autoscaler then declines to remove, which the
+drain verification catches and backs off from.
+
+Whether they are yours to set depends on where your autoscaler runs. They are ordinary flags on
+the autoscaler binary, so anywhere it is a Deployment in your own cluster — EKS, kOps, Rancher,
+any self-hosted install — they are whatever its manifest says. AKS exposes both through the
+cluster-autoscaler profile and ships `skip-nodes-with-local-storage=false`. Platforms that run
+the autoscaler in a control plane you cannot reach — DOKS, LKE, Vultr, Scaleway — leave you with
+upstream's defaults, which is what these fields default to.
+
+To read what yours is actually running, where the autoscaler is visible:
+
+```bash
+kubectl -n kube-system get deploy cluster-autoscaler -o jsonpath='{.spec.template.spec.containers[0].args}'
+```
+
+On AKS the same question is `az aks show -g <group> -n <cluster> --query autoScalerProfile`.
+
+`skipNodesWithLocalStorage: false` says the autoscaler removes nodes regardless of `emptyDir`
+and `hostPath` volumes, so binpack stops raising the
+[`local-storage`](diagnostics.md#local-storage--warning) blocker. `skipNodesWithSystemPods:
+false` does the same for [`system-pod`](diagnostics.md#system-pod--warning).
+
+### `policy.autoscaler.blockingSystemPodDistruptionTimeout`
+
+Mirrors `--blocking-system-pod-distruption-timeout`, whose misspelling is upstream's and is kept
+here so that a search for one finds the other.
+
+A kube-system pod with no PodDisruptionBudget stops the autoscaler removing its node — but only
+for this long after that pod was created, after which the autoscaler evicts it and removes the
+node anyway. Because the clock runs from the pod's creation and not from when a drain was
+attempted, the blocker has already expired for every kube-system pod in a cluster that has been
+up for an hour.
+
+**This one default is a claim about your autoscaler's version.** The grace arrived in
+cluster-autoscaler 1.33; 1.30, 1.31 and 1.32 have neither the flag nor the behaviour, and block
+on such a pod for as long as it is there. binpack cannot tell which it is talking to — the
+status ConfigMap does not report a version — so on an autoscaler older than 1.33, say so:
+
+```yaml
+policy:
+  autoscaler:
+    blockingSystemPodDistruptionTimeout: 0
+```
+
+`0` here means the blocker never expires, which is deliberately not what `0` means as an
+autoscaler flag. Upstream, a zero timeout expires the blocker immediately — but that is already
+`skipNodesWithSystemPods: false`, in both vocabularies, whereas an autoscaler with no grace at
+all has no other spelling. A negative value is rejected.
 
 ### `policy.drain.maxPodsPerDrain`
 

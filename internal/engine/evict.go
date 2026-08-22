@@ -2,6 +2,8 @@ package engine
 
 import (
 	"fmt"
+	"strings"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -14,6 +16,17 @@ import (
 // remove, whatever binpack thinks.
 const safeToEvict = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 
+// safeToEvictLocalVolumes is the autoscaler's narrower escape hatch: a
+// comma-separated list of the pod's own volume names whose contents are
+// disposable. cluster-autoscaler utils/drain/drain.go,
+// SafeToEvictLocalVolumesKey.
+//
+// Narrower is the point. safeToEvict=true also waives the bare-pod and
+// kube-system rules for the same pod, so an operator told to reach for it
+// because a scratch directory blocks a drain widens rather more than they were
+// asked to — which is why the autoscaler's own FAQ offers this one first.
+const safeToEvictLocalVolumes = "cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes"
+
 // EvictConfig describes what binpack believes about the cluster-autoscaler,
 // since the autoscaler is what ultimately removes the node. Every field
 // mirrors one of its flags, and the defaults mirror the autoscaler's.
@@ -25,21 +38,48 @@ const safeToEvict = "cluster-autoscaler.kubernetes.io/safe-to-evict"
 type EvictConfig struct {
 	// SkipNodesWithSystemPods mirrors --skip-nodes-with-system-pods, which
 	// defaults to true. Under it the autoscaler will not remove a node
-	// running a kube-system pod that is not a DaemonSet or mirror pod.
+	// running a kube-system pod that is not a DaemonSet or mirror pod — for
+	// BlockingSystemPodDistruptionTimeout after that pod was created, after
+	// which it evicts the pod and removes the node anyway.
 	SkipNodesWithSystemPods bool
 
 	// SkipNodesWithLocalStorage mirrors --skip-nodes-with-local-storage,
-	// which defaults to true. Under it a pod with an emptyDir or hostPath
-	// volume blocks removal unless annotated safe-to-evict.
+	// which defaults to true. Under it a pod with a disk-backed emptyDir or a
+	// hostPath volume blocks removal, unless the volume is named in
+	// safeToEvictLocalVolumes or the whole pod is annotated safeToEvict.
 	SkipNodesWithLocalStorage bool
+
+	// BlockingSystemPodDistruptionTimeout mirrors
+	// --blocking-system-pod-distruption-timeout, whose misspelling is
+	// upstream's and is kept here so the two can be grepped together. It is
+	// how long after a kube-system pod's creation the autoscaler waits before
+	// evicting it anyway, and it defaults to an hour.
+	//
+	// The one field here whose default is not true of every autoscaler
+	// binpack supports. The grace arrived in cluster-autoscaler 1.33 and the
+	// stated floor is 1.30, so zero means the blocker never expires — what
+	// 1.30 to 1.32 do, and deliberately not what zero means upstream. See
+	// api/v1alpha1.Autoscaler for why that reading is the safe one.
+	BlockingSystemPodDistruptionTimeout time.Duration
 }
 
-// DefaultEvictConfig mirrors the cluster-autoscaler's own defaults, which is
-// what a managed platform will be running since neither flag is exposed.
+// DefaultEvictConfig mirrors the cluster-autoscaler's own defaults at the
+// version binpack pins, which is what an autoscaler nobody has reconfigured is
+// running.
+//
+// Not more than that, and it used to claim more: the two skip flags are
+// ordinary pflags on the autoscaler binary and nothing restricts who sets
+// them. They are unexposed only where the platform runs the autoscaler in a
+// control plane the operator cannot reach — DOKS, LKE, Vultr, Scaleway. AKS
+// exposes both through its cluster-autoscaler profile and ships
+// skip-nodes-with-local-storage=false; on EKS, kOps, Rancher and every
+// self-hosted install the flags are whatever the manifest says. Where the
+// cluster differs, policy.autoscaler is how an operator says so.
 func DefaultEvictConfig() EvictConfig {
 	return EvictConfig{
-		SkipNodesWithSystemPods:   true,
-		SkipNodesWithLocalStorage: true,
+		SkipNodesWithSystemPods:             true,
+		SkipNodesWithLocalStorage:           true,
+		BlockingSystemPodDistruptionTimeout: time.Hour,
 	}
 }
 
@@ -96,6 +136,7 @@ func CheckEvictable(
 	evicting []*corev1.Pod,
 	pdbs []*policyv1.PodDisruptionBudget,
 	cfg EvictConfig,
+	now time.Time,
 ) []EvictionBlocker {
 	var blockers []EvictionBlocker
 
@@ -108,7 +149,7 @@ func CheckEvictable(
 		// from the blanket rule and governs whether it can actually go.
 		matched := matchingPDBs(pod, pdbs)
 
-		if b := checkPod(pod, matched, cfg); b != nil {
+		if b := checkPod(pod, matched, cfg, now); b != nil {
 			blockers = append(blockers, *b)
 			continue
 		}
@@ -148,7 +189,9 @@ func CheckEvictable(
 	return append(blockers, checkAllowances(demand)...)
 }
 
-func checkPod(pod *corev1.Pod, matched []*policyv1.PodDisruptionBudget, cfg EvictConfig) *EvictionBlocker {
+func checkPod(pod *corev1.Pod, matched []*policyv1.PodDisruptionBudget, cfg EvictConfig,
+	now time.Time,
+) *EvictionBlocker {
 	// An explicit refusal beats everything, including the exemptions below.
 	if pod.Annotations[safeToEvict] == "false" {
 		return &EvictionBlocker{Pod: pod, Code: BlockedSafeToEvict,
@@ -188,11 +231,17 @@ func checkPod(pod *corev1.Pod, matched []*policyv1.PodDisruptionBudget, cfg Evic
 	// Per the autoscaler's own documentation, configuring a PDB for such a
 	// pod "overrides the default strategy of not touching the node" — the
 	// budget then governs, and its allowance is checked below like any other.
+	//
+	// And only until the autoscaler's own patience runs out, which for a
+	// steady-state cluster is a blocker that has already expired: the timeout
+	// runs from the pod's creation, so the coredns replica that has been up
+	// for a fortnight is one the autoscaler will evict rather than route
+	// around.
 	if cfg.SkipNodesWithSystemPods && pod.Namespace == metav1.NamespaceSystem &&
-		!permitted && len(matched) == 0 {
+		!permitted && len(matched) == 0 && !pastSystemPodGrace(pod, cfg, now) {
 		return &EvictionBlocker{Pod: pod, Code: BlockedSystemPod,
 			Message: fmt.Sprintf(
-				"%s is a kube-system pod with no PodDisruptionBudget, so the autoscaler will not remove its node",
+				"%s is a kube-system pod with no PodDisruptionBudget, so the autoscaler will not remove its node yet",
 				podRef(pod))}
 	}
 
@@ -322,16 +371,81 @@ func matchingPDBs(pod *corev1.Pod, pdbs []*policyv1.PodDisruptionBudget) []*poli
 	return matched
 }
 
+// pastSystemPodGrace reports whether the autoscaler would by now evict a
+// blocking kube-system pod rather than leave its node alone.
+//
+// Mirrors isBspPassedDisruptionTimeout in cluster-autoscaler
+// simulator/drainability/rules/system/rule.go, including its guard on an unset
+// creation timestamp: an object that has not been through an API server has no
+// age, and reading the zero time as an instant would hand every such pod the
+// grace at once.
+//
+// A timeout of zero is no grace at all, which is what the autoscaler did
+// before 1.33 — the rule and its flag arrived there, and binpack supports 1.30
+// upward. Not upstream's reading of zero, which would expire the blocker
+// immediately; that behaviour is already spelled SkipNodesWithSystemPods
+// false, whereas an autoscaler with no grace is otherwise unsayable. It also
+// means a caller that fills in the two booleans and forgets this field gets
+// the strict answer rather than no rule at all.
+func pastSystemPodGrace(pod *corev1.Pod, cfg EvictConfig, now time.Time) bool {
+	if cfg.BlockingSystemPodDistruptionTimeout <= 0 || pod.CreationTimestamp.IsZero() {
+		return false
+	}
+	return now.After(pod.CreationTimestamp.Add(cfg.BlockingSystemPodDistruptionTimeout))
+}
+
+// firstLocalStorage names a volume whose presence stops the autoscaler
+// removing the node, mirroring drain.HasBlockingLocalStorage and isLocalVolume
+// in cluster-autoscaler utils/drain/drain.go.
+//
+// Two exclusions, and binpack had neither. A memory-medium emptyDir is tmpfs —
+// RAM with a filesystem over it, nothing of which reaches the node's disk — so
+// upstream excludes it by name, while binpack blocked on it and thereby
+// refused every node of every service-mesh cluster, since Istio and Linkerd
+// inject exactly that volume into every pod they mesh. And the operator may
+// name individual volumes as disposable, which is the autoscaler's documented
+// answer and a narrower one than safeToEvict.
 func firstLocalStorage(pod *corev1.Pod) (string, bool) {
+	disposable := nonBlockingVolumes(pod)
+
 	for _, v := range pod.Spec.Volumes {
+		if disposable[v.Name] {
+			continue
+		}
 		switch {
 		case v.EmptyDir != nil:
+			// tmpfs. It is charged to the pod's memory and it dies with the
+			// pod, so there is nothing on the node to lose.
+			if v.EmptyDir.Medium == corev1.StorageMediumMemory {
+				continue
+			}
 			return v.Name + " (emptyDir)", true
 		case v.HostPath != nil:
 			return v.Name + " (hostPath)", true
 		}
 	}
 	return "", false
+}
+
+// nonBlockingVolumes reads the volume names an operator has declared
+// disposable, mirroring getNonBlockingVolumes upstream.
+//
+// Split on commas and nothing else, because upstream splits on commas and
+// nothing else: a value written "cache, data" exempts a volume named " data"
+// there, which is to say it exempts nothing. Trimming here would be the more
+// forgiving choice and the wrong one — binpack's job is to predict what the
+// autoscaler will do with this pod, and being right about a typo the
+// autoscaler is wrong about is how a drain gets approved and then stalls.
+func nonBlockingVolumes(pod *corev1.Pod) map[string]bool {
+	value := pod.Annotations[safeToEvictLocalVolumes]
+	if value == "" {
+		return nil
+	}
+	out := make(map[string]bool)
+	for _, name := range strings.Split(value, ",") {
+		out[name] = true
+	}
+	return out
 }
 
 func podRef(pod *corev1.Pod) string { return pod.Namespace + "/" + pod.Name }

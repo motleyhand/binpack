@@ -3,6 +3,7 @@ package engine_test
 import (
 	"strings"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
@@ -59,8 +60,11 @@ func TestCheckEvictablePerPod(t *testing.T) {
 				mother.WithEmptyDir("scratch"), mother.SafeToEvict("true")),
 		},
 		{
+			// Young enough that the autoscaler is still waiting for it. The
+			// age is the whole condition, so a fixture without one would pass
+			// this case for a reason no cluster ever supplies.
 			name: "kube-system pod with no budget blocks node removal",
-			pod:  mother.Pod("kube-system", "coredns"),
+			pod:  mother.Pod("kube-system", "coredns", mother.CreatedAt(now.Add(-5*time.Minute))),
 			want: engine.BlockedSystemPod,
 		},
 		{
@@ -73,7 +77,8 @@ func TestCheckEvictablePerPod(t *testing.T) {
 		},
 		{
 			name: "kube-system pod explicitly permitted",
-			pod:  mother.Pod("kube-system", "coredns", mother.SafeToEvict("true")),
+			pod: mother.Pod("kube-system", "coredns", mother.SafeToEvict("true"),
+				mother.CreatedAt(now.Add(-5*time.Minute))),
 		},
 		{
 			name: "mirror pod cannot be evicted at all",
@@ -91,7 +96,7 @@ func TestCheckEvictablePerPod(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			got := engine.CheckEvictable([]*corev1.Pod{tc.pod}, nil, cfg)
+			got := engine.CheckEvictable([]*corev1.Pod{tc.pod}, nil, cfg, now)
 
 			if tc.want == "" {
 				if len(got) != 0 {
@@ -117,7 +122,7 @@ func TestAutoscalerFlagsAreHonoured(t *testing.T) {
 	local := mother.Pod("default", "cache", mother.WithEmptyDir("scratch"))
 	system := mother.Pod("kube-system", "coredns")
 
-	if got := engine.CheckEvictable([]*corev1.Pod{local, system}, nil, permissive); len(got) != 0 {
+	if got := engine.CheckEvictable([]*corev1.Pod{local, system}, nil, permissive, now); len(got) != 0 {
 		t.Errorf("with both skip flags off, neither should block, got %v", codes(got))
 	}
 }
@@ -134,7 +139,7 @@ func TestPDBDemandIsAggregated(t *testing.T) {
 		mother.PDB("default", "web", 1, labelled),
 	}
 
-	got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig())
+	got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig(), now)
 
 	if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
 		t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedPDBInsufficint)
@@ -152,7 +157,7 @@ func TestPDBWithEnoughSlackIsFine(t *testing.T) {
 	}
 	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("default", "web", 2, labelled)}
 
-	if got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig()); len(got) != 0 {
+	if got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig(), now); len(got) != 0 {
 		t.Errorf("two allowed disruptions cover two evictions, got %v", codes(got))
 	}
 }
@@ -164,7 +169,7 @@ func TestZeroDisruptionsBlocks(t *testing.T) {
 	pods := []*corev1.Pod{mother.Pod("staging", "lonely-1", mother.PodLabels(labelled))}
 	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("staging", "lonely", 0, labelled)}
 
-	got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig())
+	got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig(), now)
 
 	if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
 		t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedPDBInsufficint)
@@ -186,7 +191,7 @@ func TestPodMatchedByTwoPDBsIsPermanentlyStuck(t *testing.T) {
 		mother.PDB("default", "api-specific", 5, map[string]string{"app": "api"}),
 	}
 
-	got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig())
+	got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig(), now)
 
 	if len(got) != 1 || got[0].Code != engine.BlockedMultiplePDBs {
 		t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedMultiplePDBs)
@@ -206,7 +211,7 @@ func TestKubeSystemPodWithABudgetIsAllowed(t *testing.T) {
 	pod := mother.Pod("kube-system", "coredns-1", mother.PodLabels(labelled))
 	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("kube-system", "coredns", 1, labelled)}
 
-	if got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig()); len(got) != 0 {
+	if got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig(), now); len(got) != 0 {
 		t.Errorf("a kube-system pod with an adequate budget is evictable, got %v", codes(got))
 	}
 }
@@ -219,7 +224,7 @@ func TestKubeSystemPodWithARestrictiveBudgetIsBlockedByIt(t *testing.T) {
 	pod := mother.Pod("kube-system", "coredns-1", mother.PodLabels(labelled))
 	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("kube-system", "coredns", 0, labelled)}
 
-	got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig())
+	got := engine.CheckEvictable([]*corev1.Pod{pod}, pdbs, engine.DefaultEvictConfig(), now)
 
 	if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
 		t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedPDBInsufficint)
@@ -236,7 +241,7 @@ func TestStalePDBStatusIsNotTrusted(t *testing.T) {
 	stale := mother.Stale(mother.PDB("default", "web", 5, labelled))
 
 	got := engine.CheckEvictable([]*corev1.Pod{pod}, []*policyv1.PodDisruptionBudget{stale},
-		engine.DefaultEvictConfig())
+		engine.DefaultEvictConfig(), now)
 
 	if len(got) != 1 || got[0].Code != engine.BlockedPDBStale {
 		t.Fatalf("codes = %v, want [%s] despite an allowance of 5", codes(got), engine.BlockedPDBStale)
@@ -256,7 +261,7 @@ func TestUnreadyPodsMayNotConsumeTheBudget(t *testing.T) {
 		pdb := mother.AlwaysAllowUnhealthy(mother.PDB("default", "web", 0, labelled))
 
 		got := engine.CheckEvictable([]*corev1.Pod{broken},
-			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig(), now)
 
 		if len(got) != 0 {
 			t.Errorf("AlwaysAllow permits evicting an unready pod with zero allowance, got %v", codes(got))
@@ -269,7 +274,7 @@ func TestUnreadyPodsMayNotConsumeTheBudget(t *testing.T) {
 		pdb := mother.Healthy(mother.PDB("default", "web", 0, labelled), 3, 2)
 
 		got := engine.CheckEvictable([]*corev1.Pod{broken},
-			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig(), now)
 
 		if len(got) != 0 {
 			t.Errorf("a healthy budget permits evicting an unready pod, got %v", codes(got))
@@ -280,7 +285,7 @@ func TestUnreadyPodsMayNotConsumeTheBudget(t *testing.T) {
 		pdb := mother.Healthy(mother.PDB("default", "web", 0, labelled), 1, 2)
 
 		got := engine.CheckEvictable([]*corev1.Pod{broken},
-			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig(), now)
 
 		if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
 			t.Errorf("an unhealthy application still guards its budget, got %v", codes(got))
@@ -291,7 +296,7 @@ func TestUnreadyPodsMayNotConsumeTheBudget(t *testing.T) {
 		pdb := mother.AlwaysAllowUnhealthy(mother.PDB("default", "web", 0, labelled))
 
 		got := engine.CheckEvictable([]*corev1.Pod{healthy},
-			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig())
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig(), now)
 
 		if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
 			t.Errorf("AlwaysAllow applies only to unready pods, got %v", codes(got))
@@ -309,7 +314,7 @@ func TestBudgetBlockersNameAPod(t *testing.T) {
 	}
 	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("default", "web", 1, labelled)}
 
-	got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig())
+	got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig(), now)
 
 	if len(got) != 1 {
 		t.Fatalf("codes = %v", codes(got))
@@ -327,7 +332,7 @@ func TestPDBsInOtherNamespacesDoNotApply(t *testing.T) {
 	pods := []*corev1.Pod{mother.Pod("production", "web-1", mother.PodLabels(labelled))}
 	pdbs := []*policyv1.PodDisruptionBudget{mother.PDB("staging", "web", 0, labelled)}
 
-	if got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig()); len(got) != 0 {
+	if got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig(), now); len(got) != 0 {
 		t.Errorf("a budget in another namespace must not apply, got %v", codes(got))
 	}
 }
@@ -342,7 +347,7 @@ func TestNullSelectorMatchesNothing(t *testing.T) {
 	null.Spec.Selector = nil
 
 	if got := engine.CheckEvictable([]*corev1.Pod{pod}, []*policyv1.PodDisruptionBudget{null},
-		engine.DefaultEvictConfig()); len(got) != 0 {
+		engine.DefaultEvictConfig(), now); len(got) != 0 {
 		t.Errorf("a null selector selects no pods, got %v", codes(got))
 	}
 }
@@ -353,9 +358,149 @@ func TestEmptySelectorMatchesEveryPodInNamespace(t *testing.T) {
 	empty := mother.PDB("default", "catch-all", 0, map[string]string{})
 
 	got := engine.CheckEvictable([]*corev1.Pod{pod}, []*policyv1.PodDisruptionBudget{empty},
-		engine.DefaultEvictConfig())
+		engine.DefaultEvictConfig(), now)
 
 	if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
 		t.Fatalf("an empty selector covers the whole namespace, got %v", codes(got))
+	}
+}
+
+// TestCheckEvictableIgnoresMemoryBackedEmptyDir closes the gap that makes a
+// service-mesh cluster undrainable end to end.
+//
+// An emptyDir with medium Memory is tmpfs. Nothing of it reaches the node's
+// disk, so the cluster-autoscaler's isLocalVolume excludes it by name
+// (cluster-autoscaler utils/drain/drain.go) and removes the node without
+// hesitation. Istio injects one into every meshed pod as istio-envoy, Linkerd
+// as linkerd-identity-end-entity — so on such a cluster every node hosts at
+// least one, and a blocker here refuses every candidate for ever.
+func TestCheckEvictableIgnoresMemoryBackedEmptyDir(t *testing.T) {
+	pod := mother.Pod("default", "meshed", mother.WithMemoryBackedEmptyDir("istio-envoy"))
+
+	if got := engine.CheckEvictable([]*corev1.Pod{pod}, nil, engine.DefaultEvictConfig(), now); len(got) != 0 {
+		t.Errorf("a tmpfs volume blocked the drain with %v: %s", codes(got), got[0].Message)
+	}
+}
+
+// TestCheckEvictableHonoursSafeToEvictLocalVolumes covers the autoscaler's
+// per-volume escape hatch, which its own FAQ recommends ahead of the blanket
+// safe-to-evict=true.
+//
+// The unlisted volume is the half that matters. Every change in this area
+// makes binpack accept a drain it used to refuse, so a test that only asserts
+// the listed volumes pass would go green against an implementation that
+// stopped looking at local storage altogether.
+func TestCheckEvictableHonoursSafeToEvictLocalVolumes(t *testing.T) {
+	listed := mother.Pod("default", "app",
+		mother.WithEmptyDir("cache"),
+		mother.WithEmptyDir("data"),
+		mother.SafeToEvictLocalVolumes("cache", "data"))
+
+	if got := engine.CheckEvictable([]*corev1.Pod{listed}, nil, engine.DefaultEvictConfig(), now); len(got) != 0 {
+		t.Errorf("volumes the operator named as disposable still blocked: %v: %s",
+			codes(got), got[0].Message)
+	}
+
+	unlisted := mother.Pod("default", "app",
+		mother.WithEmptyDir("cache"),
+		mother.WithEmptyDir("state"),
+		mother.SafeToEvictLocalVolumes("cache"))
+
+	got := engine.CheckEvictable([]*corev1.Pod{unlisted}, nil, engine.DefaultEvictConfig(), now)
+	if len(got) != 1 || got[0].Code != engine.BlockedLocalStorage {
+		t.Fatalf("codes = %v, want [%s]: state is not named, so it still blocks",
+			codes(got), engine.BlockedLocalStorage)
+	}
+	if !strings.Contains(got[0].Message, "state") {
+		t.Errorf("message = %q, want it to name the volume that is still blocking", got[0].Message)
+	}
+
+	// The annotation is split on commas and nothing else, because that is what
+	// the autoscaler does with it. Trimming would be the friendlier reading and
+	// the wrong one: the autoscaler would still block on this pod, so binpack
+	// approving the drain buys an emptied node nothing then removes.
+	spaced := mother.Pod("default", "app",
+		mother.WithEmptyDir("cache"),
+		mother.WithEmptyDir("data"),
+		mother.Annotated("cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes", "cache, data"))
+
+	got = engine.CheckEvictable([]*corev1.Pod{spaced}, nil, engine.DefaultEvictConfig(), now)
+	if len(got) != 1 || got[0].Code != engine.BlockedLocalStorage {
+		t.Fatalf("codes = %v, want [%s]: \"cache, data\" names a volume called \" data\", "+
+			"which is no volume at all — and the autoscaler reads it the same way",
+			codes(got), engine.BlockedLocalStorage)
+	}
+	if !strings.Contains(got[0].Message, "data") {
+		t.Errorf("message = %q, want it to name data, the volume the spacing failed to exempt",
+			got[0].Message)
+	}
+}
+
+// TestCheckEvictableDoesNotBlockOnAKubeSystemPodPastTheAutoscalersGrace
+// follows the System drainability rule as it has stood since
+// cluster-autoscaler 1.33: a kube-system pod with no budget blocks removal
+// only until --blocking-system-pod-distruption-timeout has passed since the
+// pod was created, after which the autoscaler evicts it and takes the node
+// (cluster-autoscaler simulator/drainability/rules/system/rule.go).
+//
+// The five-minute case is the half that matters, and it is deliberately not
+// the mirror of the two-hour one: this change makes binpack accept drains it
+// used to refuse, so an implementation that simply deleted the branch would
+// satisfy the first assertion alone.
+func TestCheckEvictableDoesNotBlockOnAKubeSystemPodPastTheAutoscalersGrace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		pod  *corev1.Pod
+		want string // empty means evictable
+	}{
+		{
+			// The steady state of essentially every cluster: coredns,
+			// metrics-server, a CSI controller, none of them an hour young.
+			name: "two hours old, so the autoscaler's grace has passed",
+			pod:  mother.Pod("kube-system", "coredns", mother.CreatedAt(now.Add(-2*time.Hour))),
+		},
+		{
+			name: "five minutes old, so it still blocks",
+			pod:  mother.Pod("kube-system", "coredns", mother.CreatedAt(now.Add(-5*time.Minute))),
+			want: engine.BlockedSystemPod,
+		},
+		{
+			// Upstream's isBspPassedDisruptionTimeout guards on IsZero
+			// before comparing, so a pod with no creation timestamp is one
+			// whose age the autoscaler declines to reason about. Mirrored,
+			// because the alternative reads an unset field as the epoch and
+			// grants every such pod the grace.
+			name: "no creation timestamp at all, so no age to have passed",
+			pod:  mother.Pod("kube-system", "coredns"),
+			want: engine.BlockedSystemPod,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := engine.CheckEvictable([]*corev1.Pod{tc.pod}, nil, engine.DefaultEvictConfig(), now)
+
+			if tc.want == "" {
+				if len(got) != 0 {
+					t.Fatalf("expected evictable, blocked by %v: %s", codes(got), got[0].Message)
+				}
+				return
+			}
+			if len(got) != 1 || got[0].Code != tc.want {
+				t.Fatalf("codes = %v, want [%s]", codes(got), tc.want)
+			}
+		})
+	}
+
+	// A grace of zero is how an operator says their autoscaler has none —
+	// every release before 1.33, which the stated floor of 1.30 includes.
+	// Nothing about the pod changes; only what binpack believes about the
+	// component that will remove the node.
+	old := engine.DefaultEvictConfig()
+	old.BlockingSystemPodDistruptionTimeout = 0
+	ancient := mother.Pod("kube-system", "coredns", mother.CreatedAt(now.Add(-30*24*time.Hour)))
+
+	got := engine.CheckEvictable([]*corev1.Pod{ancient}, nil, old, now)
+	if len(got) != 1 || got[0].Code != engine.BlockedSystemPod {
+		t.Fatalf("codes = %v, want [%s]: with no grace configured the blocker never expires",
+			codes(got), engine.BlockedSystemPod)
 	}
 }

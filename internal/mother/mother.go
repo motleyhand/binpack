@@ -14,6 +14,7 @@ package mother
 import (
 	"maps"
 	"slices"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -914,4 +915,48 @@ func TemplateFor(
 		ObjectMeta: metav1.ObjectMeta{Labels: pod.Labels},
 		Spec:       *shape.Spec.DeepCopy(),
 	}
+}
+
+// WithMemoryBackedEmptyDir attaches a tmpfs scratch volume — an emptyDir whose
+// medium is Memory. It looks like local storage and is not: nothing is written
+// to the node's disk, so the cluster-autoscaler's isLocalVolume excludes it
+// explicitly (cluster-autoscaler utils/drain/drain.go).
+//
+// Its own archetype rather than an option on WithEmptyDir, because the two
+// differ in exactly the way that matters here and a test naming the medium
+// inline would say what it sets without saying what it is. This is the volume
+// Istio and Linkerd inject into every meshed pod.
+func WithMemoryBackedEmptyDir(name string) PodOption {
+	return func(p *corev1.Pod) {
+		p.Spec.Volumes = append(p.Spec.Volumes, corev1.Volume{
+			Name: name,
+			VolumeSource: corev1.VolumeSource{
+				EmptyDir: &corev1.EmptyDirVolumeSource{Medium: corev1.StorageMediumMemory},
+			},
+		})
+	}
+}
+
+// SafeToEvictLocalVolumes names the volumes whose contents the operator says
+// are disposable — the cluster-autoscaler's per-volume escape hatch, and a
+// narrower promise than SafeToEvict("true"), which also waives the bare-pod
+// and kube-system rules for the same pod.
+//
+// Variadic and joined here, because the wire format is one comma-separated
+// value and a test that spells the commas itself is testing its own string
+// building.
+func SafeToEvictLocalVolumes(names ...string) PodOption {
+	return Annotated("cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes",
+		strings.Join(names, ","))
+}
+
+// CreatedAt stamps the pod's creation time.
+//
+// Left unset by the archetypes, which is what an object that has never been
+// through an API server looks like — and the autoscaler treats a zero creation
+// timestamp as a pod whose age it cannot reason about. So a test about a pod's
+// age has to say the age, and one that does not is asking a different
+// question.
+func CreatedAt(t time.Time) PodOption {
+	return func(p *corev1.Pod) { p.CreationTimestamp = metav1.NewTime(t) }
 }

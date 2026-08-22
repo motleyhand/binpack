@@ -1696,3 +1696,81 @@ func TestCoolingReadsTheScaleUpStampAgainstWhatBinpackHasSeen(t *testing.T) {
 		})
 	}
 }
+
+// TestDrainableEvictConfig is the engine half of making the autoscaler's two
+// skip flags configurable.
+//
+// It passes without any change to the engine, and that is the finding rather
+// than a reason to skip it: EvictConfig has always had the field, drainable
+// has always read it, and nothing an operator can write ever reached it — so
+// on a cluster whose autoscaler runs --skip-nodes-with-local-storage=false
+// binpack modelled the opposite policy and refused every node hosting an
+// emptyDir pod, with no way to say otherwise. The half that fails today is in
+// api/v1alpha1 and internal/cli, where the document meets this struct.
+//
+// b is annotated skip so it is a destination and not a candidate, leaving a as
+// the only node under consideration.
+func TestDrainableEvictConfig(t *testing.T) {
+	nodes := []*corev1.Node{
+		inPool("a"),
+		inPool("b", mother.NodeAnnotations(map[string]string{engine.AnnotationSkip: "true"})),
+	}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "cache", mother.OnNode("a"),
+			mother.WithEmptyDir("scratch"), mother.Requests("100m", "128Mi")),
+	}
+
+	t.Run("the autoscaler's default, which binpack has always assumed", func(t *testing.T) {
+		d := engine.Decide(cluster(nodes, pods), config())
+
+		if d.Action != engine.None {
+			t.Fatalf("expected no drain, got %s of %s", d.Action, d.Node.Name)
+		}
+		a := assessmentFor(d, "a")
+		if a == nil || len(a.Blockers) != 1 || a.Blockers[0].Code != engine.BlockedLocalStorage {
+			t.Fatalf("want a single %s blocker on a, got %+v", engine.BlockedLocalStorage, a)
+		}
+	})
+
+	t.Run("an autoscaler told every emptyDir is scratch", func(t *testing.T) {
+		cfg := config()
+		cfg.Default.Evict.SkipNodesWithLocalStorage = false
+
+		d := engine.Decide(cluster(nodes, pods), cfg)
+
+		if d.Action != engine.Drain || d.Node.Name != "a" {
+			t.Fatalf("expected a to be drainable, got %s of %s: %s", d.Action, d.Node.Name, d.Reason)
+		}
+	})
+}
+
+// TestTheSystemPodGraceIsMeasuredAgainstTheSnapshotsClock holds the wiring
+// rather than the rule.
+//
+// CheckEvictable gained a clock for this, and a clock is the kind of argument
+// that can be threaded correctly in the unit test and dropped at the one call
+// site that matters: a zero time reaches every pod as one created after the
+// evaluation, so every kube-system pod blocks again and the whole rule quietly
+// reverts. Nothing else in the suite notices, because everything else asks
+// CheckEvictable directly.
+//
+// b is annotated skip so it is a destination and not a candidate, leaving a as
+// the only node under consideration.
+func TestTheSystemPodGraceIsMeasuredAgainstTheSnapshotsClock(t *testing.T) {
+	nodes := []*corev1.Node{
+		inPool("a"),
+		inPool("b", mother.NodeAnnotations(map[string]string{engine.AnnotationSkip: "true"})),
+	}
+	pods := []*corev1.Pod{
+		mother.Pod("kube-system", "metrics-server", mother.OnNode("a"),
+			mother.CreatedAt(now.Add(-2*time.Hour)), mother.Requests("100m", "128Mi")),
+	}
+
+	d := engine.Decide(cluster(nodes, pods), config())
+
+	if d.Action != engine.Drain || d.Node.Name != "a" {
+		t.Fatalf("expected a to be drainable, got %s of %s: %s — the pod is two hours old, "+
+			"so the autoscaler would evict it and take the node",
+			d.Action, d.Node.Name, d.Reason)
+	}
+}

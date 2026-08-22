@@ -327,26 +327,35 @@ func TestEnginePolicyCarriesEveryResolvedPolicyField(t *testing.T) {
 		Enabled:                  true,
 		ExpendablePriorityCutoff: -7,
 		ReserveForLargestPod:     true,
-		MaxPodsPerDrain:          3,
-		StallTimeout:             11 * time.Minute,
-		RemovalTimeout:           17 * time.Minute,
-		BackoffInitial:           5 * time.Minute,
-		BackoffMax:               72 * time.Hour,
-		CooldownAfterScaleUp:     13 * time.Minute,
-		CooldownAfterDrain:       19 * time.Minute,
-		ExcludedNamespaces:       []string{"kube-system"},
+		// Deliberately not both true. The pair is what a cluster whose
+		// autoscaler runs --skip-nodes-with-local-storage=false looks like,
+		// and two identical booleans would read as correct wired to each
+		// other.
+		SkipNodesWithLocalStorage:           false,
+		SkipNodesWithSystemPods:             true,
+		BlockingSystemPodDistruptionTimeout: 90 * time.Minute,
+		MaxPodsPerDrain:                     3,
+		StallTimeout:                        11 * time.Minute,
+		RemovalTimeout:                      17 * time.Minute,
+		BackoffInitial:                      5 * time.Minute,
+		BackoffMax:                          72 * time.Hour,
+		CooldownAfterScaleUp:                13 * time.Minute,
+		CooldownAfterDrain:                  19 * time.Minute,
+		ExcludedNamespaces:                  []string{"kube-system"},
 	}
 
 	// Counted from the struct, not taken on trust. Every field below is
-	// carried; nothing is deliberately dropped. engine.Policy.Evict is the
-	// one member with no counterpart here, and it comes from
-	// engine.DefaultEvictConfig() rather than from the configuration at all.
+	// carried; nothing is deliberately dropped. engine.Policy.Evict used to be
+	// the one member with no counterpart here — it came from
+	// engine.DefaultEvictConfig() rather than from the configuration at all,
+	// so an autoscaler running either skip flag against its default was a
+	// cluster binpack modelled wrongly and could not be told about.
 	//
 	// A Fatal rather than an Error: once the counts disagree the assertions
 	// below are answering a question about a different struct, and a
-	// twelfth field asserted by nothing is exactly what this test exists to
+	// fifteenth field asserted by nothing is exactly what this test exists to
 	// prevent.
-	const carried = 11
+	const carried = 14
 	if n := reflect.TypeFor[v1alpha1.PoolPolicy]().NumField(); n != carried {
 		t.Fatalf("PoolPolicy has %d fields and this test asserts %d: "+
 			"carry the new one into engine.Policy and assert it here, or say "+
@@ -362,6 +371,9 @@ func TestEnginePolicyCarriesEveryResolvedPolicyField(t *testing.T) {
 		{"Enabled", got.Enabled, resolved.Enabled},
 		{"Sim.ExpendablePriorityCutoff", got.Sim.ExpendablePriorityCutoff, resolved.ExpendablePriorityCutoff},
 		{"Sim.ReserveForLargestPod", got.Sim.ReserveForLargestPod, resolved.ReserveForLargestPod},
+		{"Evict.SkipNodesWithLocalStorage", got.Evict.SkipNodesWithLocalStorage, resolved.SkipNodesWithLocalStorage},
+		{"Evict.SkipNodesWithSystemPods", got.Evict.SkipNodesWithSystemPods, resolved.SkipNodesWithSystemPods},
+		{"Evict.BlockingSystemPodDistruptionTimeout", got.Evict.BlockingSystemPodDistruptionTimeout, resolved.BlockingSystemPodDistruptionTimeout},
 		{"MaxPodsPerDrain", got.MaxPodsPerDrain, resolved.MaxPodsPerDrain},
 		{"StallTimeout", got.StallTimeout, resolved.StallTimeout},
 		{"RemovalTimeout", got.RemovalTimeout, resolved.RemovalTimeout},

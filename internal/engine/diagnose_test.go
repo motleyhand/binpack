@@ -221,8 +221,9 @@ func TestDiagnoseReportsUnevictablePods(t *testing.T) {
 			engine.BlockedLocalStorage},
 		{"hostPath", mother.Pod("default", "agent", mother.OnNode("a"),
 			mother.WithHostPathVolume("logs", "/var/log")), engine.BlockedLocalStorage},
-		{"kube-system with no budget", mother.Pod("kube-system", "coredns", mother.OnNode("a")),
-			engine.BlockedSystemPod},
+		{"kube-system with no budget, still inside the autoscaler's grace",
+			mother.Pod("kube-system", "coredns", mother.OnNode("a"),
+				mother.CreatedAt(now.Add(-5*time.Minute))), engine.BlockedSystemPod},
 		{"refuses eviction", mother.Pod("default", "pinned", mother.OnNode("a"),
 			mother.SafeToEvict("false")), engine.BlockedSafeToEvict},
 	}
@@ -849,4 +850,25 @@ func TestTheNoAutoscalerFindingDoesNotContradictItsOwnDetail(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestDiagnoseDoesNotReportASystemPodTheAutoscalerWouldAlreadyEvict is the
+// diagnose half of the wiring TestTheSystemPodGraceIsMeasuredAgainstTheSnapshotsClock
+// holds for the decision path. Diagnose calls checkPod itself and has its own
+// clock to pass, so the two can be got right and wrong independently.
+//
+// The direction matters here more than in explain: this finding used to tell
+// an operator to give a kube-system workload a PodDisruptionBudget, which on a
+// managed platform may be a workload they do not own — a real availability
+// decision, asked for to clear a blockage that expires by itself.
+func TestDiagnoseDoesNotReportASystemPodTheAutoscalerWouldAlreadyEvict(t *testing.T) {
+	old := mother.Pod("kube-system", "metrics-server", mother.OnNode("a"),
+		mother.CreatedAt(now.Add(-2*time.Hour)))
+	none(t, diagnose(nil, []*corev1.Pod{old}), engine.BlockedSystemPod)
+
+	// And still reports one the autoscaler is still waiting on, or the check
+	// would be satisfied by not looking.
+	fresh := mother.Pod("kube-system", "konnectivity-agent", mother.OnNode("a"),
+		mother.CreatedAt(now.Add(-5*time.Minute)))
+	only(t, diagnose(nil, []*corev1.Pod{fresh}), engine.BlockedSystemPod)
 }

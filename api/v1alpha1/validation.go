@@ -156,6 +156,17 @@ func (p Policy) validate(path string) []error {
 			path, *cutoff))
 	}
 
+	if t := p.Autoscaler.BlockingSystemPodDistruptionTimeout; t != nil && t.Duration < 0 {
+		// Zero is meaningful here — it is how an operator says their
+		// autoscaler predates the grace entirely — so only a negative is
+		// refused, and it is refused rather than clamped because it says
+		// nothing anybody meant.
+		errs = append(errs, fmt.Errorf(
+			"%s.autoscaler.blockingSystemPodDistruptionTimeout: must not be negative, got %s "+
+				"(use 0 for an autoscaler that has no grace at all)",
+			path, t.Duration))
+	}
+
 	if n := p.Drain.MaxPodsPerDrain; n != nil && *n < 0 {
 		errs = append(errs, fmt.Errorf("%s.drain.maxPodsPerDrain: %d is negative (use 0 for unlimited)",
 			path, *n))
