@@ -1325,7 +1325,7 @@ func TestTheHardestPodToPlaceIsPlacedFirst(t *testing.T) {
 		sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 		if !sim.Feasible {
-			t.Fatalf("listed %v: the destination holds all four: %+v", listed, sim.Blocked)
+			t.Fatalf("listed %v: the destination holds all four: %s", listed, sim.Blocked.Summary)
 		}
 		var order []string
 		for _, p := range sim.Relocated {
@@ -1388,6 +1388,58 @@ func TestTheReservedShapeDoesNotDependOnInputOrder(t *testing.T) {
 	}
 }
 
+// cappedNode is a destination near its kubelet pod cap. Written as a small
+// allocatable rather than as a hundred resident pods: `remaining` sees the same
+// arithmetic either way, and the fixture then states only the thing it is about.
+func cappedNode(name, cpu, memory string, pods int64) *corev1.Node {
+	return mother.Node(name, mother.Allocatable(corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpu),
+		corev1.ResourceMemory: resource.MustParse(memory),
+		corev1.ResourcePods:   *resource.NewQuantity(pods, resource.DecimalSI),
+	}))
+}
+
+// TestTheDifficultyRankingIgnoresThePodSlot guards the ranking against the one
+// dimension binpack invents for itself.
+//
+// fit.EffectiveRequests synthesises `pods: 1` into every pod's requests, so the
+// pod cap is a resource every candidate demands exactly the same amount of. On
+// a node close to its cap that share approaches one and outgrows every real
+// demand — and because the rank is a maximum, one dimension that can never
+// separate two pods then hides every dimension that can. Every pod comes out
+// equally hard, the packing falls through to names, and a drain that had a
+// packing is reported as having none.
+func TestTheDifficultyRankingIgnoresThePodSlot(t *testing.T) {
+	candidate := wideNode("candidate", "16", "16Gi")
+	// One slot each, so the pod cap binds and the order of the two placements
+	// is the whole of whether this drain works.
+	wide := cappedNode("wide", "8", "4Gi", 1)
+	thin := cappedNode("thin", "1", "16Gi", 1)
+
+	// Named so that a fall-through to the name tie-break puts the wrong one
+	// first, which is what makes the failure visible rather than lucky.
+	small := mother.Pod("default", "a-small",
+		mother.OnNode("candidate"), mother.Requests("100m", "1Gi"))
+	hog := mother.Pod("default", "z-hog",
+		mother.OnNode("candidate"), mother.Requests("7", "2Gi"))
+
+	for _, pods := range [][]*corev1.Pod{{small, hog}, {hog, small}} {
+		listed := []string{pods[0].Name, pods[1].Name}
+		sim := engine.Simulate([]*corev1.Node{candidate, wide, thin}, pods,
+			mother.Templates(pods...), candidate, defaultCfg())
+
+		// z-hog fits only on wide, and wide has room for exactly one pod. It
+		// has to be placed first or its only destination is spent.
+		if !sim.Feasible {
+			t.Fatalf("listed %v: z-hog fits wide and a-small fits thin: %s", listed, sim.Blocked.Summary)
+		}
+		if got := sim.Relocated[0].Pod.Name; got != "z-hog" {
+			t.Errorf("listed %v: packed %s first, want z-hog — a pod slot is not a difficulty",
+				listed, got)
+		}
+	}
+}
+
 // TestExpendablePodsAreEvictedInAFixedOrder covers the one list the packing
 // never sorted, because nothing ranks a pod that needs no destination.
 //
@@ -1408,7 +1460,7 @@ func TestExpendablePodsAreEvictedInAFixedOrder(t *testing.T) {
 	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if !sim.Feasible {
-		t.Fatalf("expendable pods need no destination: %+v", sim.Blocked)
+		t.Fatalf("expendable pods need no destination: %s", sim.Blocked.Summary)
 	}
 	var order []string
 	for _, pod := range sim.Evicted {
@@ -1436,7 +1488,7 @@ func TestEquallyEmptyDestinationsAreTriedInNameOrder(t *testing.T) {
 	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
 
 	if !sim.Feasible {
-		t.Fatalf("either destination holds it: %+v", sim.Blocked)
+		t.Fatalf("either destination holds it: %s", sim.Blocked.Summary)
 	}
 	if got := sim.Relocated[0].Node.Name; got != "alpha" {
 		t.Errorf("placed on %s, want alpha — the tie is arbitrary, but it must be fixed", got)

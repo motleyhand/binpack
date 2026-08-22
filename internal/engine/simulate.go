@@ -479,6 +479,23 @@ func freeMemory(remaining corev1.ResourceList) int64 {
 // does not depend on the choice — fit.CanFit checks every resource regardless,
 // so a poor ordering costs a missed packing, never an invalid one.
 //
+// The pod slot is left out, and it is the one exclusion here. `pods` is not a
+// demand a workload makes: fit.EffectiveRequests synthesises exactly one for
+// every pod, so the subtraction loop consumes a slot at all. Being identical
+// for every candidate it can never rank two of them — and on a node near its
+// cap its share approaches one and outgrows every real demand, at which point a
+// maximum over it hides every dimension that can rank. The result was a
+// packing that fell through to names on precisely the clusters where the order
+// matters most: with one slot left on each of a wide and a narrow destination,
+// an alphabetically earlier small pod took the wide node and stranded the
+// CPU-heavy one that had nowhere else to go. The cap itself is untouched —
+// fit.CanFit still checks `pods` like any other resource, so what changed is
+// the order pods are offered in and never whether one fits.
+//
+// Only this one. A workload genuinely requesting the same amount of something
+// on every pod — one GPU each, say — is a fact about the cluster, and pods that
+// really are equally constrained by it should rank equally.
+//
 // A float, because this ranks and nobody acts on the number. The name
 // tie-break at the call site is what makes the order total, so a rounding
 // coincidence costs a swap rather than a stable answer. Dividing by a hole of
@@ -488,6 +505,9 @@ func freeMemory(remaining corev1.ResourceList) int64 {
 func difficultyOf(pod *corev1.Pod, largest map[corev1.ResourceName]float64) float64 {
 	worst := 0.0
 	for name, request := range fit.EffectiveRequests(pod) {
+		if name == corev1.ResourcePods {
+			continue
+		}
 		want := request.AsApproximateFloat64()
 		if want <= 0 {
 			continue
