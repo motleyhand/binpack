@@ -2341,3 +2341,39 @@ func TestRememberAutoscalerTellsARestartFromAScaleUp(t *testing.T) {
 		t.Error("a later restart's stamp inherited the trust earned by an earlier scale-up")
 	}
 }
+
+func TestRememberAutoscalerSurvivesAGapInTheStatus(t *testing.T) {
+	// A status read that finds nothing is not an error — a missing ConfigMap
+	// is a diagnosis, and collect returns a zero Autoscaler for it. So a
+	// transient gap while a scale-up is running arrives here looking exactly
+	// like the scan after the episode ended, and crediting it records a
+	// transition binpack never saw: the zero time. The real transition, when
+	// the status comes back, is then not recognised as watched, and the
+	// cooldown that scale-up earned is skipped.
+	t0 := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	scan := func(n int) time.Time { return t0.Add(time.Duration(n) * 10 * time.Second) }
+
+	ev := &evaluator{}
+	ev.rememberAutoscaler(&engine.Autoscaler{LastProbe: scan(0), LastScaleUp: scan(0)})
+
+	growing := engine.Autoscaler{LastProbe: scan(3), LastScaleUp: scan(3), ScaleUpInProgress: true}
+	ev.rememberAutoscaler(&growing)
+
+	// The gap: no ConfigMap, or one carrying no status document. Both reach
+	// here as an Autoscaler with nothing in it.
+	gap := engine.Autoscaler{}
+	ev.rememberAutoscaler(&gap)
+	if !gap.WatchedScaleUp.IsZero() {
+		t.Errorf("WatchedScaleUp = %s, want zero: a gap is not a scale-up binpack watched",
+			gap.WatchedScaleUp)
+	}
+
+	// And the episode still finishes, on the first sample binpack can read.
+	ended := engine.Autoscaler{LastProbe: scan(9), LastScaleUp: scan(8)}
+	ev.rememberAutoscaler(&ended)
+	if !ended.WatchedScaleUp.Equal(scan(8)) {
+		t.Errorf("WatchedScaleUp = %s, want the transition that ended the episode %s — "+
+			"a gap mid-episode lost the scale-up binpack had watched begin",
+			ended.WatchedScaleUp, scan(8))
+	}
+}

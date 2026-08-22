@@ -10,7 +10,6 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/motleyhand/binpack/api/v1alpha1"
-	"github.com/motleyhand/binpack/internal/collect"
 )
 
 func newConfigCommand(opts *options) *cobra.Command {
@@ -167,11 +166,16 @@ func writeConfigSummary(opts *options, cfg *v1alpha1.Config) error {
 			join.LabelValue, join.Group)
 	}
 	// Where binpack will look for the autoscaler, said before it has looked.
-	// A wrong label key above fails preflight loudly; a wrong namespace here
+	// A wrong label key above fails preflight loudly; a wrong location here
 	// produces a confident report that no cluster-autoscaler is running, and
 	// nothing in that report is about configuration.
-	p("autoscaler status: %s/%s\n",
-		cfg.Discovery.AutoscalerNamespace, collect.StatusConfigMapName)
+	//
+	// Both halves are read from the resolved configuration, through the same
+	// function the Get itself uses. Printing the constant name beside the
+	// configured namespace was the original defect in miniature: a command
+	// whose whole purpose is to show resolved settings, telling an operator
+	// who renamed the object to go and look at one binpack will not read.
+	p("autoscaler status: %s\n", statusRef(cfg))
 
 	// The resolved default policy is what most pools will actually get, and
 	// is far more useful to see than the sparse document that produced it.

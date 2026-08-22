@@ -656,9 +656,26 @@ func (e *evaluator) rememberAutoscaler(a *engine.Autoscaler) {
 		// is the episode's start, and the autoscaler rewrites it when the
 		// episode ends. cooling refuses on ScaleUpInProgress alone anyway.
 		e.scaleUpUnderway = true
-	case e.scaleUpUnderway:
-		// The first scan after the one binpack last saw growing, which is
-		// where the end-of-episode transition appears.
+	case e.scaleUpUnderway && !a.LastScaleUp.IsZero():
+		// The first *readable* scan after the one binpack last saw growing,
+		// which is where the end-of-episode transition appears.
+		//
+		// Readable is the load-bearing word. A missing status ConfigMap is a
+		// diagnosis rather than an error, so collect returns a zero Autoscaler
+		// for it and the evaluation carries on — which means a transient gap
+		// mid-episode arrives here looking exactly like the scan after the
+		// episode ended. Crediting it would record a transition binpack never
+		// saw, and then fail to recognise the real one when the status came
+		// back, skipping the cooldown that scale-up had earned. Losing sight
+		// of the autoscaler says nothing about the scale-up either way, so the
+		// wait simply continues.
+		//
+		// If the gap outlasts the autoscaler process, the next readable stamp
+		// is a restart's rather than that episode's, and binpack credits it —
+		// a cooldown that need not have applied. That is the safe direction of
+		// this pair: standing down for ten minutes costs a consolidation,
+		// where the other direction drains straight into a cluster that has
+		// just grown.
 		e.watchedScaleUp, e.scaleUpUnderway = a.LastScaleUp, false
 	}
 
