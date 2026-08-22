@@ -34,9 +34,15 @@ import (
 func check(t *testing.T, o *differential.Oracle, name string, pod *corev1.Pod, node *corev1.Node, residents []*corev1.Pod) differential.Verdict {
 	t.Helper()
 
+	// The same two entry points internal/engine uses, and for the same reason
+	// the scheduler has two: residents are occupancies, sized from what their
+	// node handed out, while the pod being placed is a demand, sized from its
+	// spec. framework.NewNodeInfo and computePodResourceRequest split it
+	// exactly here, so a harness that used one function for both would be
+	// comparing binpack against a scheduler that does not exist.
 	remaining := fit.Allocatable(node)
 	for _, r := range residents {
-		fit.Subtract(remaining, fit.EffectiveRequests(r))
+		fit.Subtract(remaining, fit.ObservedRequests(r))
 	}
 
 	binpackFits, reason := fit.CanFit(pod, node, remaining, residents,
@@ -206,6 +212,59 @@ func TestMirrorsUnitCases(t *testing.T) {
 			},
 			false,
 		},
+		{
+			// The same 1000Mi resident, except that its spec now says 128Mi:
+			// something patched the pod's requests downward in place and the
+			// kubelet has not actuated it, which for a memory decrease below
+			// current usage it cannot. PodInfo.CalculateResource charges
+			// max(spec, actuated, allocated), so the node still holds 1000Mi
+			// of it and 360Mi is all that is left.
+			//
+			// Read from the spec alone the node looks 1232Mi empty, which is
+			// the whole finding: binpack accepts, the scheduler refuses, and
+			// the relocated pod goes Pending on a node binpack has just
+			// cordoned.
+			"resident mid-downward-resize still occupies what it actuated",
+			mother.Pod("default", "web", mother.Requests("100m", "600Mi")),
+			mother.SmallNode("n"),
+			[]*corev1.Pod{
+				mother.Pod("default", "sitting", mother.OnNode("n"), mother.ResizingFrom(
+					corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("100m"),
+						corev1.ResourceMemory: resource.MustParse("128Mi"),
+					},
+					corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("100m"),
+						corev1.ResourceMemory: resource.MustParse("1000Mi"),
+					},
+				)),
+			},
+			false,
+		},
+		{
+			// Paired with the row above so the refusal is shown to be about
+			// the arithmetic and not about resizing residents as a class. The
+			// cheaper fix — refuse any destination hosting a pod mid-resize —
+			// is sound and would satisfy the row above while costing every
+			// relocation onto a node with 360Mi genuinely free. 300Mi fits
+			// there, and both must say so.
+			"a resizing resident does not disqualify its node",
+			mother.Pod("default", "web", mother.Requests("100m", "300Mi")),
+			mother.SmallNode("n"),
+			[]*corev1.Pod{
+				mother.Pod("default", "sitting", mother.OnNode("n"), mother.ResizingFrom(
+					corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("100m"),
+						corev1.ResourceMemory: resource.MustParse("128Mi"),
+					},
+					corev1.ResourceList{
+						corev1.ResourceCPU:    resource.MustParse("100m"),
+						corev1.ResourceMemory: resource.MustParse("1000Mi"),
+					},
+				)),
+			},
+			true,
+		},
 	}
 
 	for _, tc := range cases {
@@ -236,7 +295,7 @@ func TestGeneratedStates(t *testing.T) {
 
 		remaining := fit.Allocatable(node)
 		for _, r := range residents {
-			fit.Subtract(remaining, fit.EffectiveRequests(r))
+			fit.Subtract(remaining, fit.ObservedRequests(r))
 		}
 		if ok, _ := fit.CanFit(pod, node, remaining, residents,
 			fit.NewAntiAffinityDomains([]*corev1.Node{node}, residents)); ok {

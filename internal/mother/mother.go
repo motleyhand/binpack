@@ -670,13 +670,62 @@ func AlwaysAllowUnhealthy(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisrup
 	return pdb
 }
 
-// Resizing marks an in-place vertical scale as in progress.
+// Resizing marks an in-place vertical scale as in progress, and says nothing
+// about the sizes involved. Use [ResizingFrom] where the arithmetic is what
+// the test is about.
 func Resizing() PodOption {
 	return func(p *corev1.Pod) {
 		p.Status.Conditions = append(p.Status.Conditions, corev1.PodCondition{
 			Type:   corev1.PodResizeInProgress,
 			Status: corev1.ConditionTrue,
 		})
+	}
+}
+
+// ResizingFrom models a pod the kubelet has admitted an in-place vertical
+// scale for and not yet actuated: spec asks for the new figure, the container
+// status still reports the old one.
+//
+// One option writes every half of that state, deliberately. What the scheduler
+// charges is max(spec, actuated, allocated) — k8s.io/component-helpers
+// resource.PodRequests under UseStatusResources, which is how
+// PodInfo.CalculateResource sizes a pod already on a node — so a fixture that
+// set the spec here and the status somewhere else could express half the state
+// and produce a number no cluster ever shows. The point of a mother is that
+// the incoherent version cannot be written.
+//
+// allocated is derived rather than taken: the kubelet writes
+// allocatedResources when it *admits* the resize, and actuates afterwards, so
+// while PodResizeInProgress is set allocated is the new figure and only the
+// actuated one lags. The state where the two come apart is the other one — a
+// resize the node cannot fit, which the kubelet reports as PodResizePending
+// with reason Infeasible, and which the same helper sizes as
+// max(actuated, allocated), ignoring spec entirely. No mother models that yet;
+// binpack over-charges such a pod, which is the safe direction.
+//
+// The first container only, like [Requests], and it sets the
+// PodResizeInProgress condition itself — pairing it with [Resizing] would
+// write the condition twice.
+//
+// The pod-level status is written whichever way the pod is shaped, so that
+// composing with [WithPodLevelResources] works in either order. Where no
+// pod-level request is set it changes nothing: PodRequests reads the pod-level
+// status only behind IsPodLevelRequestsSet, which is a question about the
+// spec.
+func ResizingFrom(spec, actuated corev1.ResourceList) PodOption {
+	return func(p *corev1.Pod) {
+		container := &p.Spec.Containers[0]
+		container.Resources.Requests = spec.DeepCopy()
+
+		p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, corev1.ContainerStatus{
+			Name:               container.Name,
+			Resources:          &corev1.ResourceRequirements{Requests: actuated.DeepCopy()},
+			AllocatedResources: spec.DeepCopy(),
+		})
+		p.Status.Resources = &corev1.ResourceRequirements{Requests: actuated.DeepCopy()}
+		p.Status.AllocatedResources = spec.DeepCopy()
+
+		Resizing()(p)
 	}
 }
 

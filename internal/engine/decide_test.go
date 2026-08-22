@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/resource"
 
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
@@ -82,6 +83,50 @@ func TestDrainsTheEmptiestFeasibleNode(t *testing.T) {
 	// c is empty, so it is the cheapest to remove.
 	if d.Node.Name != "c" {
 		t.Errorf("drained %s, want the emptiest node c", d.Node.Name)
+	}
+}
+
+// TestEmptiestIsMeasuredByWhatNodesHold closes the ordering half of the same
+// question the placement simulation asks.
+//
+// "Emptiest" is a claim about a node, so it has to be read from what the node
+// has handed out rather than from what its pods most recently asked for. A pod
+// mid-downward-resize has a lowered spec and an unchanged allocation, so on
+// spec alone the node holding a gigabyte of it looks like the emptiest in the
+// pool and binpack tries to drain it first — while every other number binpack
+// computes about that node, and everything the scheduler and the autoscaler
+// see, says it is the fullest.
+//
+// The filler is expendable so that the ordering is the only thing under test:
+// a relocatable pod mid-resize is refused outright by fit, which would make
+// its node undrainable and hide which candidate was tried first behind a
+// feasibility answer.
+func TestEmptiestIsMeasuredByWhatNodesHold(t *testing.T) {
+	nodes := []*corev1.Node{inPool("a"), inPool("b"), inPool("spare")}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "filler", mother.OnNode("a"), mother.Priority(-100),
+			mother.ResizingFrom(
+				corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("128Mi"),
+				},
+				corev1.ResourceList{
+					corev1.ResourceCPU:    resource.MustParse("100m"),
+					corev1.ResourceMemory: resource.MustParse("1Gi"),
+				},
+			)),
+		mother.Pod("default", "on-b", mother.OnNode("b"), mother.Requests("100m", "512Mi")),
+		mother.Pod("default", "on-spare", mother.OnNode("spare"), mother.Requests("100m", "2Gi")),
+	}
+
+	d := engine.Decide(cluster(nodes, pods), config())
+
+	if d.Action != engine.Drain {
+		t.Fatalf("expected a drain, got none: %s", d.Reason)
+	}
+	if d.Node.Name != "b" {
+		t.Errorf("drained %s, want b: a holds a gigabyte its pod's spec no longer admits to, "+
+			"so ranking it emptiest reads the resize rather than the node", d.Node.Name)
 	}
 }
 

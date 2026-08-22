@@ -234,6 +234,13 @@ This arithmetic is fiddly and upstream already gets it right, so binpack calls
 `k8s.io/component-helpers/resource.PodRequests` rather than hand-rolling it — at the point of
 use, not precomputed into a mirror that can drift from what the scheduler does.
 
+**And it is called two ways, because the scheduler calls it two ways.** A pod being placed is
+sized from its spec; a pod already on a node is sized from `max(spec, actuated, allocated)`, so
+that an in-place vertical scale the kubelet has not finished applying is charged at what the node
+is still holding rather than at what the pod has been patched to ask for. A destination's free
+space is computed the second way and everything binpack builds — a replacement, a size probe —
+the first. [ADR-0006](adr-0006-scheduler-fidelity.md) has the reasoning.
+
 **Pod slots.** `pods` appears in `status.allocatable` but never in a pod's requests, so a
 uniform "subtract request from remaining" loop would never consume a slot, and the simulation
 would happily pack an unlimited number of pods onto a node capped at 110. Every pod's request

@@ -257,6 +257,84 @@ func TestEffectiveRequests(t *testing.T) {
 	})
 }
 
+// TestObservedRequests pins the difference between the two entry points, which
+// is a single option and the whole of what a resident costs.
+//
+// The scheduler sizes a pod already on a node from max(spec, actuated,
+// allocated) — PodInfo.CalculateResource passes UseStatusResources, and
+// InPlacePodVerticalScaling has been GA and locked on since 1.35, so there is
+// no cluster where it does not. A pod resized downward in place has a lowered
+// spec and an unchanged actuated figure until the kubelet catches up, and for
+// a memory decrease below current usage it never does.
+func TestObservedRequests(t *testing.T) {
+	mem := func(rl corev1.ResourceList) string {
+		q := rl[corev1.ResourceMemory]
+		return q.String()
+	}
+
+	requests := func(cpu, memory string) corev1.ResourceList {
+		return corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpu),
+			corev1.ResourceMemory: resource.MustParse(memory),
+		}
+	}
+
+	t.Run("a resize still in flight is charged what it actuated", func(t *testing.T) {
+		pod := mother.Pod("default", "web",
+			mother.ResizingFrom(requests("100m", "1Gi"), requests("100m", "4Gi")))
+
+		if got := mem(fit.ObservedRequests(pod)); got != "4Gi" {
+			t.Errorf("memory = %s, want 4Gi: the cgroup still holds it and so does the node", got)
+		}
+		if got := mem(fit.EffectiveRequests(pod)); got != "1Gi" {
+			t.Errorf("memory = %s, want 1Gi: a pod created from this shape asks for the spec", got)
+		}
+	})
+
+	t.Run("a settled pod is the same under both", func(t *testing.T) {
+		// The upgrade path's whole cost, and the reason it is not a
+		// consolidation regression on an ordinary cluster:
+		// max(spec, actuated, allocated) is spec once a resize has finished,
+		// and there is nothing to differ on where none ever started.
+		pod := mother.Pod("default", "web", mother.Requests("100m", "1Gi"))
+
+		if got, want := mem(fit.ObservedRequests(pod)), mem(fit.EffectiveRequests(pod)); got != want {
+			t.Errorf("memory = %s under ObservedRequests and %s under EffectiveRequests", got, want)
+		}
+	})
+
+	t.Run("a pod-level resize is read at the pod level", func(t *testing.T) {
+		// The second option, and the reason it is not decoration. Where a pod
+		// sets spec.resources the scheduler prefers it to the container
+		// aggregate outright, so without
+		// InPlacePodLevelResourcesVerticalScalingEnabled the pod-level spec
+		// overwrites the status-aware container figure and lands back at 1Gi —
+		// UseStatusResources alone does not reach this pod. Both gates are on
+		// by default at the pinned release: PodLevelResources is Beta from
+		// 1.34 and InPlacePodLevelResourcesVerticalScaling Beta from 1.36.
+		pod := mother.Pod("default", "web",
+			mother.WithPodLevelResources("100m", "1Gi"),
+			mother.ResizingFrom(requests("100m", "1Gi"), requests("100m", "4Gi")))
+
+		if got := mem(fit.ObservedRequests(pod)); got != "4Gi" {
+			t.Errorf("memory = %s, want 4Gi: the pod-level allocation the node made", got)
+		}
+		if got := mem(fit.EffectiveRequests(pod)); got != "1Gi" {
+			t.Errorf("memory = %s, want 1Gi: the pod-level request a replacement makes", got)
+		}
+	})
+
+	t.Run("always carries one pod slot", func(t *testing.T) {
+		// Both entry points feed the same subtraction loop, so both owe it the
+		// synthetic slot. Losing it on one would let the simulation pack
+		// unlimited pods onto a node capped at 110.
+		got := fit.ObservedRequests(mother.Pod("default", "web"))[corev1.ResourcePods]
+		if got.Value() != 1 {
+			t.Errorf("pods = %d, want 1", got.Value())
+		}
+	})
+}
+
 func TestSubtractMatchesCanFit(t *testing.T) {
 	// The engine subtracts as it places; CanFit compares what is left. If the
 	// two disagreed, a simulation could place more pods than actually fit.

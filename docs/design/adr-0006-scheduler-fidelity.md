@@ -99,7 +99,7 @@ this use case.
 
 | Need | Upstream |
 |---|---|
-| Effective pod requests: init-container peaks, native sidecars, `spec.overhead`, pod-level resources | `resource.PodRequests` |
+| Effective pod requests: init-container peaks, native sidecars, `spec.overhead`, pod-level resources — and, for a pod already on a node, what that node actually allocated it | `resource.PodRequests` |
 | Required node affinity and node selectors | `nodeaffinity.GetRequiredNodeAffinity` |
 | Taints and tolerations | `corev1.FindMatchingUntoleratedTaint` |
 | Node capabilities a pod's spec implies, and whether a node declares them | `nodedeclaredfeatures.DefaultFramework` |
@@ -114,6 +114,32 @@ takes an `enableComparisonOperators` flag, and the scheduler passes the
 the differential harness's feature gates from the release rather than listing them: what the
 cluster actually does is the only fidelity that counts. Where the answer is version-dependent,
 binpack takes the value that under-tolerates, which costs a consolidation rather than a wrong one.
+
+The rule has a second shape, where the right configuration depends on *which question is being
+asked* rather than on a gate. The scheduler calls `resource.PodRequests` twice, with different
+options each time. `noderesources.Fit` sizes the incoming pod with none of them, on grounds it
+states at the call site — a "pod hasn't scheduled yet so we don't need to worry about
+InPlacePodVerticalScalingEnabled". `PodInfo.CalculateResource` sizes a pod already on a node with
+`UseStatusResources`, which resolves each container to `max(spec, actuated, allocated)`. The two
+answers differ exactly while an in-place vertical scale is in flight, and for a memory decrease
+the kubelet cannot actuate below current usage — so "in flight" lasts as long as the workload's
+usage does, not as long as an API round trip.
+
+binpack makes the same split, as `fit.EffectiveRequests` and `fit.ObservedRequests`, and it is a
+split by where the pod came from rather than by what it looks like. A destination starts at
+allocatable minus its residents, and a resident is an occupancy: sized from spec alone it hands
+the simulation room the node has already given away, and both the packing and the reserve
+computed from it believe the invented figure. A replacement or a size probe is a demand and has
+actuated nothing, so it is sized from spec — which is also what keeps the reserve's two halves
+agreeing, since the frontier is computed from a replacement that carries the running pod's
+`Status` and the probe it is measured through is rebuilt without one.
+
+This one is not an instance of "resolve towards no", and it is worth being clear that it is not.
+Charging a resident `max(spec, actuated, allocated)` is usually more than spec and so happens to
+be conservative — but a resize the kubelet has rejected as infeasible resolves to
+`max(actuated, allocated)`, ignoring spec, and can be less. Matching the scheduler is the rule
+here. Conservatism is what binpack falls back on where the scheduler's answer is version-dependent
+or unknown, and this answer is neither.
 
 #### What is modelled is a closed allowlist, not an open denylist
 
@@ -181,13 +207,22 @@ Pending, so no scale-up follows and the drain stalls and backs off as
 [ADR-0007](adr-0007-drain-progress-not-deadlines.md) provides for any undetected blocker. It
 costs a wasted drain.
 
-**A pod resized downward in place.** In-place vertical scaling changes a running pod's requests
-without touching its controller's template, so `EffectiveRequests` reports less than the
-replacement will actually ask for. This one is *not* bounded: binpack could approve a node the
-replacement does not fit, leaving it Pending and provoking exactly the scale-up this design
-exists to prevent. A resize still in flight is refused outright, but a completed one leaves no
-marker on the pod — `status.resize` and the resize conditions track pending and in-progress
-operations only.
+**A pod resized downward in place, in the role of the pod being moved.** In-place vertical
+scaling changes a running pod's requests without touching its controller's template, so the
+running pod's own requests report less than the replacement will actually ask for. This one is
+*not* bounded: binpack could approve a node the replacement does not fit, leaving it Pending and
+provoking exactly the scale-up this design exists to prevent. A resize still in flight is refused
+outright, but a completed one leaves no marker on the pod — `status.resize` and the resize
+conditions track pending and in-progress operations only.
+
+**The same pod in the role of a resident is a different question, and gets a different answer.**
+A pod mid-resize sitting on a *destination* is not being moved and has no replacement; what
+matters about it is how much of that node it is holding, which is what the scheduler charges it
+and not what its spec has most recently been patched to. So it is accounted through
+`fit.ObservedRequests` rather than refused. Refusing instead — disqualifying any destination
+hosting a pod mid-resize — would also be sound, and would cost every relocation onto a node with
+gigabytes genuinely free. The refusal named above is about the relocating side only, which is why
+it never covered this.
 
 Both closed the same way: `collect` reads `ReplicaSet`, `StatefulSet`, `DaemonSet` and `Job`
 templates, and the engine builds the replacement from the template while keeping the running

@@ -277,6 +277,94 @@ func TestReserveForLargestPod(t *testing.T) {
 	}
 }
 
+// resizing spells the one fixture the two tests below turn on: a resident the
+// kubelet has been told to shrink from 4Gi to 1Gi and has not managed to.
+//
+// Durable rather than a race. A memory decrease cannot be actuated below what
+// the workload is currently using, so the kubelet keeps PodResizeInProgress
+// set with reason Error until the usage drops — which for a pod sized by a VPA
+// that got it wrong may be never.
+func resizing(namespace, name, node string) *corev1.Pod {
+	requests := func(cpu, memory string) corev1.ResourceList {
+		return corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse(cpu),
+			corev1.ResourceMemory: resource.MustParse(memory),
+		}
+	}
+	return mother.Pod(namespace, name, mother.OnNode(node),
+		mother.ResizingFrom(requests("100m", "1Gi"), requests("100m", "4Gi")))
+}
+
+// TestResidentMidResizeOccupiesWhatItActuated asks the packing alone.
+//
+// Every destination starts at allocatable minus its residents, and a resident
+// is a pod read from the cluster — so it has to be sized the way the scheduler
+// sizes one, which is max(spec, actuated, allocated) and not spec. Sized from
+// spec, a resident mid-downward-resize hands the simulation 3Gi of room that
+// the node has already given away, and binpack drains onto it.
+func TestResidentMidResizeOccupiesWhatItActuated(t *testing.T) {
+	candidate := sized("candidate", "8Gi")
+	destination := sized("destination", "8Gi")
+
+	pods := []*corev1.Pod{
+		resizing("default", "resident", "destination"),
+		mother.Pod("default", "mover", mother.OnNode("candidate"), mother.Requests("100m", "6Gi")),
+	}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("the destination has 4Gi free and the mover wants 6Gi: sizing the resident " +
+			"from its lowered spec invented 3Gi the scheduler has already reserved, and " +
+			"the pod that moves there goes Pending")
+	}
+}
+
+// TestReserveSeesWhatTheSchedulerSees asks the same question of the margin.
+//
+// The reserve is computed from the same remaining map as the packing, so an
+// over-stated destination over-states the margin by exactly the same amount —
+// it fails in the same direction as the packing rather than the opposite one,
+// and certifies a cluster with no room at all as one holding a whole spare
+// pod.
+//
+// It also pins the half that makes this two entry points rather than one
+// option. A replacement carries the running pod's Status so that the
+// status-based refusals still apply to it, while [sizeProbe] rebuilds without
+// one — so charging a replacement what its predecessor actuated would size the
+// frontier from a figure the probe then discards, picking the resizing
+// resident as the shape to reserve for and asking about a pod two thirds
+// smaller. Same approved drain, arrived at backwards. That the refusal names
+// the mover is what says the frontier and the probe are still measuring the
+// same pod.
+func TestReserveSeesWhatTheSchedulerSees(t *testing.T) {
+	candidate := sized("candidate", "8Gi")
+	destination := sized("destination", "8Gi")
+
+	pods := []*corev1.Pod{
+		resizing("default", "resident", "destination"),
+		mother.Pod("default", "mover", mother.OnNode("candidate"), mother.Requests("100m", "3Gi")),
+	}
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, cfg)
+
+	if sim.Feasible {
+		t.Fatal("4Gi free, 3Gi moved in, 1Gi left and the largest relocatable shape in the " +
+			"cluster is 3Gi: the reserve was computed from a destination that does not exist")
+	}
+	if sim.Blocked.Pod.Name != "mover" {
+		t.Errorf("the reserve refused on behalf of %s/%s; the shape it should be reserving "+
+			"for is the 3Gi mover, and naming the resizing resident means the frontier was "+
+			"sized from a status the probe throws away",
+			sim.Blocked.Pod.Namespace, sim.Blocked.Pod.Name)
+	}
+}
+
 func TestFinishedPodsDoNotOccupy(t *testing.T) {
 	// A completed Job's pod has released its resources; counting it would
 	// make nodes look fuller than they are and cost consolidations.

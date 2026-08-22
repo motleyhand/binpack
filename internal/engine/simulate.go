@@ -157,12 +157,18 @@ func Simulate(
 		}
 		destinations = append(destinations, node)
 
+		// Observed rather than effective, and it is the one loop in this
+		// function where the difference decides anything. These pods are
+		// occupancies: what the node has already handed out, which under an
+		// in-place vertical scale is not what their specs ask for. Everything
+		// else placed into this map is a pod that does not exist yet, and a
+		// pod that does not exist has actuated nothing.
 		free := fit.Allocatable(node)
 		for _, pod := range byNode[node.Name] {
 			if !Occupies(pod) {
 				continue
 			}
-			fit.Subtract(free, fit.EffectiveRequests(pod))
+			fit.Subtract(free, fit.ObservedRequests(pod))
 			residents[node.Name] = append(residents[node.Name], pod)
 		}
 		remaining[node.Name] = free
@@ -393,7 +399,10 @@ type headroomShape struct {
 	// frontier compares every shape against every other. Reading it from the
 	// replacement rather than from the probe is the same number: sizeProbe
 	// keeps exactly the fields resource.PodRequests looks at, which is what
-	// TestTheProbeCarriesEverySourceOfSize is there to hold it to.
+	// TestTheProbeCarriesEverySourceOfSize is there to hold it to — and
+	// fit.EffectiveRequests reads none of the Status that sizeProbe drops,
+	// which is what keeps the equality true for a replacement built from a
+	// pod mid-resize. Both halves are load-bearing.
 	requests corev1.ResourceList
 }
 
@@ -726,7 +735,10 @@ func indexPodsByNode(pods []*corev1.Pod) map[string][]*corev1.Pod {
 // against other nodes of much the same shape and nothing is claimed about the
 // answer beyond which one to try first.
 func memoryOf(pod *corev1.Pod) int64 {
-	requests := fit.EffectiveRequests(pod)
+	// Observed, because its one caller totals pods that are running: how much
+	// work a node is doing is a question about what it has handed out, not
+	// about what its residents have most recently asked for.
+	requests := fit.ObservedRequests(pod)
 	mem := requests[corev1.ResourceMemory]
 	return mem.Value()
 }
@@ -927,6 +939,15 @@ func sizedReplacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplat
 		// replacement. Without it fit sees an empty Status, and an in-flight
 		// resize — whose requests are changing underneath the snapshot — stops
 		// being refused at exactly the moment it matters most.
+		//
+		// For detection, and never for arithmetic. This Status belongs to the
+		// pod being replaced: it records what some kubelet actuated for an
+		// object that is going away. Size a replacement through
+		// fit.ObservedRequests and a pod mid-downward-resize takes over the
+		// frontier at its old, larger figure — which [sizeProbe] then strips
+		// back off, so the reserve enforced is the small one and the two
+		// halves of one check approve a drain by disagreeing. Everything built
+		// here is sized through fit.EffectiveRequests.
 		Status: *pod.Status.DeepCopy(),
 	}
 	out.Labels = maps.Clone(template.Labels)
