@@ -570,7 +570,7 @@ func TestEveryNodeIsAccountedFor(t *testing.T) {
 	}
 }
 
-func TestCheckPoolsNamesEveryUnknownPoolInAStableOrder(t *testing.T) {
+func TestResolvePoolsNamesEveryUnknownPoolInAStableOrder(t *testing.T) {
 	// The names come from a map. An error that reorders itself between runs
 	// is one nobody can diff, match against a log, or assert on.
 	s := cluster([]*corev1.Node{inPool("a")}, nil)
@@ -582,7 +582,7 @@ func TestCheckPoolsNamesEveryUnknownPoolInAStableOrder(t *testing.T) {
 		poolName:     {Enabled: false},
 	}
 
-	first := engine.CheckPools(s, cfg)
+	_, first := engine.ResolvePools(s, cfg)
 	if first == nil {
 		t.Fatal("three unknown pools were accepted")
 	}
@@ -595,13 +595,13 @@ func TestCheckPoolsNamesEveryUnknownPoolInAStableOrder(t *testing.T) {
 	}
 
 	for range 20 {
-		if got := engine.CheckPools(s, cfg); got.Error() != first.Error() {
+		if _, got := engine.ResolvePools(s, cfg); got.Error() != first.Error() {
 			t.Fatalf("the message varies between runs:\n %v\n %v", first, got)
 		}
 	}
 }
 
-func TestCheckPoolsAcceptsAPoolKnownOnlyToTheAutoscaler(t *testing.T) {
+func TestResolvePoolsAcceptsAPoolKnownOnlyToTheAutoscaler(t *testing.T) {
 	// A pool scaled to zero has no nodes to carry its label, but the
 	// autoscaler still reports it. Rejecting the override then would take
 	// binpack down over a pool that is merely empty.
@@ -612,7 +612,7 @@ func TestCheckPoolsAcceptsAPoolKnownOnlyToTheAutoscaler(t *testing.T) {
 	cfg := config()
 	cfg.ByPool = map[string]engine.Policy{poolID: {Enabled: false}}
 
-	if err := engine.CheckPools(s, cfg); err != nil {
+	if _, err := engine.ResolvePools(s, cfg); err != nil {
 		t.Errorf("an empty but autoscaled pool was rejected: %v", err)
 	}
 }
@@ -1191,7 +1191,7 @@ func TestALabelThatMatchesNoNodeIsReportedAsSuch(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			s, cfg := tc.build(), config()
 
-			err := engine.CheckPools(s, cfg)
+			_, err := engine.ResolvePools(s, cfg)
 			if err == nil {
 				t.Fatal("a cluster where no node carries a recognised value passed preflight")
 			}
@@ -1310,7 +1310,7 @@ func TestPreflightAcceptsEveryClusterTheLabelCouldStillBeWorkingOn(t *testing.T)
 			// A pool scaled to zero has no node to carry its label, so no
 			// node can match and nothing is wrong. Refusing here would take
 			// binpack down over a pool that is merely empty — the same
-			// false positive TestCheckPoolsAcceptsAPoolKnownOnlyToTheAutoscaler
+			// false positive TestResolvePoolsAcceptsAPoolKnownOnlyToTheAutoscaler
 			// guards on the other check.
 			name: "every reported group is scaled to zero",
 			build: func() engine.Snapshot {
@@ -1374,7 +1374,7 @@ func TestPreflightAcceptsEveryClusterTheLabelCouldStillBeWorkingOn(t *testing.T)
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := engine.CheckPools(tc.build(), config()); err != nil {
+			if _, err := engine.ResolvePools(tc.build(), config()); err != nil {
 				t.Errorf("preflight refused a cluster it cannot show is misconfigured:\n%v", err)
 			}
 		})
@@ -1423,7 +1423,7 @@ func TestThePreflightErrorDoesNotDependOnHowTheClusterWasListed(t *testing.T) {
 		s := cluster(order.nodes, nil)
 		s.Autoscaler.Groups = order.groups
 
-		err := engine.CheckPools(s, config())
+		_, err := engine.ResolvePools(s, config())
 		if err == nil {
 			t.Fatalf("%s: no node carries the configured label and preflight passed", name)
 		}

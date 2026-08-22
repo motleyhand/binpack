@@ -1191,7 +1191,7 @@ func TestADrainInProgressIsResumedBeforeTheConfigurationIsJudged(t *testing.T) {
 			// Refused first, so the case is known to be one the preflight
 			// really rejects. Without this the test passes on a configuration
 			// binpack was perfectly happy with.
-			if err := engine.CheckPools(snapshotOf(t, ev), cfg); err == nil {
+			if _, err := engine.ResolvePools(snapshotOf(t, ev), cfg); err == nil {
 				t.Fatal("this configuration passes preflight, so there is nothing to resume past")
 			}
 
@@ -2193,5 +2193,84 @@ func TestRunRefusesToStartWithNowhereToReadTheAutoscalerStatus(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "autoscalerNamespace") {
 		t.Errorf("the refusal does not name the setting to fix: %v", err)
+	}
+}
+
+// derivedStatusConfigMap publishes one pool under an identifier no label on
+// the nodes below equals — an Auto Scaling group name EKS generated from the
+// managed node group's name.
+func derivedStatusConfigMap() client.Object {
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Namespace: statusNamespace,
+			Name:      collect.StatusConfigMapName,
+		},
+		Data: map[string]string{"status": `
+autoscalerStatus: Running
+time: ` + time.Now().UTC().Format("2006-01-02 15:04:05.000000000 -0700 MST") + `
+clusterWide:
+  health:
+    status: Healthy
+    lastProbeTime: "` + time.Now().UTC().Format(time.RFC3339) + `"
+  scaleDown:
+    status: NoCandidates
+nodeGroups:
+- name: eks-workers-a2c1d3e4-1111
+  health:
+    minSize: 1
+    maxSize: 10
+    cloudProviderTarget: 3
+    nodeCounts:
+      registered:
+        ready: 3
+`},
+	}
+}
+
+func derivableNode(name string) *corev1.Node {
+	return mother.LargeNode(name, mother.NodeLabels(map[string]string{
+		"eks.amazonaws.com/nodegroup": "workers"}))
+}
+
+// TestTheEvaluationDecidesAgainstTheJoinItResolved is the call-site half of
+// this change, and it has no other cover.
+//
+// engine.ResolvePools returns the Config to decide against, because the join
+// between nodes and pools is worked out from the snapshot rather than read
+// from configuration. An evaluation that resolved and then went on using
+// e.opts.Engine would pass every test of the resolver itself and still see no
+// pools at all — the exact silent narrowing of scope ADR-0012 exists to
+// prevent, and the class of defect a mutation sweep over a function cannot
+// reach, because it lives in where the function is called.
+func TestTheEvaluationDecidesAgainstTheJoinItResolved(t *testing.T) {
+	var log captured
+	ev := newEvaluator(t, &log, &fakeRecorder{},
+		derivableNode("a"), derivableNode("b"), derivableNode("c"),
+		derivedStatusConfigMap())
+
+	// The fixture has to reproduce what this is about, or the assertions
+	// below pass over a cluster the unresolved configuration already sees.
+	unresolved := engine.Decide(snapshotOf(t, ev), ev.opts.Engine)
+	for _, a := range unresolved.Assessments {
+		if a.SkipCode != engine.SkipNotAutoscaled {
+			t.Fatalf("%s is already in a pool without resolving, so nothing here depends "+
+				"on the resolution", a.Node.Name)
+		}
+	}
+
+	if err := ev.attempt(context.Background()); err != nil {
+		t.Fatalf("evaluating a cluster whose join is derivable: %v", err)
+	}
+
+	if !log.contains("would drain") {
+		t.Fatalf("the evaluation reached no drain decision on a cluster whose join it "+
+			"had just resolved:\n%s", strings.Join(log.lines, "\n"))
+	}
+	// Both directions, because "would drain" appearing is only half the
+	// evidence: the unresolved configuration reaches a refusal, and a
+	// refusal logs its own line rather than nothing at all.
+	if log.contains("nothing to do") {
+		t.Errorf("the evaluation also refused, so it did not decide once:\n%s",
+			strings.Join(log.lines, "\n"))
 	}
 }

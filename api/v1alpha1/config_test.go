@@ -399,3 +399,94 @@ func TestDurationMarshalsAsString(t *testing.T) {
 		t.Errorf("duration should marshal as a string, got:\n%s", out)
 	}
 }
+
+// The `discovery.nodeGroups` tests below cover the one escape hatch binpack
+// has where neither join works: the identifier is not a legal label value and
+// is not built from anything a label carries. Membership only — a pool
+// minimum stated here and enforced by the autoscaler is two numbers that can
+// disagree, which is why ADR-0004's second resolution mode was withdrawn
+// rather than built.
+
+func TestAStatedJoinIsLoadedAsWritten(t *testing.T) {
+	cfg := mustLoad(t, `
+apiVersion: binpack.motleyhand.com/v1alpha1
+kind: BinpackConfig
+discovery:
+  nodeGroupIDLabel: eks.amazonaws.com/nodegroup
+  nodeGroups:
+    - labelValue: workers
+      group: eks-workers-a2c1d3e4-1111
+    - labelValue: system
+      group: eks-system-b7f10c2d-4444
+`)
+
+	want := map[string]string{
+		"workers": "eks-workers-a2c1d3e4-1111",
+		"system":  "eks-system-b7f10c2d-4444",
+	}
+	if got := cfg.NodeGroupJoin(); !reflect.DeepEqual(got, want) {
+		t.Errorf("NodeGroupJoin() = %v, want %v", got, want)
+	}
+}
+
+func TestAStatedJoinIsRejectedWhenItCannotBeActedOn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		yaml string
+		want string
+	}{
+		{
+			// Nothing to join from. An entry with no label value silently
+			// claims every unlabelled node, which is the mapping being wrong
+			// in the direction that costs a node.
+			name: "no label value",
+			yaml: "  nodeGroups:\n    - group: eks-workers-a2c1\n",
+			want: "discovery.nodeGroups[0].labelValue: must not be empty",
+		},
+		{
+			// And nothing to join to. An empty group is what the status
+			// document writes for a group with no name, so this would map a
+			// node onto a pool that is not there.
+			name: "no group",
+			yaml: "  nodeGroups:\n    - labelValue: workers\n",
+			want: "discovery.nodeGroups[0].group: must not be empty",
+		},
+		{
+			// A value can only be in one pool. Loading both and keeping
+			// whichever came last would put the nodes somewhere the document
+			// does not obviously say.
+			name: "the same label value twice",
+			yaml: "  nodeGroups:\n    - labelValue: workers\n      group: eks-a-1111\n" +
+				"    - labelValue: workers\n      group: eks-b-2222\n",
+			want: "discovery.nodeGroups[1].labelValue: \"workers\" already joined at " +
+				"discovery.nodeGroups[0]",
+		},
+		{
+			// Not a label value at all, so no node can ever carry it: this
+			// entry would sit there doing nothing.
+			name: "a label value no node could carry",
+			yaml: "  nodeGroups:\n    - labelValue: \"a/b\"\n      group: eks-a-1111\n",
+			want: "discovery.nodeGroups[0].labelValue: \"a/b\" is not a valid label value",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Load([]byte("apiVersion: binpack.motleyhand.com/v1alpha1\n" +
+				"kind: BinpackConfig\ndiscovery:\n" + tc.yaml))
+			if err == nil {
+				t.Fatal("a join binpack cannot act on was accepted")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error does not say %q:\n%v", tc.want, err)
+			}
+		})
+	}
+}
+
+func TestNoStatedJoinIsNoJoinRatherThanAnEmptyOne(t *testing.T) {
+	// Distinguished because engine.Config.NodeGroups being non-empty is what
+	// makes a mapping "configured", and an empty map arriving from a document
+	// that says nothing would be a claim binpack never made.
+	if got := mustLoad(t, "").NodeGroupJoin(); got != nil {
+		t.Errorf("NodeGroupJoin() = %v on a document that states none", got)
+	}
+}

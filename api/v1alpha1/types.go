@@ -75,6 +75,37 @@ type Discovery struct {
 	// Whatever is set here must also be the namespace binpack's Role for
 	// reading that ConfigMap is bound in — see docs/reference/rbac.md.
 	AutoscalerNamespace string `json:"autoscalerNamespace,omitempty"`
+
+	// NodeGroups states outright which node group a NodeGroupIDLabel value
+	// belongs to, for the clusters where neither join binpack can make works:
+	// the identifier is not a legal label value, and it was not generated
+	// from anything a label carries. A self-managed Auto Scaling group named
+	// by hand is the case, and so is a GKE node pool whose name the instance
+	// group truncated.
+	//
+	// Membership only. Pool bounds still come from the status ConfigMap,
+	// because a minimum stated here and enforced by the autoscaler is two
+	// numbers that can disagree — and the one binpack would act on is the one
+	// nobody updates when a pool is resized in a console. That is what
+	// ADR-0004's withdrawn second resolution mode got wrong, and this is the
+	// half of it that is safe.
+	//
+	// Additive: a value nothing here names still joins by equality, so
+	// stating one pool never takes the others out of scope.
+	NodeGroups []NodeGroupJoin `json:"nodeGroups,omitempty"`
+}
+
+// NodeGroupJoin states that nodes carrying one value of
+// Discovery.NodeGroupIDLabel are in one autoscaler node group.
+type NodeGroupJoin struct {
+	// LabelValue is what the nodes carry under NodeGroupIDLabel.
+	LabelValue string `json:"labelValue"`
+
+	// Group is the identifier the cluster-autoscaler publishes for that pool
+	// — `nodeGroups[].name` in the status ConfigMap, which is the cloud
+	// provider's own identifier and not in general the pool name anyone typed
+	// into a console.
+	Group string `json:"group"`
 }
 
 // Policy is the set of tunables that can be set globally or per pool.
@@ -212,4 +243,22 @@ type PoolPolicy struct {
 	CooldownAfterScaleUp     time.Duration
 	CooldownAfterDrain       time.Duration
 	ExcludedNamespaces       []string
+}
+
+// NodeGroupJoin resolves Discovery.NodeGroups into the lookup the engine
+// consumes: a value of the node-group label, to the identifier it belongs to.
+//
+// Nil rather than an empty map when the document states none, because "no
+// join was stated" and "a join covering nothing was stated" reach the engine
+// as different things — the first leaves every value matching by equality,
+// and the second would be a claim nobody made.
+func (c *Config) NodeGroupJoin() map[string]string {
+	if len(c.Discovery.NodeGroups) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(c.Discovery.NodeGroups))
+	for _, j := range c.Discovery.NodeGroups {
+		out[j.LabelValue] = j.Group
+	}
+	return out
 }

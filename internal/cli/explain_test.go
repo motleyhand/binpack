@@ -1080,3 +1080,101 @@ func TestExplainSaysNothingAboutWhereItLookedWhenTheAutoscalerIsThere(t *testing
 			"running, where it answers nothing:\n%s", out)
 	}
 }
+
+// derivedCluster is a cluster binpack can only see because it worked the join
+// out: nothing carries the configured label, and the provider's own pool label
+// holds a value the published identifier was built from.
+func derivedCluster() engine.Snapshot {
+	s := engine.Snapshot{
+		Now: explainNow,
+		Autoscaler: engine.Autoscaler{
+			Running:   true,
+			LastProbe: explainNow.Add(-10 * time.Second),
+			Groups: []engine.NodeGroup{
+				{ID: "eks-workers-a2c1d3e4-1111", MinSize: 1, MaxSize: 10, Ready: 2},
+			},
+		},
+	}
+	for i := range 2 {
+		s.Nodes = append(s.Nodes, mother.SmallNode(fmt.Sprintf("ip-10-0-1-1%d", i),
+			mother.NodeLabels(map[string]string{"eks.amazonaws.com/nodegroup": "workers"})))
+	}
+	return s
+}
+
+// TestExplainNamesTheJoinItDerivedAndWhy is the reporting obligation that
+// makes deriving acceptable at all.
+//
+// A heuristic that decides which nodes binpack manages has to be visible, or
+// it is indistinguishable from binpack quietly changing its mind about scope.
+// So the key, the fact that it was derived rather than configured, and what
+// each value resolved to all have to reach the operator.
+func TestExplainNamesTheJoinItDerivedAndWhy(t *testing.T) {
+	s := derivedCluster()
+	cfg, err := engine.ResolvePools(s, explainConfig())
+	if err != nil {
+		t.Fatalf("preflight refused a derivable cluster:\n%v", err)
+	}
+
+	text := renderedExplain(t, outputText, s, cfg)
+	for what, want := range map[string]string{
+		"the key it read":                 "eks.amazonaws.com/nodegroup",
+		"the value that key holds":        "workers",
+		"the pool that value resolved to": "eks-workers-a2c1d3e4-1111",
+		"that it was derived":             "derived",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("explain does not report %s (%q):\n%s", what, want, text)
+		}
+	}
+}
+
+// TestExplainSaysNothingAboutTheJoinWhenItIsTheConfiguredOne keeps the report
+// quiet on the clusters where there is nothing to disclose.
+//
+// The value being the identifier is what the configuration says binpack does,
+// so restating it every run is noise — and noise is what stops the derived
+// case standing out.
+func TestExplainSaysNothingAboutTheJoinWhenItIsTheConfiguredOne(t *testing.T) {
+	s := explainCluster([]*corev1.Node{explainNode("node-a")}, nil)
+	cfg, err := engine.ResolvePools(s, explainConfig())
+	if err != nil {
+		t.Fatalf("preflight refused an ordinary cluster:\n%v", err)
+	}
+
+	if text := renderedExplain(t, outputText, s, cfg); strings.Contains(text, "derived") {
+		t.Errorf("explain reports a derivation on a cluster that matched outright:\n%s", text)
+	}
+}
+
+// TestTheJsonReportCarriesTheJoin, because a consumer branching on scope
+// needs it as data rather than as a sentence.
+func TestTheJsonReportCarriesTheJoin(t *testing.T) {
+	s := derivedCluster()
+	cfg, err := engine.ResolvePools(s, explainConfig())
+	if err != nil {
+		t.Fatalf("preflight refused a derivable cluster:\n%v", err)
+	}
+
+	var view struct {
+		Pools struct {
+			Source string            `json:"source"`
+			Label  string            `json:"label"`
+			Groups map[string]string `json:"groups,omitempty"`
+		} `json:"pools"`
+	}
+	raw := renderedExplain(t, outputJSON, s, cfg)
+	if err := json.Unmarshal([]byte(raw), &view); err != nil {
+		t.Fatalf("decoding: %v\n%s", err, raw)
+	}
+	if view.Pools.Label != "eks.amazonaws.com/nodegroup" {
+		t.Errorf("pools.label = %q", view.Pools.Label)
+	}
+	if view.Pools.Source == "" {
+		t.Errorf("pools.source is empty, so a consumer cannot tell a derived scope "+
+			"from a configured one:\n%s", raw)
+	}
+	if got := view.Pools.Groups["workers"]; got != "eks-workers-a2c1d3e4-1111" {
+		t.Errorf("pools.groups[workers] = %q", got)
+	}
+}

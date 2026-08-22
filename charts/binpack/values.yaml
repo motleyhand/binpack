@@ -15,13 +15,17 @@ fullnameOverride: ""
 # optional: pools and their bounds are discovered from the cluster-autoscaler,
 # so an empty document is a working configuration wherever discovery works.
 #
-# It rests on one node label. binpack matches a node to a pool when the label
+# It rests on matching each node to its pool. binpack does that when the label
 # named by discovery.nodeGroupIDLabel carries, as its *value*, the identifier
 # the autoscaler publishes in nodeGroups[].name — its cloud provider's own name
-# for the group. The default is DigitalOcean's; elsewhere you may have to set
-# the field, or apply a label of your own and point it there. binpack refuses
-# to start rather than reporting every node as unmanaged, and its error names
-# the key it looked for and what your nodes carry.
+# for the group. The default is DigitalOcean's, which carries it outright.
+# Elsewhere binpack works the match out from the pool label your provider
+# already applies, since the identifier is generated from the same name, and
+# only where the whole cluster resolves unambiguously. Where it cannot, it
+# refuses to start rather than reporting every node as unmanaged, and its error
+# names the key it looked for, what your nodes carry, and any label that came
+# close. You can then point the field at a label of your own, or state the
+# mapping with discovery.nodeGroups.
 #
 # See docs/reference/configuration.md. Check a document before applying it with
 # `binpack config validate -f values-fragment.yaml`.

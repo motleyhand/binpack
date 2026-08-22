@@ -2,6 +2,7 @@ package cli
 
 import (
 	"os"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -184,7 +185,7 @@ func TestTheRemedyThePreflightPrintsIsTheOneTheReferenceGives(t *testing.T) {
 		PoolNameLabel:    v1alpha1.DefaultPoolNameLabel,
 	}
 
-	err := engine.CheckPools(s, cfg)
+	_, err := engine.ResolvePools(s, cfg)
 	if err == nil {
 		t.Fatal("no node carries the configured label and preflight passed, so there is no " +
 			"message for the reference to agree with")
@@ -234,6 +235,61 @@ func TestNoLiveRecordStillPromisesAFallbackToConfiguredMinimums(t *testing.T) {
 				if strings.Contains(text, claim) {
 					t.Errorf("%s still promises %q", source, claim)
 				}
+			}
+		})
+	}
+}
+
+// TestEveryDiscoveryFieldHasAReferenceSection is the guard the paragraph
+// above had to be written by hand for.
+//
+// `discovery` is the one section of the configuration an operator cannot
+// avoid reading: it is what decides which nodes binpack considers its own,
+// and getting it wrong is the failure ADR-0012 exists to make loud. A field
+// added to it and not documented is one nobody can be told to set — which is
+// exactly what happened to ADR-0004's step 2, published as a resolution mode
+// with no field behind it.
+//
+// Reflection rather than a hand-written list, because a list is a thing to
+// forget to add to and the struct is not.
+func TestEveryDiscoveryFieldHasAReferenceSection(t *testing.T) {
+	data, err := os.ReadFile(configurationReference)
+	if err != nil {
+		t.Fatalf("reading %s: %v", configurationReference, err)
+	}
+	reference := string(data)
+
+	// The complete document at the top, and only it. Every field also appears
+	// in some worked example further down, so a search over the whole file is
+	// answered by the wrong occurrence — which it was, until a sabotage pass
+	// deleted the line from the complete document and nothing went red.
+	_, after, found := strings.Cut(reference, "## A complete document")
+	if !found {
+		t.Fatalf("%s has no complete document to check against", configurationReference)
+	}
+	complete, _, _ := strings.Cut(after, "\n## ")
+
+	fields := reflect.VisibleFields(reflect.TypeOf(v1alpha1.Discovery{}))
+	if len(fields) == 0 {
+		t.Fatal("Discovery has no fields, so this asserts nothing")
+	}
+	for _, f := range fields {
+		name, _, _ := strings.Cut(f.Tag.Get("json"), ",")
+		if name == "" {
+			continue
+		}
+		t.Run(name, func(t *testing.T) {
+			heading := "### `discovery." + name + "`"
+			if !strings.Contains(reference, heading) {
+				t.Errorf("%s has no %s section", configurationReference, heading)
+			}
+			// And the field appears in the complete document at the top,
+			// which is the part most readers copy rather than the prose they
+			// scroll to. Two places, because either alone has been wrong: the
+			// example is what gets pasted, the section is what explains it.
+			if !strings.Contains(complete, "\n  "+name+":") {
+				t.Errorf("%s does not show discovery.%s in its complete document",
+					configurationReference, name)
 			}
 		})
 	}

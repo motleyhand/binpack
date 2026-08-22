@@ -83,7 +83,7 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			client, err := clientFor(kubeconfig, kubecontext)
+			client, err := readerFor(kubeconfig, kubecontext)
 			if err != nil {
 				return err
 			}
@@ -93,14 +93,19 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 				return err
 			}
 			// Validated even though diagnose reads only the default policy, so
-			// that a typo is not accepted here and rejected by explain.
-			if err := engine.CheckPools(snapshot, engineConfig(cfg)); err != nil {
+			// that a typo is not accepted here and rejected by explain. The
+			// resolved configuration is what everything below reads: the join
+			// between nodes and pools is derived from the cluster, and
+			// diagnosing against the unresolved one would call every node
+			// static on a cluster preflight just accepted.
+			resolved, err := engine.ResolvePools(snapshot, engineConfig(cfg))
+			if err != nil {
 				return err
 			}
 
 			opts.configSource = source
 			opts.autoscalerNamespace = cfg.Discovery.AutoscalerNamespace
-			findings := engine.Diagnose(snapshot, engineConfig(cfg))
+			findings := engine.Diagnose(snapshot, resolved)
 			if err := renderDiagnose(opts, findings); err != nil {
 				return err
 			}

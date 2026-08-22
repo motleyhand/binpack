@@ -36,6 +36,22 @@ func namespaceErrors(path, ns string) []error {
 	return errs
 }
 
+// labelValueErrors reports why a string is not a label value, if it is not.
+//
+// The same borrowing as above and for the same reason: the rule is 63
+// characters of alphanumerics, `-`, `_` and `.`, beginning and ending
+// alphanumeric, and a hand-rolled copy keeps the character half and loses the
+// length. That length is not incidental here — it is exactly why the
+// identifier a cloud provider publishes cannot always be carried by a label
+// at all, which is the case discovery.nodeGroups exists for.
+func labelValueErrors(path, value string) []error {
+	var errs []error
+	for _, why := range validation.IsValidLabelValue(value) {
+		errs = append(errs, fmt.Errorf("%s: %q is not a valid label value: %s", path, value, why))
+	}
+	return errs
+}
+
 // Validate reports every problem it finds rather than the first, so a
 // misconfigured file can be fixed in one pass instead of several.
 func (c *Config) Validate() error {
@@ -68,6 +84,7 @@ func (c *Config) Validate() error {
 	if ns := c.Discovery.AutoscalerNamespace; ns != "" {
 		errs = append(errs, namespaceErrors("discovery.autoscalerNamespace", ns)...)
 	}
+	errs = append(errs, validateNodeGroups(c.Discovery.NodeGroups)...)
 
 	errs = append(errs, c.Policy.validate("policy")...)
 
@@ -174,5 +191,37 @@ func (p Policy) validate(path string) []error {
 		}
 	}
 
+	return errs
+}
+
+// validateNodeGroups rejects a stated join binpack could not act on.
+//
+// Every one of these is an entry that would sit in the document looking
+// applied while doing nothing, or worse. An empty label value claims every
+// node that carries no label at all; an empty group names the pool the status
+// document writes for a group with no name; a duplicated value would resolve
+// to whichever entry happened to be last; and a value no label may hold can
+// never match a node.
+func validateNodeGroups(joins []NodeGroupJoin) []error {
+	var errs []error
+	seen := make(map[string]int, len(joins))
+	for i, j := range joins {
+		path := fmt.Sprintf("discovery.nodeGroups[%d]", i)
+		malformed := labelValueErrors(path+".labelValue", j.LabelValue)
+		switch first, dup := seen[j.LabelValue]; {
+		case j.LabelValue == "":
+			errs = append(errs, fmt.Errorf("%s.labelValue: must not be empty", path))
+		case dup:
+			errs = append(errs, fmt.Errorf("%s.labelValue: %q already joined at "+
+				"discovery.nodeGroups[%d]", path, j.LabelValue, first))
+		case len(malformed) > 0:
+			errs = append(errs, malformed...)
+		default:
+			seen[j.LabelValue] = i
+		}
+		if j.Group == "" {
+			errs = append(errs, fmt.Errorf("%s.group: must not be empty", path))
+		}
+	}
 	return errs
 }
