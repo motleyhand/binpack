@@ -2072,7 +2072,7 @@ func (i *interrupted) Patch(
 
 // commitment is a drain one eviction from finishing whose cluster tightens
 // underneath it: a big workload is deployed while the drain is in flight, and
-// the reserve — which asks that a pod the size of the largest one in the
+// the reserve — which asks that a pod of every maximal relocatable shape in the
 // cluster could still be placed — stops being satisfiable.
 //
 // That is the shape the reserve is dangerous in. It is a preference, so

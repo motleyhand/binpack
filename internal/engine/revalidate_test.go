@@ -171,8 +171,8 @@ func TestRevalidateTreatsAMissingNodeAsGone(t *testing.T) {
 }
 
 // reserving is a cluster where the drain of "a" is feasible but leaves nowhere
-// for a pod the size of the largest relocatable one — so the reserve refuses it
-// and nothing else does.
+// for a pod of one of the cluster's maximal relocatable shapes — so the reserve
+// refuses it and nothing else does.
 func reserving(t *testing.T, extra ...mother.NodeOption) (engine.Snapshot, engine.Config) {
 	t.Helper()
 	pods := []*corev1.Pod{
