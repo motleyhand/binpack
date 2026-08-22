@@ -138,8 +138,26 @@ This one is not an instance of "resolve towards no", and it is worth being clear
 Charging a resident `max(spec, actuated, allocated)` is usually more than spec and so happens to
 be conservative — but a resize the kubelet has rejected as infeasible resolves to
 `max(actuated, allocated)`, ignoring spec, and can be less. Matching the scheduler is the rule
-here. Conservatism is what binpack falls back on where the scheduler's answer is version-dependent
-or unknown, and this answer is neither.
+here, and matching it means following it *down*. Conservatism is what binpack falls back on where
+the scheduler's answer is version-dependent or unknown.
+
+**Which is exactly the case for one of the two options, and it is handled by asking upstream both
+ways.** `UseStatusResources` needs no judgement — `InPlacePodVerticalScaling` is GA and
+`LockToDefault` from 1.35, so every scheduler binpack meets has it on.
+`InPlacePodLevelResourcesVerticalScalingEnabled` is different: its gate is Beta, default-on at
+1.36 and therefore switchable off, and **neither constant is sound alone**. With the gate on, a
+pod-level request whose resize was refused as infeasible resolves to `max(actuated, allocated)`;
+with it off, the scheduler charges the spec that nothing has granted. Passing `true` under-charges
+that resident against a gate-disabled scheduler; passing `false` under-charges every pod-level
+resize against the default one. Under-charging a resident is the unsound direction — it invents
+free space the node has already given away — so `ObservedRequests` computes both readings, through
+upstream in each case, and keeps the larger. The second reading is taken only where
+`IsPodLevelRequestsSet` says the option is consulted at all, so nothing else pays for it.
+
+This generalises the taint rule above rather than contradicting it. There, one constant was safe
+and binpack took it. Here none is, and the fallback is to be at least as large as every scheduler
+the cluster could be running. The rule underneath both is the same: **binpack cannot read another
+component's feature gates, so where a gate changes the answer it must not guess.**
 
 #### What is modelled is a closed allowlist, not an open denylist
 

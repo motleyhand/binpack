@@ -729,6 +729,42 @@ func ResizingFrom(spec, actuated corev1.ResourceList) PodOption {
 	}
 }
 
+// ResizeInfeasibleFrom models the other half of the resize story: a scale the
+// kubelet has looked at and refused, because the node it is on cannot fit it.
+//
+// The sibling of [ResizingFrom], and the difference is which figure
+// `allocatedResources` carries. There the kubelet has admitted the resize and
+// only actuation lags, so allocated is the new spec. Here it has admitted
+// nothing, so allocated stays at what is already in force alongside actuated,
+// and spec is a request no node has granted.
+//
+// It matters because upstream sizes the two states differently.
+// resource.PodRequests under UseStatusResources branches on
+// IsPodResizeInfeasible and returns max(actuated, allocated) here — dropping
+// spec from the maximum entirely — where the admitted state returns
+// max(spec, actuated, allocated). So this is the one state in which reading
+// the status charges *less* than reading the spec would.
+func ResizeInfeasibleFrom(spec, actuated corev1.ResourceList) PodOption {
+	return func(p *corev1.Pod) {
+		container := &p.Spec.Containers[0]
+		container.Resources.Requests = spec.DeepCopy()
+
+		p.Status.ContainerStatuses = append(p.Status.ContainerStatuses, corev1.ContainerStatus{
+			Name:               container.Name,
+			Resources:          &corev1.ResourceRequirements{Requests: actuated.DeepCopy()},
+			AllocatedResources: actuated.DeepCopy(),
+		})
+		p.Status.Resources = &corev1.ResourceRequirements{Requests: actuated.DeepCopy()}
+		p.Status.AllocatedResources = actuated.DeepCopy()
+
+		p.Status.Conditions = append(p.Status.Conditions, corev1.PodCondition{
+			Type:   corev1.PodResizePending,
+			Status: corev1.ConditionTrue,
+			Reason: corev1.PodReasonInfeasible,
+		})
+	}
+}
+
 // Priority sets the pod's resolved priority value.
 func Priority(v int32) PodOption {
 	return func(p *corev1.Pod) { p.Spec.Priority = &v }

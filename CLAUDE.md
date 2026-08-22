@@ -129,7 +129,10 @@ anything read from the cluster and `fit.EffectiveRequests` for anything binpack 
 point taking the options unconditionally does not work: a replacement carries the running pod's
 `Status` for the sake of the status-based refusals while the reserve's probe is rebuilt without
 one, so it would size the frontier from a figure the probe throws away and under-reserve by the
-same amount it had been over-reserving.
+same amount it had been over-reserving. `ObservedRequests` computes its pod-level half *both* ways
+and keeps the larger, because that option's gate is Beta rather than GA-locked and neither
+constant is sound: with it on, a refused pod-level resize drops `spec` from the maximum; with it
+off, the scheduler charges that `spec`.
 
 **PDB demand aggregates across the whole drain.** Two pods matching one PDB with
 `disruptionsAllowed: 1` passes a naive zero-check and then half-drains the node. And a pod

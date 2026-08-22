@@ -243,22 +243,60 @@ func EffectiveRequests(pod *corev1.Pod) corev1.ResourceList {
 // what the node is holding and therefore what is not free.
 //
 // The options are the scheduler's own, read off its call site rather than
-// chosen: PodInfo.CalculateResource sets UseStatusResources from
-// InPlacePodVerticalScaling — GA and locked on since 1.35, so there is no
-// cluster where it is off — and InPlacePodLevelResourcesVerticalScalingEnabled
-// from a gate that is Beta and default-on at 1.36. Which way the difference
-// falls is not binpack's to decide: a destination sized any other way is a
-// destination that does not exist, and the packing believes it.
+// chosen. PodInfo.CalculateResource sets UseStatusResources from
+// InPlacePodVerticalScaling, which has been GA and LockToDefault since 1.35 —
+// there is no cluster where it is off, so `true` there is a fact about every
+// scheduler binpack will meet rather than a guess about a gate.
+//
+// InPlacePodLevelResourcesVerticalScalingEnabled is the one that is not
+// settled, and it is handled by asking upstream both ways. It comes from a
+// Beta gate — default-on at 1.36, and so switchable off — and neither constant
+// is sound alone. With it on, a pod-level request whose resize the kubelet has
+// refused as infeasible resolves to max(actuated, allocated), dropping spec
+// entirely; with it off, the scheduler charges that spec. So `true`
+// under-charges such a resident against a scheduler with the gate disabled,
+// and `false` under-charges every pod-level resize against the default one.
+// Under-charging a resident is the unsound direction: it invents free space
+// the node has already given away, and the packing spends it. binpack cannot
+// read another component's feature gates, so it charges the larger of the two
+// answers, which is at least what either scheduler reserves. The cost falls
+// only on a pod-level request in the refused state, and it is a consolidation
+// rather than a wrong answer — ADR-0006's rule for a version-dependent answer,
+// applied to a configuration-dependent one.
+//
+// The second reading is computed only where it can differ. Outside
+// IsPodLevelRequestsSet the option is never consulted, so both calls return the
+// same map and an ordinary pod pays nothing for the corner.
 //
 // The split is by where the pod came from, not by what it looks like. Anything
 // read from the cluster belongs here — the residents a destination starts out
 // holding, and the workload total that orders candidates. Anything binpack
 // built belongs in [EffectiveRequests].
 func ObservedRequests(pod *corev1.Pod) corev1.ResourceList {
-	return requestsWithPodSlot(pod, resourcehelper.PodResourcesOptions{
+	opts := resourcehelper.PodResourcesOptions{
 		UseStatusResources: true,
 		InPlacePodLevelResourcesVerticalScalingEnabled: true,
-	})
+	}
+	out := requestsWithPodSlot(pod, opts)
+
+	if resourcehelper.IsPodLevelRequestsSet(pod) {
+		opts.InPlacePodLevelResourcesVerticalScalingEnabled = false
+		raiseTo(out, requestsWithPodSlot(pod, opts))
+	}
+
+	return out
+}
+
+// raiseTo lifts have to other wherever other asks for more, in place. The
+// counterpart of [Subtract] for a caller holding two readings of one pod that
+// has to keep the conservative one.
+func raiseTo(have, other corev1.ResourceList) {
+	for name, want := range other {
+		got, present := have[name]
+		if !present || got.Cmp(want) < 0 {
+			have[name] = want.DeepCopy()
+		}
+	}
 }
 
 // requestsWithPodSlot is the shared body of the two entry points above: the

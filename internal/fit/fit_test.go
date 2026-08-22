@@ -324,6 +324,53 @@ func TestObservedRequests(t *testing.T) {
 		}
 	})
 
+	t.Run("a container resize the kubelet refused is charged what is in force", func(t *testing.T) {
+		// The same refused state without pod-level requests, and here there is
+		// no ambiguity to be conservative about: UseStatusResources comes from
+		// a GA-locked gate, so every scheduler charges max(actuated,
+		// allocated) and drops the spec nobody has granted. binpack follows it
+		// *down* to 1Gi.
+		//
+		// Worth asserting rather than assuming, because it is the case that
+		// shows this change is not "resolve towards no": matching the
+		// scheduler is the rule, and matching it here means charging less than
+		// the spec. It also pins the fixture — the kubelet has admitted
+		// nothing in this state, so allocatedResources holds the old figure
+		// alongside actuated, and a mother that wrote the new one would answer
+		// 4Gi and agree with nothing.
+		pod := mother.Pod("default", "web",
+			mother.ResizeInfeasibleFrom(requests("100m", "4Gi"), requests("100m", "1Gi")))
+
+		if got := mem(fit.ObservedRequests(pod)); got != "1Gi" {
+			t.Errorf("memory = %s, want 1Gi: the node has allocated 1Gi and refused the rest", got)
+		}
+		if got := mem(fit.EffectiveRequests(pod)); got != "4Gi" {
+			t.Errorf("memory = %s, want 4Gi: a replacement is created at the spec", got)
+		}
+	})
+
+	t.Run("a pod-level resize the kubelet refused is charged the larger reading", func(t *testing.T) {
+		// The one place the scheduler's own answer is not knowable from the
+		// cluster. InPlacePodLevelResourcesVerticalScaling is Beta rather than
+		// GA-locked, so an operator can turn it off — and with it off the
+		// scheduler charges a pod-level request its spec, while with it on it
+		// charges max(actuated, allocated) and drops spec, because the resize
+		// is infeasible. Those are 4Gi and 1Gi for this pod, and nothing
+		// binpack can read says which scheduler it is talking to.
+		//
+		// So it charges the larger. Under-charging a resident invents free
+		// space and approves a drain the scheduler refuses; over-charging
+		// costs a consolidation, which the next run may find.
+		pod := mother.Pod("default", "web",
+			mother.WithPodLevelResources("100m", "4Gi"),
+			mother.ResizeInfeasibleFrom(requests("100m", "4Gi"), requests("100m", "1Gi")))
+
+		if got := mem(fit.ObservedRequests(pod)); got != "4Gi" {
+			t.Errorf("memory = %s, want 4Gi: a scheduler with the pod-level gate off charges "+
+				"the spec, and binpack cannot see which way that gate is set", got)
+		}
+	})
+
 	t.Run("always carries one pod slot", func(t *testing.T) {
 		// Both entry points feed the same subtraction loop, so both owe it the
 		// synthetic slot. Losing it on one would let the simulation pack
