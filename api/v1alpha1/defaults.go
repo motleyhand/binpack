@@ -6,6 +6,14 @@ import "time"
 // working, safe one: pools and their bounds are discovered rather than
 // declared, and dry-run means an unconfigured binpack observes and reports
 // without touching anything.
+//
+// One of them is not binpack's to choose. DefaultRemovalTimeout bounds a wait
+// on the cluster-autoscaler, so its floor is that component's own arithmetic,
+// mirrored below: ten minutes of scale-down-unneeded-time, ten more of
+// scale-down-delay-after-add if anything in the cluster grows during the wait,
+// and up to five during which a node already found unremovable is not looked
+// at again. Twenty-five, and TestRemovalTimeoutCoversTheAutoscalersOwnDelays
+// holds it at or above the first two.
 const (
 	DefaultInterval             = time.Minute
 	DefaultDryRun               = true
@@ -18,11 +26,37 @@ const (
 	DefaultReserveForLargestPod = true
 	DefaultMaxPodsPerDrain      = 0 // unlimited
 	DefaultStallTimeout         = 10 * time.Minute
-	DefaultRemovalTimeout       = 15 * time.Minute
+	DefaultRemovalTimeout       = 25 * time.Minute
 	DefaultBackoffInitial       = 30 * time.Minute
 	DefaultBackoffMax           = 24 * time.Hour
 	DefaultCooldownAfterScaleUp = 10 * time.Minute
 	DefaultCooldownAfterDrain   = 15 * time.Minute
+)
+
+// Upstream defaults, mirrored so the derivation of a binpack default can be
+// stated as arithmetic rather than as a sentence. Not settings: nothing reads
+// these to decide anything, and changing one here changes nothing about the
+// cluster-autoscaler.
+const (
+	// DefaultScaleDownUnneededTime is the cluster-autoscaler's own
+	// --scale-down-unneeded-time: how long a node must have been unneeded
+	// before it will remove it. cluster-autoscaler config/const.go,
+	// DefaultScaleDownUnneededTime.
+	//
+	// It is the floor under [DefaultRemovalTimeout], and it restarts when the
+	// autoscaler process does: the unneeded-since map is built fresh by
+	// unneeded.NewNodes on every start, so a node the previous process had
+	// been watching for nine minutes starts again from zero.
+	DefaultScaleDownUnneededTime = 10 * time.Minute
+
+	// DefaultUnremovableNodeRecheck is the cluster-autoscaler's own
+	// --unremovable-node-recheck-timeout: having found a node unremovable it
+	// caches that answer and does not ask again for this long.
+	// cluster-autoscaler config/flags/flags.go.
+	//
+	// So the delays do not merely add up — the autoscaler can also stop
+	// looking part-way through one and come back after it has passed.
+	DefaultUnremovableNodeRecheck = 5 * time.Minute
 )
 
 // SetDefaults fills in unset top-level fields. Policy fields are left alone:

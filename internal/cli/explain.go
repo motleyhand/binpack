@@ -144,8 +144,7 @@ func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
 	out.Drain = &drainReport{
 		Node: name,
 		WouldHappen: drain.WouldHappen(a, drain.Assess(
-			drain.State{Node: a.Node, Pods: drain.PodsOn(s, name), Now: s.Now},
-			drain.PolicyFor(cfg, s, name))),
+			drain.StateFor(s, a.Node), drain.PolicyFor(cfg, s, name))),
 	}
 
 	// The marked node's own row, replaced. Selection assessed it as a node

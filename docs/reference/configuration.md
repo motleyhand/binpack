@@ -59,7 +59,7 @@ policy:
   drain:
     maxPodsPerDrain: 0
     stallTimeout: 10m0s
-    removalTimeout: 15m0s
+    removalTimeout: 25m0s
 
   backoff:
     initial: 30m0s
@@ -369,8 +369,39 @@ Once the node is **empty**, how long to wait for the autoscaler to delete it bef
 **uncordoning** and recording the drain as failed.
 
 A different question from `stallTimeout`, which is why it is a different field: that one is
-about your workload, this one is about the autoscaler. The default of 15 minutes suits a
-cluster-autoscaler that typically reaps within about ten.
+about your workload, this one is about the autoscaler. It is also the only bound here whose
+deadline binpack does not set, so the default is derived from the cluster-autoscaler's own
+arithmetic rather than chosen:
+
+| | |
+|---|---:|
+| `--scale-down-unneeded-time` — how long a node must have been unneeded before it is removed | 10m |
+| `--scale-down-delay-after-add` — all scale-down suppressed after the cluster grows | 10m |
+| `--unremovable-node-recheck-timeout` — a node already found unremovable is not looked at again | 5m |
+| **default `removalTimeout`** | **25m** |
+
+The second is cluster-wide rather than per-pool, because `--scale-down-delay-type-local` defaults
+to `false`: a scale-up in a pool binpack is not touching still holds up the removal of a node in
+one it is.
+
+Those are the upstream defaults, and your autoscaler may not be running them — a managed control
+plane sets its own, and they are not always documented. They are on the process, so its own
+command line answers it:
+
+```
+kubectl -n <autoscaler-namespace> get deploy -l app=cluster-autoscaler \
+  -o jsonpath='{.items[*].spec.template.spec.containers[*].command}'
+```
+
+If any of the three is longer than above, raise `removalTimeout` by the difference.
+
+The arithmetic covers one scale-up. It cannot cover several, so binpack does not try: while the
+autoscaler's post-growth pause is running, the removal wait is **deferred** rather than expired.
+That defers only — the clock underneath keeps running, so a node already past its bound is handed
+back on the first evaluation after the pause lifts, and a cluster that keeps growing cannot hold
+a cordoned node indefinitely. The width of the pause is `cooldown.afterScaleUp`, which is
+binpack's figure for the same flag. An autoscaler that has *stopped* ends the wait immediately
+whatever it published on its way out, since nothing would remove the node then.
 
 This is a correctness bound, not a convenience. A cordoned node that nothing removes is lost
 schedulable capacity, and if the pool is at its maximum, pods can stay Pending while a healthy
@@ -465,10 +496,12 @@ for the cluster to settle after.
 Both are distinct from the per-node backoff that follows a *failed* drain, which lives on the
 node and does survive a restart — and is therefore the one bound that works in every mode.
 
-Both govern whether a drain **starts**, not whether one continues. A cooldown opening while a
-drain is already relocating pods does not end it, and neither does the autoscaler reporting a
-scale-up in progress: the pods that have already moved would stay moved, so stopping would spend
-the disruption and keep none of the benefit. Up until the first eviction the checks do apply,
+Both govern whether a drain **starts**, not whether one continues — and neither ever *ends* one.
+A cooldown opening while a drain is already relocating pods does not end it, and neither does the
+autoscaler reporting a scale-up in progress: the pods that have already moved would stay moved,
+so stopping would spend the disruption and keep none of the benefit. `afterScaleUp` is read once
+more after that, in the opposite direction: it is how wide the pause is that defers
+`removalTimeout` on an emptied node, above. Up until the first eviction the checks do apply,
 which is the window in which stopping is free. Whether the remaining pods still fit, whether they
 are still evictable, and whether anything will still remove the node are re-asked before every
 eviction regardless —

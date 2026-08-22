@@ -2603,3 +2603,87 @@ func TestTheHardestPodToPlaceIsEvictedFirst(t *testing.T) {
 		t.Errorf("evicted a 2Gi pod first; the 7-core one is the hard placement, and it is still on the node")
 	}
 }
+
+// TestAnEmptiedNodeWaitsThroughAScaleUpButNotThroughADeadAutoscaler pairs the
+// extension with the thing that still ends it.
+//
+// The cluster-autoscaler gates all scale-down on its own
+// scale-down-delay-after-add, cluster-wide, so a deploy anywhere can hold an
+// emptied node past removalTimeout. binpack waits through that rather than
+// uncordoning a node the autoscaler was about to delete. What it must not do
+// is wait through it for ever, and the failure that makes a wait meaningless
+// is the autoscaler being gone — nothing else would ever remove the node, and
+// a scale-up it published before it stopped would otherwise keep the drain
+// alive on the strength of a process that no longer exists.
+//
+// That question is answered where every other wait answers it: revalidation
+// reads the published status, reports not-autoscaled, and the executor hands
+// the node back on the verdict before the assessment is consulted at all.
+func TestAnEmptiedNodeWaitsThroughAScaleUpButNotThroughADeadAutoscaler(t *testing.T) {
+	policy := drainPolicy()
+	policy.ScaleUpPause = 10 * time.Minute
+
+	for _, tc := range []struct {
+		name string
+		// probeAgo is how long since the autoscaler last completed a scan,
+		// against a five-minute MaxStatusAge. A status ConfigMap outlives the
+		// process that wrote it, so freshness is what tells them apart.
+		probeAgo  time.Duration
+		wantCode  string
+		wantEnded bool
+	}{
+		{
+			name:     "a live autoscaler inside its own post-scale-up pause is waited for",
+			probeAgo: 10 * time.Second,
+			wantCode: executor.StepAwaitRemoval,
+		},
+		{
+			name:      "an autoscaler that has stopped ends the wait, scale-up or no",
+			probeAgo:  30 * time.Minute,
+			wantCode:  engine.SkipNotAutoscaled,
+			wantEnded: true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			// Empty, and sixteen minutes past a fifteen-minute bound. Settled
+			// rather than bare: a node binpack emptied got that way by
+			// evicting, so the drain is committed and the cooldowns have
+			// stopped applying to it.
+			n := marked("a", time.Hour, 16*time.Minute, "0", mother.NodeAnnotations(
+				map[string]string{engine.AnnotationDrainAwaiting: engine.AwaitingSettled}))
+
+			s := snapshot([]*corev1.Node{n, node("b")}, nil)
+			s.Autoscaler.LastProbe = at.Add(-tc.probeAgo)
+			s.Autoscaler.LastScaleUp = at.Add(-2 * time.Minute)
+
+			c := clientFor(s)
+			step, err := executor.Advance(
+				context.Background(), c, s, "a", engineConfig(), policy)
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+
+			if step.Code != tc.wantCode {
+				t.Errorf("step code = %q, want %q", step.Code, tc.wantCode)
+			}
+			if step.Done != tc.wantEnded || step.Failed != tc.wantEnded {
+				t.Errorf("got %+v, want ended=%v", step, tc.wantEnded)
+			}
+			if after := nodeFrom(t, c, "a"); after.Spec.Unschedulable == tc.wantEnded {
+				t.Errorf("cordoned = %v, want %v", after.Spec.Unschedulable, !tc.wantEnded)
+			}
+			if tc.wantEnded {
+				return
+			}
+			// The pause defers the abandonment; it does not restart the clock.
+			// Restamping here would hold the removal bound at zero for as long
+			// as the cluster kept growing, so the node would never be handed
+			// back once the gate opened — the wait made unbounded by the very
+			// thing meant to keep it honest.
+			if got := nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainProgress]; got !=
+				at.Add(-16*time.Minute).Format(time.RFC3339) {
+				t.Errorf("progress marker = %q, want it left where it was", got)
+			}
+		})
+	}
+}

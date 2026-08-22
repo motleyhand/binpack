@@ -492,7 +492,9 @@ elapsed time. The reasoning is in [ADR-0007](adr-0007-drain-progress-not-deadlin
 4. **Revalidate and repeat.** Re-snapshot and re-check the remaining pods before each subsequent
    eviction. If the remaining set no longer fits, stop, uncordon, and record a partial drain.
 5. **Verify removal.** Once the node is empty, wait up to `removalTimeout` for the autoscaler to
-   delete it. If it still exists, uncordon and record the drain as failed.
+   delete it, plus the length of any post-growth pause the autoscaler is inside — it suppresses
+   its own scale-down cluster-wide after a scale-up, so the deadline for this step is partly
+   somebody else's to set. If it still exists, uncordon and record the drain as failed.
 
 Every branch of this protocol ends with the node either deleted or uncordoned. That is not
 tidiness, it is the central safety property: a cordoned node the autoscaler never removes is
@@ -659,7 +661,7 @@ policy:                               # applies to every discovered pool
   drain:
     maxPodsPerDrain: 0                # 0 = unlimited; a blast-radius guard
     stallTimeout: 10m0s               # abandon if no progress, not if slow
-    removalTimeout: 15m0s             # once empty, how long to await deletion
+    removalTimeout: 25m0s             # once empty, how long to await deletion
   backoff:
     initial: 30m0s                    # per node, after a failed drain
     max: 24h0m0s

@@ -172,10 +172,10 @@ func Advance(
 	//
 	// Assessing here costs nothing that returning early saved: it reads the
 	// snapshot and writes nothing.
-	pods := podsOn(s, name)
+	state := drain.StateFor(s, a.Node)
+	pods := state.Pods
 
-	assessment := drain.Assess(
-		drain.State{Node: a.Node, Pods: pods, Now: s.Now}, policy)
+	assessment := drain.Assess(state, policy)
 
 	switch {
 	case a.SkipCode == engine.SkipUncordoned:
@@ -655,16 +655,6 @@ func pausable(blockers []engine.EvictionBlocker) bool {
 		}
 	}
 	return len(blockers) > 0
-}
-
-func podsOn(s engine.Snapshot, name string) []*corev1.Pod {
-	var on []*corev1.Pod
-	for _, pod := range s.Pods {
-		if pod.Spec.NodeName == name {
-			on = append(on, pod)
-		}
-	}
-	return on
 }
 
 // terminating finds a pod on the node that is on its way out.

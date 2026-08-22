@@ -39,6 +39,33 @@ type State struct {
 	// a pod on its way out is still occupying it.
 	Pods []*corev1.Pod
 	Now  time.Time
+
+	// LastScaleUp is when the cluster-autoscaler last published a scale-up:
+	// clusterWide.scaleUp.lastTransitionTime, verbatim. Zero where it has
+	// published none.
+	//
+	// Taken bare, which is not what the engine's cooldown does with the same
+	// field — that one reads it against two controller-held observations,
+	// because the autoscaler restamps the transition on every restart and a
+	// stand-down of the whole cluster is too much to spend on a scale-up that
+	// never happened.
+	//
+	// The question here is a different one, and the restart answers it
+	// truthfully. This is not "did the cluster grow", it is "could the
+	// autoscaler remove this node in the next few minutes", and after a
+	// restart it could not: the unneeded-since map is process memory, built
+	// fresh by unneeded.NewNodes, so every node's scale-down-unneeded-time
+	// starts again from the new process's first scan — the same instant the
+	// restamped transition names. A different mechanism from the one the
+	// timestamp describes, beginning together and, on stock flags, lasting
+	// the same ten minutes.
+	//
+	// The directions of error settle it either way. Believing a restamp
+	// leaves an empty node cordoned for at most one pause longer than it
+	// needed to be. Disbelieving a real scale-up abandons a drain the
+	// autoscaler was going to finish, which is the whole of what this field
+	// exists to prevent.
+	LastScaleUp time.Time
 }
 
 // Policy is the part of a resolved pool policy this package needs.
@@ -54,7 +81,7 @@ type State struct {
 // pools twice: the value that says how long to wait would then be free to
 // disagree with the value that decided the wait was owed.
 //
-// All four are taken as resolved. Nothing here defaults a zero, for the same
+// All of them are taken as resolved. Nothing here defaults a zero, for the same
 // reason [Assess] does not: a caller that built this by hand has skipped the
 // layer that fills values in, and quietly supplying one is how a configured
 // setting comes to differ from the setting that is applied.
@@ -63,6 +90,19 @@ type Policy struct {
 	RemovalTimeout time.Duration
 	BackoffInitial time.Duration
 	BackoffMax     time.Duration
+
+	// ScaleUpPause is how long the cluster-autoscaler suppresses scale-down
+	// after the cluster grows — its own --scale-down-delay-after-add, which
+	// gates all scale-down cluster-wide because --scale-down-delay-type-local
+	// defaults to false.
+	//
+	// Resolved from cooldown.afterScaleUp, which is the same number: that
+	// setting is binpack's mirror of that flag and is documented as one.
+	// binpack holds one figure for the autoscaler's post-growth pause rather
+	// than two that could disagree, and the two uses are consistent — the
+	// cooldown declines to *start* a drain the autoscaler would not finish
+	// yet, and this declines to give up on one for the same reason.
+	ScaleUpPause time.Duration
 }
 
 // Action is what to do with a drain that is already under way.
@@ -137,10 +177,12 @@ func AbandonCodes() []string {
 // PodsOn is the pods a drain assessment reads. Terminating ones included: a pod
 // on its way out is still occupying the node.
 //
-// The same filter the executor applies before its own [Assess] call, and it has
-// to stay the same — which is why there is one of it rather than one per
+// The filter every [Assess] call applies, acting and reporting alike, and it
+// has to stay the same — which is why there is one of it rather than one per
 // caller. What it feeds tells an operator what acting would do, so a pod set
-// that differed from the acting path's would describe a drain nobody would get.
+// that differed from the acting path's would describe a drain nobody would
+// get. Exported because [StateFor] is not the only way in: a caller assembling
+// a [State] by hand still has to filter the same way.
 func PodsOn(s engine.Snapshot, name string) []*corev1.Pod {
 	var on []*corev1.Pod
 	for _, pod := range s.Pods {
@@ -149,6 +191,26 @@ func PodsOn(s engine.Snapshot, name string) []*corev1.Pod {
 		}
 	}
 	return on
+}
+
+// StateFor builds the assessment's input for one node from a snapshot.
+//
+// One of it for the same reason there is one [PodsOn]: three places assess a
+// drain — the executor before it acts, and `explain` and the dry-run path to
+// say what acting would do — and a report assembled from a different set of
+// facts describes a drain nobody would get. The pod filter was already shared;
+// what this adds is that a fact reaching the judgement reaches all three.
+//
+// The node is passed rather than looked up because the caller has already
+// resolved it: revalidation hands back the node it read, and re-finding it by
+// name here would be a second lookup free to disagree with the first.
+func StateFor(s engine.Snapshot, node *corev1.Node) State {
+	return State{
+		Node:        node,
+		Pods:        PodsOn(s, node.Name),
+		Now:         s.Now,
+		LastScaleUp: s.Autoscaler.LastScaleUp,
+	}
 }
 
 // PolicyFor resolves the bounds that govern the drain of one named node, from
@@ -175,6 +237,7 @@ func policyFrom(p engine.Policy) Policy {
 		RemovalTimeout: p.RemovalTimeout,
 		BackoffInitial: p.BackoffInitial,
 		BackoffMax:     p.BackoffMax,
+		ScaleUpPause:   p.CooldownAfterScaleUp,
 	}
 }
 
@@ -292,8 +355,11 @@ func Assess(s State, policy Policy) Assessment {
 		// marker says. Without this, a controller returning from a twenty-minute
 		// outage to find the last pod gone would uncordon and back off a node
 		// the autoscaler has not yet had a chance to remove.
+		//
+		// And guarded by the autoscaler's own gate, because this is the one
+		// bound whose deadline binpack does not set. See scaleDownPaused.
 		if since, known := sinceProgress(s.Node, s.Now); !progressed && known &&
-			since > policy.RemovalTimeout {
+			since > policy.RemovalTimeout && !scaleDownPaused(s, policy) {
 			return Assessment{
 				Action: Abandon, Code: AbandonNotRemoved,
 				Reason: fmt.Sprintf(
@@ -315,6 +381,38 @@ func Assess(s State, policy Policy) Assessment {
 	}
 
 	return Assessment{Action: Continue, Remaining: len(mine), Progressed: progressed}
+}
+
+// scaleDownPaused reports whether the cluster-autoscaler has told binpack it
+// will not be removing anything just yet.
+//
+// It publishes when the cluster last grew, and its own scale-down is gated on
+// that: `a.lastScaleUpTime.Add(a.ScaleDownDelayAfterAdd).After(currentTime)`
+// in isScaleDownInCooldown suppresses every scale-down cluster-wide, not
+// merely in the pool that grew. So an emptied node waiting to be reaped can be
+// held past any removalTimeout by a deploy in a namespace nobody was thinking
+// about, and abandoning there uncordons a node the autoscaler was going to
+// delete a minute later. The same predicate, read from outside.
+//
+// ADR-0007's argument, one level up: a wall clock cannot tell a slow removal
+// from an abandoned one, so bound the absence of progress instead. A scale-up
+// is the cluster stating that the removal will be slow.
+//
+// Deferring, not resetting. The pause suppresses the abandonment and nothing
+// else — in particular it is not progress, so the marker is not restamped and
+// the elapsed time keeps running underneath. When the gate opens on a node
+// that has been empty past its bound, the next evaluation abandons it at once.
+// That is what keeps the wait terminating: each scale-up buys at most one
+// pause measured from itself, never a fresh removalTimeout. What ends the wait
+// on an autoscaler that has *stopped* is separate and unaffected —
+// revalidation reports SkipNotAutoscaled from the same published status, and
+// the executor hands the node back on the verdict before it reaches this
+// assessment at all.
+func scaleDownPaused(s State, policy Policy) bool {
+	if policy.ScaleUpPause <= 0 || s.LastScaleUp.IsZero() {
+		return false
+	}
+	return s.Now.Sub(s.LastScaleUp) < policy.ScaleUpPause
 }
 
 // stuck finds a pod that is past its termination deadline, and by how much.

@@ -490,3 +490,29 @@ func TestNoStatedJoinIsNoJoinRatherThanAnEmptyOne(t *testing.T) {
 		t.Errorf("NodeGroupJoin() = %v on a document that states none", got)
 	}
 }
+
+// TestRemovalTimeoutCoversTheAutoscalersOwnDelays pins the one bound whose
+// deadline is set by a component binpack does not control.
+//
+// removalTimeout is how long binpack waits for the cluster-autoscaler to
+// delete a node it has emptied, and the autoscaler's own arithmetic decides
+// when that can happen: the node must have been unneeded for
+// scale-down-unneeded-time, and a scale-up anywhere in the cluster suppresses
+// all scale-down for scale-down-delay-after-add on top of that — one
+// cluster-wide gate, since scale-down-delay-type-local defaults to false. A
+// default shorter than the sum abandons a drain the autoscaler was going to
+// finish: the pods moved for nothing, the consolidation is lost, and a node
+// that did nothing wrong collects backoff.
+//
+// The floor, not the value. The default carries headroom over it for the
+// recheck timeout, and the assertion deliberately does not pin that — what
+// must not happen is the number drifting back under the sum.
+func TestRemovalTimeoutCoversTheAutoscalersOwnDelays(t *testing.T) {
+	floor := DefaultScaleDownUnneededTime + DefaultCooldownAfterScaleUp
+	if DefaultRemovalTimeout < floor {
+		t.Errorf("DefaultRemovalTimeout = %s, want at least %s "+
+			"(scale-down-unneeded-time %s + scale-down-delay-after-add %s)",
+			DefaultRemovalTimeout, floor,
+			DefaultScaleDownUnneededTime, DefaultCooldownAfterScaleUp)
+	}
+}
