@@ -76,6 +76,22 @@ type Discovery struct {
 	// reading that ConfigMap is bound in — see docs/reference/rbac.md.
 	AutoscalerNamespace string `json:"autoscalerNamespace,omitempty"`
 
+	// AutoscalerStatusName is what that ConfigMap is called, which is the
+	// value the autoscaler was started with --status-config-map-name and
+	// defaults to cluster-autoscaler-status.
+	//
+	// A sibling of AutoscalerNamespace rather than a field nested under it,
+	// because upstream keeps them apart: --namespace is the namespace the
+	// autoscaler runs in, and --status-config-map-name names one object
+	// inside it. Nesting the two would imply a single setting that upstream
+	// can move as a unit, and it cannot.
+	//
+	// Configurable for the same reason the namespace is. binpack looking in
+	// one place, finding nothing and reporting "no cluster-autoscaler is
+	// running" is a claim about the operator's cluster it has not established
+	// — and on a cluster that renamed the object, a false one.
+	AutoscalerStatusName string `json:"autoscalerStatusName,omitempty"`
+
 	// NodeGroups states outright which node group a NodeGroupIDLabel value
 	// belongs to, for the clusters where neither join binpack can make works:
 	// the identifier is not a legal label value, and it was not generated

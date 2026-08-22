@@ -107,18 +107,30 @@ type Finding struct {
 var diagnoses = map[string]Diagnosis{
 	FindingNoAutoscaler: {
 		Severity: Blocking,
-		Summary: "no cluster-autoscaler is running, so nothing will remove a node however " +
-			"empty it becomes",
-		// The namespace is deliberately not named here. The autoscaler
-		// publishes into the namespace it runs in, which the upstream chart
-		// sets to whatever you install it into — so a fix that says
-		// kube-system is wrong on every cluster that chose otherwise, and
-		// says it about a component that is working. Where binpack actually
-		// looked is a fact about this run rather than about the code, and the
-		// report's closing line names it.
-		Fix: "check that cluster autoscaling is enabled for this cluster, that the " +
-			"cluster-autoscaler-status ConfigMap is being updated, and that " +
-			"discovery.autoscalerNamespace names the namespace the autoscaler runs in.",
+		// Deliberately not "no cluster-autoscaler is running". Five
+		// observations reach this finding — the status object missing, the
+		// object present and empty, an autoscalerStatus other than Running, a
+		// probe time absent or too old, and an autoscaler reporting the
+		// cluster unhealthy — and binpack has established "nothing is running"
+		// in none of them from a single Get. What it has established is the
+		// consequence, which is the same in all five and is what the reader
+		// needs. The Detail says which observation this was; a summary
+		// asserting the autoscaler is gone above a detail saying binpack
+		// cannot tell whether it is alive was the pair this replaces.
+		Summary: "the cluster-autoscaler is not in a state to remove a node, so nothing will " +
+			"remove one however empty it becomes",
+		// The location is deliberately not named here. The autoscaler
+		// publishes into the namespace it runs in, under the name it was
+		// given — the upstream chart sets the first to whatever you install it
+		// into — so a fix that says kube-system/cluster-autoscaler-status is
+		// wrong on every cluster that chose otherwise, and says it about a
+		// component that is working. Where binpack actually looked is a fact
+		// about this run rather than about the code, and the report's closing
+		// line names it.
+		Fix: "read the detail above for what binpack found, then check that cluster " +
+			"autoscaling is enabled for this cluster, that the status ConfigMap is being " +
+			"updated, and that discovery.autoscalerNamespace and " +
+			"discovery.autoscalerStatusName name where the autoscaler publishes it.",
 	},
 	FindingNoCandidates: {
 		Severity: Info,
@@ -301,7 +313,7 @@ func Diagnose(s Snapshot, cfg Config) []Finding {
 	// since every pool is absent from a status document that does not exist.
 	// The remaining checks stand alone: a budget pinning a node is worth
 	// reporting whether or not anything can currently remove one.
-	if live, why := s.Autoscaler.Live(s.Now); !live {
+	if live, _, why := s.Autoscaler.Live(s.Now); !live {
 		findings = append(findings, finding(FindingNoAutoscaler, "cluster", why))
 	} else {
 		findings = append(findings, diagnoseAutoscaler(s)...)
@@ -569,7 +581,7 @@ type grouped struct {
 // Empty when there is no live autoscaler, where every pool is absent from a
 // status document that does not exist and the distinction is meaningless.
 func staticNodes(s Snapshot, cfg Config) map[string]bool {
-	if live, _ := s.Autoscaler.Live(s.Now); !live {
+	if live, _, _ := s.Autoscaler.Live(s.Now); !live {
 		return nil
 	}
 

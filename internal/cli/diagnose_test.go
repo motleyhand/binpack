@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
@@ -21,7 +22,7 @@ import (
 func renderFindings(t *testing.T, format outputFormat, findings []engine.Finding) string {
 	t.Helper()
 	var buf bytes.Buffer
-	opts := &options{output: format, out: &buf, autoscalerNamespace: renderedNamespace}
+	opts := &options{output: format, out: &buf, autoscalerStatus: renderedStatus}
 	if err := renderDiagnose(opts, findings); err != nil {
 		t.Fatalf("rendering: %v", err)
 	}
@@ -29,6 +30,13 @@ func renderFindings(t *testing.T, format outputFormat, findings []engine.Finding
 }
 
 const renderedNamespace = "kube-system"
+
+// renderedStatus is where these renderings say binpack read the autoscaler's
+// status from.
+var renderedStatus = collect.StatusRef{
+	Namespace: renderedNamespace,
+	Name:      collect.StatusConfigMapName,
+}
 
 var sample = []engine.Finding{
 	{
@@ -400,7 +408,7 @@ func TestTheBlockingFooterIsTrueOfEveryBlockingCode(t *testing.T) {
 	// exception, so a report without it must not carry it. Without this the
 	// closing could be true of every code by saying everything about all of
 	// them, which is the failure the split was made to avoid.
-	if strings.Contains(out, noAutoscalerFooter(renderedNamespace)) {
+	if strings.Contains(out, noAutoscalerFooter(renderedStatus)) {
 		t.Errorf("a report with no no-autoscaler finding still closes by talking about "+
 			"one:\n%s", out)
 	}
@@ -451,7 +459,7 @@ func TestTheBlockingFooterIsTrueOfEveryBlockingCode(t *testing.T) {
 		"until it clears, acting on the rest of this report frees no node",
 		"the rest of this report frees no node",
 	} {
-		if strings.Contains(noAutoscalerFooter(renderedNamespace), unconditional) {
+		if strings.Contains(noAutoscalerFooter(renderedStatus), unconditional) {
 			t.Errorf("the no-autoscaler closing line says %q with no condition, which is "+
 				"false when an autoscaler is running and only its status reporting is off — "+
 				"the case the line's own next sentence raises", unconditional)
@@ -518,7 +526,7 @@ func TestTheNoAutoscalerClosingLineNamesWhereBinpackLooked(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	opts := &options{output: outputText, out: &buf, autoscalerNamespace: "autoscaler"}
+	opts := &options{output: outputText, out: &buf, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName}}
 	if err := renderDiagnose(opts, []engine.Finding{findingFor(noAutoscaler)}); err != nil {
 		t.Fatalf("rendering: %v", err)
 	}
@@ -540,7 +548,7 @@ func TestTheNoAutoscalerClosingLineNamesWhereBinpackLooked(t *testing.T) {
 	// kube-system whatever binpack was configured with is the original defect
 	// in prose.
 	buf.Reset()
-	opts.autoscalerNamespace = "somewhere-else"
+	opts.autoscalerStatus = collect.StatusRef{Namespace: "somewhere-else", Name: collect.StatusConfigMapName}
 	if err := renderDiagnose(opts, []engine.Finding{findingFor(noAutoscaler)}); err != nil {
 		t.Fatalf("rendering: %v", err)
 	}

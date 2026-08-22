@@ -8,7 +8,9 @@
 package collect
 
 import (
+	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"sigs.k8s.io/yaml"
@@ -16,8 +18,8 @@ import (
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
-// StatusConfigMapName is where the cluster-autoscaler publishes what it is
-// doing.
+// StatusConfigMapName is what the cluster-autoscaler calls the object it
+// publishes its status into, unless it was told otherwise.
 //
 // This object is the reason binpack needs no cloud credentials. It is present
 // and populated even on a managed control plane whose autoscaler pods and logs
@@ -25,18 +27,60 @@ import (
 // the cluster last grew — everything binpack would otherwise have to ask a
 // cloud API for. See ADR-0004.
 //
-// The name is fixed; the namespace is not, and is configuration rather than a
-// constant here. The autoscaler writes its status into the namespace it was
-// given with --namespace, which the upstream chart sets to whatever namespace
-// you install it into — so kube-system is a common answer and not the only
-// one. binpack reads the namespace it is told to read and no other: a cluster
+// Neither half of where it lives is fixed. The autoscaler writes into the
+// namespace it was given with --namespace — which the upstream chart sets to
+// whatever namespace you install it into, so kube-system is a common answer
+// and not the only one — under the name it was given with
+// --status-config-map-name. Both are configuration here for the same reason:
+// binpack reporting "no cluster-autoscaler is running" because it looked
+// somewhere else is a claim about the operator's cluster that it has not
+// established. See discovery.autoscalerNamespace and
+// discovery.autoscalerStatusName.
+//
+// binpack reads the one location it is told to read and no other: a cluster
 // can hold a stale status ConfigMap alongside the live one, and a search
 // across namespaces would have to pick between two documents it cannot tell
-// apart. See discovery.autoscalerNamespace.
+// apart.
 const (
 	StatusConfigMapName = "cluster-autoscaler-status"
 	statusKey           = "status"
 )
+
+// StatusRef is where to look for that object.
+//
+// A type rather than two string parameters. They are adjacent, both strings,
+// and a caller that swapped them would compile, run, find nothing and report a
+// cluster with no autoscaler — which is precisely the confident, wrong answer
+// making the location configurable exists to end.
+type StatusRef struct {
+	Namespace string
+	Name      string
+}
+
+func (r StatusRef) String() string { return r.Namespace + "/" + r.Name }
+
+// legacyPrefix is what cluster-autoscaler 1.29 and earlier open their status
+// with. Before 1.30 the status was ClusterAutoscalerStatus.GetReadableString()
+// wrapped in a header line — indented free text whose continuation lines carry
+// colons, so it is not YAML and the parser fails on line 4 of a document the
+// operator did not write, naming neither the component nor the version.
+//
+// Checked ahead of the unmarshal rather than after it, because one shape of
+// that document does parse: a 1.29 autoscaler with no conditions yet yields a
+// zero struct, which reads downstream as "no autoscaler is running" — the same
+// wrong answer, arrived at silently.
+const legacyPrefix = "Cluster-autoscaler status at "
+
+// ErrPre130Status is returned for a status document in the pre-1.30 format.
+//
+// binpack's whole no-cloud-credentials design rests on the structured status
+// document, which arrived in cluster-autoscaler 1.30 (ADR-0004). Below that
+// version binpack cannot work at all, and saying so is the only useful thing
+// it can do.
+var ErrPre130Status = errors.New(
+	"the cluster-autoscaler is publishing the free-text status format used before " +
+		"cluster-autoscaler 1.30; binpack reads the structured status document that " +
+		"version introduced, and cannot work with an older autoscaler")
 
 // status mirrors the parts of the autoscaler's status document binpack reads.
 // Unknown fields are ignored: this is somebody else's schema, and it grows.
@@ -84,6 +128,10 @@ type transition struct {
 // is how binpack learns not to touch it — no configuration required, and no
 // way for that configuration to drift.
 func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
+	if strings.HasPrefix(document, legacyPrefix) {
+		return engine.Autoscaler{}, ErrPre130Status
+	}
+
 	var s status
 	if err := yaml.Unmarshal([]byte(document), &s); err != nil {
 		return engine.Autoscaler{}, fmt.Errorf("parsing the cluster-autoscaler status: %w", err)
@@ -92,7 +140,14 @@ func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
 	out := engine.Autoscaler{
 		// Anything other than Running means the autoscaler is not in a state
 		// to reap a drained node, so binpack should not create one.
-		Running:         s.AutoscalerStatus == "Running",
+		Running: s.AutoscalerStatus == "Running",
+		// Kept alongside the verdict, because the refusal has to be able to
+		// say what was read. An autoscaler reporting Initializing and one that
+		// is not there are different facts about the operator's cluster, and
+		// binpack asserted the second about both.
+		StatusFound:     true,
+		ObservedStatus:  s.AutoscalerStatus,
+		HealthStatus:    s.ClusterWide.Health.Status,
 		ScaleDownStatus: s.ClusterWide.ScaleDown.Status,
 	}
 
@@ -105,10 +160,15 @@ func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
 	if t := s.ClusterWide.Health.LastProbeTime; t != nil {
 		out.LastProbe = *t
 	} else if published, ok := parseStatusTime(s.Time); ok {
-		// Older autoscalers may not publish a health probe time. Falling back
-		// to the document's own timestamp keeps binpack usable there, rather
-		// than refusing to work at all on a cluster whose autoscaler is
-		// demonstrably fine.
+		// The document's own timestamp, for the one window where the health
+		// probe time is genuinely absent: a process that has published a
+		// status but not yet completed a scan, which reports Initializing and
+		// is refused above on that account anyway. It is not, as this comment
+		// once said, a concession to older autoscalers — every release that
+		// publishes the structured document sets the health probe time on
+		// every scan, and the ones that do not are refused outright as
+		// pre-1.30. Kept because a freshness reading binpack has is better
+		// than one it invents, not because anything depends on it.
 		out.LastProbe = published
 	}
 

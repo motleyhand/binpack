@@ -69,7 +69,8 @@ alerts rather than being folded into this one:
 | Code | Meaning |
 |---|---|
 | `drain` | A node was chosen |
-| `no-autoscaler` | No live cluster-autoscaler; binpack will not act |
+| `no-autoscaler` | Nothing binpack found would remove a drained node: no status object where it looked, one carrying no status, an `autoscalerStatus` other than `Running`, or a probe time absent or older than five minutes |
+| `autoscaler-unhealthy` | The cluster-autoscaler is alive and reporting, and reports the cluster as unhealthy — so it has stopped scaling in both directions |
 | `no-candidates` | Every node was ruled out before any simulation ran |
 | `none-feasible` | Nodes were simulated and none could be emptied |
 | `draining` | A drain was already under way, so no new node was chosen: binpack advanced that drain, or — under `dryRun: true` — reported it and carried on |

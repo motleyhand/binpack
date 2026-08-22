@@ -93,20 +93,43 @@ The count goes to stderr, so `--output json` on stdout stays machine-readable.
 
 ### `no-autoscaler` — blocking
 
-No cluster-autoscaler is running, so nothing will remove a node however empty it becomes.
+The cluster-autoscaler is not in a state to remove a node, so nothing will remove one however
+empty it becomes.
 
 binpack refuses to act at all in this state: draining a node nothing will reap is strictly
-worse than doing nothing. The check is deliberately strict — a status ConfigMap outlives the
-autoscaler that wrote it and keeps reporting `Running` indefinitely, so binpack also requires a
-recent probe time.
+worse than doing nothing.
 
-**Fix.** Check that cluster autoscaling is enabled for the cluster, that the
-`cluster-autoscaler-status` ConfigMap is being updated, and that `discovery.autoscalerNamespace`
-names the namespace the autoscaler runs in. The report's closing line names the object binpack
-read, because two healthy clusters look identical to one with no autoscaler from where binpack
-is standing: an autoscaler publishing into a namespace binpack was not pointed at, and one
-running with status reporting turned off. `kubectl get configmap cluster-autoscaler-status -A`
-tells the two apart.
+**Five observations reach this finding, and the detail line says which.** They are different
+facts about your cluster, and only one of them means no autoscaler is running:
+
+| What binpack observed | What it means |
+|---|---|
+| No status object where binpack looked | Either there is no autoscaler, or it publishes elsewhere, or it runs with `--write-status-configmap=false`. binpack cannot tell which from one read, and does not claim to |
+| The object is there and carries no status | Something is writing that ConfigMap without a status document in it |
+| `autoscalerStatus` is something other than `Running` | The autoscaler is there and said so itself — `Initializing` is the value you are most likely to see, during start-up |
+| No probe time, or one older than five minutes | The document outlived the process that wrote it. A status ConfigMap keeps reporting `Running` indefinitely after its autoscaler is gone, which is why freshness is checked separately |
+| `clusterWide.health.status: Unhealthy` | The autoscaler is alive and scanning, and has stopped scaling in **both** directions until the cluster recovers. See below |
+
+**Fix.** Read the detail line for which of those it was, then check that cluster autoscaling is
+enabled for the cluster, that the status ConfigMap is being updated, and that
+`discovery.autoscalerNamespace` and `discovery.autoscalerStatusName` name where the autoscaler
+publishes it. The report's closing line names the object binpack read, because two healthy
+clusters look identical to one with no autoscaler from where binpack is standing: an autoscaler
+publishing somewhere binpack was not pointed at, and one running with status reporting turned
+off. `kubectl get configmap -A | grep autoscaler` tells the two apart.
+
+**An `Unhealthy` cluster is worth calling out**, because `autoscalerStatus` stays `Running`
+throughout it and the probe time keeps advancing — both of binpack's other guards pass. The
+autoscaler sets this when more than `--ok-total-unready-count` nodes *and* more than
+`--max-total-unready-percentage` of the cluster are NotReady; it then logs "Cluster is not ready
+for autoscaling" and returns before any scale-up or scale-down. A drain started then evicts real
+workload during an incident and reaches a node nothing removes. The evaluation is counted under
+its own outcome code, `autoscaler-unhealthy`, so it is distinguishable in
+[the metrics](metrics.md) from a cluster with no autoscaler at all.
+
+Requires **cluster-autoscaler 1.30 or later**, which is where the structured status document
+arrived. An older autoscaler is reported as such rather than as a parse failure — see
+[the version floor](configuration.md#supported-cluster-autoscaler-versions).
 
 When there is no autoscaler, the pool checks are skipped entirely: every pool is absent from a
 status document that does not exist, and reporting each one would bury the single answer that

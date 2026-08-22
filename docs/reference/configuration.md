@@ -41,6 +41,9 @@ discovery:
   # The namespace the cluster-autoscaler publishes its status ConfigMap into,
   # which is the namespace it runs in.
   autoscalerNamespace: kube-system
+  # And what that ConfigMap is called, which is the autoscaler's own
+  # --status-config-map-name.
+  autoscalerStatusName: cluster-autoscaler-status
   # Membership stated outright, for clusters where binpack cannot work it out.
   # Bounds are never stated here: they come from the status ConfigMap.
   nodeGroups: []
@@ -236,16 +239,54 @@ chart creates binpack's Role for reading that ConfigMap in it — so if you mana
 the Role has to move too, or every read is a 403. See the
 [RBAC reference](rbac.md).
 
-Pointed at the wrong namespace, binpack reports that no cluster-autoscaler is running and
-refuses to act, which is indistinguishable from a cluster that genuinely has none. `binpack
-explain` and `binpack diagnose` both name the object they read, so the output says which
-namespace was consulted.
+Pointed at the wrong namespace, binpack finds nothing and refuses to act. It says so as what it
+observed — no status object where it looked — rather than as a claim that no autoscaler is
+running, because from one failed read those are not the same fact. `binpack explain` and
+`binpack diagnose` both name the object they read, so the output says which namespace was
+consulted.
 
 There is deliberately no search across namespaces. A status ConfigMap outlives the autoscaler
 that wrote it, so a cluster can hold a stale one beside the live one, and nothing about either
 object says which is which — a search would have to guess, and a wrong guess here produces a
 confident answer about the wrong autoscaler. See
 [ADR-0004](../design/adr-0004-provider-agnostic-no-cloud-api.md).
+
+### `discovery.autoscalerStatusName`
+
+What that ConfigMap is called. The autoscaler's own `--status-config-map-name` flag decides it,
+and defaults to `cluster-autoscaler-status`; binpack defaults to the same.
+
+A separate setting from the namespace above because upstream keeps the two flags separate — one
+names where the autoscaler runs, the other names one object inside it — and either can be
+changed without the other.
+
+Most installations never touch this. If yours might have, the same command that finds the
+namespace shows the name:
+
+```bash
+kubectl get configmap -A -l app.kubernetes.io/name=clusterautoscaler
+```
+
+or, if that label is not set, look for whatever the autoscaler's Deployment passes to
+`--status-config-map-name`:
+
+```bash
+kubectl get deploy -n <discovery.autoscalerNamespace> -o yaml | grep status-config-map-name
+```
+
+### Supported cluster-autoscaler versions
+
+binpack needs **cluster-autoscaler 1.30 or later**, on any provider.
+
+That is where the structured status document arrived. Before it, the autoscaler wrote its status
+as free text — a rendered block meant for a human reading `kubectl describe`, not a schema — and
+every fact binpack reads without cloud credentials comes out of the structured form:
+[ADR-0004](../design/adr-0004-provider-agnostic-no-cloud-api.md) rests on it entirely. Against
+an older autoscaler binpack now says so; it used to fail with a YAML parser complaining about a
+line of a document you did not write.
+
+The Kubernetes version is a separate question. A cluster can run a recent Kubernetes with a
+pinned older autoscaler, which is what this floor is about.
 
 ### `policy.enabled`
 
@@ -388,7 +429,28 @@ Suppress action cluster-wide for a period after the cluster grew, and after binp
 second lets the cluster settle before binpack considers removing another node.
 
 `afterScaleUp` is measured from what the cluster-autoscaler publishes about itself, so it
-survives a binpack restart. `afterDrain` is measured from binpack's own memory of the drain,
+survives a binpack restart. It does **not** survive a *cluster-autoscaler* restart, and that is
+worth knowing because the two look identical in the object binpack reads. The autoscaler keeps
+the previous status in process memory and starts empty, so its first scan after a restart finds
+every cluster-wide condition changed and stamps each transition — the scale-up one included —
+with that scan's time. Nothing in the published document distinguishes that stamp from a real
+scale-up.
+
+binpack therefore reads the timestamp next to what it has already seen that autoscaler publish,
+rather than on its own: a transition older than anything binpack has observed from this process,
+or one binpack watched pass through `InProgress`, is a scale-up; a stamp pinned to the first
+scan binpack ever saw is a restart. A managed control plane restarts the autoscaler for its own
+reasons — an upgrade, an OOMKill, a leader-election handover — and before this, each one cost a
+full `afterScaleUp` stand-down that `binpack explain` attributed to a scale-up that had not
+happened.
+
+The cost of reading it that way is a scale-up binpack neither preceded nor witnessed, where the
+cooldown does not apply. `scale-up-in-progress` still covers the window while the cluster is
+actually growing, and the cooldown is a preference rather than a safety check — everything that
+makes a drain safe is asked again regardless. `binpack explain`, which reads the cluster once
+and has no such history, says so in its output rather than answering as though it did.
+
+`afterDrain` is measured from binpack's own memory of the drain,
 because a successful drain deletes the node that would otherwise have recorded it — so a restart
 or a change of leader inside the cooldown window forgets it, and the next drain may come sooner
 than the interval you configured.

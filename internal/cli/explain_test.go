@@ -1060,7 +1060,7 @@ func TestExplainSaysWhereItLookedForTheAutoscaler(t *testing.T) {
 	s := explainCluster([]*corev1.Node{explainNode("a")}, nil)
 	s.Autoscaler = engine.Autoscaler{}
 
-	out := renderedExplainIn(t, &options{output: outputText, autoscalerNamespace: "autoscaler"},
+	out := renderedExplainIn(t, &options{output: outputText, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName}},
 		s, explainConfig())
 
 	if !strings.Contains(out, "autoscaler/cluster-autoscaler-status") {
@@ -1072,7 +1072,7 @@ func TestExplainSaysWhereItLookedForTheAutoscaler(t *testing.T) {
 func TestExplainSaysNothingAboutWhereItLookedWhenTheAutoscalerIsThere(t *testing.T) {
 	// The reverse: the object is worth naming as the evidence behind a
 	// refusal, and is noise on a cluster where the answer was yes.
-	out := renderedExplainIn(t, &options{output: outputText, autoscalerNamespace: "autoscaler"},
+	out := renderedExplainIn(t, &options{output: outputText, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName}},
 		explainCluster([]*corev1.Node{explainNode("a")}, nil), explainConfig())
 
 	if strings.Contains(out, "cluster-autoscaler-status") {
@@ -1176,5 +1176,74 @@ func TestTheJsonReportCarriesTheJoin(t *testing.T) {
 	}
 	if got := view.Pools.Groups["workers"]; got != "eks-workers-a2c1d3e4-1111" {
 		t.Errorf("pools.groups[workers] = %q", got)
+	}
+}
+
+func TestExplainStillShowsItsWorkingWhenTheAutoscalerIsUnhealthy(t *testing.T) {
+	// The refusal is the headline; the arithmetic underneath it is what the
+	// command exists to show, and withholding it was the defect that made a
+	// working binpack look like a broken binary. That fix was keyed on one
+	// decision code, so a second refusal reached before any node is assessed
+	// silently reintroduces it.
+	s := explainCluster(
+		[]*corev1.Node{explainNode("node-a"), explainNode("node-b"), explainNode("node-c")},
+		[]*corev1.Pod{mother.Pod("default", "web", mother.OnNode("node-a"))})
+	s.Autoscaler.HealthStatus = engine.HealthUnhealthy
+
+	out := renderedExplainIn(t, &options{output: outputText}, s, explainConfig())
+
+	if !strings.Contains(out, "unhealthy") {
+		t.Errorf("explain does not say the autoscaler reports the cluster unhealthy:\n%s", out)
+	}
+	// The verdict a row carries, not the node's name: names are single words
+	// that appear all over a page of prose, and asserting on one is an
+	// assertion that cannot fail. The pools are published here — the
+	// autoscaler wrote its whole status — so every row reaches a real verdict.
+	if !strings.Contains(out, engine.VerdictDrainable) {
+		t.Errorf("explain withheld the arithmetic on a cluster it could read in full:\n%s", out)
+	}
+	// And having refused, it must not mark one as chosen.
+	if strings.Contains(out, "* ") {
+		t.Errorf("a binpack that will not act marked a node as chosen:\n%s", out)
+	}
+
+	var view explainView
+	if err := json.Unmarshal([]byte(renderedExplain(t, outputJSON, s, explainConfig())), &view); err != nil {
+		t.Fatalf("decoding the JSON output: %v", err)
+	}
+	if len(view.Nodes) != 3 {
+		t.Errorf("json nodes = %d, want every node in the cluster", len(view.Nodes))
+	}
+	// And the sentence that goes with the empty-handed refusal is wrong here:
+	// there is an autoscaler, and binpack read its whole status document.
+	if strings.Contains(out, "could determine without one") {
+		t.Errorf("explain says it had no autoscaler to read, on a cluster where it "+
+			"read one and quoted it:\n%s", out)
+	}
+}
+
+func TestExplainDisclosesItCannotTellARestartFromAScaleUp(t *testing.T) {
+	// explain reads the cluster once, so it has none of the observations that
+	// tell the autoscaler's restart stamp from a real scale-up — and falls
+	// back to the reading that credits it. Left unsaid, an operator reads
+	// "cooldown-after-scale-up" as the deployed binpack's answer, and it may
+	// not be.
+	s := explainCluster([]*corev1.Node{explainNode("a"), explainNode("b")}, nil)
+	s.Autoscaler.LastScaleUp = s.Autoscaler.LastProbe.Add(-time.Minute)
+	cfg := explainConfig()
+	cfg.Default.CooldownAfterScaleUp = 10 * time.Minute
+
+	out := renderedExplainIn(t, &options{output: outputText}, s, cfg)
+
+	if !strings.Contains(out, "cooldown.afterScaleUp is read differently by explain") {
+		t.Errorf("explain reports a cooldown it cannot verify without saying so:\n%s", out)
+	}
+
+	// And says nothing where the cooldown decided nothing: the note is a
+	// caveat on an answer, not a standing disclaimer.
+	quiet := renderedExplainIn(t, &options{output: outputText},
+		explainCluster([]*corev1.Node{explainNode("a"), explainNode("b")}, nil), cfg)
+	if strings.Contains(quiet, "read differently by explain") {
+		t.Errorf("explain carries the caveat on a run where no cooldown applied:\n%s", quiet)
 	}
 }

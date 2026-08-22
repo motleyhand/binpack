@@ -57,10 +57,22 @@ That single object answers all three questions:
 - `minSize` and `maxSize` are the pool bounds, straight from the component that enforces them.
 
 It also yields two signals worth more than what was originally designed. `scaleUp
-lastTransitionTime` gives a precise cooldown reference, replacing an inference from node
-creation timestamps. And `scaleDown.status: NoCandidates` is the autoscaler stating binpack's
-entire reason for existing in its own words — which makes it an excellent thing to surface in
-`diagnose`.
+lastTransitionTime` gives a cooldown reference from the component that decides it, replacing an
+inference from node creation timestamps — though "precise", as this said, overstates it: the
+autoscaler carries the previous condition in process memory, so its first scan after a restart
+restamps the transition with nothing having been added, and the timestamp is only believable
+next to what binpack has already seen that process publish. And `scaleDown.status: NoCandidates`
+is the autoscaler stating binpack's entire reason for existing in its own words — which makes it
+an excellent thing to surface in `diagnose`.
+
+### Which version of that object
+
+Amended after the fact, like the namespace below. The structured document above arrived in
+cluster-autoscaler **1.30**; before it the same ConfigMap carried a rendered text block meant
+for a human. Everything in this ADR rests on the structured form, so 1.30 is a floor on the
+whole design rather than a detail of the parser — stated in
+[the configuration reference](../reference/configuration.md#supported-cluster-autoscaler-versions),
+and reported as such when binpack meets an older one.
 
 ### Which namespace that object is in
 

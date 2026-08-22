@@ -51,7 +51,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 			}
 
 			snapshot, err := collect.Snapshot(cmd.Context(), client, time.Now(),
-				cfg.Discovery.AutoscalerNamespace)
+				statusRef(cfg))
 			if err != nil {
 				return err
 			}
@@ -67,7 +67,7 @@ func newExplainCommand(opts *options) *cobra.Command {
 
 			opts.configSource = source
 			opts.dryRun = cfg.Settings().DryRun
-			opts.autoscalerNamespace = cfg.Discovery.AutoscalerNamespace
+			opts.autoscalerStatus = statusRef(cfg)
 			return renderExplain(opts, snapshot, explainOutcome(snapshot, resolved))
 		},
 	}
@@ -101,7 +101,7 @@ func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
 	// had read their cluster at all, which is what a broken binary looks like.
 	// The refusal is still the headline; what changes is that the arithmetic
 	// underneath it survives.
-	if out.Decision.Code == engine.CodeNoAutoscaler {
+	if engine.PreflightRefused(out.Decision.Code) {
 		out.Nodes = engine.Assess(s, cfg)
 	}
 
@@ -116,6 +116,18 @@ func explainOutcome(s engine.Snapshot, cfg engine.Config) explainOutput {
 		out.NotEvaluated = append(out.NotEvaluated, fmt.Sprintf(
 			"cooldown.afterDrain (%s sets %s) is not visible to explain: %s",
 			where, d, engine.NoDrainToMeasureFrom))
+	}
+
+	// And the other reading that depends on memory this process has not got.
+	// Reported only where it actually decided something: cooldown.afterScaleUp
+	// is set by default, so a note on every run would be noise, and the
+	// divergence only exists when the cooldown ruled a node out.
+	if slices.ContainsFunc(out.Nodes, func(a engine.NodeAssessment) bool {
+		return a.SkipCode == engine.SkipCooldownAfterScaleUp
+	}) {
+		out.NotEvaluated = append(out.NotEvaluated, fmt.Sprintf(
+			"cooldown.afterScaleUp is read differently by explain: %s",
+			engine.NoAutoscalerHistory))
 	}
 
 	name := engine.Marked(s)
@@ -445,7 +457,7 @@ func renderExplain(opts *options, s engine.Snapshot, out explainOutput) error {
 func buildView(s engine.Snapshot, out explainOutput) explainView {
 	d := out.Decision
 	var v explainView
-	live, _ := s.Autoscaler.Live(s.Now)
+	live, _, _ := s.Autoscaler.Live(s.Now)
 	v.Autoscaler.Running = live
 	v.Autoscaler.ScaleDownStatus = s.Autoscaler.ScaleDownStatus
 	for _, g := range s.Autoscaler.Groups {
@@ -563,7 +575,7 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 
 	// The same liveness check Decide uses, so this line cannot contradict the
 	// decision printed below it.
-	live, why := s.Autoscaler.Live(s.Now)
+	live, _, why := s.Autoscaler.Live(s.Now)
 
 	p("\ncluster-autoscaler: ")
 	if !live {
@@ -574,8 +586,8 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 		// else — which is far likelier than their autoscaler being gone.
 		// Printed only here: on a cluster where the answer is yes, the object
 		// binpack read to find that out answers nothing.
-		if opts.autoscalerNamespace != "" {
-			p(" — read %s/%s", opts.autoscalerNamespace, collect.StatusConfigMapName)
+		if opts.autoscalerStatus.Namespace != "" {
+			p(" — read %s", opts.autoscalerStatus)
 		}
 		p("\n")
 	} else {
@@ -706,7 +718,18 @@ func writeVerdict(p func(string, ...any), live bool, why string, d engine.Decisi
 		// either, which would be a second wrong answer: the pools come from
 		// the same status document, so what binpack could determine without
 		// one is exactly what the rows say and no more.
-		p("the table above is what binpack could determine without one\n")
+		//
+		// Unless there is one. An autoscaler reporting the cluster unhealthy
+		// has published its whole status, so the rows are complete and the
+		// sentence about determining things without an autoscaler is simply
+		// untrue — the refusal is about what that autoscaler is doing, not
+		// about what binpack could read.
+		if d.Code == engine.CodeAutoscalerUnhealthy {
+			p("the table above is binpack's full reading of the cluster; nothing acts on it\n")
+			p("until the autoscaler reports the cluster healthy again\n")
+		} else {
+			p("the table above is what binpack could determine without one\n")
+		}
 		// Still said, because this is the condition that ends a drain rather
 		// than one that merely stops a new one starting: revalidation refuses
 		// to continue through a dead autoscaler, so the next evaluation hands

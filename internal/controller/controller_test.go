@@ -103,6 +103,15 @@ func inPool(name string, opts ...mother.NodeOption) *corev1.Node {
 // fixture agreeing with the old constant could not have shown it.
 const statusNamespace = "autoscaler"
 
+// statusRef is that location as Options takes it. A named object as well as a
+// named namespace, and for the same reason: both were constants once, and a
+// fixture agreeing with a constant cannot show that binpack reads what it is
+// told.
+var statusRef = collect.StatusRef{
+	Namespace: statusNamespace,
+	Name:      collect.StatusConfigMapName,
+}
+
 func statusConfigMap() client.Object { return statusConfigMapProbedAt(time.Now()) }
 
 // statusConfigMapProbedAt is the autoscaler's status document with its
@@ -144,7 +153,7 @@ func newEvaluator(t *testing.T, log *captured, rec *fakeRecorder, objs ...client
 		writer:   c,
 		reporter: broadcastReporter{recorder: rec},
 		opts: Options{Engine: withDrainBounds(config()), DryRun: true,
-			Interval: time.Minute, Once: true, AutoscalerNamespace: statusNamespace},
+			Interval: time.Minute, Once: true, AutoscalerStatus: statusRef},
 		log:  log.logger(),
 		stop: func() {},
 	}
@@ -317,7 +326,7 @@ func TestARefusalIsVisibleOnTheNode(t *testing.T) {
 func decisionAt(t *testing.T, ev *evaluator, when time.Time) engine.Decision {
 	t.Helper()
 
-	s, err := collect.Snapshot(context.Background(), ev.reader, when, ev.opts.AutoscalerNamespace)
+	s, err := collect.Snapshot(context.Background(), ev.reader, when, ev.opts.AutoscalerStatus)
 	if err != nil {
 		t.Fatalf("collecting the snapshot the decision was made from: %v", err)
 	}
@@ -884,7 +893,7 @@ func TestTheCacheDoesNotWatchEveryConfigMapInTheCluster(t *testing.T) {
 	// and hold every ConfigMap in the cluster to serve that one Get — Helm
 	// release data, certificate bundles, all of it, permanently, by a tool
 	// whose purpose is to reduce what the cluster costs.
-	opts := cacheOptions(statusNamespace)
+	opts := cacheOptions(statusRef)
 
 	byConfigMap, ok := opts.ByObject[&corev1.ConfigMap{}]
 	if !ok {
@@ -971,7 +980,7 @@ func TestOnceWritesItsEventBeforeTheProcessExits(t *testing.T) {
 			now:      func() time.Time { return time.Unix(0, 0).UTC() },
 		},
 		opts: Options{Engine: config(), DryRun: true, Once: true,
-			AutoscalerNamespace: statusNamespace},
+			AutoscalerStatus: statusRef},
 		log:  log.logger(),
 		stop: func() {},
 	}
@@ -1052,7 +1061,7 @@ func TestOnceWritesARefusalOnEveryNodeBeforeTheProcessExits(t *testing.T) {
 			now: func() time.Time { return time.Unix(0, 0).UTC() },
 		},
 		opts: Options{Engine: withDrainBounds(config()), DryRun: true, Once: true,
-			AutoscalerNamespace: statusNamespace},
+			AutoscalerStatus: statusRef},
 		log:  log.logger(),
 		stop: func() {},
 	}
@@ -1264,7 +1273,7 @@ func TestAnUnresolvableConfigurationStillEndsTheEvaluationWithNoDrainInFlight(t 
 func snapshotOf(t *testing.T, ev *evaluator) engine.Snapshot {
 	t.Helper()
 	s, err := collect.Snapshot(context.Background(), ev.reader, time.Now(),
-		ev.opts.AutoscalerNamespace)
+		ev.opts.AutoscalerStatus)
 	if err != nil {
 		t.Fatalf("reading the cluster: %v", err)
 	}
@@ -2272,5 +2281,63 @@ func TestTheEvaluationDecidesAgainstTheJoinItResolved(t *testing.T) {
 	if log.contains("nothing to do") {
 		t.Errorf("the evaluation also refused, so it did not decide once:\n%s",
 			strings.Join(log.lines, "\n"))
+	}
+}
+
+func TestRememberAutoscalerTellsARestartFromAScaleUp(t *testing.T) {
+	// The half of the restart fix that a single document cannot carry. The
+	// autoscaler stamps its scale-up transition with its first scan's time
+	// after every restart, and one evaluation later that stamp is simply an
+	// old timestamp — indistinguishable from a real scale-up, and worth a
+	// full cooldown of cluster-wide inaction every time a managed control
+	// plane restarts the component.
+	t0 := time.Date(2026, 8, 15, 12, 0, 0, 0, time.UTC)
+	scan := func(n int) time.Time { return t0.Add(time.Duration(n) * 10 * time.Second) }
+
+	ev := &evaluator{}
+
+	// The generation's first scan as binpack happens to see it: transition
+	// and probe are the same moment, because the process found every
+	// condition changed against an empty memory.
+	first := engine.Autoscaler{LastProbe: scan(0), LastScaleUp: scan(0)}
+	ev.rememberAutoscaler(&first)
+	if !first.EarliestProbe.Equal(scan(0)) {
+		t.Errorf("EarliestProbe = %s, want the first scan seen %s", first.EarliestProbe, scan(0))
+	}
+	if !first.WatchedScaleUp.IsZero() {
+		t.Errorf("WatchedScaleUp = %s, want zero: binpack has watched nothing grow",
+			first.WatchedScaleUp)
+	}
+
+	// Six scans later the transition has not moved and the probe has. On this
+	// document alone the stamp reads as a scale-up a minute ago.
+	later := engine.Autoscaler{LastProbe: scan(6), LastScaleUp: scan(0)}
+	ev.rememberAutoscaler(&later)
+	if !later.EarliestProbe.Equal(scan(0)) {
+		t.Errorf("EarliestProbe = %s, want it pinned to %s", later.EarliestProbe, scan(0))
+	}
+
+	// A real one, watched from InProgress through to the transition the
+	// autoscaler writes when the episode ends.
+	growing := engine.Autoscaler{LastProbe: scan(7), LastScaleUp: scan(0), ScaleUpInProgress: true}
+	ev.rememberAutoscaler(&growing)
+	if !growing.WatchedScaleUp.IsZero() {
+		t.Errorf("WatchedScaleUp = %s, want zero while the episode is still running",
+			growing.WatchedScaleUp)
+	}
+
+	grew := engine.Autoscaler{LastProbe: scan(9), LastScaleUp: scan(9)}
+	ev.rememberAutoscaler(&grew)
+	if !grew.WatchedScaleUp.Equal(scan(9)) {
+		t.Errorf("WatchedScaleUp = %s, want the transition that ended the episode %s",
+			grew.WatchedScaleUp, scan(9))
+	}
+
+	// And a restart after that does not inherit the trust. The stamp is a new
+	// value, so it is not the one binpack watched.
+	restarted := engine.Autoscaler{LastProbe: scan(20), LastScaleUp: scan(20)}
+	ev.rememberAutoscaler(&restarted)
+	if restarted.WatchedScaleUp.Equal(restarted.LastScaleUp) {
+		t.Error("a later restart's stamp inherited the trust earned by an earlier scale-up")
 	}
 }

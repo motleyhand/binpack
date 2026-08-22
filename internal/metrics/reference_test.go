@@ -83,7 +83,8 @@ func TestEveryLabelValueTheEngineCanProduceIsDocumented(t *testing.T) {
 	doc := referenceText(t)
 
 	for _, code := range []string{
-		engine.CodeDrain, engine.CodeNoAutoscaler, engine.CodeNoCandidates, engine.CodeNoneFeasible,
+		engine.CodeDrain, engine.CodeNoAutoscaler, engine.CodeAutoscalerUnhealthy,
+		engine.CodeNoCandidates, engine.CodeNoneFeasible, engine.CodeDraining,
 		engine.VerdictSkipped, engine.VerdictInfeasible, engine.VerdictBlocked, engine.VerdictDrainable,
 		engine.SkipNotAutoscaled, engine.SkipPoolDisabled, engine.SkipScaleUpInProgress,
 		engine.SkipCooldownAfterScaleUp, engine.SkipCooldownAfterDrain, engine.SkipPoolAtMinimum,

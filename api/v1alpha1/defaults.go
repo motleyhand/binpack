@@ -12,6 +12,7 @@ const (
 	DefaultNodeGroupIDLabel     = "doks.digitalocean.com/node-pool-id"
 	DefaultPoolNameLabel        = "doks.digitalocean.com/node-pool"
 	DefaultAutoscalerNamespace  = "kube-system"
+	DefaultAutoscalerStatusName = "cluster-autoscaler-status"
 	DefaultEnabled              = true
 	DefaultExpendableCutoff     = int32(-10)
 	DefaultReserveForLargestPod = true
@@ -53,6 +54,9 @@ func (c *Config) SetDefaults() {
 	// what keeps a configuration that says nothing about it working.
 	if c.Discovery.AutoscalerNamespace == "" {
 		c.Discovery.AutoscalerNamespace = DefaultAutoscalerNamespace
+	}
+	if c.Discovery.AutoscalerStatusName == "" {
+		c.Discovery.AutoscalerStatusName = DefaultAutoscalerStatusName
 	}
 }
 

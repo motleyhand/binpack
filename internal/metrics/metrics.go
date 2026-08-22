@@ -249,7 +249,7 @@ func Observe(s engine.Snapshot, d engine.Decision, cfg engine.Config, took float
 	evaluationDuration.Observe(took)
 	lastEvaluation.Set(float64(s.Now.Unix()))
 
-	live, _ := s.Autoscaler.Live(s.Now)
+	live, _, _ := s.Autoscaler.Live(s.Now)
 	autoscalerUp.Set(boolAsFloat(live))
 
 	state.publish(func() {

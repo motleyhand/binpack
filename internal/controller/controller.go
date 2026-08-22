@@ -113,11 +113,11 @@ type Options struct {
 	Engine     engine.Config
 	Log        logr.Logger
 
-	// AutoscalerNamespace is where the cluster-autoscaler publishes its status
-	// ConfigMap. It scopes the watch-backed cache as well as the read, so a
-	// value that disagrees with the deployment's RBAC fails the cache's very
-	// first list rather than one evaluation at a time.
-	AutoscalerNamespace string
+	// AutoscalerStatus is where the cluster-autoscaler publishes its status
+	// ConfigMap. Its namespace scopes the watch-backed cache as well as the
+	// read, so a value that disagrees with the deployment's RBAC fails the
+	// cache's very first list rather than one evaluation at a time.
+	AutoscalerStatus collect.StatusRef
 
 	// Interval is how often the cluster is evaluated.
 	Interval time.Duration
@@ -199,10 +199,18 @@ func Run(ctx context.Context, opts Options) error {
 	// every ConfigMap in the cluster instead of one. Refused here so it is
 	// reported as the configuration problem it is, rather than as a cluster
 	// with no cluster-autoscaler in it.
-	if opts.AutoscalerNamespace == "" {
+	if opts.AutoscalerStatus.Namespace == "" {
 		return errors.New(
 			"no namespace to read the cluster-autoscaler's status from: set " +
 				"discovery.autoscalerNamespace to the namespace the autoscaler runs in")
+	}
+	// The same wiring mistake in the other half. An empty name selects on
+	// metadata.name="" and matches nothing, so the cache would come up empty
+	// and every evaluation would report a cluster with no autoscaler in it.
+	if opts.AutoscalerStatus.Name == "" {
+		return errors.New(
+			"no name to read the cluster-autoscaler's status by: set " +
+				"discovery.autoscalerStatusName to the object the autoscaler publishes")
 	}
 
 	mgr, err := manager.New(opts.RestConfig, managerOptions(opts))
@@ -265,7 +273,7 @@ func outcome(managerErr, evaluationErr error) error {
 func managerOptions(opts Options) manager.Options {
 	out := manager.Options{
 		Logger: opts.Log,
-		Cache:  cacheOptions(opts.AutoscalerNamespace),
+		Cache:  cacheOptions(opts.AutoscalerStatus),
 		// Nothing here serves traffic or answers webhooks, so leaving these
 		// off in Once mode is not a reduced mode of operation — it is the
 		// absence of servers a process about to exit would never be scraped
@@ -366,14 +374,14 @@ func orDefault(d, fallback time.Duration) *time.Duration {
 // place it has to arrive: a cache scoped to one namespace while the reads go
 // to another returns nothing at all, and the controller would report an
 // absent cluster-autoscaler with no error anywhere to say why.
-func cacheOptions(autoscalerNamespace string) cache.Options {
+func cacheOptions(status collect.StatusRef) cache.Options {
 	return cache.Options{
 		ByObject: map[client.Object]cache.ByObject{
 			&corev1.ConfigMap{}: {
 				Namespaces: map[string]cache.Config{
-					autoscalerNamespace: {
+					status.Namespace: {
 						FieldSelector: fields.OneTermEqualSelector(
-							"metadata.name", collect.StatusConfigMapName),
+							"metadata.name", status.Name),
 					},
 				},
 			},
@@ -483,6 +491,27 @@ type evaluator struct {
 	// failure mode, to protect against a restart that happens to fall inside
 	// one cooldown window.
 	lastDrain time.Time
+
+	// earliestProbe and watchedScaleUp are what this process has seen the
+	// cluster-autoscaler publish about itself over time, and they exist
+	// because one status document cannot be read on its own.
+	//
+	// The autoscaler holds the previous status in process memory, so its first
+	// scan after a restart finds every cluster-wide condition changed and
+	// stamps each transition with that scan's probe time. binpack read that as
+	// a scale-up and stood the whole cluster down for cooldown.afterScaleUp —
+	// on a managed control plane, every time the provider restarted the
+	// autoscaler, which the operator cannot see. Two observations tell the
+	// phantom from the real thing where one cannot: the phantom is pinned to
+	// the generation's first scan, and a real transition binpack watched pass
+	// through InProgress is one it saw happen. See [engine.Autoscaler].
+	//
+	// Memory rather than persistence, like lastDrain above and for the same
+	// trade: a restart forgets, and forgetting costs at most one cooldown that
+	// binpack does not apply.
+	earliestProbe   time.Time
+	watchedScaleUp  time.Time
+	scaleUpUnderway bool
 
 	// consecutiveFailures counts evaluations that failed back to back, and is
 	// reset by any that does not. See [evaluator.failed].
@@ -598,6 +627,44 @@ func (e *evaluator) failed(ctx context.Context, err error) error {
 	return nil
 }
 
+// rememberAutoscaler folds what this process has already seen the autoscaler
+// publish into the snapshot it is about to decide from.
+//
+// Two facts, and each answers a different half of "is this stamp real".
+//
+// The earliest probe binpack has seen this process publish bounds where a
+// restart stamp can be: the autoscaler writes it on its own first scan, so a
+// transition older than anything binpack has observed cannot be one. That is
+// the case of a scale-up that happened before binpack started watching, which
+// binpack could not have witnessed and has no other way to credit.
+//
+// The scale-up it watched go through InProgress and come out again is the
+// other: the transition time the autoscaler publishes when the episode ends is
+// the one binpack saw end, and it is trusted by value rather than by age, so a
+// later restart's stamp does not inherit that trust.
+//
+// Written before the decision and read by it, so an evaluation decides from
+// everything this process knows rather than from the last document alone.
+func (e *evaluator) rememberAutoscaler(a *engine.Autoscaler) {
+	if !a.LastProbe.IsZero() && (e.earliestProbe.IsZero() || a.LastProbe.Before(e.earliestProbe)) {
+		e.earliestProbe = a.LastProbe
+	}
+
+	switch {
+	case a.ScaleUpInProgress:
+		// Nothing to credit yet: while it is in progress the transition time
+		// is the episode's start, and the autoscaler rewrites it when the
+		// episode ends. cooling refuses on ScaleUpInProgress alone anyway.
+		e.scaleUpUnderway = true
+	case e.scaleUpUnderway:
+		// The first scan after the one binpack last saw growing, which is
+		// where the end-of-episode transition appears.
+		e.watchedScaleUp, e.scaleUpUnderway = a.LastScaleUp, false
+	}
+
+	a.EarliestProbe, a.WatchedScaleUp = e.earliestProbe, e.watchedScaleUp
+}
+
 // shuttingDown reports whether the manager has begun stopping.
 //
 // A named question rather than the cancellation read inline, because the two
@@ -610,7 +677,7 @@ func shuttingDown(ctx context.Context) bool { return ctx.Err() != nil }
 func (e *evaluator) attempt(ctx context.Context) error {
 	started := time.Now()
 
-	snapshot, err := collect.Snapshot(ctx, e.reader, started, e.opts.AutoscalerNamespace)
+	snapshot, err := collect.Snapshot(ctx, e.reader, started, e.opts.AutoscalerStatus)
 	if err != nil {
 		// Counted rather than returned on sight. A read that fails every tick
 		// is a broken deployment — bad RBAC, most likely — and a controller
@@ -620,6 +687,8 @@ func (e *evaluator) attempt(ctx context.Context) error {
 		// interval, the clock every drain ran on.
 		return fmt.Errorf("reading the cluster: %w", err)
 	}
+
+	e.rememberAutoscaler(&snapshot.Autoscaler)
 
 	// How nodes join to pools is derived from this snapshot, not configured:
 	// on EKS, GKE and AKS no label carries the identifier the autoscaler

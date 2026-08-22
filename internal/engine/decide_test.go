@@ -331,7 +331,7 @@ func TestLiveIsTheSameJudgementEverywhere(t *testing.T) {
 	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
 	s.Autoscaler.LastProbe = now.Add(-time.Hour)
 
-	live, why := s.Autoscaler.Live(s.Now)
+	live, _, why := s.Autoscaler.Live(s.Now)
 	d := engine.Decide(s, config())
 
 	if live {
@@ -1531,5 +1531,168 @@ func TestChosenCandidateDoesNotDependOnInputOrder(t *testing.T) {
 		if d.Node.Name != "a" {
 			t.Errorf("listed %v: drained %s, want a", listed, d.Node.Name)
 		}
+	}
+}
+
+func TestDecideRefusesWhenTheAutoscalerReportsAnUnhealthyCluster(t *testing.T) {
+	// autoscalerStatus is Running whenever the process is past start-up — it
+	// is the only value the constant set admits besides Initializing — so it
+	// says nothing about whether the autoscaler is doing anything. Health is
+	// the field that does: below --ok-total-unready-count the autoscaler logs
+	// "Cluster is not ready for autoscaling" and returns before any scale-up
+	// or scale-down, while still refreshing the probe time. Both of binpack's
+	// existing guards pass, and the drain it approves is one nothing will
+	// reap — during an incident, which is when the churn is least welcome.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	s.Autoscaler.HealthStatus = "Unhealthy"
+
+	d := engine.Decide(s, config())
+
+	if d.Action != engine.None {
+		t.Fatalf("an autoscaler reporting an unhealthy cluster will not reap a node, got a drain of %s", d.Node.Name)
+	}
+	if d.Code != engine.CodeAutoscalerUnhealthy {
+		t.Errorf("code = %q, want %q", d.Code, engine.CodeAutoscalerUnhealthy)
+	}
+	if !strings.Contains(d.Reason, "unhealthy") {
+		t.Errorf("reason should say the autoscaler reports the cluster unhealthy, got: %s", d.Reason)
+	}
+}
+
+func TestLiveNamesWhatTheStatusSaid(t *testing.T) {
+	// One sentence covered four different observations, and asserted the one
+	// thing binpack had not established in three of them: that no autoscaler
+	// is running. A ConfigMap nobody wrote, a ConfigMap with nothing in it and
+	// an autoscaler mid-start are different facts about the reader's cluster,
+	// and only the first is even consistent with the sentence.
+	for _, tc := range []struct {
+		name       string
+		autoscaler engine.Autoscaler
+		want       string
+		notWant    string
+	}{
+		{
+			name:       "nothing was found where binpack looked",
+			autoscaler: engine.Autoscaler{},
+			want:       "no cluster-autoscaler status",
+		},
+		{
+			name:       "the object is there but says nothing",
+			autoscaler: engine.Autoscaler{StatusFound: true},
+			want:       "carries no autoscalerStatus",
+			notWant:    "no cluster-autoscaler is running",
+		},
+		{
+			name:       "the autoscaler named a status of its own",
+			autoscaler: engine.Autoscaler{StatusFound: true, ObservedStatus: "Initializing"},
+			want:       "Initializing",
+			notWant:    "no cluster-autoscaler is running",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			live, _, why := tc.autoscaler.Live(now)
+
+			if live {
+				t.Fatalf("Live() = true for %+v", tc.autoscaler)
+			}
+			if !strings.Contains(why, tc.want) {
+				t.Errorf("reason should contain %q, got: %s", tc.want, why)
+			}
+			if tc.notWant != "" && strings.Contains(why, tc.notWant) {
+				t.Errorf("reason asserts %q, which binpack did not establish: %s", tc.notWant, why)
+			}
+		})
+	}
+}
+
+func TestCoolingIgnoresAutoscalerRestart(t *testing.T) {
+	// The autoscaler carries scaleUp.lastTransitionTime in process memory and
+	// seeds it empty, so its first scan after a restart finds the condition
+	// changed and stamps the transition with that scan's own probe time. A
+	// managed control plane restarts the autoscaler for its own reasons, and
+	// binpack read every one of those as a cluster that had just grown.
+	nodes := []*corev1.Node{inPool("a"), inPool("b")}
+	cfg := config()
+	cfg.Default.CooldownAfterScaleUp = 10 * time.Minute
+
+	restarted := cluster(nodes, nil)
+	restarted.Autoscaler.LastScaleUp = restarted.Autoscaler.LastProbe
+
+	if d := engine.Decide(restarted, cfg); d.Action != engine.Drain {
+		t.Errorf("a restart is not a scale-up, got %s: %s", d.Code, d.Reason)
+	}
+
+	// The same document one scan later, with a transition that predates
+	// everything binpack has seen this autoscaler publish: a real scale-up.
+	grew := cluster(nodes, nil)
+	grew.Autoscaler.LastScaleUp = grew.Autoscaler.LastProbe.Add(-time.Second)
+
+	d := engine.Decide(grew, cfg)
+	if d.Action != engine.None {
+		t.Fatalf("a scale-up a second before the last scan is still a scale-up, got a drain of %s", d.Node.Name)
+	}
+	if a := assessmentFor(d, "a"); a == nil || a.SkipCode != engine.SkipCooldownAfterScaleUp {
+		t.Errorf("skip code = %+v, want %s", a, engine.SkipCooldownAfterScaleUp)
+	}
+}
+
+func TestCoolingReadsTheScaleUpStampAgainstWhatBinpackHasSeen(t *testing.T) {
+	// One scan after a restart the phantom stamp is just an old timestamp,
+	// and nothing in the document says otherwise — so the single-document
+	// reading credits it and the cluster stands down for a scale-up that did
+	// not happen. What the controller carries across evaluations is what
+	// settles it.
+	nodes := []*corev1.Node{inPool("a"), inPool("b")}
+	cfg := config()
+	cfg.Default.CooldownAfterScaleUp = 10 * time.Minute
+
+	for _, tc := range []struct {
+		name       string
+		autoscaler func(*engine.Autoscaler)
+		want       engine.Action
+	}{
+		{
+			name: "the stamp is pinned to the first scan binpack ever saw",
+			autoscaler: func(a *engine.Autoscaler) {
+				a.LastScaleUp = a.LastProbe.Add(-time.Minute)
+				a.EarliestProbe = a.LastScaleUp
+			},
+			want: engine.Drain,
+		},
+		{
+			name: "the stamp predates everything binpack has seen",
+			autoscaler: func(a *engine.Autoscaler) {
+				a.LastScaleUp = a.LastProbe.Add(-time.Minute)
+				a.EarliestProbe = a.LastProbe.Add(-30 * time.Second)
+			},
+			want: engine.None,
+		},
+		{
+			name: "binpack watched this one grow",
+			autoscaler: func(a *engine.Autoscaler) {
+				a.LastScaleUp = a.LastProbe.Add(-time.Minute)
+				a.EarliestProbe = a.LastProbe.Add(-2 * time.Hour)
+				a.WatchedScaleUp = a.LastScaleUp
+			},
+			want: engine.None,
+		},
+		{
+			name: "an older scale-up binpack watched does not vouch for a later stamp",
+			autoscaler: func(a *engine.Autoscaler) {
+				a.LastScaleUp = a.LastProbe.Add(-time.Minute)
+				a.EarliestProbe = a.LastProbe.Add(-2 * time.Hour)
+				a.WatchedScaleUp = a.LastProbe.Add(-time.Hour)
+			},
+			want: engine.Drain,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s := cluster(nodes, nil)
+			tc.autoscaler(&s.Autoscaler)
+
+			if d := engine.Decide(s, cfg); d.Action != tc.want {
+				t.Errorf("action = %s, want %s (%s: %s)", d.Action, tc.want, d.Code, d.Reason)
+			}
+		})
 	}
 }

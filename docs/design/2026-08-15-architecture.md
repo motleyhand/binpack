@@ -112,11 +112,19 @@ one-shot client is ordered by storage key. So "cannot tell them apart" is a prop
 has to hold up rather than one the shared `Snapshot` confers — every ordering in it is total,
 breaking ties on object names, so no answer depends on the order objects were listed in.
 
-One field is the exception, and `explain` names it rather than answering as though it were not.
-`Snapshot.LastDrain` is the controller's own memory of when it last finished a drain — a
+Two fields are the exception, and `explain` names them rather than answering as though they were
+not. `Snapshot.LastDrain` is the controller's own memory of when it last finished a drain — a
 completed drain deletes the node that would otherwise have recorded it — so a process that did
 not perform the drain reads zero, and the after-drain cooldown can never fire for it. That is
 the same condition `run --once` refuses to start on, and the two say it in one shared clause.
+
+`Autoscaler.EarliestProbe` and `Autoscaler.WatchedScaleUp` are the same shape of thing for the
+other cooldown. The autoscaler restamps `clusterWide.scaleUp.lastTransitionTime` on every
+restart, because it carries the previous status in process memory and starts empty — so one
+document cannot tell a scale-up from a restart, and reading it as one stood the whole cluster
+down every time a managed control plane restarted the autoscaler. What distinguishes them is
+what binpack has already seen that process publish, which is memory the controller has and a
+one-shot command does not.
 
 The shared `Snapshot` is necessary but not sufficient, and the gap is worth naming because this
 project fell into it. A rule enforced *above* `Decide` is a rule only the caller holding it
@@ -133,11 +141,24 @@ shared informer cache, and writing to one corrupts it for every other consumer i
 
 Before any evaluation, on every command:
 
-1. **Is a cluster-autoscaler running?** Read the `cluster-autoscaler-status` ConfigMap from
-   `discovery.autoscalerNamespace` — the namespace the autoscaler runs in and publishes into,
-   defaulting to `kube-system`. If it is absent, stale, or reports anything other than
-   `Running`, binpack refuses to act and says why. Draining nodes that nothing will reap is
-   strictly worse than doing nothing — see
+1. **Is there a cluster-autoscaler that would remove a drained node?** Read the status ConfigMap
+   from `discovery.autoscalerNamespace`/`discovery.autoscalerStatusName` — the namespace the
+   autoscaler runs in and publishes into, and the object it publishes, defaulting to
+   `kube-system` and `cluster-autoscaler-status`. Both are configuration because both are
+   autoscaler flags. Requires cluster-autoscaler 1.30 or later, where the structured status
+   document arrived; an older one is named as such rather than failing as a parse error.
+
+   Five observations make binpack refuse: no object where it looked, an object carrying no
+   status, an `autoscalerStatus` other than `Running`, a probe time absent or older than
+   `MaxStatusAge`, and `clusterWide.health.status: Unhealthy` — the last of which passes the
+   other four, because an autoscaler that has given up on the cluster keeps reporting `Running`
+   and keeps refreshing its probe time while doing nothing in either direction.
+
+   binpack says which of the five it observed, and does not collapse them into "no
+   cluster-autoscaler is running": from one failed read that is a claim about the operator's
+   cluster it has not established, and three of the five are consistent with an autoscaler
+   running perfectly well somewhere binpack was not pointed at. The refusal itself is the same
+   in all five — draining nodes that nothing will reap is strictly worse than doing nothing, see
    [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md).
 2. **Which node groups autoscale, and what are their bounds?** Discovered from the same
    ConfigMap, through a node label whose *value* is the identifier it publishes — see
@@ -160,7 +181,9 @@ Evaluated per run, cheapest checks first.
 
 1. **Cooldown.** Has the cluster grown recently? Draining immediately after a scale-up is how
    oscillation starts, so binpack mirrors the autoscaler's own `scale-down-delay-after-add`.
-   The status ConfigMap's `scaleUp.lastTransitionTime` gives this directly.
+   The status ConfigMap's `scaleUp.lastTransitionTime` is where the answer comes from — but not
+   on its own: the autoscaler restamps it on every restart, so it is read against what binpack
+   has already seen that process publish. See *Data flow* above.
 2. **Scope.** Consider only nodes in autoscaling node groups. A node the autoscaler does not
    manage — a static pool, a control-plane node — must never be a candidate.
 3. **Pool floor.** Is the group above its minimum? At the minimum, the autoscaler replaces
