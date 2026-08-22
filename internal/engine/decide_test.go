@@ -864,3 +864,235 @@ func TestADrainInProgressStillAccountsForEveryNode(t *testing.T) {
 		t.Error("b is marked chosen; a drain in progress must choose nothing")
 	}
 }
+
+// backingOff is a node binpack has failed to drain, waiting until when.
+//
+// Each caller passes its own expiry because a shared one would hide the whole
+// defect below: the sentences only collide when the timestamps do.
+func backingOff(name string, until time.Time, attempts string) *corev1.Node {
+	annotations := map[string]string{
+		engine.AnnotationBackoffUntil: until.Format(time.RFC3339),
+		engine.AnnotationLastFailure:  "pod stuck terminating",
+	}
+	if attempts != "" {
+		annotations[engine.AnnotationDrainAttempts] = attempts
+	}
+	return inPool(name, mother.NodeAnnotations(annotations))
+}
+
+// TestTheSummaryCountsSkipsByCodeNotBySentence pins the sentence an operator
+// reads before anything else.
+//
+// It is Decision.Reason, and the `reason` key of the controller's "nothing to
+// do" log line. Taking the mode over the rendered prose rather than the code
+// beside it is wrong in two directions at once. Five skip reasons interpolate
+// per-node data — a backoff expiry, a pod reference, a pool's size — so each
+// of their nodes contributes a distinct string counted once: a unanimous wall
+// reads as one node's sentence "most commonly", and a fragmented majority
+// loses outright to any smaller group whose prose happens to be identical.
+//
+// Both directions are here because fixing one is not fixing the other: a mode
+// over codes with no count still cannot say the cluster was unanimous, and a
+// count over sentences would count the wrong thing accurately.
+func TestTheSummaryCountsSkipsByCodeNotBySentence(t *testing.T) {
+	for _, tc := range []struct {
+		name            string
+		nodes           []*corev1.Node
+		want, doNotWant string
+	}{
+		{
+			// The count is the claim. Without it the sentence cannot
+			// distinguish "every node" from "one of them".
+			name: "a wall every node hit",
+			nodes: []*corev1.Node{
+				backingOff("a", now.Add(time.Hour), ""),
+				backingOff("b", now.Add(45*time.Minute), ""),
+				backingOff("c", now.Add(30*time.Minute), ""),
+			},
+			want:      "3 of 3",
+			doNotWant: "already cordoned",
+		},
+		{
+			// The count and the sentence have to be about one code. Ruled out
+			// first is a node the modal code does not cover, so a
+			// representative taken from the front pairs three nodes' count
+			// with a fourth node's wall.
+			name: "a reason from the modal code, not from whichever node came first",
+			nodes: []*corev1.Node{
+				inPool("e", mother.Cordoned()),
+				backingOff("a", now.Add(time.Hour), ""),
+				backingOff("b", now.Add(45*time.Minute), ""),
+				backingOff("c", now.Add(30*time.Minute), ""),
+			},
+			want:      "3 of 4",
+			doNotWant: "already cordoned",
+		},
+		{
+			// The sharper failure: four nodes share a code and lose to two
+			// that share a string, so the summary names a minority reason as
+			// the typical one.
+			name: "a fragmented majority against a smaller identical minority",
+			nodes: []*corev1.Node{
+				backingOff("a", now.Add(time.Hour), ""),
+				backingOff("b", now.Add(45*time.Minute), ""),
+				backingOff("c", now.Add(30*time.Minute), ""),
+				backingOff("d", now.Add(15*time.Minute), ""),
+				inPool("e", mother.Cordoned()),
+				inPool("f", mother.Cordoned()),
+			},
+			want:      "4 of 6",
+			doNotWant: "already cordoned",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			d := engine.Decide(cluster(tc.nodes, nil), config())
+
+			if d.Action != engine.None {
+				t.Fatalf("every node was ruled out, expected no drain: %s", d.Reason)
+			}
+			if !strings.Contains(d.Reason, tc.want) {
+				t.Errorf("the summary does not count the nodes the modal code covers "+
+					"(want %q), got: %s", tc.want, d.Reason)
+			}
+			if !strings.Contains(d.Reason, "in backoff") {
+				t.Errorf("the summary names a reason other than the modal code's, got: %s",
+					d.Reason)
+			}
+			if strings.Contains(d.Reason, tc.doNotWant) {
+				t.Errorf("the summary names %q, which fewer nodes hit than the modal code, "+
+					"got: %s", tc.doNotWant, d.Reason)
+			}
+		})
+	}
+}
+
+// TestTheSummaryDoesNotDependOnHowTheClusterWasListed pins the half of
+// counting by code that the tables above cannot reach: the sentence must be a
+// function of the cluster and of nothing else.
+//
+// Two things that are not the cluster can reach it. The counting is a map, so
+// without a tie-break two equally common codes swap places between
+// evaluations. And the reason is one node's, so without an order the
+// representative is whichever node came first — which is whatever
+// `reader.List` returned, since collect.Snapshot appends nodes in list order
+// and sorts nothing. Either one produces a `reason` log line that changes with
+// nothing in the cluster changing, which is the defect this PR is about
+// wearing a different hat.
+//
+// Which of two tied codes wins is arbitrary and deliberately not asserted.
+// That the same cluster answers the same way is.
+func TestTheSummaryDoesNotDependOnHowTheClusterWasListed(t *testing.T) {
+	// Distinct expiries, so every backoff node renders a different sentence
+	// and only the choice between them can vary.
+	backoff := []*corev1.Node{
+		backingOff("a", now.Add(time.Hour), ""),
+		backingOff("b", now.Add(45*time.Minute), ""),
+		backingOff("c", now.Add(30*time.Minute), ""),
+	}
+	cordoned := []*corev1.Node{inPool("d", mother.Cordoned()), inPool("e", mother.Cordoned())}
+	cfg := config()
+
+	orders := map[string][]*corev1.Node{
+		"as listed":            {backoff[0], backoff[1], backoff[2], cordoned[0], cordoned[1]},
+		"reversed":             {cordoned[1], cordoned[0], backoff[2], backoff[1], backoff[0]},
+		"interleaved":          {cordoned[0], backoff[2], cordoned[1], backoff[0], backoff[1]},
+		"modal node not first": {cordoned[0], cordoned[1], backoff[1], backoff[2], backoff[0]},
+	}
+
+	var first, firstName string
+	for name, nodes := range orders {
+		reason := engine.Decide(cluster(nodes, nil), cfg).Reason
+		if !strings.Contains(reason, "3 of 5") {
+			t.Fatalf("%s: the modal code does not cover the nodes it should, got: %s",
+				name, reason)
+		}
+		if first == "" {
+			first, firstName = reason, name
+			continue
+		}
+		if reason != first {
+			t.Errorf("the same cluster summarised two ways, by list order alone:\n"+
+				"%s: %s\n%s: %s", firstName, first, name, reason)
+		}
+	}
+
+	// Which representative, not only that it is stable. Ordering by the
+	// sentence instead of by the node would also be deterministic and would
+	// pass everything above — and for backoff expiries the smallest string is
+	// node c at 12:30, the node closest to recovering and the least
+	// representative of the three. Node a's is the answer that comes from an
+	// identity rather than from a spelling.
+	if !strings.Contains(first, now.Add(time.Hour).Format(time.RFC3339)) {
+		t.Errorf("the representative is not the winning code's first node by name, so it "+
+			"was chosen by how its sentence reads: %s", first)
+	}
+
+	// And the map half, which needs repetition rather than reordering: two
+	// codes covering the same number of nodes must not swap between runs.
+	tied := cluster([]*corev1.Node{backoff[0], backoff[1], cordoned[0], cordoned[1]}, nil)
+	stable := engine.Decide(tied, cfg).Reason
+	if !strings.Contains(stable, "2 of 4") {
+		t.Fatalf("neither tied code covers the nodes it should, got: %s", stable)
+	}
+	for i := 0; i < 32; i++ {
+		if again := engine.Decide(tied, cfg).Reason; again != stable {
+			t.Fatalf("the same cluster summarised two ways:\n%s\n%s", stable, again)
+		}
+	}
+}
+
+// TestBackoffStateNamesTheAttemptCount closes the gap between the metric an
+// alert fires on and the two surfaces an operator then reads.
+//
+// `binpack_drain_attempts_max` climbing is the alert; ADR-0007 says explain
+// and diagnose are where the node behind it is named. Both name the node and
+// withhold the number, so with more than one node in backoff neither says
+// which one the alert was about.
+func TestBackoffStateNamesTheAttemptCount(t *testing.T) {
+	for _, tc := range []struct {
+		name, attempts, want, doNotWant string
+	}{
+		// The number the doubling is computed from, and the only thing that
+		// tells a first failure from a seventh.
+		{name: "several attempts", attempts: "3", want: "after 3 attempts"},
+		// Written as prose an operator reads, so it has to agree with itself.
+		{name: "one attempt", attempts: "1", want: "after 1 attempt", doNotWant: "1 attempts"},
+		// Absent or unreadable is not zero attempts, it is no answer — and a
+		// clause claiming none would be worse than no clause.
+		{name: "nothing recorded", attempts: "", doNotWant: "attempt"},
+		// A node in backoff has failed at least once, so a recorded zero is a
+		// corrupt value like any other and "after 0 attempts" is a sentence
+		// that contradicts the one it is attached to.
+		{name: "zero recorded", attempts: "0", doNotWant: "attempt"},
+		{name: "unreadable", attempts: "seven", doNotWant: "attempt"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			node := backingOff("failed", now.Add(time.Hour), tc.attempts)
+			nodes := []*corev1.Node{node, inPool("healthy-1"), inPool("healthy-2")}
+			s := cluster(nodes, nil)
+
+			a := assessmentFor(engine.Decide(s, config()), node.Name)
+			if a == nil {
+				t.Fatalf("every node must be accounted for; %s was not", node.Name)
+			}
+			detail := only(t, engine.Diagnose(s, config()), engine.FindingNodeInBackoff).Detail
+
+			// Both, because they are one fact rendered twice: explain reads
+			// the skip reason and diagnose reads the finding, and an operator
+			// meeting both is the same person.
+			for surface, got := range map[string]string{
+				"the skip reason":            a.SkipReason,
+				"the node-in-backoff detail": detail,
+			} {
+				if tc.want != "" && !strings.Contains(got, tc.want) {
+					t.Errorf("%s does not carry the recorded attempt count (want %q), got: %s",
+						surface, tc.want, got)
+				}
+				if tc.doNotWant != "" && strings.Contains(got, tc.doNotWant) {
+					t.Errorf("%s says %q on a count it does not have, got: %s",
+						surface, tc.doNotWant, got)
+				}
+			}
+		})
+	}
+}

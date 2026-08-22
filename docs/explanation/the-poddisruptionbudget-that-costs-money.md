@@ -50,8 +50,28 @@ replica is more than cancelled by the node that can now never be reclaimed.
 kubectl get pdb -A
 ```
 
-Every row showing `ALLOWED DISRUPTIONS: 0` is a node anchor. If the matching workload has one
-replica, it is anchored permanently rather than momentarily.
+A row showing `ALLOWED DISRUPTIONS: 0` is a candidate rather than a verdict, because two
+different things produce it. A budget that permits nothing while its workload is healthy is the
+anchor described above. A budget that selects no pods reports zero as well, and pins nothing:
+Kubernetes forces the zero so that a budget matching no pods is in a safe state when its first
+pods appear.
+
+The second is the leftover — a workload renamed, re-labelled by a chart upgrade, or deleted
+while its budget stayed — and it is a real problem of its own, just not this one. Somebody
+believes that workload is protected, and it is not.
+
+What separates them, per budget:
+
+```bash
+kubectl get pdb -n NS NAME -o jsonpath='{.status.expectedPods}{"\n"}{.status.currentHealthy}{"\n"}'
+```
+
+A first number of zero is a selector matching nothing. `binpack diagnose` makes the same
+distinction across the whole cluster in one pass, reporting the two as `pdb-zero-disruptions`
+and `pdb-selects-nothing`.
+
+Where the budget does select pods and the workload has one replica, it is anchored permanently
+rather than momentarily.
 
 ## Fixing it
 
