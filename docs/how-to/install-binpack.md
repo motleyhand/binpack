@@ -6,14 +6,21 @@
 
 ## What binpack needs
 
-One thing, and it is not optional: a cluster-autoscaler publishing
-`kube-system/cluster-autoscaler-status`. binpack drains a node, and the autoscaler is the
+One thing, and it is not optional: a cluster-autoscaler publishing a
+`cluster-autoscaler-status` ConfigMap. binpack drains a node, and the autoscaler is the
 component that then removes it — without one, a drained node would stay cordoned and empty
 indefinitely, so binpack refuses to act at all rather than produce that.
 
+The autoscaler writes that object into the namespace it runs in, which is whatever its own
+`--namespace` flag says and therefore whatever namespace it was installed into. Find yours:
+
 ```bash
-kubectl get configmap cluster-autoscaler-status -n kube-system
+kubectl get configmap cluster-autoscaler-status -A
 ```
+
+If the namespace it prints is not `kube-system`, set `config.discovery.autoscalerNamespace` to
+it at install time — binpack reads that namespace and no other, and the chart puts binpack's
+Role for reading it there too.
 
 Managed clusters publish it once a pool has autoscaling switched on. `kind`, `minikube`, `k3d`
 and `kubeadm` do not run a cluster-autoscaler at all, so binpack has nothing to offer them: it
@@ -180,8 +187,8 @@ See the [configuration reference](../reference/configuration.md).
 ## What it is not granted
 
 No cloud provider credentials, on any platform. No `pods: delete`. No write access to workloads —
-`diagnose` suggests fixes and never applies them. No Secrets. No ConfigMaps outside `kube-system`,
-where it reads exactly one.
+`diagnose` suggests fixes and never applies them. No Secrets. No ConfigMaps outside the one
+namespace `discovery.autoscalerNamespace` names, where it reads exactly one object.
 
 The [RBAC reference](../reference/rbac.md) lists every permission and what each is for.
 

@@ -51,3 +51,19 @@ just the other way to install cleanly and not work.
 {{- required "serviceAccount.create is false but serviceAccount.name is empty: the chart would bind binpack's roles to the namespace's default ServiceAccount, which every pod that names no account of its own already has. Set serviceAccount.name to the account you manage, or leave serviceAccount.create: true." .Values.serviceAccount.name -}}
 {{- end -}}
 {{- end -}}
+
+{{/*
+binpack.autoscalerNamespace is where the cluster-autoscaler publishes its
+status, and therefore where binpack's Role for reading it must be bound.
+
+One value, read in two places: the ConfigMap this renders into tells binpack
+where to look, and the Role below grants it the right to. They cannot be
+allowed to disagree — a Role in the wrong namespace 403s on binpack's first
+read, and nothing in the resulting failure says which of the two is wrong.
+
+Defaulted here as well as in the binary because a values file that clears the
+`config` block entirely still has to produce a Role somewhere.
+*/}}
+{{- define "binpack.autoscalerNamespace" -}}
+{{- default "kube-system" (dig "discovery" "autoscalerNamespace" "" .Values.config) -}}
+{{- end -}}

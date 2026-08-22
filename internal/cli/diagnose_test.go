@@ -11,14 +11,24 @@ import (
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
+// renderFindings renders a report as an operator would see it.
+//
+// The namespace is set rather than left empty because the no-autoscaler
+// closing line is built from it: a report rendered without one carries the
+// generic wording, so an assertion written against noAutoscalerFooter of a
+// named namespace could never match, and every negative about that line would
+// hold vacuously.
 func renderFindings(t *testing.T, format outputFormat, findings []engine.Finding) string {
 	t.Helper()
 	var buf bytes.Buffer
-	if err := renderDiagnose(&options{output: format, out: &buf}, findings); err != nil {
+	opts := &options{output: format, out: &buf, autoscalerNamespace: renderedNamespace}
+	if err := renderDiagnose(opts, findings); err != nil {
 		t.Fatalf("rendering: %v", err)
 	}
 	return buf.String()
 }
+
+const renderedNamespace = "kube-system"
 
 var sample = []engine.Finding{
 	{
@@ -390,7 +400,7 @@ func TestTheBlockingFooterIsTrueOfEveryBlockingCode(t *testing.T) {
 	// exception, so a report without it must not carry it. Without this the
 	// closing could be true of every code by saying everything about all of
 	// them, which is the failure the split was made to avoid.
-	if strings.Contains(out, noAutoscalerFooter) {
+	if strings.Contains(out, noAutoscalerFooter(renderedNamespace)) {
 		t.Errorf("a report with no no-autoscaler finding still closes by talking about "+
 			"one:\n%s", out)
 	}
@@ -441,7 +451,7 @@ func TestTheBlockingFooterIsTrueOfEveryBlockingCode(t *testing.T) {
 		"until it clears, acting on the rest of this report frees no node",
 		"the rest of this report frees no node",
 	} {
-		if strings.Contains(noAutoscalerFooter, unconditional) {
+		if strings.Contains(noAutoscalerFooter(renderedNamespace), unconditional) {
 			t.Errorf("the no-autoscaler closing line says %q with no condition, which is "+
 				"false when an autoscaler is running and only its status reporting is off — "+
 				"the case the line's own next sentence raises", unconditional)
@@ -484,4 +494,58 @@ func closingOf(t *testing.T, out string) string {
 		t.Fatalf("no counts line to read the closing sentences from:\n%s", out)
 	}
 	return closing
+}
+
+// TestTheNoAutoscalerClosingLineNamesWhereBinpackLooked holds the one
+// blocking code binpack cannot check to what binpack can actually observe.
+//
+// The line already hedged with "an autoscaler running with status reporting
+// turned off looks the same from here", which was right and incomplete: an
+// autoscaler running in a namespace binpack was not pointed at looks the same
+// from here too, and is the likelier of the two. The cluster this was found on
+// ran a perfectly healthy autoscaler in `autoscaler`, and every sentence
+// binpack printed about it was false.
+//
+// So the line has to name the namespace it read. A hedge that does not say
+// where binpack looked cannot be acted on: the reader has no way to tell
+// whether the place binpack looked is the place their autoscaler is.
+func TestTheNoAutoscalerClosingLineNamesWhereBinpackLooked(t *testing.T) {
+	var noAutoscaler engine.Diagnosis
+	for _, d := range engine.Diagnoses() {
+		if d.Code == engine.FindingNoAutoscaler {
+			noAutoscaler = d
+		}
+	}
+
+	var buf bytes.Buffer
+	opts := &options{output: outputText, out: &buf, autoscalerNamespace: "autoscaler"}
+	if err := renderDiagnose(opts, []engine.Finding{findingFor(noAutoscaler)}); err != nil {
+		t.Fatalf("rendering: %v", err)
+	}
+	closing := closingOf(t, buf.String())
+
+	if !strings.Contains(closing, "autoscaler/cluster-autoscaler-status") {
+		t.Errorf("the closing line does not name the object binpack read, so a reader "+
+			"cannot tell whether binpack looked where their autoscaler is:\n%s", closing)
+	}
+	// The second reading of "looks the same from here", and the one that
+	// costs an operator a day: their autoscaler is running, reporting, and
+	// somewhere else.
+	if !strings.Contains(closing, "namespace") {
+		t.Errorf("the closing line does not raise the namespace at all, so the likelier "+
+			"of the two explanations goes unsaid:\n%s", closing)
+	}
+
+	// And that the namespace is read rather than spelled: a line that says
+	// kube-system whatever binpack was configured with is the original defect
+	// in prose.
+	buf.Reset()
+	opts.autoscalerNamespace = "somewhere-else"
+	if err := renderDiagnose(opts, []engine.Finding{findingFor(noAutoscaler)}); err != nil {
+		t.Fatalf("rendering: %v", err)
+	}
+	if !strings.Contains(buf.String(), "somewhere-else/cluster-autoscaler-status") {
+		t.Errorf("the closing line names a namespace binpack was not configured with:\n%s",
+			buf.String())
+	}
 }

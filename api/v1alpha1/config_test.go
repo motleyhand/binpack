@@ -33,6 +33,13 @@ func TestEmptyConfigIsValidAndSafe(t *testing.T) {
 	if cfg.Discovery.NodeGroupIDLabel != DefaultNodeGroupIDLabel {
 		t.Errorf("nodeGroupIDLabel = %q", cfg.Discovery.NodeGroupIDLabel)
 	}
+	// kube-system is where most clusters run the autoscaler, and an empty
+	// value is not a namespace anything can be read from — so the default has
+	// to be a name, not the absence of one.
+	if cfg.Discovery.AutoscalerNamespace != DefaultAutoscalerNamespace {
+		t.Errorf("autoscalerNamespace = %q, want %q",
+			cfg.Discovery.AutoscalerNamespace, DefaultAutoscalerNamespace)
+	}
 
 	p := cfg.PolicyFor("any-pool")
 	if !p.Enabled {
@@ -216,6 +223,15 @@ func TestValidation(t *testing.T) {
 			name:    "invalid label key",
 			yaml:    "discovery:\n  poolNameLabel: \"has spaces\"",
 			wantErr: "not a valid label key",
+		},
+		{
+			// A namespace binpack cannot read is worth rejecting where
+			// somebody is still watching: the runtime symptom is a report
+			// that no cluster-autoscaler is running, which reads as a fact
+			// about the cluster rather than about a typo.
+			name:    "invalid autoscaler namespace",
+			yaml:    "discovery:\n  autoscalerNamespace: Kube_System",
+			wantErr: "not a valid namespace",
 		},
 	}
 

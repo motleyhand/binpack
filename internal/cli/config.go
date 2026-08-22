@@ -10,6 +10,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/motleyhand/binpack/api/v1alpha1"
+	"github.com/motleyhand/binpack/internal/collect"
 )
 
 func newConfigCommand(opts *options) *cobra.Command {
@@ -161,6 +162,12 @@ func writeConfigSummary(opts *options, cfg *v1alpha1.Config) error {
 	p("\n")
 	p("pool label: %s\n", cfg.Discovery.PoolNameLabel)
 	p("group label: %s\n", cfg.Discovery.NodeGroupIDLabel)
+	// Where binpack will look for the autoscaler, said before it has looked.
+	// A wrong label key above fails preflight loudly; a wrong namespace here
+	// produces a confident report that no cluster-autoscaler is running, and
+	// nothing in that report is about configuration.
+	p("autoscaler status: %s/%s\n",
+		cfg.Discovery.AutoscalerNamespace, collect.StatusConfigMapName)
 
 	// The resolved default policy is what most pools will actually get, and
 	// is far more useful to see than the sparse document that produced it.

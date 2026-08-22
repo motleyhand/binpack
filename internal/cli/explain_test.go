@@ -1047,3 +1047,36 @@ func TestExplainAnswersAboutTheDeployedBinpack(t *testing.T) {
 		})
 	}
 }
+
+// TestExplainSaysWhereItLookedForTheAutoscaler is the same obligation as
+// diagnose's closing line, on the command an operator reaches for first.
+//
+// "cluster-autoscaler: unavailable" is a claim about the cluster, and binpack
+// has read exactly one object to make it. On a cluster whose autoscaler runs
+// outside the namespace binpack was pointed at, that claim is false and there
+// is nothing in the output to suggest where to look — so naming the object is
+// what turns an assertion into something checkable.
+func TestExplainSaysWhereItLookedForTheAutoscaler(t *testing.T) {
+	s := explainCluster([]*corev1.Node{explainNode("a")}, nil)
+	s.Autoscaler = engine.Autoscaler{}
+
+	out := renderedExplainIn(t, &options{output: outputText, autoscalerNamespace: "autoscaler"},
+		s, explainConfig())
+
+	if !strings.Contains(out, "autoscaler/cluster-autoscaler-status") {
+		t.Errorf("explain calls the autoscaler unavailable without saying what it read "+
+			"to decide that:\n%s", out)
+	}
+}
+
+func TestExplainSaysNothingAboutWhereItLookedWhenTheAutoscalerIsThere(t *testing.T) {
+	// The reverse: the object is worth naming as the evidence behind a
+	// refusal, and is noise on a cluster where the answer was yes.
+	out := renderedExplainIn(t, &options{output: outputText, autoscalerNamespace: "autoscaler"},
+		explainCluster([]*corev1.Node{explainNode("a")}, nil), explainConfig())
+
+	if strings.Contains(out, "cluster-autoscaler-status") {
+		t.Errorf("explain names the object it read on a cluster whose autoscaler is "+
+			"running, where it answers nothing:\n%s", out)
+	}
+}

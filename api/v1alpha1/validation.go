@@ -45,6 +45,13 @@ func (c *Config) Validate() error {
 		errs = append(errs, fmt.Errorf("discovery.poolNameLabel: %q is not a valid label key",
 			c.Discovery.PoolNameLabel))
 	}
+	// A namespace no object can live in is worth refusing where somebody is
+	// still watching. Left to runtime it surfaces as "no cluster-autoscaler is
+	// running", which reads as a fact about the cluster rather than a typo in
+	// the document that produced it.
+	if ns := c.Discovery.AutoscalerNamespace; ns != "" && !namespaceRE.MatchString(ns) {
+		errs = append(errs, fmt.Errorf("discovery.autoscalerNamespace: %q is not a valid namespace name", ns))
+	}
 
 	errs = append(errs, c.Policy.validate("policy")...)
 

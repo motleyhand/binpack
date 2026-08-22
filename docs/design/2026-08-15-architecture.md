@@ -128,10 +128,12 @@ shared informer cache, and writing to one corrupts it for every other consumer i
 
 Before any evaluation, on every command:
 
-1. **Is a cluster-autoscaler running?** Read the `cluster-autoscaler-status` ConfigMap in
-   `kube-system`. If it is absent, stale, or reports anything other than `Running`, binpack
-   refuses to act and says why. Draining nodes that nothing will reap is strictly worse than
-   doing nothing — see [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md).
+1. **Is a cluster-autoscaler running?** Read the `cluster-autoscaler-status` ConfigMap from
+   `discovery.autoscalerNamespace` — the namespace the autoscaler runs in and publishes into,
+   defaulting to `kube-system`. If it is absent, stale, or reports anything other than
+   `Running`, binpack refuses to act and says why. Draining nodes that nothing will reap is
+   strictly worse than doing nothing — see
+   [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md).
 2. **Which node groups autoscale, and what are their bounds?** Discovered from the same
    ConfigMap, through a node label whose *value* is the identifier it publishes — see
    `discovery.nodeGroupIDLabel`. Where no node carries such a value, binpack fails preflight

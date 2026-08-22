@@ -59,15 +59,23 @@ looks at one field of each.
 Pods owned by a controller binpack cannot read a template for — an operator's own CRD — are not
 moved at all, rather than being sized from the running pod.
 
-The cluster-autoscaler's status ConfigMap is granted separately, as a **Role in `kube-system`**:
+The cluster-autoscaler's status ConfigMap is granted separately, as a **Role in the namespace
+`discovery.autoscalerNamespace` names** — the namespace the autoscaler runs in, which defaults
+to `kube-system` and is not always it:
 
 ```yaml
-# Role, namespace: kube-system
+# Role, namespace: whatever discovery.autoscalerNamespace is set to
 rules:
   - apiGroups: [""]
     resources: [configmaps]
     verbs: [get, list, watch]
 ```
+
+The chart creates that Role and its binding in whatever `config.discovery.autoscalerNamespace`
+says, so the two cannot drift apart. **If you manage RBAC yourself, they can**: a Role left in
+`kube-system` while binpack reads elsewhere installs cleanly and then 403s on every read, which
+the controller reports as a failed evaluation and the one-shot commands as a failure to read the
+cluster. Neither says the Role is in the wrong namespace.
 
 ### Why that one is not restricted by name
 
@@ -82,9 +90,9 @@ all, because its cache issues a `list` followed by a `watch`.
 
 Narrowing by namespace is the restriction that does hold. binpack still reads only the one
 object: the cache is configured with a field selector on `metadata.name`, which the API server
-applies, so no other ConfigMap in `kube-system` is ever transmitted or held in memory. The
+applies, so no other ConfigMap in that namespace is ever transmitted or held in memory. The
 difference is that this is binpack declining to read them rather than Kubernetes refusing —
-so grant the Role in `kube-system` alone, and never cluster-wide, where it would cover
+so grant the Role in that one namespace alone, and never cluster-wide, where it would cover
 application configuration binpack has no business seeing.
 
 ## Report
@@ -191,7 +199,7 @@ node or evict a pod, whatever its configuration says.
 - `pods: delete`
 - Write access to workloads — Deployments, StatefulSets, PodDisruptionBudgets. `diagnose`
   reports problems and suggests fixes; it never applies them
-- ConfigMaps outside `kube-system`
+- ConfigMaps outside the namespace `discovery.autoscalerNamespace` names
 - Secrets, of any kind
 
 Note that `apps` and `batch` are granted **read-only**, and only for the four kinds that own

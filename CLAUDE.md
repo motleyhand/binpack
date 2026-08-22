@@ -181,8 +181,12 @@ legitimate forty-minute shutdown must not kill a healthy drain because a timesta
 - **API group `binpack.motleyhand.com`**, metric prefix `binpack_`. Both are public API from the
   first release.
 - **No cloud credentials, ever.** Pool bounds and autoscaler presence come from the
-  `cluster-autoscaler-status` ConfigMap in `kube-system`, which is populated even on managed
-  control planes. [ADR-0004](docs/design/adr-0004-provider-agnostic-no-cloud-api.md).
+  `cluster-autoscaler-status` ConfigMap, which is populated even on managed control planes.
+  [ADR-0004](docs/design/adr-0004-provider-agnostic-no-cloud-api.md). The namespace is
+  `discovery.autoscalerNamespace`, not a constant: the autoscaler publishes into the namespace
+  it runs in, and its own chart sets that to whatever you install it into. Anything reading or
+  documenting that object must take the namespace from configuration — and the chart's Role has
+  to be bound in the same one, which fails at runtime rather than at install.
 - **Dependencies are added as a PR first needs them**, not upfront. Note that adding `k8s.io/*`
   will push the `go` directive past 1.25 — that is a deliberate decision, not an accident to
   accept silently.

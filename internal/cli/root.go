@@ -86,6 +86,16 @@ type options struct {
 	// nothing else in the output reveals which one it answered.
 	configSource string
 
+	// autoscalerNamespace is where this configuration says the
+	// cluster-autoscaler publishes its status, and therefore the one object
+	// every verdict about the autoscaler rests on. Carried for the same reason
+	// as the two above: it says what the answer is an answer about. "no
+	// cluster-autoscaler is running" is a claim binpack makes from a single
+	// Get, and without naming where that Get went the reader has no way to
+	// tell a cluster with no autoscaler from a binpack pointed at the wrong
+	// namespace.
+	autoscalerNamespace string
+
 	// dryRun is that configuration's mode, and it belongs beside the source
 	// for the same reason: both say what the verdict is a verdict about. It is
 	// the one setting that decides whether "would drain node-a" describes

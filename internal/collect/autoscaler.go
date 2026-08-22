@@ -16,17 +16,26 @@ import (
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
-// StatusConfigMap is where the cluster-autoscaler publishes what it is doing.
+// StatusConfigMapName is where the cluster-autoscaler publishes what it is
+// doing.
 //
 // This object is the reason binpack needs no cloud credentials. It is present
 // and populated even on a managed control plane whose autoscaler pods and logs
 // are invisible, and it reports which pools autoscale, their bounds, and when
 // the cluster last grew — everything binpack would otherwise have to ask a
 // cloud API for. See ADR-0004.
+//
+// The name is fixed; the namespace is not, and is configuration rather than a
+// constant here. The autoscaler writes its status into the namespace it was
+// given with --namespace, which the upstream chart sets to whatever namespace
+// you install it into — so kube-system is a common answer and not the only
+// one. binpack reads the namespace it is told to read and no other: a cluster
+// can hold a stale status ConfigMap alongside the live one, and a search
+// across namespaces would have to pick between two documents it cannot tell
+// apart. See discovery.autoscalerNamespace.
 const (
-	StatusConfigMapNamespace = "kube-system"
-	StatusConfigMapName      = "cluster-autoscaler-status"
-	statusKey                = "status"
+	StatusConfigMapName = "cluster-autoscaler-status"
+	statusKey           = "status"
 )
 
 // status mirrors the parts of the autoscaler's status document binpack reads.

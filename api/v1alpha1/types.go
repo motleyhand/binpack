@@ -59,6 +59,22 @@ type Discovery struct {
 	// PoolNameLabel holds a human-readable pool name, used only so that
 	// Pools entries can be written as "pool-4g" rather than a UUID.
 	PoolNameLabel string `json:"poolNameLabel,omitempty"`
+
+	// AutoscalerNamespace is where the cluster-autoscaler publishes its
+	// status ConfigMap, which is the namespace it was started with
+	// --namespace and therefore the one it runs in. The upstream Helm chart
+	// sets that flag to whatever namespace you install it into, so
+	// kube-system is the common answer rather than the only one.
+	//
+	// binpack reads this namespace and no other. Searching for the name
+	// across the cluster was the alternative and is worse: a status
+	// ConfigMap outlives the autoscaler that wrote it, so a cluster can hold
+	// a stale one beside the live one, and nothing about either says which
+	// is which.
+	//
+	// Whatever is set here must also be the namespace binpack's Role for
+	// reading that ConfigMap is bound in — see docs/reference/rbac.md.
+	AutoscalerNamespace string `json:"autoscalerNamespace,omitempty"`
 }
 
 // Policy is the set of tunables that can be set globally or per pool.

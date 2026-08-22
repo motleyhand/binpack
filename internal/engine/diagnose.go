@@ -109,8 +109,16 @@ var diagnoses = map[string]Diagnosis{
 		Severity: Blocking,
 		Summary: "no cluster-autoscaler is running, so nothing will remove a node however " +
 			"empty it becomes",
-		Fix: "check that cluster autoscaling is enabled for this cluster, and that the " +
-			"cluster-autoscaler-status ConfigMap in kube-system is being updated.",
+		// The namespace is deliberately not named here. The autoscaler
+		// publishes into the namespace it runs in, which the upstream chart
+		// sets to whatever you install it into — so a fix that says
+		// kube-system is wrong on every cluster that chose otherwise, and
+		// says it about a component that is working. Where binpack actually
+		// looked is a fact about this run rather than about the code, and the
+		// report's closing line names it.
+		Fix: "check that cluster autoscaling is enabled for this cluster, that the " +
+			"cluster-autoscaler-status ConfigMap is being updated, and that " +
+			"discovery.autoscalerNamespace names the namespace the autoscaler runs in.",
 	},
 	FindingNoCandidates: {
 		Severity: Info,

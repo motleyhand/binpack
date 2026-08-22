@@ -97,6 +97,12 @@ func inPool(name string, opts ...mother.NodeOption) *corev1.Node {
 		mother.InPool(poolName, poolID)}, opts...)...)
 }
 
+// statusNamespace is where these tests put the autoscaler's status, and what
+// they configure binpack to read. Not kube-system: the defect these tests were
+// written for was binpack reading kube-system whatever it was told, and a
+// fixture agreeing with the old constant could not have shown it.
+const statusNamespace = "autoscaler"
+
 func statusConfigMap() client.Object { return statusConfigMapProbedAt(time.Now()) }
 
 // statusConfigMapProbedAt is the autoscaler's status document with its
@@ -105,7 +111,7 @@ func statusConfigMap() client.Object { return statusConfigMapProbedAt(time.Now()
 func statusConfigMapProbedAt(probed time.Time) client.Object {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
-			Namespace: collect.StatusConfigMapNamespace,
+			Namespace: statusNamespace,
 			Name:      collect.StatusConfigMapName,
 		},
 		Data: map[string]string{"status": `
@@ -138,7 +144,7 @@ func newEvaluator(t *testing.T, log *captured, rec *fakeRecorder, objs ...client
 		writer:   c,
 		reporter: broadcastReporter{recorder: rec},
 		opts: Options{Engine: withDrainBounds(config()), DryRun: true,
-			Interval: time.Minute, Once: true},
+			Interval: time.Minute, Once: true, AutoscalerNamespace: statusNamespace},
 		log:  log.logger(),
 		stop: func() {},
 	}
@@ -311,7 +317,7 @@ func TestARefusalIsVisibleOnTheNode(t *testing.T) {
 func decisionAt(t *testing.T, ev *evaluator, when time.Time) engine.Decision {
 	t.Helper()
 
-	s, err := collect.Snapshot(context.Background(), ev.reader, when)
+	s, err := collect.Snapshot(context.Background(), ev.reader, when, ev.opts.AutoscalerNamespace)
 	if err != nil {
 		t.Fatalf("collecting the snapshot the decision was made from: %v", err)
 	}
@@ -799,7 +805,7 @@ func TestAOneShotRunReturnsAReadFailureRatherThanHidingIt(t *testing.T) {
 	ev := newEvaluator(t, &log, &fakeRecorder{},
 		&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
-				Namespace: collect.StatusConfigMapNamespace,
+				Namespace: statusNamespace,
 				Name:      collect.StatusConfigMapName,
 			},
 			Data: map[string]string{"status": "\tnot: [valid"},
@@ -878,7 +884,7 @@ func TestTheCacheDoesNotWatchEveryConfigMapInTheCluster(t *testing.T) {
 	// and hold every ConfigMap in the cluster to serve that one Get — Helm
 	// release data, certificate bundles, all of it, permanently, by a tool
 	// whose purpose is to reduce what the cluster costs.
-	opts := cacheOptions()
+	opts := cacheOptions(statusNamespace)
 
 	byConfigMap, ok := opts.ByObject[&corev1.ConfigMap{}]
 	if !ok {
@@ -893,9 +899,9 @@ func TestTheCacheDoesNotWatchEveryConfigMapInTheCluster(t *testing.T) {
 		t.Fatal("ConfigMaps are cached without restriction")
 	}
 
-	scoped, inKubeSystem := byConfigMap.Namespaces[collect.StatusConfigMapNamespace]
-	if !inKubeSystem {
-		t.Fatalf("the ConfigMap cache is not scoped to %s", collect.StatusConfigMapNamespace)
+	scoped, inStatusNamespace := byConfigMap.Namespaces[statusNamespace]
+	if !inStatusNamespace {
+		t.Fatalf("the ConfigMap cache is not scoped to %s", statusNamespace)
 	}
 	if len(byConfigMap.Namespaces) != 1 {
 		t.Errorf("cached ConfigMaps in %d namespaces, want only the autoscaler's",
@@ -964,7 +970,8 @@ func TestOnceWritesItsEventBeforeTheProcessExits(t *testing.T) {
 			instance: "binpack-test",
 			now:      func() time.Time { return time.Unix(0, 0).UTC() },
 		},
-		opts: Options{Engine: config(), DryRun: true, Once: true},
+		opts: Options{Engine: config(), DryRun: true, Once: true,
+			AutoscalerNamespace: statusNamespace},
 		log:  log.logger(),
 		stop: func() {},
 	}
@@ -1044,7 +1051,8 @@ func TestOnceWritesARefusalOnEveryNodeBeforeTheProcessExits(t *testing.T) {
 			// moved between two writes.
 			now: func() time.Time { return time.Unix(0, 0).UTC() },
 		},
-		opts: Options{Engine: withDrainBounds(config()), DryRun: true, Once: true},
+		opts: Options{Engine: withDrainBounds(config()), DryRun: true, Once: true,
+			AutoscalerNamespace: statusNamespace},
 		log:  log.logger(),
 		stop: func() {},
 	}
@@ -1255,7 +1263,8 @@ func TestAnUnresolvableConfigurationStillEndsTheEvaluationWithNoDrainInFlight(t 
 // configuration is refused asks it about the same objects evaluate will see.
 func snapshotOf(t *testing.T, ev *evaluator) engine.Snapshot {
 	t.Helper()
-	s, err := collect.Snapshot(context.Background(), ev.reader, time.Now())
+	s, err := collect.Snapshot(context.Background(), ev.reader, time.Now(),
+		ev.opts.AutoscalerNamespace)
 	if err != nil {
 		t.Fatalf("reading the cluster: %v", err)
 	}
@@ -2160,5 +2169,29 @@ func TestALostFrozenDrainEventFailsAOneShotRunAndOnlyAOneShotRun(t *testing.T) {
 					strings.Join(log.lines, "\n"))
 			}
 		})
+	}
+}
+
+// TestRunRefusesToStartWithNowhereToReadTheAutoscalerStatus closes the one
+// route by which an empty namespace is worse than a read that finds nothing.
+//
+// cache.Options treats the empty string as AllNamespaces, so a controller
+// started without this value would not merely fail its reads: the ConfigMap
+// cache binpack narrows on purpose would watch and hold every ConfigMap in the
+// cluster — Helm release data, certificate bundles, all of it — which is the
+// exact cost cacheOptions exists to avoid, arrived at by a config field being
+// dropped somewhere between the flag and here.
+//
+// Refused at startup, beside the lease check, for the same reason as the lease
+// check: this is a wiring mistake, and it should be reported as one rather
+// than as a cluster with no cluster-autoscaler.
+func TestRunRefusesToStartWithNowhereToReadTheAutoscalerStatus(t *testing.T) {
+	err := Run(context.Background(), Options{Once: true, Log: logr.Discard()})
+
+	if err == nil {
+		t.Fatal("started with no namespace to read the autoscaler's status from")
+	}
+	if !strings.Contains(err.Error(), "autoscalerNamespace") {
+		t.Errorf("the refusal does not name the setting to fix: %v", err)
 	}
 }

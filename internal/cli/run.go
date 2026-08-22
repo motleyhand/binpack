@@ -69,6 +69,7 @@ func newRunCommand(opts *options) *cobra.Command {
 			return controller.Run(cmd.Context(), controller.Options{
 				RestConfig:              restCfg,
 				Engine:                  engineConfig(cfg),
+				AutoscalerNamespace:     cfg.Discovery.AutoscalerNamespace,
 				Log:                     log.WithName("binpack"),
 				Interval:                settings.Interval,
 				DryRun:                  settings.DryRun,

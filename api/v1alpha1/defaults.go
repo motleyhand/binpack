@@ -11,6 +11,7 @@ const (
 	DefaultDryRun               = true
 	DefaultNodeGroupIDLabel     = "doks.digitalocean.com/node-pool-id"
 	DefaultPoolNameLabel        = "doks.digitalocean.com/node-pool"
+	DefaultAutoscalerNamespace  = "kube-system"
 	DefaultEnabled              = true
 	DefaultExpendableCutoff     = int32(-10)
 	DefaultReserveForLargestPod = true
@@ -44,6 +45,14 @@ func (c *Config) SetDefaults() {
 	}
 	if c.Discovery.PoolNameLabel == "" {
 		c.Discovery.PoolNameLabel = DefaultPoolNameLabel
+	}
+	// Unlike the label keys, an unset value here cannot be tolerated further
+	// down: a Get for a namespaced object with no namespace finds nothing, and
+	// binpack would report a healthy cluster-autoscaler as absent. collect
+	// refuses an empty namespace rather than reading one, so this default is
+	// what keeps a configuration that says nothing about it working.
+	if c.Discovery.AutoscalerNamespace == "" {
+		c.Discovery.AutoscalerNamespace = DefaultAutoscalerNamespace
 	}
 }
 

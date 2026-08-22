@@ -87,7 +87,8 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			snapshot, err := collect.Snapshot(cmd.Context(), client, time.Now())
+			snapshot, err := collect.Snapshot(cmd.Context(), client, time.Now(),
+				cfg.Discovery.AutoscalerNamespace)
 			if err != nil {
 				return err
 			}
@@ -98,6 +99,7 @@ func newDiagnoseCommand(opts *options) *cobra.Command {
 			}
 
 			opts.configSource = source
+			opts.autoscalerNamespace = cfg.Discovery.AutoscalerNamespace
 			findings := engine.Diagnose(snapshot, engineConfig(cfg))
 			if err := renderDiagnose(opts, findings); err != nil {
 				return err
@@ -279,7 +281,7 @@ func renderDiagnoseText(opts *options, findings []engine.Finding) error {
 		p("\n" + blockingClassFooter)
 	}
 	if noAutoscaler {
-		p("\n" + noAutoscalerFooter)
+		p("\n%s", noAutoscalerFooter(opts.autoscalerNamespace))
 	}
 
 	return errors.Join(errs...)
@@ -302,20 +304,42 @@ const blockingClassFooter = "blocking findings hold a node open until the object
 // sentence above is not about.
 //
 // Every claim here is conditioned on something the reader can check, because
-// binpack cannot check it: this finding comes from the autoscaler's own status
-// ConfigMap, and an autoscaler running with status reporting turned off is
-// indistinguishable from none at all. A first version said flatly that acting
-// on the rest of the report frees no node until this clears, which is false in
-// exactly that case — the budget above gets fixed and the running autoscaler
+// binpack cannot check it: this finding comes from one object, and more than
+// one healthy cluster looks exactly like a cluster with no autoscaler from
+// where binpack is standing. A first version said flatly that acting on the
+// rest of the report frees no node until this clears, which is false in
+// exactly those cases — the budget above gets fixed and the running autoscaler
 // removes the node — so the sentence sent operators past a remedy that works,
 // under a caveat two lines later saying it might. The condition and the caveat
 // have to be the same sentence.
-const noAutoscalerFooter = "no-autoscaler is the exception: it is not about an object, and binpack learns it\n" +
-	"only from the cluster-autoscaler's own status ConfigMap — an autoscaler running\n" +
-	"with status reporting turned off looks the same from here. Check which you have\n" +
-	"before deciding what the rest of this report is worth: if one is running, fixing\n" +
-	"a blocker above can still free a node, and if none is, nothing above will until\n" +
-	"one does.\n"
+//
+// Two ways to look the same, not one. Status reporting turned off was the
+// first; the second was found by running binpack against a cluster whose
+// autoscaler was healthy, reporting, and in `autoscaler` rather than
+// kube-system — which binpack called unavailable, and blocked on. That one is
+// the likelier of the two, because the upstream chart sets the autoscaler's
+// --namespace to whatever namespace you install it into. So the object binpack
+// actually read is named: it is the difference between a claim about the
+// cluster and a claim the reader can check in one command.
+func noAutoscalerFooter(namespace string) string {
+	// On its own line rather than inside a sentence: a namespace is up to 63
+	// characters, and every wrapping in this report is hand-made. It also puts
+	// the thing to go and look at where it can be copied.
+	where := "no-autoscaler is the exception: it is not about an object. binpack learns it\n" +
+		"from one object alone, and this is the one it read:\n\n  " +
+		namespace + "/" + collect.StatusConfigMapName + "\n\n"
+	if namespace == "" {
+		where = "no-autoscaler is the exception: it is not about an object. binpack learns it\n" +
+			"from the cluster-autoscaler's own status ConfigMap alone.\n\n"
+	}
+	return where +
+		"An autoscaler publishing its status into another namespace, or one running with\n" +
+		"status reporting turned off, looks the same from here — set\n" +
+		"discovery.autoscalerNamespace if yours runs elsewhere. Check which you have\n" +
+		"before deciding what the rest of this report is worth: if one is running, fixing\n" +
+		"a blocker above can still free a node, and if none is, nothing above will until\n" +
+		"one does.\n"
+}
 
 // classFooterSpeaksFor reports whether the sentence above is a sentence about
 // this code.
