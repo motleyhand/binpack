@@ -36,9 +36,26 @@ const (
 	// which is why it carries what advancing it would do.
 	ReasonWouldAdvanceDrain = "WouldAdvanceDrain"
 
-	// ReasonNoNodeChosen is an evaluation that considered the cluster and
-	// picked nothing. It is the only one of these that is not about a
-	// particular node, and the note says so: see ADR-0011.
+	// ReasonNoCandidates and ReasonNoneFeasible are the two walls an
+	// evaluation that chose nothing can hit, named the way
+	// binpack_evaluations_total{code} names them so the node and the metric
+	// say the same word. Unlike the five above they are not about a particular
+	// node, and the note says so: see ADR-0011.
+	//
+	// Two reasons rather than one carrying the wall in its note, and that is
+	// forced rather than stylistic. The aggregation key covers the reason and
+	// not the note, so a cluster moving from one wall to the other under a
+	// single reason would leave the first note on the node for ever. The rule
+	// is the one ReasonDraining states above: when the thing differs, the
+	// reason differs.
+	ReasonNoCandidates = "NoCandidates"
+	ReasonNoneFeasible = "NoneFeasible"
+
+	// ReasonNoNodeChosen is the same decision reached by some other route. It
+	// exists so that reportRefusal's question stays "did this decision name a
+	// node" rather than becoming a list of codes: a refusal code added later
+	// gets an event that is true but unspecific, instead of silently getting
+	// none.
 	ReasonNoNodeChosen = "NoNodeChosen"
 
 	// ReasonDrained and ReasonDrainAbandoned are how a drain ended. Both are
@@ -148,7 +165,7 @@ func (e *evaluator) reportRefusal(ctx context.Context, d engine.Decision) error 
 	// its own, which this surface cannot hold (see [refusalNote]). What that
 	// condition has instead is binpack_autoscaler_up, which the metrics
 	// reference already ranks second of the three things to alert on.
-	note := refusalNote(d)
+	reason, note := refusal(d)
 	for i := range d.Assessments {
 		node := d.Assessments[i].Node
 		// Returned rather than logged, as the chosen-node report does and for
@@ -156,35 +173,56 @@ func (e *evaluator) reportRefusal(ctx context.Context, d engine.Decision) error 
 		// anything will try again, which the caller knows. A failure part-way
 		// leaves some nodes carrying the event and some not, which the next
 		// evaluation repairs by writing all of them again.
-		if err := e.reporter.emit(ctx, node, ReasonNoNodeChosen, ActionConsolidate, note); err != nil {
+		if err := e.reporter.emit(ctx, node, reason, ActionConsolidate, note); err != nil {
 			return fmt.Errorf("recording the decision on %s: %w", node.Name, err)
 		}
 	}
 	return nil
 }
 
-// refusalNote is what a node says about an evaluation that chose nothing.
+// refusal is the reason and the note for an evaluation that chose no node.
 //
-// Built from the decision and nothing else, and it must stay that way. The
-// events.k8s.io aggregation key covers the type, action, reason, reporting
+// One function returning both, because they are not independent: **the note
+// has to be decided by the reason**, and returning them together is the only
+// shape in which that cannot quietly stop being true.
+//
+// The events.k8s.io aggregation key covers the type, action, reason, reporting
 // controller and instance, and the object the event is about — and not the
-// note (k8s.io/client-go@v0.36.3, tools/events/event_broadcaster.go, getKey). So the second and later events of a
-// series only bump a count and a timestamp, and the note the API server keeps
-// is the one the first event carried. A note that varied while the decision
-// held would therefore not produce a second event; it would produce one event
-// showing a stale sentence under a timestamp saying "a minute ago", which is
-// worse than showing nothing. Anything that moves belongs in the log line
-// above, in the metrics, or in `binpack explain`.
+// note (k8s.io/client-go@v0.36.3, tools/events/event_broadcaster.go, getKey).
+// An event whose key matches one the recorder has already seen is not recorded
+// at all: recordToSink bumps the cached event's series count and observed time
+// and drops the new event, and the patch it then sends carries only the
+// series. So the note the API server holds is the one the *first* event of
+// that series carried. A series ends only after finishTime — six minutes —
+// with nothing further observed, and binpack re-decides every minute, so while
+// it keeps refusing the series never ends and the note never moves.
+//
+// Two consequences, and the first of them was got wrong once. A note that
+// varies with the *cluster* is as unusable as one that varies with the clock:
+// a cluster going from every-node-ruled-out to nothing-fits would keep the
+// first sentence on the node under a timestamp that keeps advancing, which is
+// a confident lie rather than stale information. That is why the wall is in
+// the reason, where the key can see it, and why what is left in the note is
+// fixed prose. The detail that does move lives where it can: the log line
+// above, binpack_nodes_skipped, and `binpack explain`.
 //
 // One note for both modes, deliberately. The drain events distinguish dry run
 // from acting because what happens differs; here nothing happens either way,
 // so a mode in the note would split one series into two and tell the reader
 // nothing.
-func refusalNote(d engine.Decision) string {
-	return fmt.Sprintf(
-		"binpack evaluated the cluster and chose no node to drain: %s. This is the "+
-			"cluster's answer, written on every node binpack looked at; "+
-			"`binpack explain` gives this node's own reason", d.Reason)
+func refusal(d engine.Decision) (reason, note string) {
+	reason, wall := ReasonNoNodeChosen, ""
+	switch d.Code {
+	case engine.CodeNoCandidates:
+		reason, wall = ReasonNoCandidates,
+			": every node was ruled out before it could be simulated"
+	case engine.CodeNoneFeasible:
+		reason, wall = ReasonNoneFeasible,
+			": nodes were simulated and none could be emptied onto the rest of the cluster"
+	}
+	return reason, "binpack evaluated the cluster and chose no node to drain" + wall +
+		". This is the cluster's answer, written on every node binpack looked at; " +
+		"`binpack explain` gives this node's own reason"
 }
 
 func relocationSummary(pods int) string {

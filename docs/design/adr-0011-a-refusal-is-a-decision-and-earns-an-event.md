@@ -55,10 +55,11 @@ So the sentence is right and the code was wrong.
 
 ## Decision
 
-**An evaluation that chose no node writes an Event, reason `NoNodeChosen`, action `Consolidate`,
-on every node it assessed.**
+**An evaluation that chose no node writes an Event, action `Consolidate`, on every node it
+assessed — with a reason naming which wall it hit: `NoCandidates`, `NoneFeasible`, or
+`NoNodeChosen` for a refusal reached by some later route.**
 
-Four parts of that need saying, because each was a choice.
+Five parts of that need saying, because each was a choice.
 
 ### Every assessed node, not one of them
 
@@ -72,15 +73,37 @@ Consequences below quantify.
 
 ### The note says whose answer it is
 
-A refusal's sentence is cluster-wide prose: "3 node(s) considered, none whose workload fits
-elsewhere". Written bare onto a node it reads as a claim about that node, which it is not. So the
-note frames itself:
+A refusal's answer is about the cluster, not about the node the Event sits on. Written bare it
+would read as a claim about that node, so the note frames itself:
 
-> binpack evaluated the cluster and chose no node to drain: *&lt;reason&gt;*. This is the cluster's
-> answer, written on every node binpack looked at; `binpack explain` gives this node's own reason.
+> binpack evaluated the cluster and chose no node to drain: nodes were simulated and none could be
+> emptied onto the rest of the cluster. This is the cluster's answer, written on every node binpack
+> looked at; `binpack explain` gives this node's own reason.
 
 The pointer at the end is not filler. The per-node question — why not *this* node — has a better
 answer than this Event can give, and saying where it is costs one clause.
+
+### The wall travels in the reason, not in the note
+
+The clause naming the wall comes from the decision's *code*, and each code gets its own Event
+reason. It is not the engine's prose sentence, and it is not carried in the note.
+
+That is forced by the aggregation rule in the section below, and the first version of this change
+got it wrong: it used one reason, `NoNodeChosen`, and put the engine's sentence in the note. Since
+the aggregation key does not cover the note, a cluster moving from one wall to the other — every
+node ruled out before simulation, then nodes simulated and none emptiable — would have kept the
+first sentence on the node for ever, under a timestamp that kept advancing. Not stale information:
+a confident lie with a fresh timestamp on it.
+
+The rule that avoids it is already in this codebase, stated in `ReasonDraining`'s own comment:
+"A separate reason rather than a different note, so the two can never be confused by anything
+filtering events — including a person skimming `kubectl describe node`." When the thing differs,
+the reason differs.
+
+The two names are the ones `binpack_evaluations_total{code}` already uses, so the node and the
+metric say the same word. A third, `NoNodeChosen`, exists so the branch's question can stay "did
+this decision name a node" rather than becoming a list of codes: a refusal code added later gets an
+Event that is true but unspecific, instead of silently getting none.
 
 ### A decision that names a node is not a refusal
 
@@ -101,20 +124,27 @@ this surface cannot hold. That condition has `binpack_autoscaler_up`, which the 
 ranks second of the three things to alert on, and it is the one refusal an operator is most likely
 to already be alerting on.
 
-### The note is a function of the decision, and nothing else
+### The note is decided by the reason, and by nothing else
 
 This is a property of the surface rather than a style preference, and it comes from how
 `events.k8s.io` aggregates. The key is the event type, action, reason, reporting controller,
-reporting instance and the object it is about — verified in
-`k8s.io/client-go@v0.36.3`, `tools/events/event_broadcaster.go`, `getKey`. **The note is not in the
-key.** The second and later events of a series therefore patch a count and a timestamp onto the
-object that already exists, and the note the API server keeps is the one the *first* event carried.
+reporting instance and the object it is about — verified in `k8s.io/client-go@v0.36.3`,
+`tools/events/event_broadcaster.go`, `getKey`. **The note is not in the key**, and the consequence
+is stronger than it first looks. An event whose key the recorder has already seen is not written at
+all: `recordToSink` increments the cached event's series count and observed time and discards the
+new event, and the patch it then sends carries only the series. A series is dropped only by
+`finishSeries`, after `finishTime` — six minutes — with nothing further observed. binpack
+re-decides every minute, so while a refusal holds the series never ends and the note never moves.
 
-So a note that moved while the decision held would not produce a second Event saying the new
-thing. It would produce one Event showing a stale sentence under a `lastTimestamp` saying it was
-written a minute ago — which is worse than showing nothing, because it is confidently wrong and
-carries a fresh timestamp to prove it. Anything that varies belongs in the log line, in the
-metrics, or in `binpack explain`.
+So the note the API server holds is the one the *first* event of that series carried, and anything
+that varies underneath a fixed reason is invisible for as long as binpack keeps saying it. That
+rules out two things, not one: a clock or a counter, and — less obviously, and the mistake this
+document's first version made — the cluster's own changing answer. What is left in the note is
+fixed prose per reason. Everything that moves lives where it can: the log line, the metrics, and
+`binpack explain`.
+
+The code expresses this by returning the pair from one function. A reason and a note that are
+computed separately are two things that can drift; a reason and a note returned together cannot.
 
 One note for both modes follows from the same rule. The drain Events distinguish dry run from
 acting because what happens differs; here nothing happens either way, so a mode in the note would
@@ -122,8 +152,10 @@ split one series into two and tell the reader nothing.
 
 ## Consequences
 
-**`NoNodeChosen` is public API from the moment it ships**, like the other five reasons and the
-metric names. People filter on it.
+**`NoCandidates`, `NoneFeasible` and `NoNodeChosen` are public API from the moment they ship**,
+like the other five reasons and the metric names. People filter on them. Three rather than one is a
+real cost in vocabulary, paid for the property above: one reason would have frozen the first
+sentence onto every node.
 
 **Volume, in the controller.** One Event object per assessed node per distinct refusal, refreshed
 with a count while the refusal holds — not one per evaluation. A cluster that has nothing to
@@ -138,14 +170,10 @@ with a frequent schedule that is a real quantity of short-lived objects, bounded
 server's event TTL. If it proves too much, the bound to add is on the `--once` path specifically,
 and this decision is not what would need revisiting.
 
-**The engine's reason sentences must not carry elapsed time.** Three do today. One is structurally
-excluded above. The other two are skip reasons for the post-scale-up and post-drain cooldowns
-("the cluster scaled up 3m ago; waiting 10m before considering a drain"), and they can reach this
-note as the modal reason in a refusal summary. When they do, the Event freezes at the first
-rendering for as long as the cooldown holds — the sentence stays true in substance, since it names
-the wait, but the elapsed figure in it stops advancing. Stating an absolute moment the way the
-backoff reason already does ("in backoff until *&lt;time&gt;*") would remove the last of it. That is
-a change to the engine's prose, which is deliberately not public surface, and it is not made here.
+**The engine's prose sentences do not reach the node.** They are the right answer for the log line
+and for `binpack explain`, both of which are read once and rendered fresh, and three of them count
+elapsed time into themselves, which this surface could not have carried in any case. What the node
+gets instead is the wall, which is bounded, and a pointer to where the detail is.
 
 **The architecture's Observability rule is now met, with one exception**, and the paragraph names
 it rather than being narrowed.
@@ -159,6 +187,12 @@ argument and removes the thing it argues for, in the install notes printed to ev
 
 **One Event on one node per evaluation.** Half the volume and none of the property: the operator
 chooses the node, so the answer would be there or not depending on a coin toss.
+
+**One reason, `NoNodeChosen`, with the wall and the engine's sentence in the note.** This is what
+the first version of this change did, and it is wrong for the reason set out above: the note is
+outside the aggregation key, so the node would keep the first sentence for as long as binpack kept
+refusing. It is the more tempting shape precisely because it adds one vocabulary member instead of
+three, and the cost is invisible until the cluster changes.
 
 **One Event on an object of binpack's own** — its lease, or its own Pod. Genuinely a stable
 subject, and it fails the requirement: it is not on the node, which is the whole of what the three

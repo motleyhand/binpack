@@ -286,16 +286,19 @@ func TestARefusalIsVisibleOnTheNode(t *testing.T) {
 		t.Fatal("binpack refused and wrote nothing on the node")
 	}
 
-	// Taken from the engine rather than written out here, so the note cannot
-	// drift away from the sentence the decision actually carried.
-	want := decisionAt(t, ev, time.Now()).Reason
-	got := rec.events[0]
-	if !strings.Contains(got.note, want) {
-		t.Errorf("note does not carry the decision's reason %q: %s", want, got.note)
+	// The wall is in the reason rather than in the note, and it is taken from
+	// the engine's own code rather than written out here, so the two cannot
+	// drift. This cluster's node was simulated and could not be emptied.
+	if code := decisionAt(t, ev, time.Now()).Code; code != engine.CodeNoneFeasible {
+		t.Fatalf("the fixture decides %s, so it is no longer the case this test describes", code)
 	}
-	if got.reason != ReasonNoNodeChosen || got.action != ActionConsolidate {
+	got := rec.events[0]
+	if got.reason != ReasonNoneFeasible || got.action != ActionConsolidate {
 		t.Errorf("reason/action = %s/%s, want %s/%s",
-			got.reason, got.action, ReasonNoNodeChosen, ActionConsolidate)
+			got.reason, got.action, ReasonNoneFeasible, ActionConsolidate)
+	}
+	if !strings.Contains(got.note, "chose no node to drain") {
+		t.Errorf("the note does not say what happened: %s", got.note)
 	}
 	if got.eventType != corev1.EventTypeNormal {
 		t.Errorf("type = %s: a refusal binpack made deliberately is not a warning", got.eventType)
@@ -373,26 +376,27 @@ func TestARefusalReadsTheSameOnEveryEvaluation(t *testing.T) {
 	)
 
 	// The note is this sentence and nothing else. Spelled out rather than
-	// rebuilt the way refusalNote builds it, because the property being
-	// asserted is that nothing outside the decision reaches the note — a
-	// clock, a counter, a per-node detail — and a test that composed it the
-	// same way the code does would carry any of them along with it and agree.
-	// Two renderings a moment apart cannot see a clock at all: RFC3339 is
+	// rebuilt the way refusal builds it, because the property being asserted
+	// is that nothing outside the reason reaches the note — a clock, a
+	// counter, a cluster detail — and a test that composed it the same way the
+	// code does would carry any of them along with it and agree. Two
+	// renderings a moment apart cannot see a clock at all: RFC3339 is
 	// second-granular and both would read the same second.
 	d := decisionAt(t, ev, time.Now())
-	want := "binpack evaluated the cluster and chose no node to drain: " + d.Reason +
-		". This is the cluster's answer, written on every node binpack looked at; " +
+	want := "binpack evaluated the cluster and chose no node to drain: nodes were " +
+		"simulated and none could be emptied onto the rest of the cluster. This is " +
+		"the cluster's answer, written on every node binpack looked at; " +
 		"`binpack explain` gives this node's own reason"
-	if got := refusalNote(d); got != want {
-		t.Errorf("the note carries something the decision did not:\n got %s\nwant %s", got, want)
+	if _, got := refusal(d); got != want {
+		t.Errorf("the note carries something the reason did not:\n got %s\nwant %s", got, want)
 	}
 
 	// And minutes apart on a cluster that has not changed. This is the half
-	// that sees a reason counting elapsed time into itself, which three of the
-	// engine's sentences do.
+	// that would see a sentence counting elapsed time into itself, which three
+	// of the engine's do.
 	now := time.Now()
-	first := refusalNote(decisionAt(t, ev, now))
-	later := refusalNote(decisionAt(t, ev, now.Add(2*time.Minute)))
+	_, first := refusal(decisionAt(t, ev, now))
+	_, later := refusal(decisionAt(t, ev, now.Add(2*time.Minute)))
 	if first != later {
 		t.Errorf("the note moved while the decision held:\n%s\n%s", first, later)
 	}
@@ -428,7 +432,7 @@ func TestADrainInProgressIsNotReportedAsChoosingNothing(t *testing.T) {
 	}
 
 	for _, e := range rec.events {
-		if e.reason == ReasonNoNodeChosen {
+		if isRefusal(e.reason) {
 			t.Errorf("said binpack chose no node while it is draining one: %s", e.note)
 		}
 	}
@@ -436,6 +440,62 @@ func TestADrainInProgressIsNotReportedAsChoosingNothing(t *testing.T) {
 	if !recorded(rec, ReasonWouldAdvanceDrain) {
 		t.Fatalf("the drain in progress went unreported: %+v", rec.events)
 	}
+}
+
+func TestARefusalNoteIsDecidedByItsEventReason(t *testing.T) {
+	// The aggregation key covers the reason and not the note, and an event
+	// whose key the recorder has already seen is dropped rather than written:
+	// recordToSink bumps the cached series and returns nothing, and a series
+	// ends only after six minutes with nothing observed, which a controller
+	// deciding every minute never reaches. So the note on the node is the one
+	// the first event of its series carried, for as long as binpack keeps
+	// refusing.
+	//
+	// A note varying with the cluster is therefore as unusable as one varying
+	// with the clock — worse, in fact, because the sentence would be wrong
+	// rather than merely old, under a timestamp that keeps advancing. What
+	// makes it safe is that the note is decided by the reason, and the wall
+	// travels in the reason where the key can see it. Asserted over every
+	// code, with deliberately different prose in each pair.
+	notes := map[string]string{}
+	for _, tc := range []struct{ code, want string }{
+		{engine.CodeNoCandidates, ReasonNoCandidates},
+		{engine.CodeNoneFeasible, ReasonNoneFeasible},
+		{"a-refusal-code-added-later", ReasonNoNodeChosen},
+	} {
+		for _, prose := range []string{
+			"no node was eligible: already cordoned",
+			"3 node(s) considered, none whose workload fits elsewhere",
+		} {
+			reason, note := refusal(engine.Decision{Code: tc.code, Reason: prose})
+			if reason != tc.want {
+				t.Errorf("code %s gives reason %s, want %s", tc.code, reason, tc.want)
+			}
+			if seen, ok := notes[reason]; ok && seen != note {
+				t.Errorf("reason %s carries two notes, so the node keeps whichever came first:"+
+					"\n%s\n%s", reason, seen, note)
+			}
+			notes[reason] = note
+		}
+	}
+
+	// And the walls must not share a reason, or the same freeze happens one
+	// level up: the node would keep the first wall's sentence when the cluster
+	// moved to the other.
+	if len(notes) != 3 {
+		t.Errorf("got %d reasons across three codes, so two of them aggregate together", len(notes))
+	}
+}
+
+// isRefusal reports whether a reason is one of the ways binpack says it chose
+// no node. A list rather than a prefix match, so a reason added later has to
+// be considered rather than swept in.
+func isRefusal(reason string) bool {
+	switch reason {
+	case ReasonNoCandidates, ReasonNoneFeasible, ReasonNoNodeChosen:
+		return true
+	}
+	return false
 }
 
 func TestADeadAutoscalerIsNotReportedOnEveryNode(t *testing.T) {
@@ -479,7 +539,7 @@ func refusalNotes(t *testing.T, ev *evaluator, rec *fakeRecorder) []string {
 	}
 	var notes []string
 	for _, e := range rec.events {
-		if e.reason == ReasonNoNodeChosen {
+		if isRefusal(e.reason) {
 			notes = append(notes, e.note)
 		}
 	}
@@ -1001,9 +1061,9 @@ func TestOnceWritesARefusalOnEveryNodeBeforeTheProcessExits(t *testing.T) {
 		t.Fatalf("got %d events written, want one per node", len(written.Items))
 	}
 	for _, got := range written.Items {
-		if got.Reason != ReasonNoNodeChosen {
+		if got.Reason != ReasonNoCandidates {
 			t.Errorf("event on %s has reason %s, want %s",
-				got.Regarding.Name, got.Reason, ReasonNoNodeChosen)
+				got.Regarding.Name, got.Reason, ReasonNoCandidates)
 		}
 		if problems := validation.IsDNS1123Subdomain(got.Name); len(problems) > 0 {
 			t.Errorf("event name %q would be rejected: %v", got.Name, problems)
