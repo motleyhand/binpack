@@ -107,6 +107,11 @@ watch-backed cache. Both produce the same `Snapshot` — Kubernetes objects as r
 translated — so the engine cannot tell them apart, which is what makes `explain` a preview of
 `run` rather than a second implementation of it.
 
+Order is returned too, and the two readers do not agree on it: the cache walks a Go map, the
+one-shot client is ordered by storage key. So "cannot tell them apart" is a property the engine
+has to hold up rather than one the shared `Snapshot` confers — every ordering in it is total,
+breaking ties on object names, so no answer depends on the order objects were listed in.
+
 One field is the exception, and `explain` names it rather than answering as though it were not.
 `Snapshot.LastDrain` is the controller's own memory of when it last finished a drain — a
 completed drain deletes the node that would otherwise have recorded it — so a process that did
@@ -176,11 +181,11 @@ not sufficient. Three nodes with 1GB free each do not hold a 3GB pod, but the su
 The check passes, binpack drains, the pod goes Pending, and the autoscaler adds the node back.
 That is precisely the outcome binpack exists to prevent, and it would be reported as a success.
 
-So feasibility is a real placement simulation: sort relocatable pods largest-first and place
-each onto a specific node with sufficient remaining room, honouring node selectors, affinity and
-taints. First-fit-decreasing is sufficient — it is a heuristic, so it can fail to find a packing
-that exists, but it never claims a packing that does not. Erring towards "infeasible" is the
-correct direction: the cost is a missed consolidation, not a scale-up.
+So feasibility is a real placement simulation: sort relocatable pods hardest-to-place first
+and place each onto a specific node with sufficient remaining room, honouring node selectors,
+affinity and taints. First-fit-decreasing is sufficient — it is a heuristic, so it can fail to
+find a packing that exists, but it never claims a packing that does not. Erring towards
+"infeasible" is the correct direction: the cost is a missed consolidation, not a scale-up.
 
 This is cheap at cluster scale: tens of nodes, hundreds of pods, run once a minute.
 

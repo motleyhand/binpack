@@ -1,6 +1,8 @@
 package engine_test
 
 import (
+	"maps"
+	"slices"
 	"strings"
 	"testing"
 
@@ -1206,5 +1208,237 @@ func TestAGenuineShortfallIsStillReportedPerDestination(t *testing.T) {
 	}
 	if len(sim.Blocked.PerNode) != 2 {
 		t.Errorf("PerNode = %v, want a reason for each destination that refused", sim.Blocked.PerNode)
+	}
+}
+
+// wideNode is a destination whose CPU and memory are set independently, so a
+// test can build an exact tie in one dimension and a difference in the other —
+// which is the shape a single-dimension ordering key cannot see.
+func wideNode(name, cpu, memory string) *corev1.Node {
+	return mother.Node(name, mother.Allocatable(corev1.ResourceList{
+		corev1.ResourceCPU:    resource.MustParse(cpu),
+		corev1.ResourceMemory: resource.MustParse(memory),
+		corev1.ResourcePods:   resource.MustParse("110"),
+	}))
+}
+
+// placements renders a simulation as pod name to node name, which is the part
+// of the answer that has to be identical between two runs over the same
+// cluster.
+func placements(sim engine.Simulation) map[string]string {
+	out := make(map[string]string, len(sim.Relocated))
+	for _, p := range sim.Relocated {
+		out[p.Pod.Name] = p.Node.Name
+	}
+	return out
+}
+
+// TestPackingDoesNotDependOnInputOrder is the property both frontends rest on.
+//
+// The controller lists from a watch-backed cache, whose List walks a Go map;
+// `explain` lists from a live client, whose List is ordered by storage key.
+// Neither order is wrong, and neither is stable — the cache's differs between
+// two calls in the same process. So any tie the packing breaks by slice order
+// makes the same cluster feasible for one frontend and infeasible for the
+// other, and makes a mid-drain revalidation disagree with the decision that
+// started the drain.
+func TestPackingDoesNotDependOnInputOrder(t *testing.T) {
+	// An exact tie on free memory between two destinations that differ in the
+	// dimension a memory key cannot see. Whichever is tried first takes the
+	// 8Gi pod, and only one of the two answers leaves the 6-core pod a home.
+	candidate := sized("candidate", "16Gi")
+	thin := wideNode("thin", "1", "8Gi")
+	wide := wideNode("wide", "8", "8Gi")
+
+	memPod := mother.Pod("default", "mem-pod",
+		mother.OnNode("candidate"), mother.Requests("100m", "8Gi"))
+	cpuPod := mother.Pod("default", "cpu-pod",
+		mother.OnNode("candidate"), mother.Requests("6", "8Gi"))
+
+	orders := []struct {
+		name  string
+		nodes []*corev1.Node
+		pods  []*corev1.Pod
+	}{
+		{"thin first, mem first", []*corev1.Node{candidate, thin, wide}, []*corev1.Pod{memPod, cpuPod}},
+		{"wide first, mem first", []*corev1.Node{candidate, wide, thin}, []*corev1.Pod{memPod, cpuPod}},
+		{"thin first, cpu first", []*corev1.Node{candidate, thin, wide}, []*corev1.Pod{cpuPod, memPod}},
+		{"wide first, cpu first", []*corev1.Node{candidate, wide, thin}, []*corev1.Pod{cpuPod, memPod}},
+	}
+
+	var wantFeasible bool
+	var want map[string]string
+	for i, o := range orders {
+		sim := engine.Simulate(o.nodes, o.pods, mother.Templates(o.pods...), candidate, defaultCfg())
+		got := placements(sim)
+		if i == 0 {
+			wantFeasible, want = sim.Feasible, got
+			continue
+		}
+		if sim.Feasible != wantFeasible {
+			t.Errorf("%s: Feasible = %t, want %t — the same cluster, listed differently",
+				o.name, sim.Feasible, wantFeasible)
+		}
+		if !maps.Equal(got, want) {
+			t.Errorf("%s: placements = %v, want %v", o.name, got, want)
+		}
+	}
+
+	// Stated separately from the comparison above, which two consistently
+	// wrong answers would also satisfy: a packing exists, and both orders
+	// must find it.
+	if !wantFeasible {
+		t.Errorf("both pods have a home — mem-pod on thin and cpu-pod on wide — and the packing missed it")
+	}
+}
+
+// TestTheHardestPodToPlaceIsPlacedFirst pins the ordering key itself.
+//
+// First-fit-decreasing needs one scalar per pod, and memory was it. A 7-core
+// pod with a trivial memory request therefore sorted below every 2Gi pod on
+// the node — last in the packing, and so last in the eviction order the
+// executor reads off it, which is the opposite of what that order is for.
+func TestTheHardestPodToPlaceIsPlacedFirst(t *testing.T) {
+	candidate := wideNode("candidate", "16", "16Gi")
+	dest := wideNode("dest", "16", "16Gi")
+
+	web := func(name string) *corev1.Pod {
+		return mother.Pod("default", name, mother.OnNode("candidate"), mother.Requests("500m", "2Gi"))
+	}
+	hog := mother.Pod("default", "hog", mother.OnNode("candidate"), mother.Requests("7", "100Mi"))
+	nodes := []*corev1.Node{candidate, dest}
+
+	// hog first because it is the hardest to place; then the three identical
+	// web pods by name, because equal difficulty must still be a total order.
+	want := []string{"hog", "web-a", "web-b", "web-c"}
+
+	// Listed against the answer both times, and in two different wrong orders.
+	// One list would not settle it: at this size the sort falls back to
+	// insertion, which leaves a tied run in the order it found it — so a
+	// fixture that happened to list the ties correctly would pass with no
+	// tie-break at all, agreeing with the defect rather than catching it.
+	for _, pods := range [][]*corev1.Pod{
+		{web("web-c"), web("web-b"), web("web-a"), hog},
+		{web("web-b"), hog, web("web-c"), web("web-a")},
+	} {
+		listed := []string{pods[0].Name, pods[1].Name, pods[2].Name, pods[3].Name}
+		sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
+
+		if !sim.Feasible {
+			t.Fatalf("listed %v: the destination holds all four: %+v", listed, sim.Blocked)
+		}
+		var order []string
+		for _, p := range sim.Relocated {
+			order = append(order, p.Pod.Name)
+		}
+		if !slices.Equal(order, want) {
+			t.Errorf("listed %v: packed in order %v, want %v", listed, order, want)
+		}
+	}
+}
+
+// TestTheReservedShapeDoesNotDependOnInputOrder covers the third comparison in
+// the packing, which is a maximum rather than a sort and ties just as often:
+// a Deployment's replicas are the same size as each other.
+//
+// The pod the reserve is held for decides the shape probed against every
+// destination, so a maximum settled by list position asks one question through
+// the controller and a different one through `explain` — and the two shapes
+// need not both fit.
+func TestTheReservedShapeDoesNotDependOnInputOrder(t *testing.T) {
+	candidate := wideNode("candidate", "16", "16Gi")
+	hostA := wideNode("host-a", "16", "16Gi")
+	hostB := wideNode("host-b", "16", "16Gi")
+
+	small := mother.Pod("default", "small",
+		mother.OnNode("candidate"), mother.Requests("100m", "1Gi"))
+	// Equal memory, opposite CPU. Whichever of the two is picked as "largest"
+	// decides the verdict — after the drain no node has room for an 8-core
+	// replacement and every node has room for a 100m one — and memory alone
+	// cannot separate them.
+	wide := mother.Pod("default", "wide-one",
+		mother.OnNode("host-a"), mother.Requests("8", "4Gi"))
+	narrow := mother.Pod("default", "narrow-one",
+		mother.OnNode("host-a"), mother.Requests("100m", "4Gi"))
+	// Smaller than either, so it never wins the maximum, and wide enough that
+	// host-b cannot take an 8-core replacement either.
+	filler := mother.Pod("default", "filler",
+		mother.OnNode("host-b"), mother.Requests("15", "1Gi"))
+
+	cfg := defaultCfg()
+	cfg.ReserveForLargestPod = true
+
+	// Both orders must agree; which verdict they agree on is the reserve's own
+	// question and not this test's.
+	var want *bool
+	for _, pods := range [][]*corev1.Pod{
+		{small, filler, wide, narrow},
+		{small, filler, narrow, wide},
+	} {
+		sim := engine.Simulate([]*corev1.Node{candidate, hostA, hostB}, pods,
+			mother.Templates(pods...), candidate, cfg)
+		if want == nil {
+			want = &sim.Feasible
+			continue
+		}
+		if sim.Feasible != *want {
+			t.Errorf("Feasible = %t, want %t — the same two pods, listed the other way round",
+				sim.Feasible, *want)
+		}
+	}
+}
+
+// TestExpendablePodsAreEvictedInAFixedOrder covers the one list the packing
+// never sorted, because nothing ranks a pod that needs no destination.
+//
+// Nothing ranks them, but they are still evicted one at a time and the
+// executor reads this order — so leaving it at list position makes which
+// expendable pod goes first differ between the controller and `explain`, and
+// between one evaluation of an unchanged cluster and the next.
+func TestExpendablePodsAreEvictedInAFixedOrder(t *testing.T) {
+	candidate := sized("candidate", "4Gi")
+	// Listed out of name order, so passing means the sort did the work.
+	pods := []*corev1.Pod{
+		mother.Pod("default", "filler-c", mother.OnNode("candidate"), mother.Priority(-100)),
+		mother.Pod("default", "filler-a", mother.OnNode("candidate"), mother.Priority(-100)),
+		mother.Pod("default", "filler-b", mother.OnNode("candidate"), mother.Priority(-100)),
+	}
+	nodes := []*corev1.Node{candidate, sized("dest", "4Gi")}
+
+	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
+
+	if !sim.Feasible {
+		t.Fatalf("expendable pods need no destination: %+v", sim.Blocked)
+	}
+	var order []string
+	for _, pod := range sim.Evicted {
+		order = append(order, pod.Name)
+	}
+	want := []string{"filler-a", "filler-b", "filler-c"}
+	if !slices.Equal(order, want) {
+		t.Errorf("evicting in order %v, want %v", order, want)
+	}
+}
+
+// TestEquallyEmptyDestinationsAreTriedInNameOrder pins the other half.
+//
+// Which of two interchangeable nodes takes the pod does not matter; that the
+// answer is the same one every time does. The name is the only key the engine
+// has that is unique, stable, and identical through both frontends.
+func TestEquallyEmptyDestinationsAreTriedInNameOrder(t *testing.T) {
+	candidate := sized("candidate", "4Gi")
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web", mother.OnNode("candidate"), mother.Requests("100m", "1Gi")),
+	}
+	// Listed out of name order, so passing means the sort did the work.
+	nodes := []*corev1.Node{candidate, sized("zulu", "4Gi"), sized("alpha", "4Gi")}
+
+	sim := engine.Simulate(nodes, pods, mother.Templates(pods...), candidate, defaultCfg())
+
+	if !sim.Feasible {
+		t.Fatalf("either destination holds it: %+v", sim.Blocked)
+	}
+	if got := sim.Relocated[0].Node.Name; got != "alpha" {
+		t.Errorf("placed on %s, want alpha — the tie is arbitrary, but it must be fixed", got)
 	}
 }
