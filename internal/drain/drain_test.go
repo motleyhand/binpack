@@ -517,6 +517,7 @@ func TestAssessRemovalWaitsThroughScaleUpDelay(t *testing.T) {
 	for _, tc := range []struct {
 		name        string
 		lastScaleUp time.Time
+		inProgress  bool
 		want        drain.Action
 		code        string
 	}{
@@ -544,11 +545,23 @@ func TestAssessRemovalWaitsThroughScaleUpDelay(t *testing.T) {
 			lastScaleUp: now.Add(-11 * time.Minute),
 			want:        drain.Abandon, code: drain.AbandonNotRemoved,
 		},
+		{
+			// The two fields describe one episode from different ends, and the
+			// timestamp is the end that does not move: it is stamped when the
+			// scale-up began, so a slow one ages past the pause while it is
+			// still going on. Reading only the timestamp would expire the
+			// removal wait in the middle of the growth it exists to wait out —
+			// and hand back an emptied node, with backoff, at the moment the
+			// cluster is least able to absorb the churn.
+			name:        "a scale-up still in progress defers however old the stamp is",
+			lastScaleUp: now.Add(-11 * time.Minute), inProgress: true,
+			want: drain.AwaitRemoval,
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := drain.Assess(drain.State{
 				Node: draining(16*time.Minute, "0"), Now: now,
-				LastScaleUp: tc.lastScaleUp,
+				LastScaleUp: tc.lastScaleUp, ScaleUpInProgress: tc.inProgress,
 			}, p)
 			if got.Action != tc.want || got.Code != tc.code {
 				t.Errorf("Assess() = %v/%q, want %v/%q",

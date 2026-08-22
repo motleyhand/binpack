@@ -2628,20 +2628,63 @@ func TestAnEmptiedNodeWaitsThroughAScaleUpButNotThroughADeadAutoscaler(t *testin
 		// probeAgo is how long since the autoscaler last completed a scan,
 		// against a five-minute MaxStatusAge. A status ConfigMap outlives the
 		// process that wrote it, so freshness is what tells them apart.
-		probeAgo  time.Duration
-		wantCode  string
-		wantEnded bool
+		probeAgo time.Duration
+		// scaleUpAgo ages the transition stamp. Past the pause it defers
+		// nothing on its own, which is what leaves the flag as the only thing
+		// that can decide the case.
+		scaleUpAgo time.Duration
+		inProgress bool
+		wantCode   string
+		wantEnded  bool
 	}{
 		{
-			name:     "a live autoscaler inside its own post-scale-up pause is waited for",
-			probeAgo: 10 * time.Second,
-			wantCode: executor.StepAwaitRemoval,
+			name:       "a live autoscaler inside its own post-scale-up pause is waited for",
+			probeAgo:   10 * time.Second,
+			scaleUpAgo: 2 * time.Minute,
+			wantCode:   executor.StepAwaitRemoval,
 		},
 		{
-			name:      "an autoscaler that has stopped ends the wait, scale-up or no",
-			probeAgo:  30 * time.Minute,
-			wantCode:  engine.SkipNotAutoscaled,
-			wantEnded: true,
+			// The stamp has aged out, so only the flag can defer this — which
+			// makes it the case that proves the flag reaches the assessment at
+			// all. A slow scale-up is precisely the shape that gets here: the
+			// stamp names when the growth began and stops moving, so it ages
+			// past the pause while the growth is still going on.
+			name:       "a scale-up still in progress is waited for past the stamp's pause",
+			probeAgo:   10 * time.Second,
+			scaleUpAgo: 30 * time.Minute,
+			inProgress: true,
+			wantCode:   executor.StepAwaitRemoval,
+		},
+		{
+			// The control for the one above, and the reason it is not vacuous.
+			name:       "the same aged stamp with no scale-up under way hands the node back",
+			probeAgo:   10 * time.Second,
+			scaleUpAgo: 30 * time.Minute,
+			wantCode:   drain.AbandonNotRemoved,
+			wantEnded:  true,
+		},
+		{
+			name:       "an autoscaler that has stopped ends the wait, scale-up or no",
+			probeAgo:   30 * time.Minute,
+			scaleUpAgo: 2 * time.Minute,
+			wantCode:   engine.SkipNotAutoscaled,
+			wantEnded:  true,
+		},
+		{
+			// The deferral binpack cannot time out of on its own. A timestamp
+			// ages; a flag does not, so a status document frozen mid-scale-up
+			// by an autoscaler that then died reads InProgress for ever — the
+			// unbounded wait in its purest form, and the reason this pair is
+			// tested together rather than the deferral alone. Nothing new
+			// bounds it, because the bound is the same one: the document has
+			// stopped being refreshed, so it has stopped vouching for the
+			// process that wrote it.
+			name:       "an InProgress scale-up frozen by a dead autoscaler ends the wait too",
+			probeAgo:   30 * time.Minute,
+			scaleUpAgo: 2 * time.Minute,
+			inProgress: true,
+			wantCode:   engine.SkipNotAutoscaled,
+			wantEnded:  true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2654,7 +2697,8 @@ func TestAnEmptiedNodeWaitsThroughAScaleUpButNotThroughADeadAutoscaler(t *testin
 
 			s := snapshot([]*corev1.Node{n, node("b")}, nil)
 			s.Autoscaler.LastProbe = at.Add(-tc.probeAgo)
-			s.Autoscaler.LastScaleUp = at.Add(-2 * time.Minute)
+			s.Autoscaler.LastScaleUp = at.Add(-tc.scaleUpAgo)
+			s.Autoscaler.ScaleUpInProgress = tc.inProgress
 
 			c := clientFor(s)
 			step, err := executor.Advance(

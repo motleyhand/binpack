@@ -66,6 +66,26 @@ type State struct {
 	// autoscaler was going to finish, which is the whole of what this field
 	// exists to prevent.
 	LastScaleUp time.Time
+
+	// ScaleUpInProgress is clusterWide.scaleUp.status reading InProgress: the
+	// autoscaler is adding nodes right now.
+	//
+	// Needed beside [State.LastScaleUp] because the two describe the same
+	// episode from different ends, and only one of them moves. The transition
+	// time is stamped when the scale-up *began*, so a slow one — a cloud
+	// provider taking its time, a quota refusal being retried — ages out of
+	// the pause below while the flag is still set, and the removal wait would
+	// expire in the middle of the growth it is meant to wait out. The
+	// autoscaler restamps its own gate only on a scale-up that succeeded, so
+	// nothing in the document moves during the wait either.
+	//
+	// binpack already holds this flag as the strongest reason there is not to
+	// be removing a node: the eligibility check refuses on it outright, ahead
+	// of any cooldown and with no duration involved. Deferring on the tail of
+	// an episode while ignoring the episode itself is the same signal read two
+	// ways, and it errs at the worst available moment — handing back an
+	// emptied node, with backoff, while the cluster is actively growing.
+	ScaleUpInProgress bool
 }
 
 // Policy is the part of a resolved pool policy this package needs.
@@ -206,10 +226,11 @@ func PodsOn(s engine.Snapshot, name string) []*corev1.Pod {
 // name here would be a second lookup free to disagree with the first.
 func StateFor(s engine.Snapshot, node *corev1.Node) State {
 	return State{
-		Node:        node,
-		Pods:        PodsOn(s, node.Name),
-		Now:         s.Now,
-		LastScaleUp: s.Autoscaler.LastScaleUp,
+		Node:              node,
+		Pods:              PodsOn(s, node.Name),
+		Now:               s.Now,
+		LastScaleUp:       s.Autoscaler.LastScaleUp,
+		ScaleUpInProgress: s.Autoscaler.ScaleUpInProgress,
 	}
 }
 
@@ -398,17 +419,32 @@ func Assess(s State, policy Policy) Assessment {
 // from an abandoned one, so bound the absence of progress instead. A scale-up
 // is the cluster stating that the removal will be slow.
 //
+// Two arms, in the order the eligibility check asks the same two questions,
+// because they are the same episode seen from different ends and only one of
+// them has a clock in it. A scale-up under way is stated outright and takes no
+// duration; the transition time it was stamped with covers the tail afterwards.
+// Reading only the tail expires the wait in the middle of a slow scale-up — the
+// stamp names when growth *began*, and the autoscaler restamps its own gate
+// only on one that succeeded, so neither figure moves while a cloud provider
+// takes its time.
+//
 // Deferring, not resetting. The pause suppresses the abandonment and nothing
 // else — in particular it is not progress, so the marker is not restamped and
 // the elapsed time keeps running underneath. When the gate opens on a node
 // that has been empty past its bound, the next evaluation abandons it at once.
-// That is what keeps the wait terminating: each scale-up buys at most one
-// pause measured from itself, never a fresh removalTimeout. What ends the wait
-// on an autoscaler that has *stopped* is separate and unaffected —
-// revalidation reports SkipNotAutoscaled from the same published status, and
-// the executor hands the node back on the verdict before it reaches this
-// assessment at all.
+// That is what keeps the timed arm terminating: each scale-up buys at most one
+// pause measured from itself, never a fresh removalTimeout.
+//
+// The flag has no clock at all, so nothing in it expires — a status document
+// frozen mid-scale-up by an autoscaler that then died would read InProgress for
+// ever. What bounds that is what bounds every other wait on this component, and
+// it is why nothing new is needed here: revalidation stops believing a document
+// that has stopped being refreshed, reports SkipNotAutoscaled, and the executor
+// hands the node back on the verdict before it reaches this assessment at all.
 func scaleDownPaused(s State, policy Policy) bool {
+	if s.ScaleUpInProgress {
+		return true
+	}
 	if policy.ScaleUpPause <= 0 || s.LastScaleUp.IsZero() {
 		return false
 	}

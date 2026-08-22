@@ -395,13 +395,23 @@ kubectl -n <autoscaler-namespace> get deploy -l app=cluster-autoscaler \
 
 If any of the three is longer than above, raise `removalTimeout` by the difference.
 
-The arithmetic covers one scale-up. It cannot cover several, so binpack does not try: while the
-autoscaler's post-growth pause is running, the removal wait is **deferred** rather than expired.
-That defers only — the clock underneath keeps running, so a node already past its bound is handed
-back on the first evaluation after the pause lifts, and a cluster that keeps growing cannot hold
-a cordoned node indefinitely. The width of the pause is `cooldown.afterScaleUp`, which is
-binpack's figure for the same flag. An autoscaler that has *stopped* ends the wait immediately
-whatever it published on its way out, since nothing would remove the node then.
+The arithmetic covers one scale-up. It cannot cover several, nor one that takes longer than the
+autoscaler's own delay, so binpack does not try: while the autoscaler reports a scale-up **in
+progress**, or its last one falls inside the post-growth pause, the removal wait is **deferred**
+rather than expired. Both readings are needed, because they are the same episode from different
+ends — the transition timestamp is stamped when growth *began* and does not move while it
+continues, so a scale-up waiting on a slow cloud provider ages out of the pause without finishing.
+
+Deferred, not restarted. The clock underneath keeps running, so a node already past its bound is
+handed back on the first evaluation after the deferral lifts, and a cluster that keeps growing
+cannot hold a cordoned node indefinitely. The width of the pause is `cooldown.afterScaleUp`,
+which is binpack's figure for the same flag; the in-progress reading takes no duration at all,
+exactly as it takes none when it refuses to *start* a drain.
+
+An autoscaler that has **stopped** ends the wait immediately whatever it published on its way
+out — including a status left reading in-progress for ever, which is the one deferral nothing in
+it would expire. binpack stops believing a status document that has stopped being refreshed, so
+nothing separate is needed to bound that case.
 
 This is a correctness bound, not a convenience. A cordoned node that nothing removes is lost
 schedulable capacity, and if the pool is at its maximum, pods can stay Pending while a healthy
