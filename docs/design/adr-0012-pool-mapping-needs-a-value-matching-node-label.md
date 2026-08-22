@@ -70,10 +70,16 @@ labels. `eks.amazonaws.com/nodegroup` carries the *EKS managed node group's* nam
 identifier is the name of the Auto Scaling group EKS generates to back it;
 `kubernetes.azure.com/agentpool` carries the agent pool's name, while the identifier is the scale
 set's. In both, the two strings are related but not equal, so a reader who assumes the key is the
-answer because it looks like the answer gets the silent failure above. A self-managed Auto Scaling
-group is a different matter: its name is the operator's to choose, so it may well already be a
-node label value on that cluster — which is exactly why binpack points at the commands rather
-than asserting.
+answer because it looks like the answer gets the silent failure above.
+
+Nodes that did not come from a managed node group carry neither label, and the tool that created
+them may supply one of its own that is no better. Checked against a real EKS cluster whose nodes
+eksctl created and whose autoscaler discovers Auto Scaling groups by tag: the published identifier
+was `eksctl-testing-nodegroup-testing-24-NodeGroup-iOzTWO7QftDh` — the generated CloudFormation
+name — while the nearest label was `alpha.eksctl.io/nodegroup-name=testing-24`, which is a
+substring of it and not equal to it. No `eks.amazonaws.com/*` label existed at all. A self-managed
+Auto Scaling group's name is the operator's to choose, so on some clusters it *will* already be a
+label value — which is exactly why binpack points at the two commands rather than asserting.
 
 GCE is worse than a mismatch and worse in kind. A Kubernetes label value is at most 63
 characters, may contain only alphanumerics, `-`, `_` and `.`, and must begin and end with an
