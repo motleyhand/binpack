@@ -5,7 +5,9 @@
   moves from Soundness to Preference. Everything else in ADR-0009 stands. Amended since, not
   superseded: the soundness list below is qualified by
   [a blocker that has not been computed yet is not an answer](#a-blocker-that-has-not-been-computed-yet-is-not-an-answer),
-  which says what stopping means for a refusal that lifts on its own.
+  which says what stopping means for a refusal that lifts on its own, and
+  [extend the window rather than abandon](#extend-the-window-rather-than-abandon) records that the
+  half it left open — sizing the removal window — has since been made.
 - **Date:** 2026-08-21
 
 ## Context
@@ -153,6 +155,17 @@ scale-down past binpack's deadline. Before this ADR that node was abandoned on t
 it, it is abandoned at the removal deadline with a reason that names what actually happened.
 Strictly better, and still not right; the derivation of that number belongs beside the number.
 
+**Both halves are made now.** The default is derived from the autoscaler's arithmetic rather than
+chosen, and the derivation is written out in the `removalTimeout` section of
+[the configuration reference](../reference/configuration.md). Arithmetic alone only ever covers
+one scale-up, though, so the second half is the ADR-0007 move: while the autoscaler's post-growth
+pause is running, the removal wait is deferred rather than expired. Deferred and not restarted —
+the elapsed time keeps running underneath, so a node already past its bound is handed back on the
+first evaluation after the pause lifts. That distinction is what keeps the wait bounded, and it
+is the same reason ADR-0007 withdrew "an eviction was accepted" from its progress signals: a
+keep-alive that resets the clock every interval is not a bound. An autoscaler that has stopped
+still ends the wait at once, under `not-autoscaled`, whatever it published on its way out.
+
 That direction is [ADR-0007](adr-0007-drain-progress-not-deadlines.md)'s shape applied one level
 up. ADR-0007 bounds the absence of progress rather than the wall clock, because a clock cannot
 tell a slow shutdown from a wedged one. A scale-up is the cluster saying the reaping will be
@@ -175,7 +188,9 @@ instrument.
   this change is comparing two different populations.
 - **A drain can now run to completion while the cluster is growing.** Deliberate, and the point.
   It is still bounded, by everything ADR-0007 governs: the stall timeout, the removal timeout and
-  the positive detection of a pod past its termination deadline. None of those changes here.
+  the positive detection of a pod past its termination deadline. None of those changes here; the
+  removal timeout has changed since, in the second half recorded above, and it is the same bound
+  applied to a longer worst case rather than a different kind of bound.
 - **Selection is untouched.** Selection never resumes a drain, so it still applies the full set
   of checks and still reports a cooldown as the reason a node was ruled out — even a node that a
   drain is already under way on. ADR-0009 asserted that in prose; it is now a test.

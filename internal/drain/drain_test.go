@@ -457,9 +457,15 @@ func TestPolicyForResolvesTheNodesOwnPool(t *testing.T) {
 	cfg := engine.Config{
 		NodeGroupIDLabel: "doks.digitalocean.com/node-pool-id",
 		PoolNameLabel:    "doks.digitalocean.com/node-pool",
-		Default:          engine.Policy{StallTimeout: time.Minute, RemovalTimeout: 2 * time.Minute},
+		Default: engine.Policy{
+			StallTimeout: time.Minute, RemovalTimeout: 2 * time.Minute,
+			CooldownAfterScaleUp: 3 * time.Minute,
+		},
 		ByPool: map[string]engine.Policy{
-			"slow": {StallTimeout: time.Hour, RemovalTimeout: 2 * time.Hour},
+			"slow": {
+				StallTimeout: time.Hour, RemovalTimeout: 2 * time.Hour,
+				CooldownAfterScaleUp: 30 * time.Minute,
+			},
 		},
 	}
 	s := engine.Snapshot{Nodes: []*corev1.Node{
@@ -477,5 +483,98 @@ func TestPolicyForResolvesTheNodesOwnPool(t *testing.T) {
 	// autoscaler has already removed still needs bounds to be assessed against.
 	if got := drain.PolicyFor(cfg, s, "gone"); got.RemovalTimeout != 2*time.Minute {
 		t.Errorf("removal timeout for a missing node = %s, want the default 2m", got.RemovalTimeout)
+	}
+	// The autoscaler's post-growth pause travels with the rest, from the one
+	// setting that describes it. An operator whose autoscaler holds scale-down
+	// for half an hour configures that once, and both the refusal to start a
+	// drain and the refusal to give up on one read the same number.
+	if got := drain.PolicyFor(cfg, s, "a"); got.ScaleUpPause != 30*time.Minute {
+		t.Errorf("scale-up pause for a = %s, want the slow pool's 30m", got.ScaleUpPause)
+	}
+	if got := drain.PolicyFor(cfg, s, "b"); got.ScaleUpPause != 3*time.Minute {
+		t.Errorf("scale-up pause for b = %s, want the default 3m", got.ScaleUpPause)
+	}
+}
+
+// TestAssessRemovalWaitsThroughScaleUpDelay covers the one bound whose
+// deadline belongs to a component binpack does not control.
+//
+// The cluster-autoscaler suppresses all scale-down for
+// scale-down-delay-after-add following any scale-up anywhere in the cluster,
+// so a scale-up landing late in an emptied node's wait holds the removal past
+// removalTimeout however that number is sized. Abandoning there uncordons a
+// node the autoscaler was about to delete: every pod moved for nothing, the
+// consolidation lost, and backoff filed against a node with no problem of its
+// own.
+//
+// ADR-0007's shape, applied to the reaping phase. A scale-up is the cluster
+// saying the removal will be slow, and reading that as "stop" is the same
+// mistake as reading a one-hour termination grace period as a wedged pod.
+func TestAssessRemovalWaitsThroughScaleUpDelay(t *testing.T) {
+	p := policy()
+	p.ScaleUpPause = 10 * time.Minute
+
+	for _, tc := range []struct {
+		name        string
+		lastScaleUp time.Time
+		inProgress  bool
+		want        drain.Action
+		code        string
+	}{
+		{
+			// The finding: 16 minutes empty is past the bound, and the
+			// autoscaler's own gate is still shut for another eight.
+			name:        "a scale-up inside the pause defers the abandonment",
+			lastScaleUp: now.Add(-2 * time.Minute),
+			want:        drain.AwaitRemoval,
+		},
+		{
+			// The control, and the half that keeps the wait terminating: with
+			// nothing holding the autoscaler back, an empty node it has not
+			// removed is handed back on the bound.
+			name: "no scale-up, so the bound still applies",
+			want: drain.Abandon, code: drain.AbandonNotRemoved,
+		},
+		{
+			// The pause defers; it does not restart the clock. Once the
+			// autoscaler's gate opens the node has still been empty for
+			// sixteen minutes, and the very next evaluation says so — which is
+			// what stops a cluster that keeps growing from holding a cordoned
+			// node indefinitely.
+			name:        "a scale-up older than the pause defers nothing",
+			lastScaleUp: now.Add(-11 * time.Minute),
+			want:        drain.Abandon, code: drain.AbandonNotRemoved,
+		},
+		{
+			// The two fields describe one episode from different ends, and the
+			// timestamp is the end that does not move: it is stamped when the
+			// scale-up began, so a slow one ages past the pause while it is
+			// still going on. Reading only the timestamp would expire the
+			// removal wait in the middle of the growth it exists to wait out —
+			// and hand back an emptied node, with backoff, at the moment the
+			// cluster is least able to absorb the churn.
+			name:        "a scale-up still in progress defers however old the stamp is",
+			lastScaleUp: now.Add(-11 * time.Minute), inProgress: true,
+			want: drain.AwaitRemoval,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := drain.Assess(drain.State{
+				Node: draining(16*time.Minute, "0"), Now: now,
+				LastScaleUp: tc.lastScaleUp, ScaleUpInProgress: tc.inProgress,
+			}, p)
+			if got.Action != tc.want || got.Code != tc.code {
+				t.Errorf("Assess() = %v/%q, want %v/%q",
+					got.Action, got.Code, tc.want, tc.code)
+			}
+			// Never progress. Recording one would restamp the marker every
+			// evaluation the pause lasted, so the removal clock would restart
+			// from zero when it lifted rather than expiring at once — the
+			// self-emitted keep-alive ADR-0007 withdrew its fourth progress
+			// signal over, arrived at by a different route.
+			if got.Progressed {
+				t.Error("a scale-up is not progress on this node")
+			}
+		})
 	}
 }

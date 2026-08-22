@@ -894,7 +894,7 @@ func (e *evaluator) frozen(ctx context.Context, s engine.Snapshot, cfg engine.Co
 	}
 
 	would := drain.WouldHappen(a, drain.Assess(
-		drain.State{Node: a.Node, Pods: drain.PodsOn(s, name), Now: s.Now}, drain.PolicyFor(cfg, s, name)))
+		drain.StateFor(s, a.Node), drain.PolicyFor(cfg, s, name)))
 
 	e.log.Info("a drain is in progress but dryRun is set; leaving it alone",
 		"node", name, "wouldHappen", would)
