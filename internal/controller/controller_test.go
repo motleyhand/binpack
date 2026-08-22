@@ -1438,6 +1438,13 @@ func TestOnceRefusesACooldownItCannotHonour(t *testing.T) {
 			if tc.refused && !strings.Contains(err.Error(), "Deployment") {
 				t.Errorf("the refusal does not say how to resolve it: %v", err)
 			}
+			// The clause `binpack explain` discloses for the same condition,
+			// asserted literally on both surfaces so that rewording it in one
+			// place fails rather than leaving two accounts of one fact.
+			if tc.refused && !strings.Contains(err.Error(),
+				"a completed drain leaves nothing in the cluster to measure from") {
+				t.Errorf("the refusal does not say why the cooldown cannot apply: %v", err)
+			}
 		})
 	}
 }

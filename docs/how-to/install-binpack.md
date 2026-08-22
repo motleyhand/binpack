@@ -4,6 +4,21 @@
 > permission that could change anything — which is the state to install and leave running for a
 > while. [Let binpack drain nodes](let-binpack-drain-nodes.md) is the step after it.
 
+## What binpack needs
+
+One thing, and it is not optional: a cluster-autoscaler publishing
+`kube-system/cluster-autoscaler-status`. binpack drains a node, and the autoscaler is the
+component that then removes it — without one, a drained node would stay cordoned and empty
+indefinitely, so binpack refuses to act at all rather than produce that.
+
+```bash
+kubectl get configmap cluster-autoscaler-status -n kube-system
+```
+
+Managed clusters publish it once a pool has autoscaling switched on. `kind`, `minikube`, `k3d`
+and `kubeadm` do not run a cluster-autoscaler at all, so binpack has nothing to offer them: it
+will still read the cluster and describe every node, and it will say it would not act.
+
 ## Before installing anything
 
 Two of binpack's three commands need nothing installed in your cluster. Run them first — they

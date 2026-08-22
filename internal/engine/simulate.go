@@ -171,13 +171,20 @@ func Simulate(
 	})
 
 	for _, pod := range toPlace {
-		placedOn, perNode := place(pod, destinations, remaining, residents, domains)
+		placedOn, unsupported, perNode := place(pod, destinations, remaining, residents, domains)
 		if placedOn == nil {
 			was := running[pod]
 			sim.Blocked = &Blocked{
 				Pod:     was,
 				PerNode: perNode,
 				Summary: fmt.Sprintf("%s/%s has nowhere to go", was.Namespace, was.Name),
+			}
+			// A refusal about the pod rather than about anywhere it might
+			// have gone: its own sentence is the whole answer, and there is
+			// no per-node half to report. It names the running pod, because
+			// a replacement carries the running pod's ObjectMeta.
+			if !unsupported.Empty() {
+				sim.Blocked.Summary = unsupported.Message
 			}
 			return sim
 		}
@@ -204,13 +211,27 @@ func Simulate(
 // Packing onto the fullest node leaves the emptier ones emptier, which is the
 // shape that makes the *next* run's candidate obvious. Spreading would undo
 // the consolidation as it went.
+// The second return value is a refusal binpack made about the pod itself; the
+// third is one refusal per destination. Never both, because they are answers
+// to different questions.
 func place(
 	pod *corev1.Pod,
 	destinations []*corev1.Node,
 	remaining map[string]corev1.ResourceList,
 	residents map[string][]*corev1.Pod,
 	domains fit.AntiAffinityDomains,
-) (*corev1.Node, map[string]string) {
+) (*corev1.Node, fit.Reason, map[string]string) {
+	// Asked once, above the loop, because it is a verdict about the pod alone:
+	// fit reaches it before reading a single node property. Left inside, it
+	// wrote the identical sentence under every destination's name — asserting
+	// N node-specific walls that were never observed, under a verdict and a
+	// summary the how-to guide primes an operator to read as a capacity
+	// answer. The cluster may have room to spare; binpack declined to model
+	// the pod.
+	if r := fit.UnsupportedPod(pod); !r.Empty() {
+		return nil, r, nil
+	}
+
 	ordered := make([]*corev1.Node, len(destinations))
 	copy(ordered, destinations)
 	sort.SliceStable(ordered, func(i, j int) bool {
@@ -221,11 +242,11 @@ func place(
 	for _, node := range ordered {
 		ok, reason := fit.CanFit(pod, node, remaining[node.Name], residents[node.Name], domains)
 		if ok {
-			return node, nil
+			return node, fit.Reason{}, nil
 		}
 		refusals[node.Name] = reason.Message
 	}
-	return nil, refusals
+	return nil, fit.Reason{}, refusals
 }
 
 // checkHeadroom enforces ReserveForLargestPod: after the drain, some node must
@@ -306,18 +327,62 @@ func checkHeadroom(
 	// function's probe exists to avoid.
 	refusals := make(map[string]string, len(destinations))
 	for _, node := range destinations {
-		if ok, _ := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name], nil); ok {
+		ok, reason := fit.CanFit(probe, node, remaining[node.Name], residents[node.Name], nil)
+		if ok {
 			return nil
 		}
-		refusals[node.Name] = "no room for a pod the size of the largest relocatable one"
+		refusals[node.Name] = headroomRefusal(reason)
 	}
 
+	// What was observed, rather than what it would mean. Every destination
+	// refusing is not the same as the cluster being full: three of them may
+	// be cordoned.
 	return &Blocked{
 		Pod:     largestRunning,
 		PerNode: refusals,
 		Summary: fmt.Sprintf(
-			"draining would leave nowhere for a pod the size of %s/%s, the largest in the cluster",
+			"no destination would accept a pod the size of %s/%s, the largest in the cluster",
 			largestRunning.Namespace, largestRunning.Name),
+	}
+}
+
+// headroomRefusal says why one destination would not take the probe.
+//
+// fit's own sentence, kept rather than replaced by a capacity one. The reserve
+// probes every destination, and a node that refused because it is cordoned,
+// not Ready, or carrying a taint the probe does not tolerate refused for
+// something an operator can act on — reported as "no room" it becomes a
+// capacity claim about a node with tens of gigabytes free, and none of the
+// responses that invites (raise the pool maximum, add a node, turn the reserve
+// off) touches the thing that actually refused. It is also what makes a
+// cluster whose spare capacity sits in a tainted pool undiagnosable: the probe
+// carries no tolerations by construction, so it refuses there for ever.
+//
+// The shortfall is the one message that is not enough by itself. fit says
+// which resource ran out; the reserve has to add how much of it was being
+// asked for, because that is the whole of what this check is about.
+func headroomRefusal(r fit.Reason) string {
+	if r.Code == fit.ReasonInsufficient {
+		return r.Message + " for a pod the size of the largest relocatable one"
+	}
+	return r.Message
+}
+
+// RelocationSummary says what draining a node would move, in one clause.
+//
+// One sentence with two callers rather than two renderings of one number. The
+// Event on the node and `binpack explain` describe the same decision from the
+// same field, and an operator checking one against the other must not find
+// them disagreeing about the arithmetic — which they did, by the Event stating
+// the count and explain omitting it.
+func RelocationSummary(pods int) string {
+	switch pods {
+	case 0:
+		return "it runs nothing that would need to move"
+	case 1:
+		return "its 1 relocatable pod fits elsewhere"
+	default:
+		return fmt.Sprintf("all %d of its relocatable pods fit elsewhere", pods)
 	}
 }
 

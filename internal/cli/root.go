@@ -85,6 +85,14 @@ type options struct {
 	// differently from the one running is answering a different question, and
 	// nothing else in the output reveals which one it answered.
 	configSource string
+
+	// dryRun is that configuration's mode, and it belongs beside the source
+	// for the same reason: both say what the verdict is a verdict about. It is
+	// the one setting that decides whether "would drain node-a" describes
+	// something about to happen or something that never will, and the engine
+	// does not read it — so a command that prints a decision has to carry it
+	// separately or not at all.
+	dryRun bool
 }
 
 // NewRootCommand builds the command tree. out receives normal output, which

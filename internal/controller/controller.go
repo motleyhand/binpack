@@ -10,8 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"maps"
-	"slices"
 	"time"
 
 	"github.com/go-logr/logr"
@@ -119,9 +117,14 @@ type Options struct {
 	Interval time.Duration
 
 	// DryRun decides everything and changes nothing: no cordon, no eviction,
-	// no annotation. The default, and the mode to run first — the decisions
-	// are identical either way, so a week of events on nodes tells you what
-	// binpack would have done before it does any of it.
+	// no annotation. The default, and the mode to run first — each evaluation
+	// reaches the identical decision either way, so the events on nodes say
+	// which node binpack would pick and why before it picks one.
+	//
+	// What they cannot say is what follows, because in this mode nothing is
+	// drained: the cluster never consolidates, so binpack goes on choosing a
+	// first node, and every control that governs a second one — the after-drain
+	// cooldown, per-node backoff, the one-drain-at-a-time gate — is unreachable.
 	DryRun bool
 
 	// Once evaluates a single time and exits, for running binpack as a
@@ -155,19 +158,15 @@ type Options struct {
 //
 // Refused rather than quietly degraded, and refused only when it would matter:
 // a dry run changes nothing to need settling after.
+//
+// Which pool set it is the engine's question, not this one's: `binpack
+// explain` is in exactly the same position — a process that did not perform
+// the drain — and asks it too.
 func cooldownIsUnenforceable(opts Options) (string, time.Duration, bool) {
 	if !opts.Once || opts.DryRun {
 		return "", 0, false
 	}
-	if d := opts.Engine.Default.CooldownAfterDrain; d > 0 {
-		return "the default policy", d, true
-	}
-	for _, name := range slices.Sorted(maps.Keys(opts.Engine.ByPool)) {
-		if d := opts.Engine.ByPool[name].CooldownAfterDrain; d > 0 {
-			return "pool " + name, d, true
-		}
-	}
-	return "", 0, false
+	return engine.CooldownAfterDrain(opts.Engine)
 }
 
 func Run(ctx context.Context, opts Options) error {
@@ -183,10 +182,9 @@ func Run(ctx context.Context, opts Options) error {
 	if where, d, unenforceable := cooldownIsUnenforceable(opts); unenforceable {
 		return fmt.Errorf(
 			"--once cannot honour cooldown.afterDrain (%s sets %s): each run is a new process, "+
-				"and a completed drain leaves nothing in the cluster to measure from, so the "+
-				"cooldown would never apply. Run binpack as a Deployment, or set "+
+				"and %s, so the cooldown would never apply. Run binpack as a Deployment, or set "+
 				"cooldown.afterDrain: 0 to say that consecutive drains are acceptable",
-			where, d)
+			where, d, engine.NoDrainToMeasureFrom)
 	}
 
 	mgr, err := manager.New(opts.RestConfig, managerOptions(opts))

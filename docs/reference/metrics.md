@@ -214,7 +214,7 @@ Every label value is drawn from a bounded set: the verdicts, skip codes and outc
 plus pool names, which are counted in single digits.
 
 The engine's prose reasons are deliberately **not** exposed as labels. They name individual
-nodes and pods — "draining would leave nowhere for a pod the size of
+nodes and pods — "no destination would accept a pod the size of
 `monitoring/prometheus-…`" — and a label whose values are unbounded is how a monitoring system
 falls over. The prose is in the logs, in the Events on the node, and in `binpack explain`.
 

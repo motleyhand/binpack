@@ -37,6 +37,11 @@ deliberately, on any platform. [ADR-0005](docs/design/adr-0005-why-not-a-karpent
 sets out the comparison honestly, including why binpack exists at all given that Karpenter's
 consolidation is a superset of it.
 
+**Either way, binpack needs a cluster-autoscaler** publishing
+`kube-system/cluster-autoscaler-status` — it drains a node, and the autoscaler is what removes
+it. `kubectl get configmap cluster-autoscaler-status -n kube-system` says whether yours does.
+Without one binpack refuses to act, so it has nothing to offer a `kind` or `minikube` cluster.
+
 **Before installing anything**, work through the
 [quick wins](docs/how-to/quick-wins-before-installing-binpack.md). Several of them recover more
 capacity than binpack can, because they remove *permanent* blocks rather than optimising around

@@ -116,12 +116,12 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 	// it would be telling them the opposite of what is happening.
 	reason, note := ReasonWouldDrain, fmt.Sprintf(
 		"binpack would drain this node: %s. No action taken — dry run",
-		relocationSummary(relocating))
+		engine.RelocationSummary(relocating))
 	if !e.opts.DryRun {
 		reason, note = ReasonDraining, fmt.Sprintf(
 			"binpack is draining this node: %s. Pods are evicted one at a time, and the "+
 				"cluster-autoscaler removes the node once it is empty",
-			relocationSummary(relocating))
+			engine.RelocationSummary(relocating))
 	}
 
 	// Returned rather than logged here: whether a lost report is fatal depends
@@ -223,16 +223,6 @@ func refusal(d engine.Decision) (reason, note string) {
 	return reason, "binpack evaluated the cluster and chose no node to drain" + wall +
 		". This is the cluster's answer, written on every node binpack looked at; " +
 		"`binpack explain` gives this node's own reason"
-}
-
-func relocationSummary(pods int) string {
-	if pods == 0 {
-		return "it runs nothing that would need to move"
-	}
-	if pods == 1 {
-		return "its 1 relocatable pod fits elsewhere"
-	}
-	return fmt.Sprintf("all %d of its relocatable pods fit elsewhere", pods)
 }
 
 func chosenAssessment(d engine.Decision) *engine.NodeAssessment {

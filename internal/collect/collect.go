@@ -23,9 +23,16 @@ import (
 // One interface for both frontends, and that is the point. `binpack explain`
 // satisfies it with a direct client built from a kubeconfig; the controller
 // satisfies it with the manager's watch-backed cache. Neither `collect` nor
-// the engine can tell which it has, which is what guarantees that what
-// `explain` prints is what `run` will do — a property that would otherwise
-// rest on two code paths being kept in step by hand.
+// the engine can tell which it has, so both frontends decide on the same
+// cluster — a property that would otherwise rest on two code paths being kept
+// in step by hand.
+//
+// It guarantees the inputs, not the answer. One field of Snapshot is not read
+// from the cluster at all: LastDrain is the controller's own memory of when it
+// last finished a drain, because a completed drain deletes the node that would
+// have recorded it. So `explain` decides as though no drain had ever happened,
+// and says so rather than answering silently — see the after-drain cooldown in
+// its output.
 type Reader = client.Reader
 
 // Snapshot reads the cluster into the value the engine decides on.
