@@ -415,8 +415,21 @@ func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
 	// does not install it — it reads one object out of it.
 	installed[v1alpha1.DefaultAutoscalerNamespace] = true
 
-	example := regexp.MustCompile(`kubectl\s+(?:-n|--namespace)\s+([A-Za-z0-9-]+)`)
-	examples := 0
+	// The flag is read from anywhere in the command, not just straight after
+	// `kubectl`. Both positions are valid and both are used here — the docs
+	// carry `kubectl -n kube-system get deploy` and `kubectl get pdb -n NS`
+	// — so a pattern anchored to the first position inspects about half the
+	// examples while reading as though it inspected all of them.
+	flag := regexp.MustCompile(`(?:^|\s)(?:-n|--namespace)[=\s]+(\S+)`)
+	// A namespace is an RFC 1123 label. Anything else in that position is a
+	// placeholder — `NS`, `<ns>`, `<discovery.autoscalerNamespace>` — and is
+	// skipped rather than reported, by a rule rather than a list of spellings,
+	// so a new placeholder convention needs no change here. The distinction is
+	// safe in the direction that matters: the defect this test exists for was
+	// `binpack` for `binpack-system`, and both are legal labels.
+	namespace := regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
+
+	checked, skipped := 0, 0
 	// README.md is walked too: it is the highest-traffic surface of the lot and
 	// carries the same kind of example.
 	roots := []string{"../../docs", "../../README.md"}
@@ -432,12 +445,33 @@ func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
 			return err
 		}
 		for i, line := range strings.Split(string(body), "\n") {
-			for _, m := range example.FindAllStringSubmatch(line, -1) {
-				examples++
-				if !installed[m[1]] {
+			cmd := strings.Index(line, "kubectl ")
+			if cmd < 0 {
+				continue
+			}
+			// Only as far as the first pipe: `kubectl describe node <n> | sed
+			// -n '...'` is one line with two `-n` flags on it, and the second
+			// belongs to sed.
+			run := line[cmd:]
+			if pipe := strings.Index(run, "|"); pipe >= 0 {
+				run = run[:pipe]
+			}
+			for _, m := range flag.FindAllStringSubmatch(run, -1) {
+				// Markup travels with the token when the command is written
+				// inline rather than fenced — "`kubectl edit deploy -n
+				// kube-system`" ends the namespace with a backtick. Angle
+				// brackets are deliberately not trimmed: `<ns>` is a
+				// placeholder and must stay one.
+				ns := strings.Trim(m[1], "`'\",.;)")
+				if len(ns) > 63 || !namespace.MatchString(ns) {
+					skipped++
+					continue
+				}
+				checked++
+				if !installed[ns] {
 					t.Errorf("%s:%d uses namespace %q, which no install command in "+
 						"docs/how-to/install-binpack.md creates: %s",
-						path, i+1, m[1], strings.TrimSpace(line))
+						path, i+1, ns, strings.TrimSpace(line))
 				}
 			}
 		}
@@ -448,8 +482,12 @@ func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
 			t.Fatalf("walking %s: %v", root, err)
 		}
 	}
-	if examples == 0 {
-		t.Fatal("found no `kubectl -n` examples under docs/; this test asserts " +
-			"nothing if its pattern has stopped matching")
+	// Both counts, because the two ways this stops asserting anything are the
+	// pattern matching nothing at all and every match being written off as a
+	// placeholder.
+	if checked == 0 {
+		t.Fatalf("found no real namespace in a `kubectl` example under docs/ or the "+
+			"README (%d placeholders skipped); this test asserts nothing if its "+
+			"pattern has stopped matching", skipped)
 	}
 }

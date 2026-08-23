@@ -142,10 +142,13 @@ provider runs the autoscaler for you, its own API is the whole surface: DigitalO
 of the thresholds above are yours to set and `scale-down-delay-after-add` is not (the
 [`doctl kubernetes cluster update`](https://docs.digitalocean.com/reference/doctl/reference/kubernetes/cluster/update/)
 flags, read 2026-08-23). Where instead the autoscaler is a Deployment in your own cluster, every
-flag it has is reachable with `kubectl edit`. Which of those you are looking at is one command:
+flag it has is reachable with `kubectl edit`. Which of those you are looking at is one command.
+The autoscaler's name and namespace both vary by install, so match on the substring rather than
+guessing at either — and read a quiet result as pointing at a managed control plane rather than
+proving one:
 
 ```bash
-kubectl -n kube-system get deploy cluster-autoscaler
+kubectl get deploy -A | grep cluster-autoscaler
 ```
 
 Either way the control plane's own logs are not yours to read on a managed service.

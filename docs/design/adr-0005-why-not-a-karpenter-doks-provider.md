@@ -116,8 +116,9 @@ documentation gives `kubectl edit deployment cluster-autoscaler -n kube-system` 
 `--nodes=min:max:workers` flag as the worked example — so every flag is available. Vultr,
 Scaleway and OVH were not checked either way and should not be named again until they are. The
 durable form of the claim is not a list but the command that answers it on the reader's own
-cluster, `kubectl -n kube-system get deploy cluster-autoscaler`, and the architectural argument
-below holds for everyone regardless of the answer.
+cluster, `kubectl get deploy -A | grep cluster-autoscaler` — matched by substring across all
+namespaces, because both the name and the namespace vary by install, and read as evidence rather
+than proof. The architectural argument below holds for everyone regardless of the answer.
 
 **Permanence of the gap.** binpack is not a workaround for DigitalOcean hiding
 `scale-down-utilization-threshold`. Even a fully tunable cluster-autoscaler never rebalances;

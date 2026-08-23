@@ -125,10 +125,10 @@ Neither makes it rebalance, which is the gap binpack exists for, but both are fr
 needs a new component.
 
 If your autoscaler is instead a Deployment in your own cluster, every flag is reachable directly
-and none of this applies:
+and none of this applies. Its name and namespace vary by install, so look for it by substring:
 
 ```bash
-kubectl -n kube-system get deploy cluster-autoscaler
+kubectl get deploy -A | grep cluster-autoscaler
 ```
 
 ## 6. Check the expander, if you run multiple pools
