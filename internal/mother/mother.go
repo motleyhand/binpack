@@ -817,10 +817,32 @@ func WithResourceClaim(name string) PodOption {
 
 // Gated adds a scheduling gate, which holds the pod unschedulable until
 // something removes it.
+//
+// The status is what the API server writes, not decoration. PrepareForCreate
+// stamps {PodScheduled, False, SchedulingGated} on any pod created with a
+// non-empty spec.schedulingGates (kubernetes pkg/registry/core/pod/strategy.go,
+// applySchedulingGatedCondition), and that condition is the only thing a gated
+// pod ever gets: a gated pod never enters the scheduler's active queue — the
+// SchedulingGates PreEnqueue plugin holds it in unschedulablePods — so nothing
+// ever writes Unschedulable over it. Reading a gated replacement is reading
+// that condition, so a fixture that omitted it would agree with code that
+// looked for the wrong one.
+//
+// The node assignment is dropped for the same reason: ValidatePodCreate
+// forbids spec.nodeName while any gate remains (pkg/apis/core/validation),
+// so a bound gated pod is an object no cluster ever held.
 func Gated(name string) PodOption {
 	return func(p *corev1.Pod) {
 		p.Spec.SchedulingGates = append(p.Spec.SchedulingGates,
 			corev1.PodSchedulingGate{Name: name})
+		p.Spec.NodeName = ""
+		p.Status.Phase = corev1.PodPending
+		p.Status.Conditions = []corev1.PodCondition{{
+			Type:    corev1.PodScheduled,
+			Status:  corev1.ConditionFalse,
+			Reason:  corev1.PodReasonSchedulingGated,
+			Message: "Scheduling is blocked due to non-empty scheduling gates",
+		}}
 	}
 }
 

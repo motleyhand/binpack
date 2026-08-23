@@ -61,6 +61,7 @@ const (
 	FindingAbandonedDrain         = "abandoned-drain"
 	FindingNodeInBackoff          = "node-in-backoff"
 	FindingNoTemplate             = "unreadable-template"
+	FindingTemplateDivergence     = "template-divergence"
 )
 
 // Diagnosis is one class of finding: how much it matters, what it means and
@@ -304,6 +305,37 @@ var diagnoses = map[string]Diagnosis{
 			"DaemonSets and Jobs; a pod owned directly by an operator's own resource has none. " +
 			"Nothing to change on your side: please report the controller, so the list can be " +
 			"widened against evidence rather than guesswork.",
+	},
+	FindingTemplateDivergence: {
+		Severity: Warning,
+		Summary: "these pods carry a placement constraint their controller's template does " +
+			"not, so binpack cannot tell where their replacements would be allowed to run " +
+			"and will not move them",
+		// Named for the observation and not for a cause, because binpack
+		// cannot establish the cause and there is more than one. Admission
+		// adding a constraint at CREATE is the common one and the only one
+		// with a remedy; a StatefulSet held mid-rollout by OnDelete or a
+		// partition is the other, and there the template is simply ahead of
+		// the pods and nothing is wrong. An earlier draft called this
+		// `admission-divergence` and told every reader to go and look for a
+		// webhook, which for the second reader is a hunt for something that
+		// does not exist.
+		//
+		// The refusal is right either way, and for different reasons: in the
+		// first case the template understates where the replacement may go,
+		// and in the second it is the pods that are stale — binpack cannot
+		// tell which, so it declines to predict. Sizing the move from the
+		// running pod instead is the unsound inference.
+		Fix: "unlike everything else here this blocks binpack alone — the cluster-autoscaler " +
+			"and kubectl drain are unaffected. Two things produce it. Something may be adding " +
+			"the constraint when the pod is created rather than in the workload's own " +
+			"template — a mutating admission webhook, or a namespace default node selector — " +
+			"and putting the same constraint in the pod template makes the pod movable again. " +
+			"Or the template is simply newer than the pods, which is what a StatefulSet with " +
+			"an OnDelete strategy or a rolling update held at a partition looks like; there " +
+			"the pods become movable as the rollout completes. The detail names the field, " +
+			"and comparing it against the controller's own template says which of the two " +
+			"this is.",
 	},
 	FindingAbandonedDrain: {
 		Severity: Warning,
@@ -636,9 +668,22 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 		// Guarded on having a controller at all: a bare pod is already its own
 		// finding, and reporting it twice would say the same thing in two
 		// vocabularies.
+		//
+		// Split by cause, because the two remedies are not merely different,
+		// they are addressed to different people. One asks for a report so
+		// binpack's allowlist can be widened; the other asks the operator to
+		// look at their own webhook, and answering it with the first sent them
+		// to file a bug against a ReplicaSet — which the same finding's detail
+		// named, while its fix said binpack reads ReplicaSets.
 		if owner := metav1.GetControllerOf(pod); owner != nil {
-			if _, ok := replacement(pod, s.Templates); !ok {
-				g.add(pod, FindingNoTemplate, "owned by "+owner.Kind+" "+owner.Name)
+			if _, diverged, ok := replacement(pod, s.Templates); !ok {
+				if diverged == "" {
+					g.add(pod, FindingNoTemplate, "owned by "+owner.Kind+" "+owner.Name)
+				} else {
+					g.add(pod, FindingTemplateDivergence,
+						"carries a "+diverged+" its "+owner.Kind+" "+owner.Name+
+							" template does not")
+				}
 			}
 		}
 

@@ -755,6 +755,71 @@ func TestOneRefusedReplacementEndsTheDrainWhateverItsSiblingsDid(t *testing.T) {
 	}
 }
 
+func TestAJustAdmittedReplacementIsWaitedForRatherThanAbandoned(t *testing.T) {
+	// The window the gate detection must not fire in. A gating controller
+	// admits a pod by removing spec.schedulingGates, and the API server keeps
+	// the old status wholesale on a spec update — PrepareForUpdate is
+	// `newPod.Status = oldPod.Status` — so the {PodScheduled: False, reason:
+	// SchedulingGated} condition it stamped at CREATE stays standing until the
+	// scheduler gets round to the pod and writes a new one.
+	//
+	// An evaluation landing in that window sees a healthy replacement about to
+	// be placed. Reading the condition would abandon the drain and uncordon
+	// at the exact moment it was about to succeed, which is worse than the
+	// wait this detection replaced: the wait ended correctly, just late.
+	admitted := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+	mother.Gated("kueue.x-k8s.io/admission")(admitted)
+	// What admission does, and all it does. The condition is left behind.
+	admitted.Spec.SchedulingGates = nil
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), admitted}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Done || step.Failed {
+		t.Errorf("abandoned a drain whose replacement had just been admitted: %+v", step)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("uncordoned a node whose drain is still in flight")
+	}
+}
+
+func TestOneGatedReplacementEndsTheDrainWhateverItsSiblingsDid(t *testing.T) {
+	// The same ordering rule as the refusal above, and it needs stating
+	// separately because it is the case where the two readings disagree: a
+	// controller with a bound pod newer than the eviction *and* a gated one.
+	// Reading "landed" there lets the drain evict the next pod while the
+	// replacement for the last one is still queued for admission — which is
+	// exactly the one-in-flight rule being spent on a pod that has not
+	// arrived. Listed with the bound pod first, so an implementation that
+	// answered from whichever it saw first would call this healthy.
+	bound := pending("landed", "web-rs", at.Add(-30*time.Second), false)
+	bound.Spec.NodeName = "b"
+
+	gated := pending("gated", "web-rs", at.Add(-20*time.Second), false)
+	mother.Gated("kueue.x-k8s.io/admission")(gated)
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), bound, gated}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+
+	step, err := executor.Advance(context.Background(), clientFor(s), s, "a",
+		engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+	if step.Code != drain.AbandonUnschedulable || !step.Failed {
+		t.Errorf("expected the drain abandoned, got %+v", step)
+	}
+	if !strings.Contains(step.Reason, "default/gated") {
+		t.Errorf("the reason should name the pod nothing will place: %q", step.Reason)
+	}
+}
+
 func TestSomebodyElsesUnschedulablePodDoesNotEndTheDrain(t *testing.T) {
 	// A workload deployed with impossible requests, while this drain happens
 	// to be running. Correlating by controller rather than by time alone is
@@ -1948,6 +2013,42 @@ func TestARefusedReplacementEndsTheDrainEvenWhileABudgetIsCatchingUp(t *testing.
 	}
 }
 
+func TestAGatedReplacementEndsTheDrainEvenWhileABudgetIsCatchingUp(t *testing.T) {
+	// The same hole, reached by the state next door. The pause branch and the
+	// awaiting block below it ask the same question of the same helper, so a
+	// replacement state that ends the drain in one and waits in the other
+	// leaves a node cordoned for whichever of the two conditions happens to be
+	// checked first — and here that is a pod nothing is going to place held
+	// down behind a budget that will catch up in one sync.
+	//
+	// Its own test rather than a row on the one above, because the two
+	// branches are separate call sites and only crossing the state with the
+	// blocker separates them: with no blocker the awaiting block answers, and
+	// this branch could return anything at all without a test noticing.
+	gated := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+	mother.Gated("kueue.x-k8s.io/admission")(gated)
+
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")},
+		[]*corev1.Pod{covered("stayer", "web"), gated})
+	s.PDBs = []*policyv1.PodDisruptionBudget{stalePDB()}
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Code != drain.AbandonUnschedulable || !step.Done || !step.Failed {
+		t.Errorf("expected the gated replacement to end the drain, got %+v", step)
+	}
+	if !strings.Contains(step.Reason, "scheduling gate") {
+		t.Errorf("the reason should say the pod is gated, got %q", step.Reason)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node stayed cordoned behind a replacement nothing will place")
+	}
+}
+
 // refusingEvictions answers every eviction with err while letting the node
 // patches through, so a test can assert what the drain did about the refusal
 // rather than only that it stopped.
@@ -2729,5 +2830,45 @@ func TestAnEmptiedNodeWaitsThroughAScaleUpButNotThroughADeadAutoscaler(t *testin
 				t.Errorf("progress marker = %q, want it left where it was", got)
 			}
 		})
+	}
+}
+
+func TestAdvanceAbandonsWhenTheReplacementIsSchedulingGated(t *testing.T) {
+	// An admission webhook that attaches a scheduling gate at CREATE — Kueue,
+	// or any quota or policy gate — re-gates the replacement the controller
+	// makes for an evicted pod. The gate is on neither of the two objects
+	// binpack builds a replacement from: not the stored template, since it is
+	// injected at CREATE, and not the running pod, since the API server
+	// forbids spec.nodeName while a gate remains. So the allowlist's
+	// scheduling-gate refusal never sees it and the eviction happens.
+	//
+	// What arrives then is a pod in neither state this drain can act on. The
+	// API server stamps {PodScheduled, False, SchedulingGated}, the scheduler
+	// never dequeues it, and nothing ever writes Unschedulable — so it is not
+	// refused, and having no node it has not landed either. Waiting for it is
+	// waiting on a third-party controller that publishes nothing binpack can
+	// read, which is the one shape CLAUDE.md says must never bound a wait.
+	// Detect it positively and hand the node back: it is where that pod could
+	// have stayed.
+	gated := pending("gated", "web-rs", at.Add(-30*time.Second), false)
+	mother.Gated("kueue.x-k8s.io/admission")(gated)
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), gated}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Done || !step.Failed {
+		t.Errorf("expected the drain abandoned, got %+v", step)
+	}
+	if !strings.Contains(step.Reason, "default/gated") {
+		t.Errorf("the reason should name the pod: %q", step.Reason)
+	}
+	if nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the node was left cordoned")
 	}
 }

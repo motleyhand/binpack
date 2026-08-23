@@ -42,7 +42,10 @@ Pay particular attention to the refusals binpack marks **unmodelled**, and to an
 finding a wall in your cluster — and they are the places where your cluster does something binpack
 does not understand, so they are worth reading before it starts acting anywhere. The first is
 counted by `binpack_nodes_unmodelled`, and [`binpack diagnose`](../reference/diagnostics.md)
-reports it per workload under `unreadable-template`, with the owning controller named.
+reports it per workload under `unreadable-template` — binpack found no template to read — or
+`template-divergence`, where it read one and the running pods disagree with it. The metric's
+`cause` label carries the same distinction, which is worth keeping: the first widens on a bug
+report, and the second is answered in your own cluster.
 
 ### Decide what you do not want touched
 

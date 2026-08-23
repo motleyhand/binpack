@@ -416,7 +416,7 @@ func TestUnmodelledNodesAreCountedApartFromOrdinaryShortfalls(t *testing.T) {
 
 	unreadable := assess(engine.VerdictInfeasible, "")
 	unreadable.Simulation.Blocked = &engine.Blocked{
-		Summary: "no readable controller template", NoTemplate: true,
+		Summary: "no readable controller template", Unmodelled: engine.FindingNoTemplate,
 	}
 
 	Observe(snapshot(), engine.Decision{
@@ -427,8 +427,89 @@ func TestUnmodelledNodesAreCountedApartFromOrdinaryShortfalls(t *testing.T) {
 	if got := testutil.ToFloat64(nodes.WithLabelValues(engine.VerdictInfeasible)); got != 2 {
 		t.Errorf("infeasible = %v, want both nodes counted", got)
 	}
-	if got := testutil.ToFloat64(unmodelled); got != 1 {
+	if got := unmodelledFor(engine.FindingNoTemplate); got != 1 {
 		t.Errorf("binpack_nodes_unmodelled = %v, want only the unreadable one", got)
+	}
+}
+
+// unmodelledFor is one arm of binpack_nodes_unmodelled, by cause.
+func unmodelledFor(cause string) float64 {
+	return testutil.ToFloat64(unmodelled.WithLabelValues(cause))
+}
+
+// simulationRefusing runs a real simulation of a candidate whose one pod is
+// this one, so the cause this gauge publishes is the one the engine decided
+// rather than one the test asserted into place.
+func simulationRefusing(
+	pod *corev1.Pod, templates map[engine.OwnerRef]*corev1.PodTemplateSpec,
+) engine.NodeAssessment {
+	candidate, destination := mother.LargeNode("candidate"), mother.LargeNode("destination")
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, []*corev1.Pod{pod},
+		templates, candidate, engine.SimConfig{ExpendablePriorityCutoff: -10})
+	return engine.NodeAssessment{Node: candidate, Simulation: &sim}
+}
+
+func TestTheTwoUnmodelledCausesAreCountedApart(t *testing.T) {
+	// ADR-0006 settles the controller allowlist against measurement, and this
+	// gauge is the measurement. Two quite different conditions reach it: a
+	// controller kind binpack has no reader for, which is a gap in binpack and
+	// widens on evidence, and a template this cluster's running pods disagree
+	// with, which binpack cannot widen its way out of at all. A single number
+	// that adds them together answers neither question — and the second is
+	// much the commoner, so it would be the one drowning out the evidence the
+	// ADR asked for.
+	// An owner kind collect reads no template from, so there is no entry.
+	exotic := mother.Pod("default", "shard-0", mother.OnNode("candidate"),
+		mother.OwnedBy("KafkaCluster", "events"))
+
+	// A readable template the running pod diverges from.
+	mutated := mother.Pod("default", "web", mother.OnNode("candidate"),
+		mother.WithNodeSelector("tier", "app"))
+	diverging := mother.Templates(mutated)
+	mother.TemplateFor(diverging, mutated) // the template lacks the selector
+
+	Observe(snapshot(), engine.Decision{
+		Code: engine.CodeNoneFeasible,
+		Assessments: []engine.NodeAssessment{
+			simulationRefusing(exotic, mother.Templates(exotic)),
+			simulationRefusing(mutated, diverging),
+		},
+	}, config(), 0.01)
+
+	if got := unmodelledFor(engine.FindingNoTemplate); got != 1 {
+		t.Errorf("unreadable-template arm = %v, want 1", got)
+	}
+	if got := unmodelledFor(engine.FindingTemplateDivergence); got != 1 {
+		t.Errorf("template-divergence arm = %v, want 1", got)
+	}
+}
+
+func TestBothUnmodelledCausesHaveAZeroSeries(t *testing.T) {
+	// Same rule as the verdicts, and the same gap it has to be tested through:
+	// an arm that only appears once it has fired makes the comparison above
+	// impossible on the cluster where nothing has fired yet, and an absent
+	// series reads as "binpack is not reporting" rather than as zero.
+	//
+	// Driven from a draining tick because that is the path where seeding is
+	// the only thing that writes these arms — an ordinary evaluation sets both
+	// every time, so it would pass with no seeding at all. A leader that
+	// restarts mid-drain opens the gate on this tick.
+	unmodelled.Reset()
+
+	Observe(snapshot(), engine.Decision{
+		Code:   engine.CodeDraining,
+		Reason: "a drain is in progress on node-a",
+	}, config(), 0.01)
+
+	// Spelled out rather than ranged over unmodelledCauses: a test that reads
+	// the same list the code publishes from cannot notice the list shrinking,
+	// which is the failure it exists to catch.
+	scrape := gather(t)
+	for _, cause := range []string{"unreadable-template", "template-divergence"} {
+		want := `binpack_nodes_unmodelled{cause="` + cause + `"}`
+		if !strings.Contains(scrape, want) {
+			t.Errorf("%s is not published:\n%s", want, scrape)
+		}
 	}
 }
 

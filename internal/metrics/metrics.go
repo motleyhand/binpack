@@ -116,13 +116,14 @@ var (
 		Help: "Nodes ruled out before simulation at the last evaluation, by reason code.",
 	}, []string{"code"})
 
-	unmodelled = prometheus.NewGauge(prometheus.GaugeOpts{
+	unmodelled = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "binpack_nodes_unmodelled",
-		Help: "Nodes refused because binpack could not read a pod's controller template, " +
-			"and so cannot predict what its replacement would request. " +
-			"A gap in what binpack models rather than a fact about the cluster: " +
-			"persistently above zero means the allowlist is too narrow for this cluster.",
-	})
+		Help: "Nodes refused because binpack could not predict what a pod's replacement " +
+			"would be, by cause. The two are gaps in different things: unreadable-template " +
+			"persistently above zero means binpack's controller allowlist is too narrow for " +
+			"this cluster, which is a gap in binpack; template-divergence means running pods " +
+			"disagree with their controller's template, which no change to binpack reaches.",
+	}, []string{"cause"})
 
 	drainable = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "binpack_drainable_nodes",
@@ -298,7 +299,8 @@ func observeNodes(d engine.Decision) {
 
 	seedVerdicts()
 
-	var canDrain, cannotModel float64
+	var canDrain float64
+	cannotModel := map[string]float64{}
 	for _, a := range d.Assessments {
 		verdict := a.Verdict()
 		nodes.WithLabelValues(verdict).Inc()
@@ -315,13 +317,15 @@ func observeNodes(d engine.Decision) {
 			// fit" is a fact about the cluster and "binpack cannot tell what
 			// the workload is" is a gap in binpack, and they call for
 			// completely different responses.
-			if a.Simulation != nil && a.Simulation.Blocked != nil && a.Simulation.Blocked.NoTemplate {
-				cannotModel++
+			if a.Simulation != nil && a.Simulation.Blocked != nil && a.Simulation.Blocked.Unmodelled != "" {
+				cannotModel[a.Simulation.Blocked.Unmodelled]++
 			}
 		}
 	}
 	drainable.Set(canDrain)
-	unmodelled.Set(cannotModel)
+	for _, cause := range unmodelledCauses {
+		unmodelled.WithLabelValues(cause).Set(cannotModel[cause])
+	}
 }
 
 // seedVerdicts makes sure every verdict has a series, without disturbing one
@@ -333,7 +337,18 @@ func observeNodes(d engine.Decision) {
 // creates a child at zero on first sight and returns the existing one
 // afterwards — so this seeds a fresh process and leaves a draining tick's
 // inherited counts alone, from the one line.
+// unmodelledCauses is the closed set of reasons binpack could not predict a
+// replacement, and so the label values binpack_nodes_unmodelled publishes.
+//
+// Both are always published, for the same reason every verdict is: an absent
+// series reads as "binpack is not reporting", and these two are the ones an
+// operator is meant to compare.
+var unmodelledCauses = []string{engine.FindingNoTemplate, engine.FindingTemplateDivergence}
+
 func seedVerdicts() {
+	for _, cause := range unmodelledCauses {
+		unmodelled.WithLabelValues(cause)
+	}
 	for _, verdict := range []string{
 		engine.VerdictSkipped, engine.VerdictInfeasible,
 		engine.VerdictBlocked, engine.VerdictDrainable,
