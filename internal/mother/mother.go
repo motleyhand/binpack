@@ -24,7 +24,6 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
-	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
@@ -899,13 +898,13 @@ func Templates(pods ...*corev1.Pod) map[engine.OwnerRef]*corev1.PodTemplateSpec 
 	// no-template refusal turns on — building one for every kind would make
 	// that case untestable and the fixture a lie.
 	//
-	// Taken from collect rather than restated, because a fixture that stops
+	// Taken from the engine rather than restated, because a fixture that stops
 	// agreeing with the read path does not fail: it goes on producing the
 	// refusal the tests were written against, so a kind added to the reader
 	// and forgotten here leaves the suite green and the work looking done.
 	readable := map[string]bool{}
-	for _, src := range collect.TemplateSources() {
-		readable[src.Kind] = true
+	for _, kind := range engine.TemplateKinds() {
+		readable[kind.Kind] = true
 	}
 
 	out := map[engine.OwnerRef]*corev1.PodTemplateSpec{}

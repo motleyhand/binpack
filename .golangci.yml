@@ -30,10 +30,15 @@ linters:
         # ADR-0006 applies to unmodelled scheduler constraints.
         #
         # Named `purity` rather than `engine-purity` because it no longer
-        # covers only the engine, and the four packages are here for three
+        # covers only the engine, and the five packages are here for four
         # different reasons — each stated below, because a files: list nobody
         # can justify line by line is one the next entry gets added to by
         # sympathy rather than by argument.
+        #
+        # The set is closed: every package listed here may import only packages
+        # that are also listed here. That is what makes the guarantee hold one
+        # level down, and it is not an accident of the current import graph —
+        # see the allow list.
         purity:
           files:
             # The decision engine itself, which is what ADR-0008 decided.
@@ -50,14 +55,27 @@ linters:
             # Its package doc says it "answers it as a pure function so the
             # judgement can be stated as a table". Held to what it claims.
             - "**/internal/drain/**"
+            # The fixture package, which is here to keep the set closed. It
+            # holds no client, but the packages above import it from their test
+            # files — depguard checks those too — so admitting it unguarded
+            # would let any of them reach a client one hop out. Its own purity
+            # is the thing that makes admitting it safe, so it is enforced
+            # rather than assumed.
+            - "**/internal/mother/**"
           allow:
             - $gostd
-            # Wholesale, so the rule stops at the package boundary rather than
-            # at the module's: nothing prevents a guarded package reaching a
-            # client through an unguarded internal one except the import cycle
-            # that would result. Widening this list is not the only way to
-            # break the property.
-            - github.com/motleyhand/binpack
+            # The module, package by package rather than wholesale. Wholesale
+            # stopped the rule at the package boundary instead of the
+            # property's: internal/collect holds a client and neither
+            # internal/drain nor api/v1alpha1 imports anything that would make
+            # importing it a cycle, so a guarded package could have reached
+            # cluster access through it with nothing failing. Every entry here
+            # is a package this same rule guards.
+            - github.com/motleyhand/binpack/api/v1alpha1
+            - github.com/motleyhand/binpack/internal/engine
+            - github.com/motleyhand/binpack/internal/fit
+            - github.com/motleyhand/binpack/internal/drain
+            - github.com/motleyhand/binpack/internal/mother
             - k8s.io/api
             - k8s.io/apimachinery
             - k8s.io/component-helpers

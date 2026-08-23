@@ -50,8 +50,11 @@ on.
 is not: that is what forces a cluster into a test and makes behaviour depend on the environment.
 Enforced by the `purity` `depguard` rule, which is an **allowlist** — a list of clients we
 remembered can never be complete — so any import not named in it fails CI. It covers
-`internal/engine`, `internal/fit`, `internal/drain` and `api/v1alpha1`: the last two because
-each had a document claiming the property before anything held them to it. Rationale:
+`internal/engine`, `internal/fit`, `internal/drain`, `api/v1alpha1` and `internal/mother`: the
+middle two because each had a document claiming the property before anything held them to it,
+and `mother` because the others import it from their test files, which `depguard` also checks.
+**The set is closed — a guarded package may import only guarded packages** — because `depguard`
+sees one hop and an unguarded intermediary is otherwise a way round the rule. Rationale:
 [ADR-0008](docs/design/adr-0008-engine-uses-api-types.md), which supersedes the stricter
 no-Kubernetes-imports rule of [ADR-0003](docs/design/adr-0003-pure-decision-engine.md) — that
 rule was a proxy, and the mirror types it required caused most of the defects found in review.

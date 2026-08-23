@@ -300,9 +300,14 @@ var diagnoses = map[string]Diagnosis{
 		Severity: Warning,
 		Summary: "these pods are created by a controller binpack cannot read a pod template " +
 			"from, so it cannot tell what their replacements would request and will not move them",
+		// The kinds are rendered from [TemplateKinds] rather than written out.
+		// This sentence is where an operator learns which owners binpack
+		// understands, and it was one of five places the set was spelled out by
+		// hand — the only one of the five a reader could not check, since a
+		// stale list here reads exactly like a current one.
 		Fix: "unlike everything else here this blocks binpack alone — the cluster-autoscaler and " +
-			"kubectl drain are unaffected. binpack reads templates from ReplicaSets, StatefulSets, " +
-			"DaemonSets and Jobs; a pod owned directly by an operator's own resource has none. " +
+			"kubectl drain are unaffected. binpack reads templates from " + templateKindsProse() +
+			"; a pod owned directly by an operator's own resource has none. " +
 			"Nothing to change on your side: please report the controller, so the list can be " +
 			"widened against evidence rather than guesswork.",
 	},

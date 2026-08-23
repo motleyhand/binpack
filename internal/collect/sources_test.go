@@ -18,12 +18,12 @@ import (
 // templates from — no fewer, or every evaluation fails with Forbidden, and no
 // more, since a permission nothing uses is one an operator has to justify.
 //
-// This is the assertion that makes [collect.TemplateSources] a single source
-// of truth rather than one more copy of the set. The other consumers —
-// `templates`, the controller's cache restrictions, the test fixtures — all
-// derive from the slice, so shortening it changes all of them together and
-// nothing they assert would notice. The chart does not derive from it, so this
-// is what fails when the slice and the cluster stop agreeing.
+// This is the assertion that makes the declaration a single source of truth
+// rather than one more copy of the set. Every consumer in Go derives from it —
+// `templates`, the controller's cache restrictions, the diagnosis sentence,
+// the test fixtures — so shortening it changes all of them together and
+// nothing they assert would notice. The chart is the one thing that cannot
+// derive from it, which is exactly why it is the one that can fail.
 func TestTheChartGrantsExactlyTheKindsTemplatesReads(t *testing.T) {
 	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
 	if err != nil {
@@ -62,31 +62,41 @@ func TestTheRBACReferenceGrantsWhatTheChartDoes(t *testing.T) {
 	}
 }
 
-// The diagnosis an operator is shown when a pod cannot be moved names the
-// kinds binpack *can* read, and it must name exactly the ones it reads.
+// The declaration has two halves in two packages, and they must cover the same
+// kinds.
 //
-// That sentence is the only place a cluster's operator learns why their pod is
-// excluded and what would change it, and the catalogue it lives in is public
-// API. It cannot be generated from the slice — internal/engine holds no
-// clients and so cannot import the package that reads them, which is the
-// whole of ADR-0008 — so it stays prose and this holds it to the prose being
-// true.
+// [engine.TemplateKinds] says which owners binpack understands;
+// [collect.TemplateSources] says how each is read. The split is forced —
+// internal/engine may hold no client, and a client.ObjectList is a client —
+// so what would otherwise be one literal is two, and this is what keeps them
+// one set.
 //
-// Written as one phrase rather than as four containment checks on purpose. A
-// test asking only whether each kind is mentioned passes when the slice
-// shrinks, since a shorter list is trivially all mentioned — it would report a
-// catalogue that had gone stale as agreeing.
-func TestTheNoTemplateDiagnosisNamesExactlyTheKindsThatAreRead(t *testing.T) {
-	var fix string
-	for _, d := range engine.Diagnoses() {
-		if d.Code == engine.FindingNoTemplate {
-			fix = d.Fix
-		}
+// Both directions, because they fail differently. A kind the engine names with
+// no source here is caught at runtime by `templates`, loudly, but only on a
+// cluster; a source for a kind the engine does not name is never read at all,
+// and nothing would ever say so.
+func TestEveryKindTheEngineNamesCanBeRead(t *testing.T) {
+	named := map[engine.TemplateKind]bool{}
+	for _, kind := range engine.TemplateKinds() {
+		named[kind] = true
 	}
 
-	if phrase := readableKinds(); !strings.Contains(fix, phrase) {
-		t.Errorf("the %s diagnosis does not say binpack reads templates from %q:\n\n%s",
-			engine.FindingNoTemplate, phrase, fix)
+	read := map[engine.TemplateKind]bool{}
+	for _, src := range collect.TemplateSources() {
+		read[src.TemplateKind] = true
+	}
+
+	for kind := range named {
+		if !read[kind] {
+			t.Errorf("the engine names %s %s and nothing here reads it",
+				kind.APIVersion, kind.Kind)
+		}
+	}
+	for kind := range read {
+		if !named[kind] {
+			t.Errorf("%s %s is read and the engine does not name it, so no pod is "+
+				"ever matched to it", kind.APIVersion, kind.Kind)
+		}
 	}
 }
 
@@ -122,7 +132,7 @@ func TestTheReferenceDocsNameExactlyTheKindsThatAreRead(t *testing.T) {
 }
 
 // readableKinds is the set as running prose: "ReplicaSets, StatefulSets,
-// DaemonSets and Jobs".
+// DaemonSets and Jobs" — the same sentence the diagnosis catalogue renders.
 //
 // One phrase rather than a containment check per kind, because a test asking
 // only whether each kind is mentioned passes when the set shrinks — a shorter
@@ -135,10 +145,10 @@ func readableKinds() string {
 
 // kindNames is every readable kind, each with the given suffix.
 func kindNames(suffix string) []string {
-	sources := collect.TemplateSources()
-	out := make([]string, 0, len(sources))
-	for _, src := range sources {
-		out = append(out, src.Kind+suffix)
+	kinds := engine.TemplateKinds()
+	out := make([]string, 0, len(kinds))
+	for _, kind := range kinds {
+		out = append(out, kind.Kind+suffix)
 	}
 	return out
 }
@@ -184,7 +194,8 @@ func TestTheCoreGroupIsNamedByItsAbsence(t *testing.T) {
 		"batch/v1":  "batch",
 		"batch/v1b": "batch",
 	} {
-		if got := (collect.TemplateSource{APIVersion: apiVersion}).Group(); got != want {
+		src := collect.TemplateSource{TemplateKind: engine.TemplateKind{APIVersion: apiVersion}}
+		if got := src.Group(); got != want {
 			t.Errorf("Group() of %q = %q, want %q", apiVersion, got, want)
 		}
 	}

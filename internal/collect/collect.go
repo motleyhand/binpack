@@ -105,7 +105,18 @@ func Snapshot(ctx context.Context, reader Reader, now time.Time, status StatusRe
 func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.PodTemplateSpec, error) {
 	out := map[engine.OwnerRef]*corev1.PodTemplateSpec{}
 
-	for _, src := range templateSources {
+	for _, kind := range engine.TemplateKinds() {
+		src, readable := sourceFor(kind)
+		if !readable {
+			// Loud, because the alternative is a kind the engine believes is
+			// understood and nothing ever reads — every pod owned by one
+			// refused, and the refusal indistinguishable from the ordinary
+			// case it is supposed to describe.
+			return nil, fmt.Errorf(
+				"no way to read a %s %s template: internal/engine names the kind and "+
+					"internal/collect has no source for it", kind.APIVersion, kind.Kind)
+		}
+
 		list := src.List()
 		if err := reader.List(ctx, list); err != nil {
 			return nil, fmt.Errorf("listing %s: %w", src.Resource, err)
@@ -129,8 +140,8 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 			}
 			out[engine.OwnerRef{
 				Namespace:  obj.GetNamespace(),
-				APIVersion: src.APIVersion,
-				Kind:       src.Kind,
+				APIVersion: kind.APIVersion,
+				Kind:       kind.Kind,
 				Name:       obj.GetName(),
 				UID:        obj.GetUID(),
 			}] = src.Template(obj)
@@ -140,32 +151,35 @@ func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.
 	return out, nil
 }
 
-// TemplateSource is one controller kind binpack reads pod templates from.
+// TemplateSource is how one controller kind is read.
 //
-// The set is closed, small, and — from here on — written down once. It used to
-// be written in five places: the four list-and-key blocks this replaces, the
-// cache's per-kind restrictions and its trim in internal/controller, and the
-// fixture in internal/mother that decides whether a test can observe a kind at
-// all. Only one of the five failed loudly when they disagreed. A kind missing
-// from the chart's RBAC produces a Forbidden on every evaluation; a kind
-// missing from the cache restrictions gets an unrestricted informer, one
-// missing from the trim is cached with its whole status, and one missing from
-// the fixture leaves every test asserting the behaviour from before the change
-// and still passing — which is the worst of the four, because it makes the
-// work look finished.
+// [engine.TemplateKind] says *which* owners binpack understands; this says how
+// each of them is listed, where its template lives, and what an RBAC rule has
+// to grant to reach it. The split is by what the fact is about rather than for
+// tidiness: the set of understood owners is a property of what binpack can
+// predict and belongs with the diagnosis that reports it, while a
+// client.ObjectList is cluster machinery the engine may not hold at all.
 //
-// Which four kinds, and why only these, is explained where operators read it:
+// Between them they are the only place the set is written down. It used to be
+// five places: the four list-and-key blocks this replaces, the cache's
+// per-kind restrictions and its trim in internal/controller, and the fixture
+// in internal/mother that decides whether a test can observe a kind at all.
+// Only one of the five failed loudly when they disagreed. A kind missing from
+// the chart's RBAC produces a Forbidden on every evaluation; a kind missing
+// from the cache restrictions gets an unrestricted informer, one missing from
+// the trim is cached with its whole status, and one missing from the fixture
+// leaves every test asserting the behaviour from before the change and still
+// passing — which is the worst of the four, because it makes the work look
+// finished.
+//
+// Which kinds, and why only these, is explained where operators read it:
 // docs/reference/rbac.md, docs/reference/diagnostics.md and ADR-0006. Those
 // stay prose — they answer "why" and a generated list would not — and the
-// tests beside this file hold them to what the slice says.
+// tests beside this file hold them to what the declaration says.
 type TemplateSource struct {
-	// APIVersion and Kind are the strings an ownerReference carries, so they
-	// are what a pod names its controller by and what the engine keys its
-	// template map on. Stated here rather than read back off a listed object,
-	// because a typed List leaves TypeMeta empty: the scheme knows the kind,
-	// the decoded object does not carry it.
-	APIVersion string
-	Kind       string
+	// The kind this reads, embedded so a source carries its own identity
+	// rather than being findable only by the position it sits in.
+	engine.TemplateKind
 
 	// Resource is the plural the API server serves the kind under, which is
 	// the name an RBAC rule grants. Stated rather than derived from Kind:
@@ -204,29 +218,31 @@ func (s TemplateSource) Group() string {
 	return group
 }
 
-// TemplateSources is every controller kind binpack can read a pod template
-// from.
+// TemplateSources is how every controller kind is read, one entry per
+// [engine.TemplateKind].
 //
-// Enumerable on purpose, and for the same reason [engine.SkipCodes] is: this
-// is a closed set that several other things have to agree with, and a set
-// nothing can range over is one they agree with only by inspection.
+// Held equal to that list by the loud failure in [templates] and by
+// TestEveryKindTheEngineNamesCanBeRead, so a caller may range this and know it
+// has covered the set.
 func TemplateSources() []TemplateSource {
 	return slices.Clone(templateSources)
 }
 
-// The four kinds, and everything that differs between them.
-//
-// DaemonSets earn their row despite nothing ever asking for their template:
-// their pods are node-local, never relocated, and [engine.NodeBound]
-// recognises them by owner kind before a template is looked up. They are read
-// because a DaemonSet is one of the kinds a pod can name as its controller,
-// and an absent entry is indistinguishable from a kind binpack genuinely
-// cannot read — the distinction the whole refusal path turns on. Dropping the
-// row would cost nothing today and would make that correct only for as long
-// as the engine's shortcut stays where it is.
+// sourceFor returns how to read a kind, and whether anything here can.
+func sourceFor(kind engine.TemplateKind) (TemplateSource, bool) {
+	for _, src := range templateSources {
+		if src.TemplateKind == kind {
+			return src, true
+		}
+	}
+	return TemplateSource{}, false
+}
+
+// Everything that differs between the kinds. One row per [engine.TemplateKinds]
+// entry; why each kind is in that list is recorded there.
 var templateSources = []TemplateSource{
 	{
-		APIVersion: "apps/v1", Kind: "ReplicaSet", Resource: "replicasets",
+		TemplateKind: engine.TemplateKind{APIVersion: "apps/v1", Kind: "ReplicaSet"}, Resource: "replicasets",
 		List:     func() client.ObjectList { return &appsv1.ReplicaSetList{} },
 		Object:   func() client.Object { return &appsv1.ReplicaSet{} },
 		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*appsv1.ReplicaSet).Spec.Template },
@@ -239,7 +255,7 @@ var templateSources = []TemplateSource{
 		},
 	},
 	{
-		APIVersion: "apps/v1", Kind: "StatefulSet", Resource: "statefulsets",
+		TemplateKind: engine.TemplateKind{APIVersion: "apps/v1", Kind: "StatefulSet"}, Resource: "statefulsets",
 		List:     func() client.ObjectList { return &appsv1.StatefulSetList{} },
 		Object:   func() client.Object { return &appsv1.StatefulSet{} },
 		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*appsv1.StatefulSet).Spec.Template },
@@ -252,7 +268,7 @@ var templateSources = []TemplateSource{
 		},
 	},
 	{
-		APIVersion: "apps/v1", Kind: "DaemonSet", Resource: "daemonsets",
+		TemplateKind: engine.TemplateKind{APIVersion: "apps/v1", Kind: "DaemonSet"}, Resource: "daemonsets",
 		List:     func() client.ObjectList { return &appsv1.DaemonSetList{} },
 		Object:   func() client.Object { return &appsv1.DaemonSet{} },
 		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*appsv1.DaemonSet).Spec.Template },
@@ -265,7 +281,7 @@ var templateSources = []TemplateSource{
 		},
 	},
 	{
-		APIVersion: "batch/v1", Kind: "Job", Resource: "jobs",
+		TemplateKind: engine.TemplateKind{APIVersion: "batch/v1", Kind: "Job"}, Resource: "jobs",
 		List:     func() client.ObjectList { return &batchv1.JobList{} },
 		Object:   func() client.Object { return &batchv1.Job{} },
 		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*batchv1.Job).Spec.Template },
