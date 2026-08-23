@@ -3,7 +3,6 @@ package v1alpha1
 import (
 	"errors"
 	"fmt"
-	"regexp"
 	"time"
 
 	"k8s.io/apimachinery/pkg/util/validation"
@@ -13,12 +12,6 @@ import (
 // re-reading cluster state outweighs any benefit, and a mistake in
 // configuration turns into API pressure.
 const minInterval = 10 * time.Second
-
-// Label keys are a name, optionally prefixed by a DNS subdomain. This is the
-// subset of the Kubernetes rule that matters here; a wrong key produces a
-// clear "no nodes matched" failure at preflight rather than silent damage.
-var labelKeyRE = regexp.MustCompile(
-	`^([a-z0-9]([-a-z0-9]*[a-z0-9])?\.)*[a-z0-9]([-a-z0-9]*[a-z0-9])?/?[A-Za-z0-9]([-A-Za-z0-9_.]*[A-Za-z0-9])?$`)
 
 // namespaceErrors reports why a string is not a namespace name, if it is not.
 //
@@ -32,6 +25,28 @@ func namespaceErrors(path, ns string) []error {
 	var errs []error
 	for _, why := range validation.IsDNS1123Label(ns) {
 		errs = append(errs, fmt.Errorf("%s: %q is not a valid namespace name: %s", path, ns, why))
+	}
+	return errs
+}
+
+// labelKeyErrors reports why a string is not a label key, if it is not.
+//
+// The same borrowing as above, and the one that had gone wrong. What used to
+// be here was a regexp applying the *prefix* rule to a key with no prefix, so
+// it required a bare key to begin lowercase — and Kubernetes does not:
+// upstream splits on '/', validates any prefix as a DNS subdomain and the name
+// part against a rule whose own error message offers "MyName" as its first
+// example (k8s.io/apimachinery pkg/api/validate/content, IsLabelKey, which is
+// what the API server's ValidateLabelName calls).
+//
+// Getting this wrong is not a missed consolidation. Validate runs at load, so
+// a key binpack refuses is binpack refusing to start — on a field every
+// operator whose cluster is not DOKS has to set, since the defaults are
+// DigitalOcean's.
+func labelKeyErrors(path, key string) []error {
+	var errs []error
+	for _, why := range validation.IsQualifiedName(key) {
+		errs = append(errs, fmt.Errorf("%s: %q is not a valid label key: %s", path, key, why))
 	}
 	return errs
 }
@@ -69,13 +84,11 @@ func (c *Config) Validate() error {
 			c.Interval.Duration, minInterval))
 	}
 
-	if c.Discovery.NodeGroupIDLabel != "" && !labelKeyRE.MatchString(c.Discovery.NodeGroupIDLabel) {
-		errs = append(errs, fmt.Errorf("discovery.nodeGroupIDLabel: %q is not a valid label key",
-			c.Discovery.NodeGroupIDLabel))
+	if key := c.Discovery.NodeGroupIDLabel; key != "" {
+		errs = append(errs, labelKeyErrors("discovery.nodeGroupIDLabel", key)...)
 	}
-	if c.Discovery.PoolNameLabel != "" && !labelKeyRE.MatchString(c.Discovery.PoolNameLabel) {
-		errs = append(errs, fmt.Errorf("discovery.poolNameLabel: %q is not a valid label key",
-			c.Discovery.PoolNameLabel))
+	if key := c.Discovery.PoolNameLabel; key != "" {
+		errs = append(errs, labelKeyErrors("discovery.poolNameLabel", key)...)
 	}
 	// A namespace no object can live in is worth refusing where somebody is
 	// still watching. Left to runtime it surfaces as "no cluster-autoscaler is

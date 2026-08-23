@@ -230,6 +230,28 @@ func TestValidation(t *testing.T) {
 			wantErr: "not a valid label key",
 		},
 		{
+			// The other of the two keys. Both are checked and only one was
+			// ever exercised, so the guard on this one could have been
+			// deleted with nothing going red.
+			name:    "invalid node group ID label",
+			yaml:    "discovery:\n  nodeGroupIDLabel: \"has spaces\"",
+			wantErr: "discovery.nodeGroupIDLabel",
+		},
+		{
+			// Zero is not "no backoff", it is a retry loop with no delay in
+			// it: the doubling starts from the initial value, so a zero
+			// initial can never grow. Rejected rather than clamped, and the
+			// exact value is what separates that from the legal 1h below.
+			name:    "zero backoff initial would never grow",
+			yaml:    "policy:\n  backoff:\n    initial: 0s",
+			wantErr: "backoff.initial: must be positive",
+		},
+		{
+			name:    "zero backoff max would cap every retry at nothing",
+			yaml:    "policy:\n  backoff:\n    max: 0s",
+			wantErr: "backoff.max: must be positive",
+		},
+		{
 			// A namespace binpack cannot read is worth rejecting where
 			// somebody is still watching: the runtime symptom is a report
 			// that no cluster-autoscaler is running, which reads as a fact
@@ -267,6 +289,128 @@ func TestValidation(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.wantErr) {
 				t.Errorf("error should mention %q, got: %v", tc.wantErr, err)
 			}
+		})
+	}
+}
+
+func TestLabelKeysKubernetesAcceptsAreAccepted(t *testing.T) {
+	// The rule is the API server's, not binpack's: a label key is an optional
+	// DNS-subdomain prefix and a name, and the name may start with an
+	// uppercase letter — "MyName" is the first example in upstream's own
+	// error message (k8s.io/apimachinery pkg/api/validate/content, IsLabelKey,
+	// which is what ValidateLabelName calls). Refusing one is not a
+	// consolidation binpack declines; it is binpack refusing to start, on a
+	// field every operator not on DOKS has to set.
+	for _, key := range []string{
+		"NodeGroup", // a hand-rolled labelling scheme
+		"Pool_Name", // underscores are legal in the name part
+		"eks.amazonaws.com/nodegroup",
+		"example.com/MyName", // uppercase behind a prefix
+		"123-abc",
+	} {
+		t.Run(key, func(t *testing.T) {
+			if _, err := Load([]byte("discovery:\n  poolNameLabel: " + key)); err != nil {
+				t.Errorf("Kubernetes accepts %q as a label key: %v", key, err)
+			}
+		})
+	}
+}
+
+func TestValuesAtTheBoundaryAreValid(t *testing.T) {
+	// TestValidation is a rejection-only table, and a validator is two claims:
+	// this value is refused, and the one next to it is not. Only the first had
+	// a test, so every accepting side of every bound could be tightened by one
+	// with the suite green — and a validator that refuses a legal value is not
+	// a worse decision, it is binpack failing to start.
+	//
+	// Each row is a value the documentation, an error message or the reference
+	// tells an operator they may write. The resolved figure is asserted too,
+	// because "loaded without error" does not say the value survived
+	// defaulting: a zero that is silently replaced by a default reads as
+	// accepted and is not.
+	for _, tc := range []struct {
+		name  string
+		yaml  string
+		check func(*testing.T, *Config)
+	}{
+		{
+			// The documented minimum, stated as the minimum. Rejecting it
+			// leaves the reference describing a value the loader refuses.
+			name: "interval at the documented minimum",
+			yaml: "interval: 10s",
+			check: func(t *testing.T, c *Config) {
+				if got := c.Settings().Interval; got != 10*time.Second {
+					t.Errorf("interval = %s, want 10s", got)
+				}
+			},
+		},
+		{
+			// The validator's own error message documents this value: "use 0
+			// for unlimited".
+			name: "maxPodsPerDrain zero means unlimited",
+			yaml: "policy:\n  drain:\n    maxPodsPerDrain: 0",
+			check: func(t *testing.T, c *Config) {
+				if got := c.PolicyFor().MaxPodsPerDrain; got != 0 {
+					t.Errorf("maxPodsPerDrain = %d, want 0", got)
+				}
+			},
+		},
+		{
+			// Zero is the boundary of "above 0 would treat ordinary pods as
+			// expendable", and it is the value that excludes only pods of
+			// negative priority.
+			name: "expendable cutoff at zero",
+			yaml: "policy:\n  feasibility:\n    expendablePriorityCutoff: 0",
+			check: func(t *testing.T, c *Config) {
+				if got := c.PolicyFor().ExpendablePriorityCutoff; got != 0 {
+					t.Errorf("expendablePriorityCutoff = %d, want 0", got)
+				}
+			},
+		},
+		{
+			// binpack prints this one at the operator: refusing to start
+			// under --once, it says "set cooldown.afterDrain: 0 to say that
+			// consecutive drains are acceptable". Nothing asserted that the
+			// value binpack instructs them to write survives its own loader.
+			name: "cooldowns at zero",
+			yaml: "policy:\n  cooldown:\n    afterDrain: 0s\n    afterScaleUp: 0s",
+			check: func(t *testing.T, c *Config) {
+				p := c.PolicyFor()
+				if p.CooldownAfterDrain != 0 || p.CooldownAfterScaleUp != 0 {
+					t.Errorf("cooldowns = %s/%s, want 0s/0s",
+						p.CooldownAfterDrain, p.CooldownAfterScaleUp)
+				}
+			},
+		},
+		{
+			// max equal to initial is a backoff that does not double, which is
+			// a legitimate thing to ask for. The rejection is for a max
+			// *below* initial, where the cap would shorten the first retry.
+			name: "backoff max equal to initial",
+			yaml: "policy:\n  backoff:\n    initial: 1h\n    max: 1h",
+			check: func(t *testing.T, c *Config) {
+				p := c.PolicyFor()
+				if p.BackoffInitial != time.Hour || p.BackoffMax != time.Hour {
+					t.Errorf("backoff = %s/%s, want 1h/1h", p.BackoffInitial, p.BackoffMax)
+				}
+			},
+		},
+		{
+			name: "a prefixed node group ID label",
+			yaml: "discovery:\n  nodeGroupIDLabel: example.com/pool",
+			check: func(t *testing.T, c *Config) {
+				if got := c.Discovery.NodeGroupIDLabel; got != "example.com/pool" {
+					t.Errorf("nodeGroupIDLabel = %q", got)
+				}
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := Load([]byte(tc.yaml))
+			if err != nil {
+				t.Fatalf("a documented value was refused: %v", err)
+			}
+			tc.check(t, cfg)
 		})
 	}
 }

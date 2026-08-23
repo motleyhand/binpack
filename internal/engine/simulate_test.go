@@ -371,8 +371,8 @@ func TestFinishedPodsDoNotOccupy(t *testing.T) {
 	candidate := sized("candidate", "4Gi")
 	destination := sized("destination", "2Gi")
 
-	done := mother.Pod("default", "finished", mother.OnNode("destination"), mother.Requests("100m", "2Gi"))
-	done.Status.Phase = corev1.PodSucceeded
+	done := mother.Pod("default", "finished", mother.OnNode("destination"),
+		mother.Requests("100m", "2Gi"), mother.Succeeded())
 
 	pods := []*corev1.Pod{
 		mother.Pod("default", "moving", mother.OnNode("candidate"), mother.Requests("100m", "1Gi")),
@@ -762,7 +762,16 @@ func TestRestrictiveConstraintsAddedByAdmissionBlockTheSimulation(t *testing.T) 
 		running mother.PodOption
 	}{
 		{"nodeSelector", mother.WithNodeSelector("disk", "ssd")},
-		{"required affinity", mother.WithRequiredAntiAffinity("app", "web")},
+		{"required anti-affinity", mother.WithRequiredAntiAffinity("app", "web")},
+		// Its own row because requiredAffinity keeps three kinds in three
+		// fields, and the arm is applied to both sides of the comparison — so
+		// a transformation that drops a kind drops it from template and pod
+		// alike and is invisible unless a fixture makes the two differ in
+		// exactly that kind. Anti-affinity covering the arm covers one third
+		// of it. Node affinity is the third a webhook actually injects: zone
+		// or licence pinning, GPU steering, a cost-management controller.
+		{"required node affinity",
+			mother.WithRequiredNodeAffinity("topology.kubernetes.io/zone", "a")},
 		{"topology spread", mother.WithHardTopologySpread("topology.kubernetes.io/zone")},
 		{"scheduler name", mother.ScheduledBy("stork")},
 	} {
@@ -784,6 +793,29 @@ func TestRestrictiveConstraintsAddedByAdmissionBlockTheSimulation(t *testing.T) 
 				t.Errorf("not counted as a template divergence: %q", sim.Blocked.Unmodelled)
 			}
 		})
+	}
+}
+
+func TestTheSameRequiredAffinityOnBothSidesIsNotADivergence(t *testing.T) {
+	// The converse of the row above, and it is what stops that row being
+	// satisfiable by an arm that refuses on sight. A pod pinned to a zone by
+	// its own template is the ordinary case — the divergence check exists to
+	// catch a constraint the *replacement* would not carry, not to disable
+	// consolidation for every workload that declares one.
+	inZoneA := mother.NodeLabels(map[string]string{"topology.kubernetes.io/zone": "a"})
+	candidate := mother.LargeNode("candidate", inZoneA)
+	destination := mother.LargeNode("destination", inZoneA)
+	pod := mother.Pod("default", "web", mother.OnNode("candidate"),
+		mother.WithRequiredNodeAffinity("topology.kubernetes.io/zone", "a"))
+	pods := []*corev1.Pod{pod}
+
+	// Templates derives each template from its pod, so this one carries the
+	// same term rather than the missing one the divergence rows build.
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if !sim.Feasible {
+		t.Errorf("refused a pod whose template declares the same affinity: %s", sim.Blocked.Summary)
 	}
 }
 

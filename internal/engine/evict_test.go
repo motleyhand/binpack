@@ -292,6 +292,25 @@ func TestUnreadyPodsMayNotConsumeTheBudget(t *testing.T) {
 		}
 	})
 
+	t.Run("a budget that desires nothing charges for it", func(t *testing.T) {
+		// The other end of the exemption, and the reason it carries a second
+		// clause. A budget desiring nothing reports currentHealthy 0 against
+		// desiredHealthy 0, so "the application is meeting its budget" is
+		// true as arithmetic and false as a statement about the workload —
+		// there is no health to meet. The eviction API charges the pod, and
+		// so must binpack: without the desiredHealthy > 0 guard an unready
+		// pod would be evicted for free against an allowance of zero, and the
+		// drain would be approved for evictions the API server then refuses.
+		pdb := mother.DesiresNothing(mother.PDB("default", "web", 0, labelled))
+
+		got := engine.CheckEvictable([]*corev1.Pod{broken},
+			[]*policyv1.PodDisruptionBudget{pdb}, engine.DefaultEvictConfig(), now)
+
+		if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
+			t.Errorf("a budget desiring nothing still guards its allowance, got %v", codes(got))
+		}
+	})
+
 	t.Run("a ready pod always draws on the allowance", func(t *testing.T) {
 		pdb := mother.AlwaysAllowUnhealthy(mother.PDB("default", "web", 0, labelled))
 
