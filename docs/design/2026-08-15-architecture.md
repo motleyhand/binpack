@@ -70,8 +70,9 @@ internal/
   controller           owns the manager, caches and leader election
   executor             cordons, evicts, uncordons, writes drain markers
   cli                  cobra commands: explain, diagnose, run, version
-  state                cooldown and backoff bookkeeping
   metrics              Prometheus collectors
+  mother               test fixtures: object mothers and builders
+  version              build metadata
 
 charts/binpack         Helm chart, RBAC, ConfigMap
 ```
@@ -135,8 +136,11 @@ precisely the window an operator is most likely to be asking what binpack is doi
 that decides belongs in the engine. The frontends differ only in how they render what it
 decided.
 
-Objects reaching the engine are **read-only**. The controller path hands out pointers into a
-shared informer cache, and writing to one corrupts it for every other consumer in the process.
+Objects reaching the engine are **read-only**. One `Snapshot` holds a single pointer per object
+and hands it to every candidate assessment, to `internal/fit` for a destination's residents, and
+to the executor — so writing to a Node or Pod changes what a later step of the same evaluation
+sees. (The informer cache behind it is safe: controller-runtime deep-copies on the way out. That
+is not what this rule protects, and it stops being true if anyone disables the copy.)
 
 ## Preflight
 
@@ -241,6 +245,16 @@ real scheduler leaves the pod Pending until the autoscaler adds a node. Iteratin
 resource names actually present is both more correct and less code, and it means binpack
 supports resources that did not exist when it was written.
 
+**One known divergence, and it is on the safe side.** "A node that does not advertise a resource
+can never satisfy a request for it" stopped being unconditionally true at Kubernetes 1.36. With
+`DRAExtendedResource` — beta and on by default there — a DeviceClass may declare
+`spec.extendedResourceName`, and the scheduler then satisfies a request for that name through
+dynamic resource allocation, skipping the `status.allocatable` comparison entirely. binpack does
+not read the `resource.k8s.io` objects that would answer this, deliberately, so it treats the
+absent key as a refusal. The cost is a permanent missed consolidation on DRA clusters using that
+feature, with a refusal naming a resource the operator can see the node does not need to
+advertise — never a wrong drain.
+
 #### What counts as a pod's request
 
 The map a pod contributes is **not** a copy of `resources.requests`. Building it naively
@@ -258,6 +272,16 @@ lightweight main container and a 2GB init container needs 2GB at admission time.
 resource cost of the sandbox itself, and clusters using gVisor or Kata have a non-trivial amount
 of it.
 
+**Pod-level requests.** `spec.resources` sizes the pod rather than a container, and since
+Kubernetes 1.34 the `PodLevelResources` gate has been beta and on by default, so this is live on
+a stock cluster rather than an opt-in curiosity. It does not replace the container aggregate
+wholesale: upstream computes the aggregate first and then overrides only the names that are both
+present in `spec.resources.requests` and pod-level-supported — `cpu`, `memory` and
+`hugepages-*`. Every other name keeps its container-aggregate value, and `spec.overhead` is added
+on top of the result. So a pod naming only memory at the pod level still contributes its
+containers' CPU. binpack models this: it asks upstream for pod-level resources unconditionally,
+which matches a 1.34-or-later cluster and over-reserves — safely — below one.
+
 This arithmetic is fiddly and upstream already gets it right, so binpack calls
 `k8s.io/component-helpers/resource.PodRequests` rather than hand-rolling it — at the point of
 use, not precomputed into a mirror that can drift from what the scheduler does.
@@ -272,12 +296,20 @@ the first. [ADR-0006](adr-0006-scheduler-fidelity.md) has the reasoning.
 **Pod slots.** `pods` appears in `status.allocatable` but never in a pod's requests, so a
 uniform "subtract request from remaining" loop would never consume a slot, and the simulation
 would happily pack an unlimited number of pods onto a node capped at 110. Every pod's request
-map therefore carries a synthetic `pods: 1`, added during collection. The kubelet's pod limit is
-a real scheduling constraint and a genuine ceiling that clusters hit while showing plenty of
-free CPU and memory.
+map therefore carries a synthetic `pods: 1`, synthesised in `internal/fit.EffectiveRequests` at
+the point of use — the same place and for the same reason as the arithmetic above, rather than
+precomputed into a mirror that can drift. The kubelet's pod limit is a real scheduling constraint
+and a genuine ceiling that clusters hit while showing plenty of free CPU and memory.
 
-The engine adds it when accounting for a placement, so the arithmetic stays uniform: it
-subtracts resource lists from resource lists, with pod count simply one more entry.
+`internal/collect` transforms nothing on the way through, so the entry could not live there even
+if it were wanted: what it hands the engine is one `*corev1.Pod` pointer per pod, shared by every
+step that follows, and writing to one is what the read-only rule forbids. (An earlier design
+had `collect` build a mirror `map[string]int64`, and this sentence outlived it —
+[ADR-0003](adr-0003-pure-decision-engine.md) is where that shape is described, and
+[ADR-0008](adr-0008-engine-uses-api-types.md) is what replaced it.)
+
+The arithmetic then stays uniform: the engine subtracts resource lists from resource lists, with
+pod count simply one more entry.
 
 #### Fit predicates come from upstream, not from us
 
@@ -364,7 +396,10 @@ one goes away; they cease to exist with it, and an equivalent already runs elsew
 - DaemonSet-owned pods. The CNI agent, `kube-proxy`, log shippers, node exporters. Every
   remaining node already runs its own copy, so there is nothing to relocate.
 - Mirror pods (static pods managed directly by a kubelet, marked with
-  `kubernetes.io/config.mirror`). They cannot be evicted at all; the kubelet owns them.
+  `kubernetes.io/config.mirror`). Evicting one is *accepted* — the eviction subresource has no
+  mirror-pod case — and achieves nothing: it deletes the mirror object while the static pod keeps
+  running, and the kubelet recreates the mirror from the on-disk manifest. The pod does not leave
+  the node, so the drain would never finish.
 - Pods already terminating.
 
 Both halves of "not simulated, not evicted" matter. Counting DaemonSet pods as workload

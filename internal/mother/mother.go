@@ -59,6 +59,16 @@ func Node(name string, opts ...NodeOption) *corev1.Node {
 // SmallNode is a 2 vCPU / 4GB worker after kubelet reservations — the shape
 // that makes percentage-based reasoning go wrong, and the reason binpack works
 // in absolute quantities.
+//
+// The figures are chosen so that a test table's arithmetic can be read at a
+// glance, not to model a node any provider sells: 1360Mi of a nominal 4GB is a
+// larger reservation than anything real, and it is not in the same proportion
+// as [LargeNode]'s. What the tests need is only that the two differ enough to
+// make a mixed-size cluster where the smaller node's workload fits on the
+// larger one. Real allocatable is a provider question — DigitalOcean publishes
+// 2.5 GiB on a 4 GiB node and 6 GiB on an 8 GiB one — and nothing outside this
+// package depends on these values, so treat them as arithmetic rather than as
+// a claim about hardware.
 func SmallNode(name string, opts ...NodeOption) *corev1.Node {
 	return Node(name, append([]NodeOption{
 		Allocatable(corev1.ResourceList{
@@ -240,17 +250,33 @@ func PausePod(namespace, name string, opts ...PodOption) *corev1.Pod {
 
 // WithPodLevelResources sets requests on the pod rather than on a container.
 //
-// An alpha field behind the PodLevelResources gate, and where it is set the
-// scheduler reserves it in place of the container aggregate — so a pod whose
-// containers ask for almost nothing can still be large.
+// Beta and enabled by default since 1.34 (k8s.io/kubernetes v1.36.3
+// pkg/features/kube_features.go, PodLevelResources), so this is live on a
+// stock cluster rather than an opt-in curiosity.
+//
+// It does not replace the container aggregate wholesale. PodRequests computes
+// the container aggregate first and then overrides only the names that are
+// both present in spec.resources.requests and pod-level-supported — cpu,
+// memory and hugepages-* (k8s.io/component-helpers v0.36.3
+// resource/helpers.go, IsSupportedPodLevelResource); every other name keeps
+// its container-aggregate value, and spec.overhead is added on top of the
+// result. So a pod whose containers ask for almost nothing can still be
+// large, but only in the dimensions the pod names.
+//
+// Either argument may be empty, meaning that name is left out of the pod-level
+// map — which is the shape that distinguishes the two readings, and the one
+// the fixture could not express while this comment said "in place of the
+// container aggregate".
 func WithPodLevelResources(cpu, memory string) PodOption {
 	return func(p *corev1.Pod) {
-		p.Spec.Resources = &corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{
-				corev1.ResourceCPU:    resource.MustParse(cpu),
-				corev1.ResourceMemory: resource.MustParse(memory),
-			},
+		requests := corev1.ResourceList{}
+		if cpu != "" {
+			requests[corev1.ResourceCPU] = resource.MustParse(cpu)
 		}
+		if memory != "" {
+			requests[corev1.ResourceMemory] = resource.MustParse(memory)
+		}
+		p.Spec.Resources = &corev1.ResourceRequirements{Requests: requests}
 	}
 }
 

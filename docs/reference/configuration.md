@@ -301,6 +301,49 @@ autoscaler above it behaves alike. One default assumes 1.33 or later — the gra
 [`policy.autoscaler.blockingSystemPodDistruptionTimeout`](#policyautoscalerblockingsystempoddistruptiontimeout),
 which is a setting rather than an assumption for exactly that reason.
 
+### Supported scheduler configuration
+
+binpack models the **default scheduler at stock plugin arguments**. Two arguments of the default
+profile make the real scheduler refuse placements binpack accepts, and binpack reads no scheduler
+configuration at all — on a cluster that sets either, the one-directional soundness claim in
+[ADR-0006](../design/adr-0006-scheduler-fidelity.md) does not hold.
+
+- **`NodeAffinity.addedAffinity`.** A required node selector the profile applies to every pod it
+  schedules, on top of whatever the pod declares. binpack evaluates only the pod's own affinity,
+  so a node the added selector excludes still looks like a destination.
+- **`PodTopologySpread.defaultConstraints`** with a `whenUnsatisfiable: DoNotSchedule` entry.
+  These apply to exactly the population binpack deliberately lets through — pods declaring no
+  constraints of their own. The stock system defaults are both `ScheduleAnyway`, which is why
+  binpack is correct out of the box; an admin-supplied hard entry is what changes the answer.
+
+Refusing to run on the possibility would refuse every cluster, and reading the scheduler's
+configuration is impossible on the managed control planes
+[ADR-0004](../design/adr-0004-provider-agnostic-no-cloud-api.md) targets. So this is stated
+rather than detected.
+
+Whether it applies to you depends on who wrote your scheduler's profile, and that is a different
+question from who can read it. Where you run the control plane, you wrote it: it is the file or
+ConfigMap `kube-scheduler` was started against, and
+
+```bash
+kubectl -n kube-system get cm
+```
+
+is where a `KubeSchedulerConfiguration` shows up if one is held that way.
+
+Where the control plane is managed for you, your provider wrote it, and not being able to read it
+is not evidence that it is stock — the provider chooses those arguments exactly as you would on
+your own cluster. Treat the profile as **unknown** unless your provider documents it or confirms
+it on request. What you have instead of a guarantee is detection. If a hidden argument refuses a
+destination binpack accepted, the replacement for the pod binpack evicted goes Pending and the
+autoscaler adds a node — the outcome binpack exists to prevent, and the one
+[ADR-0006](../design/adr-0006-scheduler-fidelity.md) already says binpack makes unlikely and
+immediately detectable rather than impossible. Because evictions are sequential with
+revalidation between each, that surfaces after the first pod rather than after a whole node.
+
+The differential harness shares the assumption rather than testing it: its oracle constructs
+`NodeAffinity` with empty arguments and does not construct `PodTopologySpread` at all.
+
 ### `policy.enabled`
 
 `false` leaves a pool's nodes alone entirely — never a drain candidate, though its free capacity
@@ -364,9 +407,11 @@ drain verification catches and backs off from.
 Whether they are yours to set depends on where your autoscaler runs. They are ordinary flags on
 the autoscaler binary, so anywhere it is a Deployment in your own cluster — EKS, kOps, Rancher,
 any self-hosted install — they are whatever its manifest says. AKS exposes both through the
-cluster-autoscaler profile and ships `skip-nodes-with-local-storage=false`. Where instead the
-autoscaler runs in a control plane you cannot reach — DOKS and LKE are the cases checked here —
-you get upstream's defaults, which is what these fields default to. Which of those describes
+cluster-autoscaler profile and ships `skip-nodes-with-local-storage=false` rather than upstream's
+`true` (Microsoft's cluster-autoscaler profile settings table, read 2026-08-23; the `az` command
+below re-checks it). Where instead the autoscaler runs in a control plane you cannot reach —
+DOKS and LKE are the cases checked here — you get upstream's defaults, which is what these
+fields default to. Which of those describes
 your cluster is the command below rather than a list: a platform that runs the autoscaler for
 you today may expose it tomorrow, and several that are assumed to hide it do not.
 
@@ -652,9 +697,12 @@ Two things to know:
 `maxPodsPerDrian: 5` fails rather than being quietly ignored while you believe you set
 something.
 
-**Field names are matched case-insensitively**, a consequence of parsing YAML through JSON,
-which is how Kubernetes behaves too. `dryrun` and `dryRun` are the same field; `dryRunn` is an
-error.
+**Field names are matched case-insensitively** — a consequence of parsing YAML through Go's
+`encoding/json`. `dryrun` and `dryRun` are the same field; `dryRunn` is an error.
+
+Do not carry the habit into your manifests. The Kubernetes API server is stricter: it decodes
+JSON and YAML case-*sensitively*, so a mis-cased field in a Deployment is an unknown field —
+discarded silently, or rejected under strict validation.
 
 **Every problem is reported at once**, so a bad document can be fixed in one pass rather than
 several.

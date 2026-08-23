@@ -112,13 +112,6 @@ func (c *Config) SetDefaults() {
 	}
 }
 
-// PolicyFor resolves the policy for a pool, layering the built-in defaults,
-// the global policy, and any override naming this pool — in that order, field
-// by field. Names are matched against the pool name label value or the node
-// group identifier, whichever the operator wrote.
-//
-// Unknown pool names are a validation error rather than a silent no-op, so a
-// name reaching here has already been checked against discovery.
 // Settings is the resolved top-level configuration: what a document means
 // once defaults have been applied, with nothing left to dereference.
 type Settings struct {
@@ -149,6 +142,13 @@ func (c *Config) Settings() Settings {
 	return s
 }
 
+// PolicyFor resolves the policy for a pool, layering the built-in defaults,
+// the global policy, and any override naming this pool — in that order, field
+// by field. Names are matched against the pool name label value or the node
+// group identifier, whichever the operator wrote.
+//
+// Unknown pool names are a validation error rather than a silent no-op, so a
+// name reaching here has already been checked against discovery.
 func (c *Config) PolicyFor(names ...string) PoolPolicy {
 	p := PoolPolicy{
 		Enabled:                  DefaultEnabled,

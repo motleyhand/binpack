@@ -115,8 +115,20 @@ func newRunCommand(opts *options) *cobra.Command {
 //
 // Unlike the read-only commands, `run` normally has no kubeconfig at all: it
 // runs in a pod with a service account. controller-runtime's resolver tries
-// in-cluster credentials first and falls back to the usual kubeconfig rules,
-// which is what makes the same binary work in a cluster and on a laptop.
+// --kubeconfig, then $KUBECONFIG, then in-cluster credentials, then
+// ~/.kube/config, which is what makes the same binary work in a cluster and on
+// a laptop.
+//
+// In-cluster is third, not first, and the difference is only invisible while
+// the pod's environment is clean: loadConfig reaches the in-cluster branch
+// only inside `if len(os.Getenv("KUBECONFIG")) == 0`
+// (sigs.k8s.io/controller-runtime@v0.24.1 pkg/client/config/config.go). A
+// KUBECONFIG set by a base image, an injected sidecar or a Helm values block
+// therefore wins over the service account, and binpack authenticates as
+// whatever that file names — with the chart's RBAC written for an identity it
+// is no longer using. The symptom is Forbidden errors part-way through an
+// evaluation, which looks nothing like a credential-precedence problem, so the
+// ordering is worth stating exactly.
 func runRestConfig(kubeconfig, kubecontext string) (*rest.Config, error) {
 	if kubeconfig != "" {
 		return restConfigFor(kubeconfig, kubecontext)

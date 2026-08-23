@@ -1,11 +1,27 @@
-// Package executor performs the only changes binpack makes to a cluster:
-// cordoning a node, annotating it, handing it back, and evicting a pod.
+// Package executor performs the only changes binpack makes to a cluster —
+// cordoning a node, annotating it, handing it back, and evicting a pod — and
+// sequences them into a drain.
 //
-// It holds no policy. Whether a node should be drained is [engine.Decide]'s
-// answer and the order things happen in is the drain protocol's; what lives
-// here is how each individual change is made, and what each way of failing
-// means. Keeping every write in one package means the set of things binpack
-// can do to a cluster is enumerable by reading one file.
+// Two halves, and the split is the thing to know. executor.go is the writes
+// and nothing else: how each individual change is made, and what each way of
+// failing means. Keeping every write in one file means the set of things
+// binpack can do to a cluster is enumerable by reading it.
+//
+// drain.go is the drain protocol, and that is policy. It decides what an
+// evaluation does next to a node already being drained: whether to hand over
+// to the cluster-autoscaler, whether a replacement is still in flight, which
+// pod is evicted next, and what to call a revalidation failure. Whether a node
+// should be drained at all remains [engine.Decide]'s answer, and what should
+// happen next given one node's state remains [drain.Assess]'s — a pure
+// function this package calls. What lives here is the part neither can be:
+// carrying a step out and deciding the next one are a single unit against a
+// node whose state is the annotations these writes set.
+//
+// The doc this replaces said "It holds no policy" and located the ordering in
+// "the drain protocol", as a component living somewhere else. That was true
+// when the package was four writes and the protocol had no home yet; it
+// survived unchanged through all fifteen commits that have touched drain.go
+// since, which is how a package doc ends up denying what the package holds.
 package executor
 
 import (

@@ -98,9 +98,15 @@ func NodeBound(pod *corev1.Pod) bool {
 			return true
 		}
 	}
-	// A mirror pod is a static pod managed directly by a kubelet. It cannot
-	// be evicted at all, and the kubelet recreates it from an on-disk
-	// manifest.
+	// A mirror pod is a static pod managed directly by a kubelet. Node-bound
+	// by effect rather than by API refusal: the eviction subresource has no
+	// mirror-pod branch (k8s.io/kubernetes v1.36.3
+	// pkg/registry/core/pod/storage/eviction.go names neither mirror nor
+	// static pods anywhere, and has not back to 1.30), so an eviction is
+	// accepted and deletes the mirror object — whereupon the kubelet recreates
+	// it from the on-disk manifest and the static pod itself never stopped
+	// running. It does not leave the node, which is the property this
+	// predicate is about.
 	_, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]
 	return mirror
 }

@@ -210,7 +210,9 @@ func checkPod(pod *corev1.Pod, matched []*policyv1.PodDisruptionBudget, cfg Evic
 
 	if _, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
 		return &EvictionBlocker{Pod: pod, Code: BlockedMirrorPod,
-			Message: fmt.Sprintf("%s is a static pod managed by the kubelet and cannot be evicted", podRef(pod))}
+			Message: fmt.Sprintf("%s is a static pod — the kubelet recreates it from an "+
+				"on-disk manifest, so evicting it moves nothing and the drain would never "+
+				"finish", podRef(pod))}
 	}
 
 	// A pod with no *controlling* owner is not recreated after eviction, so

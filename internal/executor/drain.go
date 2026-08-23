@@ -773,6 +773,12 @@ const (
 
 // awaiting reads the controller this drain is waiting on, and since when.
 //
+// It exists because evictions are sequential with revalidation between each,
+// which ADR-0006 requires and states the reason for: the simulation proves a
+// valid assignment exists, not that the scheduler will choose it. Never more
+// than one replacement in flight is how that requirement is kept, and this is
+// where the invariant is read.
+//
 // Not found is the answer for both states that name no controller: a drain that
 // has evicted nothing, and one whose marker has settled. Neither parses, and
 // that is a property of [engine.AwaitingSettled]'s shape rather than a case

@@ -99,6 +99,25 @@ func CanFit(
 	if node.Spec.Unschedulable {
 		return false, Reason{ReasonUnschedulable, "node " + node.Name + " is cordoned"}
 	}
+	// Deliberate conservatism, and the only refusal here that is not fidelity
+	// to a Filter plugin. There is no NodeReady plugin: the 1.36 default
+	// profile has none (k8s.io/kubernetes v1.36.3
+	// pkg/scheduler/apis/config/v1/default_plugins.go) and no such package
+	// exists under pkg/scheduler/framework/plugins. What repels pods from a
+	// NotReady node is the node-lifecycle controller tainting it
+	// node.kubernetes.io/not-ready:NoSchedule from the NodeReady condition
+	// (pkg/controller/nodelifecycle/node_lifecycle_controller.go,
+	// doNoScheduleTaintingPass) — which the TaintToleration check below would
+	// already have covered, so a pod tolerating that key is one the scheduler
+	// *would* place here, and this refuses it anyway.
+	//
+	// Kept because a destination binpack picks has to be able to actually
+	// receive the replacement, which a node whose kubelet has stopped
+	// reporting cannot. isReady also answers false when the condition is
+	// absent entirely, for the same reason. The error direction is the safe
+	// one: a missed consolidation, never a wrong placement. Recorded in
+	// ADR-0006 beside the modelled plugins so an audit against upstream's list
+	// does not read a fifth code as a modelling error.
 	if !isReady(node) {
 		return false, Reason{ReasonNodeNotReady, "node " + node.Name + " is not Ready"}
 	}
@@ -137,21 +156,24 @@ func CanFit(
 			podRef(pod) + " requires node labels that " + node.Name + " does not have"}
 	}
 
-	// pod.Spec.NodeName is deliberately not compared against node.Name.
+	// pod.Spec.NodeName is deliberately not compared against node.Name, and
+	// there is nothing left here for such a comparison to catch.
 	//
-	// Every pod binpack sees is already bound, so its NodeName always names
-	// the node it is being relocated *from*. Refusing when they differ would
-	// refuse every relocation there is.
+	// Every pod that reaches CanFit is the pod a controller *would create* —
+	// a replacement the engine builds from the owner's template, taking
+	// NodeName from the template and nowhere else, or a size probe rebuilt
+	// from one. So an ordinary replacement arrives unbound and a comparison
+	// would be vacuous, while a template that *does* pin spec.nodeName arrives
+	// already refused: UnsupportedPod rejects a non-empty NodeName outright,
+	// which it can only do because the caller hands over the replacement
+	// rather than the running pod.
 	//
-	// The gap this leaves: a controller whose pod *template* pins NodeName
-	// recreates its pod on the same node regardless of what binpack decides,
-	// and such a pod ignores cordon because setting NodeName bypasses the
-	// scheduler entirely. Detecting that needs the owner's template, which
-	// binpack does not read. The consequence is bounded — the pod reappears on
-	// the node being drained, no pod goes Pending, so no scale-up follows, and
-	// the drain stalls and backs off exactly as ADR-0007 provides for an
-	// undetected blocker. It costs a wasted drain, not the failure this
-	// project exists to prevent.
+	// That input is the whole reason this reads as a non-check. The question
+	// was once unanswerable — a running pod's NodeName always names the node
+	// it is leaving, so it cannot distinguish a pinned template from an
+	// ordinary scheduling decision — and ADR-0006 records the case under
+	// "Closed: the running pod was a proxy for the replacement", together with
+	// the permissions reading templates costs.
 
 	if short, ok := firstShortfall(EffectiveRequests(pod), remaining); !ok {
 		return false, Reason{ReasonInsufficient,

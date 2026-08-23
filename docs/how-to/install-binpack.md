@@ -172,8 +172,23 @@ The defaults are measured rather than guessed: against a 4-node, 145-pod cluster
 at 43 MiB resident and spends about half a second per evaluation.
 
 Memory scales with the number of objects cached — every pod, node and disruption budget, plus
-each controller's pod template — not with load. On a large cluster raise the **limit** rather
-than the request: the initial LIST of every pod is the peak, not the steady state.
+each controller's pod template — not with load.
+
+The cache is not the whole of it, and the initial LIST is not the peak. Every evaluation asks the
+cache for a *fresh copy* of everything it reads: controller-runtime deep-copies each object out
+of the informer on the way out, binpack issues seven list calls per evaluation (nodes, pods,
+disruption budgets, and the four controller kinds), and it holds the result for the length of the
+decision. So the steady state includes a recurring transient roughly the size of the cached set
+itself, and lowering `interval` raises how often it is allocated in direct proportion.
+
+On a large cluster, raise the **limit** rather than the request, and set it from what the process
+actually does rather than from the object count. Where the Metrics API is working,
+
+```bash
+kubectl -n binpack-system top pod
+```
+
+sampled across a few evaluations answers it directly, and is worth more than the arithmetic.
 
 There is no CPU limit by default, and adding one is a poor trade: throttling a controller that
 wakes once a minute buys nothing and turns a slow evaluation into a stalled one.
