@@ -341,8 +341,9 @@ autoscaler adds a node — the outcome binpack exists to prevent, and the one
 immediately detectable rather than impossible. Because evictions are sequential with
 revalidation between each, that surfaces after the first pod rather than after a whole node.
 
-The differential harness shares the assumption rather than testing it: its oracle constructs
-`NodeAffinity` with empty arguments and does not construct `PodTopologySpread` at all.
+The differential harness shares the assumption rather than testing it: its oracle builds every
+plugin with the arguments the release's own default profile carries, which is the stock
+configuration and not an operator's.
 
 ### `policy.enabled`
 

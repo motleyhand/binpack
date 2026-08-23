@@ -36,6 +36,13 @@ It consumes the main module via `replace`, so **a main-module dependency bump le
 and fails the differential CI job on an unrelated PR. Run `cd test/differential && go mod tidy`
 after any dependency change.
 
+Tidiness catches a stale *require* and never a stale *replace*: a replace overrides version
+selection unconditionally, so a `k8s.io/*` bump in the main module leaves the harness's thirty
+replace lines pointing at the old release with `go mod tidy` silent and the build green — and
+the oracle then judges a copy of `internal/fit` compiled against a library binpack does not
+ship. `TestHarnessTracksTheShippedLibraries` is what fails instead; update the replace block when
+it does.
+
 CI additionally verifies `go.mod`/`go.sum` are tidy and runs `goreleaser release --snapshot
 --skip=publish`, so release-config breakage surfaces on the PR rather than on a tag.
 
@@ -85,6 +92,21 @@ that accepted everything would satisfy it vacuously: every binpack refusal logs 
 expected scheduler verdict *independently of binpack*, and the generated suite fails if the
 oracle refused nothing. Verified by sabotage: an always-accepting oracle must make the suite
 fail, and it does.
+
+**An aggregate guard is satisfied by the easy cases.** "The oracle refused something" is answered
+a thousand times over by cordons and taints, so it says nothing about the resource arithmetic the
+project is actually at risk in. The guards are therefore per plugin and per resource dimension:
+every plugin the corpus is meant to reach must refuse at least once, every plugin it cannot reach
+is listed with the reason and asserted to refuse nothing, and NodeResourcesFit must be seen
+refusing on cpu, memory, `pods` and an extended resource by name. Each is verified by sabotage
+too — ignoring `nvidia.com/gpu` in the oracle's arguments leaves both aggregate guards green and
+only the dimension guard red.
+
+**A dimension the generator cannot reach is a dimension nothing is testing.** Every node mother
+but `mother.CappedNode` advertises 110 pod slots against at most three residents, so before that
+archetype existed the whole differential evidence for `pods` was one hand-written case: deleting
+the synthetic `pods: 1` from `fit.EffectiveRequests` moved none of the three thousand generated
+decisions. It now moves 67 of them.
 
 **The differential harness's feature gates come from `NewSchedulerFeaturesFromGates`, never a
 hand-written list.** Its first run reported 171 unsound placements, all one message: sidecar
