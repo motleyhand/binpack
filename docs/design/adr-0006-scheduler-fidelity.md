@@ -45,8 +45,29 @@ enters the scheduling queue, so no Filter runs on it and no Filter refuses it. `
 off by default at this release, is PreEnqueue and Permit, and can hold a pod that every Filter
 accepted. A replacement blocked at either point never binds, while a simulation that asks only
 whether a destination filters cleanly sees nothing wrong. Refusing those pods is the allowlist's
-job rather than the fit predicate's — `internal/fit` refuses a pod carrying `spec.schedulingGates`,
-which covers the gate a workload declares in its own template.
+job rather than the fit predicate's — `internal/fit` refuses a pod carrying `spec.schedulingGates`.
+
+**That refusal covers the gate a workload declares in its own template, and it cannot cover a gate
+admission attaches.** The distinction is not a matter of degree: a webhook-injected gate is absent
+from *both* objects the replacement is built from. It is not in the stored template, because it is
+injected at CREATE; and it is not on the running pod either, because `ValidatePodCreate` forbids
+`spec.nodeName` while any gate remains, so every pod binpack can see on a candidate node is
+ungated by construction. There is no merge that recovers it, unlike the restrictive fields, where
+the running pod holds the answer and the fix is to compare. Kueue with a ResourceFlavor carrying
+no `nodeLabels` is the shape that reaches this; one carrying `nodeLabels` does not, because the
+selector it patches onto the gated pod before admitting it is itself a divergence from the
+template, and that is refused.
+
+The residual case is therefore bounded rather than modelled, in the executor. The API server
+stamps `{PodScheduled: False, reason: SchedulingGated}` on a gated pod at creation
+(`applySchedulingGatedCondition`, called from `PrepareForCreate`), and it is the only condition
+such a pod ever carries, since the PreEnqueue plugin keeps it out of the active queue and nothing
+writes `Unschedulable` over it. A drain waiting for a replacement in that state is waiting on a
+gating controller that publishes nothing binpack can read, so it recognises the condition, hands
+the node back and records `replacement-unschedulable` naming the gate. That costs one eviction of
+a pod that is then admitted late; it does not leave a node cordoned on a wait with no bound, which
+is the failure that matters. Named here beside the admission-label gap below, because it is the
+same shape: a residual the allowlist cannot close, recorded rather than left implicit.
 
 **An unmodelled constraint is a bounded limitation, not a bug** — provided its *presence* is
 detected and causes a refusal. "We do not model hard topology spread" is acceptable. "We
@@ -179,7 +200,8 @@ Everything else triggers a refusal. That includes, non-exhaustively: `hostPort` 
 any persistent volume claim, since deciding whether a volume can follow the pod means modelling
 `VolumeBinding`, `VolumeZone`, `VolumeRestrictions` and per-node CSI attachment limits; required
 inter-pod affinity or anti-affinity; topology spread with `whenUnsatisfiable: DoNotSchedule`; a
-non-default `schedulerName`; scheduling gates; and dynamic resource allocation claims.
+non-default `schedulerName`; scheduling gates the pod or its template declares (see above for the
+one an admission webhook attaches, which reaches neither); and dynamic resource allocation claims.
 
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
@@ -307,6 +329,16 @@ DaemonSet controller pins with `matchFields: metadata.name` and which binpack ne
 So the check refuses only on the fields where a missing constraint is unsound, and on the cluster
 that made the first attempt look unworkable it now refuses nothing at all.
 
+**The refusal has its own vocabulary, and giving it one was a correction.** It used to be reported
+as "no readable controller template" — the same code, the same metric, the same remedy — which
+made the report contradict itself, since it named the ReplicaSet it had just read the template
+from and then asked for a bug report because binpack cannot read ReplicaSets. The two are
+different findings addressed to different people. An unreadable kind is a gap in binpack and
+widens on evidence; a constraint admission added is a fact about that cluster, and no widening
+reaches it — putting the constraint in the workload's own template does, and nothing else. They
+are reported as `unreadable-template` and `admission-divergence`, and counted as the two arms of
+`binpack_nodes_unmodelled`.
+
 **The gap was not bounded, and this ADR previously said it was.** The reasoning given — that the
 scheduler rejects the pod, so the drain stalls and backs off — does not hold. Once a pod is
 evicted its replacement is not aimed at the node binpack chose; the scheduler places it wherever
@@ -364,6 +396,13 @@ measurement rather than intuition, and it can only grow as constraints are genui
 
 If the refusal reason above fires often on real clusters, adopt the full scheduler framework
 from `k8s.io/kubernetes/pkg/scheduler/framework/plugins`, behind the same `CanFit` signature.
+
+The measurement has to be able to answer that question, which is why
+`binpack_nodes_unmodelled` carries a `cause` label. Only the `unreadable-template` arm argues for
+escalating: it counts the workloads a wider allowlist would reach. `admission-divergence` counts
+workloads no allowlist reaches, so a single number adding them together would read as evidence
+for a change that would not have helped — and it is the arm more likely to be non-zero, since a
+mutating webhook is ordinary and a controller outside the four readable kinds is not.
 
 That is deliberately deferred rather than rejected. It buys exact fidelity, and it costs a
 dependency on the main Kubernetes repository: replace directives across every staging module, a

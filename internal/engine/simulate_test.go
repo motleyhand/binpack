@@ -451,8 +451,8 @@ func TestAPodWithNoReadableTemplateIsRefused(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("moved a pod whose replacement binpack cannot predict")
 	}
-	if !sim.Blocked.NoTemplate {
-		t.Errorf("refusal is not marked as a gap in what binpack models: %+v", sim.Blocked)
+	if sim.Blocked.Unmodelled != engine.FindingNoTemplate {
+		t.Errorf("refusal is not marked as an unreadable template: %q", sim.Blocked.Unmodelled)
 	}
 	if !strings.Contains(sim.Blocked.Summary, "no readable controller template") {
 		t.Errorf("summary does not say why: %s", sim.Blocked.Summary)
@@ -708,8 +708,8 @@ func TestHeadroomRefusesWhenATemplateCannotBeRead(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("reserved headroom while unable to size the cluster's largest pod")
 	}
-	if !sim.Blocked.NoTemplate {
-		t.Errorf("refusal is not marked as a gap in what binpack models: %+v", sim.Blocked)
+	if sim.Blocked.Unmodelled != engine.FindingNoTemplate {
+		t.Errorf("refusal is not marked as an unreadable template: %q", sim.Blocked.Unmodelled)
 	}
 }
 
@@ -780,8 +780,8 @@ func TestRestrictiveConstraintsAddedByAdmissionBlockTheSimulation(t *testing.T) 
 			if sim.Feasible {
 				t.Errorf("planned a move from a template missing the pod's %s", tc.name)
 			}
-			if !sim.Blocked.NoTemplate {
-				t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
+			if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
+				t.Errorf("not counted as an admission divergence: %q", sim.Blocked.Unmodelled)
 			}
 		})
 	}
@@ -831,8 +831,8 @@ func TestAVolumeOnlyTheRunningPodHasIsCarriedOver(t *testing.T) {
 	}
 	// Refused for the claim, not for being unmodellable: the template was read
 	// perfectly well, and the volume is a real constraint on the replacement.
-	if sim.Blocked.NoTemplate {
-		t.Errorf("refused as an unreadable template rather than for the claim: %+v", sim.Blocked)
+	if sim.Blocked.Unmodelled != "" {
+		t.Errorf("refused as unpredictable rather than for the claim: %q", sim.Blocked.Unmodelled)
 	}
 }
 
@@ -1077,8 +1077,8 @@ func TestAVolumeRewrittenUnderTheSameNameIsRefused(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("kept the template's emptyDir over the claim the pod actually has")
 	}
-	if !sim.Blocked.NoTemplate {
-		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
+	if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
+		t.Errorf("not counted as an admission divergence: %q", sim.Blocked.Unmodelled)
 	}
 }
 
@@ -1130,8 +1130,8 @@ func TestRelocatingThatSamePodIsStillRefused(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("planned to move a pod whose template is missing its selector")
 	}
-	if !sim.Blocked.NoTemplate {
-		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
+	if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
+		t.Errorf("not counted as an admission divergence: %q", sim.Blocked.Unmodelled)
 	}
 }
 
@@ -1153,8 +1153,8 @@ func TestTheReserveStillNeedsATemplateToSizeAgainst(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("reserved headroom while unable to size the cluster's largest pod")
 	}
-	if !sim.Blocked.NoTemplate {
-		t.Errorf("not counted as a gap in what binpack models: %+v", sim.Blocked)
+	if sim.Blocked.Unmodelled != engine.FindingNoTemplate {
+		t.Errorf("refusal is not marked as an unreadable template: %q", sim.Blocked.Unmodelled)
 	}
 }
 
@@ -1930,5 +1930,63 @@ func TestTwoReplicasOfOneWorkloadCanBeDifferentShapes(t *testing.T) {
 	}
 	if got := sim.Blocked.Pod.Name; got != "web-b" {
 		t.Errorf("blocked on %s, want web-b — the replica whose replacement is the larger", got)
+	}
+}
+
+func TestAdmissionAddedNodeSelectorIsNotReportedAsAnUnreadableTemplate(t *testing.T) {
+	// The refusal is right and the vocabulary is wrong. A webhook — a policy
+	// controller pinning zone or architecture, or the in-tree PodNodeSelector
+	// plugin driven by the namespace's scheduler.alpha.kubernetes.io/
+	// node-selector annotation — adds a nodeSelector at CREATE that the stored
+	// template does not carry, and binpack correctly declines to predict where
+	// the replacement would go. Reporting that as "no readable controller
+	// template" sends the operator to file a bug against a ReplicaSet, which
+	// is one of the four kinds binpack demonstrably does read, when the thing
+	// to change is in their own cluster.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	mutated := mother.Pod("default", "web", mother.OnNode("candidate"),
+		mother.WithNodeSelector("tier", "app"))
+	pods := []*corev1.Pod{mutated}
+
+	templates := mother.Templates(pods...)
+	mother.TemplateFor(templates, mutated) // the template lacks the selector
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		templates, candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("planned to move a pod whose template is missing its selector")
+	}
+	if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
+		t.Errorf("a template binpack read is reported as %q, want %q",
+			sim.Blocked.Unmodelled, engine.FindingAdmissionDivergence)
+	}
+	if !strings.Contains(sim.Blocked.Summary, "nodeSelector") {
+		t.Errorf("summary does not name the diverging field: %s", sim.Blocked.Summary)
+	}
+}
+
+func TestATemplateBinpackTrulyCannotReadIsStillReportedAsUnreadable(t *testing.T) {
+	// The control for the test above, and the direction that matters: the fix
+	// makes binpack report *less*, so a test that only checked the divergence
+	// case would pass just as happily against code that had stopped saying
+	// "unreadable template" at all. An owner kind collect has no reader for
+	// still has to reach the vocabulary written for it — the one whose fix
+	// asks for a bug report, because there the allowlist really is too narrow.
+	candidate := mother.LargeNode("candidate")
+	destination := mother.LargeNode("destination")
+	exotic := mother.Pod("default", "shard-0", mother.OnNode("candidate"),
+		mother.OwnedBy("KafkaCluster", "events"))
+	pods := []*corev1.Pod{exotic}
+
+	sim := engine.Simulate([]*corev1.Node{candidate, destination}, pods,
+		mother.Templates(pods...), candidate, defaultCfg())
+
+	if sim.Feasible {
+		t.Fatal("moved a pod whose replacement binpack cannot predict")
+	}
+	if sim.Blocked.Unmodelled != engine.FindingNoTemplate {
+		t.Errorf("reported as %q, want %q", sim.Blocked.Unmodelled, engine.FindingNoTemplate)
 	}
 }

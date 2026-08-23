@@ -224,25 +224,31 @@ func Advance(
 		// for its own controller resolves in one disruption-controller sync;
 		// nothing about it survives to the interval that would have retried.
 		//
-		// A replacement the scheduler has already refused outranks the pause,
-		// and it is the one thing that does. Every other non-drainable verdict
-		// uncordons, so before this branch existed a refused replacement got
-		// its node back whatever else was wrong with the drain; pausing is the
+		// A replacement that is not going to be placed outranks the pause, and
+		// it is the one thing that does. Every other non-drainable verdict
+		// uncordons, so before this branch existed such a replacement got its
+		// node back whatever else was wrong with the drain; pausing is the
 		// first verdict that keeps the cordon, and the cordon is precisely
-		// what that pod is waiting for — uncordoning is its repair, as the
+		// what a refused pod is waiting for — uncordoning is its repair, as the
 		// awaiting block below says. Holding it down until a budget catches up
 		// trades a Pending workload for a consolidation, which is the wrong
 		// way round, and the trade lasts until the stall timeout if the thing
 		// that is broken is the disruption controller itself.
+		//
+		// Both ending states, not just the refusal, because this branch and
+		// the awaiting block ask the same helper the same question — and a
+		// state one of them ends on and the other waits through leaves the
+		// answer depending on whether a transient blocker happened to be
+		// present. [settledReplacement] is where the pair is kept in step.
 		//
 		// Ahead of the assessment's abandonment for the reason the assessment
 		// is always ranked behind a named cause: "the replacement could not be
 		// scheduled" tells an operator where to look, and "nothing has moved
 		// for eleven minutes" is the same node with the reason filed off. The
 		// awaiting block orders these two the same way.
-		if pod, ok := refusedReplacement(s, name, a.Node); ok {
+		if state, pod, ok := settledReplacement(s, name, a.Node); ok {
 			return Abandon(ctx, w, a.Node,
-				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now, policy)
+				drain.AbandonUnschedulable, replacementReason(state, pod), s.Now, policy)
 		}
 		// Bounded by the same thing every other wait is bounded by, and
 		// checked before the wait rather than after it, because a pause that
@@ -288,24 +294,36 @@ func Advance(
 	// works if "in flight" means bound rather than merely gone from here.
 	if owner, since, ok := awaiting(a.Node); ok {
 		switch state, pod := replacementFor(s, name, owner, since); state {
-		case refused:
+		case refused, gated:
 			// The scheduler said so itself — PodScheduled=False, reason
 			// Unschedulable — so this is detected rather than inferred from a
 			// timeout, and it names the pod. Uncordoning is also the repair:
 			// this node is where that pod can go.
+			//
+			// A gate reaches the same end by the opposite route: nobody has
+			// said no, and nobody is going to say anything at all until the
+			// gating controller admits the pod. That is a wait on a component
+			// that publishes nothing binpack can read, so there is no bound to
+			// draw from it — and an unbounded wait is the one thing a drain
+			// branch may not end in. Uncordoning is still the repair, for a
+			// weaker reason than a refusal's: this node is where that workload
+			// was already running.
 			return Abandon(ctx, w, a.Node,
-				drain.AbandonUnschedulable, unschedulableReason(pod), s.Now, policy)
+				drain.AbandonUnschedulable, replacementReason(state, pod), s.Now, policy)
 
 		case awaited:
 			// Bounded, because having a controller does not mean the
 			// controller will produce a bound pod carrying that same UID. A
 			// rollout or a scale-down supersedes the ReplicaSet and every
 			// later pod is owned by a different one; a Job at its backoffLimit
-			// creates nothing at all; an admission-attached scheduling gate
-			// leaves the replacement neither placed nor refused. None of those
-			// is distinguishable from a replacement that is merely slow, and
-			// all of them show up as an absence of progress — which is the
-			// question the assessment already answers.
+			// creates nothing at all. Neither is distinguishable from a
+			// replacement that is merely slow, and both show up as an absence
+			// of progress — which is the question the assessment already
+			// answers. A scheduling gate used to arrive here too, and it is
+			// the case that showed why this fallback is not enough on its own:
+			// it is positively detectable, so reporting it as "nothing has
+			// moved for eleven minutes" spends the eleven minutes and then
+			// says the one thing an operator cannot act on.
 			if assessment.Action == drain.Abandon {
 				return Abandon(ctx, w, a.Node, assessment.Code, assessment.Reason, s.Now, policy)
 			}
@@ -747,6 +765,10 @@ const (
 	landed
 	// refused: the scheduler tried and could not place it.
 	refused
+	// gated: the replacement carries a scheduling gate, so the scheduler will
+	// not try. Distinct from awaited because nothing binpack can read says
+	// when — or whether — the gating controller will admit it.
+	gated
 )
 
 // awaiting reads the controller this drain is waiting on, and since when.
@@ -783,10 +805,11 @@ func replacementFor(
 	// Every candidate is examined rather than the first match returned. A
 	// controller can have several pods newer than the eviction — a rollout, a
 	// scale-up — and returning on whichever the snapshot happened to list
-	// first would make the answer depend on iteration order. Refused wins:
-	// a pod the scheduler could not place is the fact worth acting on,
-	// whatever its siblings are doing.
-	var landedPod, pendingPod *corev1.Pod
+	// first would make the answer depend on iteration order. The two states
+	// that end the drain win: a pod the scheduler could not place, and one it
+	// will not look at, are the facts worth acting on whatever their siblings
+	// are doing.
+	var landedPod, gatedPod, pendingPod *corev1.Pod
 	for _, pod := range s.Pods {
 		ref := metav1.GetControllerOf(pod)
 		if ref == nil || ref.UID != owner || pod.CreationTimestamp.Before(&metav1.Time{Time: since}) {
@@ -815,42 +838,86 @@ func replacementFor(
 		}
 		pendingPod = pod
 		for _, c := range pod.Status.Conditions {
-			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse &&
-				c.Reason == corev1.PodReasonUnschedulable {
+			if c.Type != corev1.PodScheduled || c.Status != corev1.ConditionFalse {
+				continue
+			}
+			switch c.Reason {
+			case corev1.PodReasonUnschedulable:
 				return refused, pod
+			// Written by the API server at CREATE, not by the scheduler:
+			// PrepareForCreate stamps it on any pod with a non-empty
+			// spec.schedulingGates (kubernetes pkg/registry/core/pod/
+			// strategy.go, applySchedulingGatedCondition). It is the only
+			// condition such a pod gets, because the SchedulingGates
+			// PreEnqueue plugin keeps it out of the scheduler's active queue
+			// entirely — so no Filter runs on it and nothing ever writes
+			// Unschedulable over this.
+			//
+			// Not returned on sight, unlike a refusal: a refusal is the
+			// scheduler's own verdict on this pod, and a gate is a fact about
+			// the workload that a sibling may already have got past.
+			case corev1.PodReasonSchedulingGated:
+				gatedPod = pod
 			}
 		}
 	}
 
+	// Ahead of landed for the same reason refused is: whatever the siblings of
+	// a gated pod are doing, this drain cannot see the replacement it is owed
+	// arrive, and proceeding would put a second eviction behind a first whose
+	// pod is still waiting to be admitted.
+	if gatedPod != nil {
+		return gated, gatedPod
+	}
 	if landedPod != nil {
 		return landed, landedPod
 	}
 	return awaited, pendingPod
 }
 
-// refusedReplacement reports the pod this drain awaits when the scheduler has
-// definitively refused it, and nothing otherwise.
+// settledReplacement reports the pod this drain awaits when nothing binpack is
+// waiting for will change the answer, and nothing otherwise.
 //
 // A narrow reading of the awaiting block below, for the one caller that has to
-// ask the question before that block is reached. Kept to the refused state on
-// purpose: "awaited" and "landed" both mean the drain should carry on doing
-// whatever it was doing, and only a refusal is a fact that outranks another
+// ask the question before that block is reached. Kept to the two ending states
+// on purpose: "awaited" and "landed" both mean the drain should carry on doing
+// whatever it was doing, and only an ending is a fact that outranks another
 // branch's answer.
-func refusedReplacement(s engine.Snapshot, name string, node *corev1.Node) (*corev1.Pod, bool) {
+//
+// It has to name the same two states that block does, and for the same
+// reasons. A caller recognising only a refusal would pause a drain whose
+// replacement is gated for as long as a transient blocker lasted — holding the
+// cordon down for a workload nothing is going to place, which is exactly the
+// trade the pause exists to avoid making.
+func settledReplacement(
+	s engine.Snapshot, name string, node *corev1.Node,
+) (replacement, *corev1.Pod, bool) {
 	owner, since, ok := awaiting(node)
 	if !ok {
-		return nil, false
+		return awaited, nil, false
 	}
-	if state, pod := replacementFor(s, name, owner, since); state == refused {
-		return pod, true
+	switch state, pod := replacementFor(s, name, owner, since); state {
+	case refused, gated:
+		return state, pod, true
 	}
-	return nil, false
+	return awaited, nil, false
 }
 
-// unschedulableReason renders a refused replacement, in one place because two
-// branches now report it and a drain's recorded failure is what an operator
-// reads to find out what happened.
-func unschedulableReason(pod *corev1.Pod) string {
+// replacementReason renders a replacement that ends the drain, in one place
+// because two branches now report it and a drain's recorded failure is what an
+// operator reads to find out what happened.
+//
+// The two states are told apart because their remedies have nothing in common.
+// A refusal is about capacity or constraints and is answered in the shape of
+// the cluster; a gate is answered by whatever attached it, and an operator
+// reading "could not be scheduled" would go looking for room that was never
+// the problem.
+func replacementReason(state replacement, pod *corev1.Pod) string {
+	if state == gated {
+		return fmt.Sprintf("pod %s/%s carries a scheduling gate after moving off this node, "+
+			"so the scheduler will not consider it until something clears the gate",
+			pod.Namespace, pod.Name)
+	}
 	return fmt.Sprintf("pod %s/%s could not be scheduled after moving off this node",
 		pod.Namespace, pod.Name)
 }

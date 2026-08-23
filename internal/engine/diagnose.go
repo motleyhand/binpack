@@ -61,6 +61,7 @@ const (
 	FindingAbandonedDrain         = "abandoned-drain"
 	FindingNodeInBackoff          = "node-in-backoff"
 	FindingNoTemplate             = "unreadable-template"
+	FindingAdmissionDivergence    = "admission-divergence"
 )
 
 // Diagnosis is one class of finding: how much it matters, what it means and
@@ -304,6 +305,24 @@ var diagnoses = map[string]Diagnosis{
 			"DaemonSets and Jobs; a pod owned directly by an operator's own resource has none. " +
 			"Nothing to change on your side: please report the controller, so the list can be " +
 			"widened against evidence rather than guesswork.",
+	},
+	FindingAdmissionDivergence: {
+		Severity: Warning,
+		Summary: "these pods carry a placement constraint their controller's template does " +
+			"not, so binpack cannot tell where their replacements would be allowed to run " +
+			"and will not move them",
+		// Names the mechanism rather than an object, because the object is
+		// what the operator has to go and find: a MutatingWebhookConfiguration,
+		// or a namespace annotated with a default node selector. Sizing the
+		// move from the running pod instead is the unsound inference — the
+		// replacement is what admission produces next, not what is running now.
+		Fix: "unlike everything else here this blocks binpack alone — the cluster-autoscaler " +
+			"and kubectl drain are unaffected. Something is adding the constraint when the " +
+			"pod is created rather than in the workload's own template: a mutating admission " +
+			"webhook, or the namespace's scheduler.alpha.kubernetes.io/node-selector " +
+			"annotation. Putting the same constraint in the workload's pod template makes " +
+			"the pod movable again, because then binpack can see where its replacement " +
+			"would go.",
 	},
 	FindingAbandonedDrain: {
 		Severity: Warning,
@@ -636,9 +655,22 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 		// Guarded on having a controller at all: a bare pod is already its own
 		// finding, and reporting it twice would say the same thing in two
 		// vocabularies.
+		//
+		// Split by cause, because the two remedies are not merely different,
+		// they are addressed to different people. One asks for a report so
+		// binpack's allowlist can be widened; the other asks the operator to
+		// look at their own webhook, and answering it with the first sent them
+		// to file a bug against a ReplicaSet — which the same finding's detail
+		// named, while its fix said binpack reads ReplicaSets.
 		if owner := metav1.GetControllerOf(pod); owner != nil {
-			if _, ok := replacement(pod, s.Templates); !ok {
-				g.add(pod, FindingNoTemplate, "owned by "+owner.Kind+" "+owner.Name)
+			if _, diverged, ok := replacement(pod, s.Templates); !ok {
+				if diverged == "" {
+					g.add(pod, FindingNoTemplate, "owned by "+owner.Kind+" "+owner.Name)
+				} else {
+					g.add(pod, FindingAdmissionDivergence,
+						"carries a "+diverged+" its "+owner.Kind+" "+owner.Name+
+							" template does not")
+				}
 			}
 		}
 

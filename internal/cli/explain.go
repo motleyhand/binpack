@@ -429,10 +429,15 @@ type nodeReport struct {
 	Detail    string   `json:"detail,omitempty"`
 	Relocates int      `json:"relocates,omitempty"`
 	Blockers  []string `json:"blockers,omitempty"`
-	// Unmodelled marks a refusal binpack made because it could not read what
-	// the replacement would request, rather than because the cluster is full.
+	// Unmodelled marks a refusal binpack made because it could not predict
+	// what the replacement would be, rather than because the cluster is full.
 	// Exactly the set binpack_nodes_unmodelled counts, and named the same way,
 	// because the how-to guide sends a reader here to look for the word.
+	//
+	// A boolean while the metric now has two arms, deliberately: which of the
+	// two causes it was belongs in the detail beside it, which already carries
+	// the summary naming the field. Splitting a documented JSON field in two
+	// would break every consumer to say something the same line already says.
 	Unmodelled bool `json:"unmodelled,omitempty"`
 	// Refusals maps each destination to why it would not take the pod that
 	// could not be placed. Without it, "nowhere to go" is unactionable: the
@@ -517,7 +522,7 @@ func reportFor(a engine.NodeAssessment, d engine.Decision) nodeReport {
 		if a.Simulation.Blocked != nil {
 			r.Detail = a.Simulation.Blocked.Summary
 			r.Refusals = a.Simulation.Blocked.PerNode
-			r.Unmodelled = a.Simulation.Blocked.NoTemplate
+			r.Unmodelled = a.Simulation.Blocked.Unmodelled != ""
 		}
 	default:
 		// Why this node is not being drained, which depends on what the

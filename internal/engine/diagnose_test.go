@@ -735,6 +735,33 @@ func TestDiagnoseReportsAPodWhoseTemplateCannotBeRead(t *testing.T) {
 	}), engine.FindingNoTemplate)
 }
 
+func TestDiagnoseReportsAWebhookMutatedPodAsADivergenceNotAnUnreadableTemplate(t *testing.T) {
+	// The report used to contradict itself in the space of two lines: its
+	// detail said "owned by ReplicaSet web-rs" and its fix said binpack reads
+	// templates from ReplicaSets and asked for a bug report about the
+	// controller. The controller is fine. What is adding the selector is a
+	// webhook in this cluster, and that is a thing the reader can actually go
+	// and change — so it is worth a code and a remedy of its own.
+	mutated := mother.Pod("default", "web", mother.OnNode("a"),
+		mother.WithNodeSelector("tier", "app"))
+
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b")}, []*corev1.Pod{mutated})
+	mother.TemplateFor(s.Templates, mutated) // the template lacks the selector
+
+	findings := engine.Diagnose(s, config())
+
+	f := only(t, findings, engine.FindingAdmissionDivergence)
+	if f.Severity != engine.Warning {
+		t.Errorf("severity = %s: it blocks binpack, not the cluster", f.Severity)
+	}
+	if !strings.Contains(f.Detail, "nodeSelector") {
+		t.Errorf("detail does not name the diverging field: %q", f.Detail)
+	}
+	// The whole point of the split: this pod's template was read perfectly
+	// well, so the code that asks for a bug report must not also fire.
+	none(t, findings, engine.FindingNoTemplate)
+}
+
 func TestACordonBinpackLeftBehindIsReportedEvenWithoutItsMarkers(t *testing.T) {
 	// The half-cleaned state: the annotations are gone and the cordon is not.
 	// It is what the documented hand-back leaves behind between its first

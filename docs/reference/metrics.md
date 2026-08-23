@@ -85,7 +85,7 @@ is a capacity one.
 | `binpack_nodes` | gauge | `verdict` | Nodes by verdict at the last evaluation |
 | `binpack_nodes_skipped` | gauge | `code` | Nodes ruled out before simulation, by reason |
 | `binpack_drainable_nodes` | gauge | — | Nodes whose whole workload was shown to fit elsewhere |
-| `binpack_nodes_unmodelled` | gauge | — | Nodes refused because a pod's controller template could not be read |
+| `binpack_nodes_unmodelled` | gauge | `cause` | Nodes refused because binpack could not predict what a pod's replacement would be |
 
 `verdict` is one of `skipped`, `infeasible`, `blocked`, `drainable`. All four are always
 published, reporting zero rather than disappearing — "no drainable nodes" and "binpack is not
@@ -211,8 +211,8 @@ Pools that no longer exist stop being reported rather than freezing at their fin
 
 ## Notes on cardinality
 
-Every label value is drawn from a bounded set: the verdicts, skip codes and outcome codes above,
-plus pool names, which are counted in single digits.
+Every label value is drawn from a bounded set: the verdicts, skip codes, outcome codes and the
+two unmodelled causes above, plus pool names, which are counted in single digits.
 
 The engine's prose reasons are deliberately **not** exposed as labels. They name individual
 nodes and pods — "no destination would accept a pod the size of
@@ -221,18 +221,33 @@ falls over. The prose is in the logs, in the Events on the node, and in `binpack
 
 ### When `binpack_nodes_unmodelled` is above zero
 
-binpack asks whether a pod's *replacement* would fit, which it reads from the pod's controller.
-For a pod created by an operator's own CRD there is no template to read, and binpack refuses to
-move it rather than sizing it from the running pod — the inference that is unsound, since a pod
-resized downward in place would be sized too small.
+binpack asks whether a pod's *replacement* would fit, and it reads that from the pod's
+controller. Two quite different things stop it, and `cause` says which:
 
-Zero on every cluster measured so far. Persistently above zero means the four readable kinds
+| `cause` | What binpack could not do |
+|---|---|
+| `unreadable-template` | Find a template at all — the pod's controller is a kind binpack reads none from |
+| `admission-divergence` | Trust the template it read — the running pod carries a placement constraint the template does not |
+
+Both arms are always published, so a zero reads as zero rather than as a series that has not
+appeared yet.
+
+**`unreadable-template`** is a gap in binpack. For a pod created by an operator's own CRD there
+is no template, and binpack refuses to move it rather than sizing it from the running pod — the
+inference that is unsound, since a pod resized downward in place would be sized too small. Zero
+on every cluster measured so far. Persistently above zero means the four readable kinds
 (ReplicaSet, StatefulSet, DaemonSet, Job) do not cover your workloads, and it is worth saying
 so — [ADR-0006](../design/adr-0006-scheduler-fidelity.md) settles the allowlist against
 measurement, and this is the measurement.
 
-It is deliberately separate from the ordinary infeasible count: "the workload does not fit" is a
-fact about your cluster, and "binpack cannot tell what the workload is" is a gap in binpack.
+**`admission-divergence`** is not a gap widening that allowlist would close: the template was
+read, and something added a constraint to the pod after it. Widening the list of readable kinds
+would not change the answer, so this arm is evidence about the cluster rather than about binpack
+— which is why the two are counted apart, and why summing them would answer neither question.
+[`binpack diagnose`](diagnostics.md#admission-divergence--warning) names the field and the pods.
+
+Both are deliberately separate from the ordinary infeasible count: "the workload does not fit"
+is a fact about your cluster, and "binpack cannot tell what the workload is" is not.
 
 ## Replicas that have not evaluated
 

@@ -46,11 +46,28 @@ type Blocked struct {
 	PerNode map[string]string
 	// Summary is a one-line description.
 	Summary string
-	// NoTemplate marks the refusal as "binpack could not read what the
-	// replacement would look like" rather than "it did not fit". They are
-	// counted apart, because the first is a gap in what binpack models and the
-	// second is a fact about the cluster.
-	NoTemplate bool
+	// Unmodelled marks the refusal as "binpack could not predict what the
+	// replacement would be" rather than "it did not fit", and names which of
+	// the two causes it was — [FindingNoTemplate] or
+	// [FindingAdmissionDivergence]. Empty for an ordinary shortfall.
+	//
+	// The distinction from a shortfall is the older one: "the workload does
+	// not fit" is a fact about the cluster and "binpack cannot tell what the
+	// workload is" is a gap in binpack, and they call for different responses.
+	//
+	// A cause rather than a flag because that reasoning goes one level
+	// further, and stopping at the flag made both surfaces say the wrong
+	// thing. An unreadable template is a gap in binpack's controller allowlist
+	// and widens on evidence; a constraint admission added to the pod and not
+	// to its template is a fact about *this* cluster that no widening reaches.
+	// Reported as one, the report contradicts itself — it names a ReplicaSet
+	// and then says binpack cannot read ReplicaSets — and it asks the operator
+	// to file a bug about a controller when what to change is their own
+	// webhook.
+	//
+	// The values are the diagnosis codes, so the metric arm, the diagnosis and
+	// the reference documentation are one vocabulary rather than three.
+	Unmodelled string
 }
 
 // Simulation is the result of asking whether a node could be emptied.
@@ -108,15 +125,9 @@ func Simulate(
 		case Relocatable:
 			// Placed as the pod its controller will create, not as the pod
 			// leaving. See [replacement].
-			next, ok := replacement(pod, templates)
+			next, diverged, ok := replacement(pod, templates)
 			if !ok {
-				sim.Blocked = &Blocked{
-					Pod: pod,
-					Summary: fmt.Sprintf(
-						"%s/%s has no readable controller template, so binpack cannot tell what "+
-							"its replacement would request", pod.Namespace, pod.Name),
-					NoTemplate: true,
-				}
+				sim.Blocked = unpredictable(pod, diverged)
 				return sim
 			}
 			toPlace = append(toPlace, next)
@@ -451,7 +462,7 @@ func relocatableShapes(
 				Summary: fmt.Sprintf(
 					"%s/%s has no readable controller template, so binpack cannot tell how much "+
 						"room to reserve for a pod of its size", pod.Namespace, pod.Name),
-				NoTemplate: true,
+				Unmodelled: FindingNoTemplate,
 			}
 		}
 		shapes = append(shapes, headroomShape{
@@ -902,17 +913,58 @@ func ControllerOf(pod *corev1.Pod) (OwnerRef, bool) {
 // moving any of them — so a webhook-mutated workload on some unrelated node
 // would otherwise make every candidate refuse, which is the third route to the
 // same "one pod blocks all drains" failure this change has now closed.
-func replacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec) (*corev1.Pod, bool) {
-	out, ok := sizedReplacement(pod, templates)
+//
+// Three outcomes, not two. ok reports whether the pod can be moved; when it
+// cannot, diverged names the field admission added, or is empty when there was
+// no template to read in the first place. Both helpers below already compute
+// that name, and discarding it was what let one refusal be reported as the
+// other — see [Blocked.Unmodelled].
+func replacement(
+	pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec,
+) (out *corev1.Pod, diverged string, ok bool) {
+	out, ok = sizedReplacement(pod, templates)
 	if !ok {
-		return nil, false
+		return nil, "", false
 	}
 	ref, _ := ControllerOf(pod)
 	template := templates[ref]
-	if restrictiveDivergence(template, pod) != "" || mutatedVolume(template, pod) != "" {
-		return nil, false
+	if field := restrictiveDivergence(template, pod); field != "" {
+		return nil, field, false
 	}
-	return out, true
+	if volume := mutatedVolume(template, pod); volume != "" {
+		// Named as the field it is, since "volumes" alone would not tell an
+		// operator which of a meshed pod's half-dozen to go and look at.
+		return nil, "volume " + volume, false
+	}
+	return out, "", true
+}
+
+// unpredictable is the refusal for a pod whose replacement binpack cannot
+// predict, in whichever of the two vocabularies fits the cause.
+//
+// One function rather than two call sites, because keeping the pair together
+// is what stops the second being written as a variation on the first — which
+// is how it went wrong before: the divergence case borrowed the unreadable
+// case's whole vocabulary, and told operators to report a controller binpack
+// reads perfectly well.
+func unpredictable(pod *corev1.Pod, diverged string) *Blocked {
+	if diverged == "" {
+		return &Blocked{
+			Pod: pod,
+			Summary: fmt.Sprintf(
+				"%s/%s has no readable controller template, so binpack cannot tell what "+
+					"its replacement would request", pod.Namespace, pod.Name),
+			Unmodelled: FindingNoTemplate,
+		}
+	}
+	return &Blocked{
+		Pod: pod,
+		Summary: fmt.Sprintf(
+			"%s/%s carries a %s its controller template does not, so binpack cannot tell "+
+				"where its replacement would be allowed to go",
+			pod.Namespace, pod.Name, diverged),
+		Unmodelled: FindingAdmissionDivergence,
+	}
 }
 
 // sizedReplacement is the pod a controller would create, as far as its

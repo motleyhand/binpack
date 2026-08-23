@@ -116,13 +116,15 @@ var (
 		Help: "Nodes ruled out before simulation at the last evaluation, by reason code.",
 	}, []string{"code"})
 
-	unmodelled = prometheus.NewGauge(prometheus.GaugeOpts{
+	unmodelled = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "binpack_nodes_unmodelled",
-		Help: "Nodes refused because binpack could not read a pod's controller template, " +
-			"and so cannot predict what its replacement would request. " +
-			"A gap in what binpack models rather than a fact about the cluster: " +
-			"persistently above zero means the allowlist is too narrow for this cluster.",
-	})
+		Help: "Nodes refused because binpack could not predict what a pod's replacement " +
+			"would be, by cause. A gap in what binpack models rather than a fact about the " +
+			"cluster — but the two causes are gaps in different things: unreadable-template " +
+			"persistently above zero means binpack's controller allowlist is too narrow for " +
+			"this cluster, and admission-divergence means a webhook here mutates pods it does " +
+			"not mutate templates.",
+	}, []string{"cause"})
 
 	drainable = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: "binpack_drainable_nodes",
@@ -265,7 +267,7 @@ func Observe(s engine.Snapshot, d engine.Decision, cfg engine.Config, took float
 			// Seeded even so, because a leader that restarts mid-drain opens the
 			// gate here without ever having counted anything, and an absent
 			// series reads as "binpack is not reporting" rather than as zero.
-			seedVerdicts()
+			seedNodeSeries()
 		} else {
 			observeNodes(d)
 		}
@@ -296,9 +298,10 @@ func observeNodes(d engine.Decision) {
 	nodes.Reset()
 	skipped.Reset()
 
-	seedVerdicts()
+	seedNodeSeries()
 
-	var canDrain, cannotModel float64
+	var canDrain float64
+	cannotModel := map[string]float64{}
 	for _, a := range d.Assessments {
 		verdict := a.Verdict()
 		nodes.WithLabelValues(verdict).Inc()
@@ -315,17 +318,32 @@ func observeNodes(d engine.Decision) {
 			// fit" is a fact about the cluster and "binpack cannot tell what
 			// the workload is" is a gap in binpack, and they call for
 			// completely different responses.
-			if a.Simulation != nil && a.Simulation.Blocked != nil && a.Simulation.Blocked.NoTemplate {
-				cannotModel++
+			//
+			// And apart from each other, by the cause the engine decided,
+			// because that reasoning applies again one level down: only one of
+			// the two is a gap a wider allowlist would close, and it is the
+			// rarer one. See [engine.Blocked].
+			if a.Simulation != nil && a.Simulation.Blocked != nil {
+				if cause := a.Simulation.Blocked.Unmodelled; cause != "" {
+					cannotModel[cause]++
+				}
 			}
 		}
 	}
 	drainable.Set(canDrain)
-	unmodelled.Set(cannotModel)
+	for _, cause := range unmodelledCauses {
+		unmodelled.WithLabelValues(cause).Set(cannotModel[cause])
+	}
 }
 
-// seedVerdicts makes sure every verdict has a series, without disturbing one
-// that already has a count.
+// unmodelledCauses is the closed set of reasons binpack could not predict a
+// pod's replacement, and so the label values binpack_nodes_unmodelled
+// publishes. They are the diagnosis codes, because `binpack diagnose` reports
+// the same two conditions per workload and one vocabulary is better than two.
+var unmodelledCauses = []string{engine.FindingNoTemplate, engine.FindingAdmissionDivergence}
+
+// seedNodeSeries makes sure every verdict and every unmodelled cause has a
+// series, without disturbing one that already has a count.
 //
 // A verdict nobody currently holds must report zero rather than vanishing: to
 // an alert, "no drainable nodes" and "binpack is not reporting" must not look
@@ -333,7 +351,15 @@ func observeNodes(d engine.Decision) {
 // creates a child at zero on first sight and returns the existing one
 // afterwards — so this seeds a fresh process and leaves a draining tick's
 // inherited counts alone, from the one line.
-func seedVerdicts() {
+//
+// The causes are here for the same reason and one further one: they exist to
+// be compared with each other, and a comparison against a series that has not
+// appeared yet is not a comparison. On the ordinary path they are written
+// anyway; this is what covers the leader that restarts into a drain.
+func seedNodeSeries() {
+	for _, cause := range unmodelledCauses {
+		unmodelled.WithLabelValues(cause)
+	}
 	for _, verdict := range []string{
 		engine.VerdictSkipped, engine.VerdictInfeasible,
 		engine.VerdictBlocked, engine.VerdictDrainable,

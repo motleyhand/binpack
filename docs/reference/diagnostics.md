@@ -418,7 +418,42 @@ is the inference that is unsound (see
 [ADR-0006](../design/adr-0006-scheduler-fidelity.md)).
 
 **Fix.** Nothing on your side. Please report the controller, so the list can be widened against
-evidence rather than guesswork. `binpack_nodes_unmodelled` counts the same thing as a metric.
+evidence rather than guesswork. `binpack_nodes_unmodelled{cause="unreadable-template"}` counts the
+same thing as a metric.
+
+### `admission-divergence` — warning
+
+The pods carry a placement constraint their controller's template does not, so binpack cannot
+tell where their replacements would be allowed to run and will not move them.
+
+**Unlike everything else in this reference, this blocks binpack alone.** The cluster-autoscaler
+and `kubectl drain` are unaffected. binpack sizes and places the pod a controller *would create*,
+which it reads from the template — so a `nodeSelector`, a required node affinity, a
+`schedulerName`, a hard topology spread constraint, a `runtimeClassName` or a rewritten volume
+that is on the running pod and not in the template describes a replacement binpack cannot predict.
+Assuming the replacement is as free to move as its template says would approve a destination the
+scheduler then refuses, which is the one direction binpack will not err in
+(see [ADR-0006](../design/adr-0006-scheduler-fidelity.md)).
+
+Something adds the constraint when the pod is created rather than in the workload's own template.
+Two common sources are a mutating admission webhook, and — on a cluster whose API server enables
+the in-tree `PodNodeSelector` admission plugin — the namespace's
+`scheduler.alpha.kubernetes.io/node-selector` annotation, which that plugin merges into
+`pod.spec.nodeSelector` and not into any template. The finding's detail names the field, and these
+say which namespaces and which webhooks are in play:
+
+```bash
+kubectl get namespace <namespace> -o jsonpath='{.metadata.annotations}'
+```
+
+```bash
+kubectl get mutatingwebhookconfigurations
+```
+
+**Fix.** Put the same constraint in the workload's own pod template. binpack can then see where
+the replacement would go, and the pod becomes movable again — nothing about where it actually
+runs changes. `binpack_nodes_unmodelled{cause="admission-divergence"}` counts the same thing as a
+metric.
 
 ### `mirror-pod` — blocking
 
