@@ -102,6 +102,20 @@ impossible, and it cannot be linted — it is a review rule, recorded in `CLAUDE
 - **`internal/fit` needs no interface.** It takes `*corev1.Pod` and `*corev1.Node`, and the
   engine calls it directly. No eligibility relation, no lookup table, no injected logic. See
   [ADR-0006](adr-0006-scheduler-fidelity.md).
+- **The rule outgrew the engine, so it is called `purity` and covers four packages.** `fit` was
+  the first to join, on this ADR's own reasoning. `internal/drain` and `api/v1alpha1` joined
+  later, on reasoning this ADR did not supply, and the gap between what was decided here and
+  what was written elsewhere is worth recording: the architecture document had described
+  `api/v1alpha1` as guarded by this allowlist for some time before it was, and the package doc
+  of `internal/drain` had claimed to be a pure function with nothing holding it to it. Neither
+  claim was false about the code — both packages satisfied the rule the whole time — but
+  "enforced" and "true so far" are different assurances, and only one of them survives the next
+  person who needs one more fact. Widening the rule made the documents true rather than the
+  reverse.
+
+  `api/v1alpha1` brings one entry with it: `sigs.k8s.io/yaml`, which parses bytes it is handed
+  and opens nothing. Allowing a parser is not a hole in "no I/O" — `Load` takes its document as
+  an argument precisely so that reading it stays somebody else's job.
 - **Upstream helpers are used at the point of use.** Effective pod requests come from
   `k8s.io/component-helpers/resource.PodRequests` where they are needed, rather than being
   precomputed into a mirror that can drift from what the scheduler does.

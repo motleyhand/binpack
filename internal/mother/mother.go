@@ -24,6 +24,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/intstr"
 
+	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
@@ -897,8 +898,14 @@ func Templates(pods ...*corev1.Pod) map[engine.OwnerRef]*corev1.PodTemplateSpec 
 	// an operator's own CRD gets no entry, which is the whole distinction the
 	// no-template refusal turns on — building one for every kind would make
 	// that case untestable and the fixture a lie.
-	readable := map[string]bool{
-		"ReplicaSet": true, "StatefulSet": true, "DaemonSet": true, "Job": true,
+	//
+	// Taken from collect rather than restated, because a fixture that stops
+	// agreeing with the read path does not fail: it goes on producing the
+	// refusal the tests were written against, so a kind added to the reader
+	// and forgotten here leaves the suite green and the work looking done.
+	readable := map[string]bool{}
+	for _, src := range collect.TemplateSources() {
+		readable[src.Kind] = true
 	}
 
 	out := map[engine.OwnerRef]*corev1.PodTemplateSpec{}

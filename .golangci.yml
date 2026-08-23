@@ -18,29 +18,54 @@ linters:
   settings:
     depguard:
       rules:
-        # ADR-0008: the decision engine is a pure function over data. It may
-        # name Kubernetes API types — those are inert structs, constructible in
-        # a test literal — but it must never hold anything that talks to a
-        # cluster, or do I/O of any kind.
+        # ADR-0008: these packages are pure functions over data. They may name
+        # Kubernetes API types — those are inert structs, constructible in a
+        # test literal — but must never hold anything that talks to a cluster,
+        # or do I/O of any kind.
         #
         # An allowlist, not a denylist. A list of clients we remembered can
         # never be complete: k8s.io/metrics ships one, every cloud SDK ships
         # one, and the next Kubernetes release may add another. Anything not
         # named here is refused by default, which is the same reasoning
         # ADR-0006 applies to unmodelled scheduler constraints.
-        engine-purity:
+        #
+        # Named `purity` rather than `engine-purity` because it no longer
+        # covers only the engine, and the four packages are here for three
+        # different reasons — each stated below, because a files: list nobody
+        # can justify line by line is one the next entry gets added to by
+        # sympathy rather than by argument.
+        purity:
           files:
-            # internal/fit is held to the same rule: ADR-0008 gives it no
-            # cluster access either, and it is the package most likely to be
-            # tempted by a client when a predicate needs one more fact.
+            # The decision engine itself, which is what ADR-0008 decided.
             - "**/internal/engine/**"
+            # Held to the same rule by the same ADR, and the package most
+            # likely to be tempted by a client when a predicate needs one more
+            # fact.
             - "**/internal/fit/**"
+            # The module's only importable package, so its dependency set is
+            # public surface: anything it imports, a consumer importing the
+            # configuration types inherits. docs/design/2026-08-15-architecture.md
+            # has claimed this row was enforced since before it was.
+            - "**/api/v1alpha1/**"
+            # Its package doc says it "answers it as a pure function so the
+            # judgement can be stated as a table". Held to what it claims.
+            - "**/internal/drain/**"
           allow:
             - $gostd
+            # Wholesale, so the rule stops at the package boundary rather than
+            # at the module's: nothing prevents a guarded package reaching a
+            # client through an unguarded internal one except the import cycle
+            # that would result. Widening this list is not the only way to
+            # break the property.
             - github.com/motleyhand/binpack
             - k8s.io/api
             - k8s.io/apimachinery
             - k8s.io/component-helpers
+            # A parser, not a client: it converts bytes that are already in
+            # hand and opens nothing. api/v1alpha1.Load takes those bytes as an
+            # argument, which is what keeps the package free of I/O even though
+            # reading configuration is its whole job.
+            - sigs.k8s.io/yaml
             # Interfaces only, no implementation: some upstream signatures take
             # a logger, and logr.Discard satisfies them without doing anything.
             # k8s.io/klog is deliberately NOT allowed — it is a logging
@@ -48,19 +73,19 @@ linters:
             # logr.Logger, so nothing is lost by refusing it.
             - github.com/go-logr/logr
           deny:
-            # $gostd is allowed wholesale for the arithmetic and formatting the
-            # engine genuinely needs, so the I/O-capable corners of it are
-            # named explicitly.
+            # $gostd is allowed wholesale for the arithmetic and formatting
+            # these packages genuinely need, so the I/O-capable corners of it
+            # are named explicitly.
             - pkg: os
-              desc: internal/engine must perform no I/O (ADR-0008)
+              desc: this package must perform no I/O (ADR-0008)
             - pkg: os/exec
-              desc: internal/engine must perform no I/O (ADR-0008)
+              desc: this package must perform no I/O (ADR-0008)
             - pkg: net
-              desc: internal/engine must perform no I/O (ADR-0008)
+              desc: this package must perform no I/O (ADR-0008)
             - pkg: net/http
-              desc: internal/engine must perform no I/O (ADR-0008)
+              desc: this package must perform no I/O (ADR-0008)
             - pkg: database/sql
-              desc: internal/engine must perform no I/O (ADR-0008)
+              desc: this package must perform no I/O (ADR-0008)
 
     revive:
       rules:

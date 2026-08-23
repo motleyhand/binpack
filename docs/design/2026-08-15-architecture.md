@@ -65,6 +65,7 @@ api/v1alpha1           configuration types (CRD-shaped), defaulting, validation
 internal/
   engine               Snapshot -> Decision. no clients, no I/O, inputs read-only
   fit                  can this pod go on this node? upstream predicates. no clients
+  drain                is a drain in progress alive, finished or lost? no clients
   collect              reads cluster state into a Snapshot
   controller           owns the manager, caches and leader election
   executor             cordons, evicts, uncordons, writes drain markers
@@ -80,7 +81,7 @@ touch a cluster at all.
 
 | Package | Cluster access |
 |---|---|
-| `engine`, `fit`, `api/v1alpha1` | **None.** API types as data, no clients, no I/O — enforced by a `depguard` allowlist, see [ADR-0008](adr-0008-engine-uses-api-types.md) |
+| `engine`, `fit`, `drain`, `api/v1alpha1` | **None.** API types as data, no clients, no I/O — enforced by the `purity` `depguard` allowlist, see [ADR-0008](adr-0008-engine-uses-api-types.md) |
 | `collect` | Reads. Lists nodes, pods, PDBs and the autoscaler status into a `Snapshot`, without transforming them |
 | `controller` | Owns the controller-runtime manager, its caches and leader election |
 | `executor` | Writes. Cordon, uncordon, eviction, and the drain marker annotations |
