@@ -971,6 +971,18 @@ func TestDiagnoseReportsAnUnparseableSelectorRatherThanDroppingIt(t *testing.T) 
 	if !strings.Contains(f.Detail, "Not A Valid Label Value!") {
 		t.Errorf("detail does not show the selector that will not parse: %s", f.Detail)
 	}
+
+	// And it outranks the staleness an edit creates, unlike every other budget
+	// finding. This one reads the spec, which is current whatever the status
+	// is doing — and the pending sync will not settle it, since that sync
+	// fails on the same unparseable selector.
+	t.Run("an edit does not demote it to staleness", func(t *testing.T) {
+		findings := diagnose(nil, nil,
+			mother.Stale(mother.UnparseableSelector(mother.PDB("default", "grandfathered", 1, nil))))
+
+		only(t, findings, engine.FindingPDBUnparseableSelector)
+		none(t, findings, engine.BlockedPDBStale)
+	})
 }
 
 // TestDiagnoseDoesNotSendAnOperatorAfterAStartingPodsBudgets is the report's
@@ -998,4 +1010,48 @@ func TestDiagnoseDoesNotSendAnOperatorAfterAStartingPodsBudgets(t *testing.T) {
 	running := mother.Pod("default", "web-0", mother.OnNode("a"), mother.PodLabels(labelled))
 
 	only(t, diagnose(nil, []*corev1.Pod{running}, pdbs...), engine.BlockedMultiplePDBs)
+}
+
+// TestDiagnoseReportsAnEditedBudgetAsStaleEvenWhenItsLastSyncFailed settles
+// which of two status-derived findings wins while the status is behind the
+// spec, and the answer is neither of them: the staleness does.
+//
+// Nothing clears a condition when a spec is edited — only the disruption
+// controller writes status, and it writes on sync — so a budget that was
+// failing and has just been corrected still carries the old SyncFailed
+// condition and its old message, with observedGeneration behind generation
+// until the next sync. That window is the state an operator creates by acting
+// on pdb-sync-failed, so it is common rather than exotic, and during it binpack
+// does not yet know whether the edit worked.
+//
+// This is upstream's own precedence: checkAndDecrement compares
+// observedGeneration against generation and returns 429 before it reads the
+// condition at all. The rule is uniform — a status behind its spec is
+// untrustworthy in every field, the condition included, which is the same
+// reasoning that makes the counters untrustworthy under a sync failure.
+func TestDiagnoseReportsAnEditedBudgetAsStaleEvenWhenItsLastSyncFailed(t *testing.T) {
+	labelled := map[string]string{"app": "web"}
+	failing := func() *policyv1.PodDisruptionBudget {
+		return mother.SyncFailed(mother.PDB("default", "web", 0, labelled),
+			`found no controllers for pod "web-0"`)
+	}
+
+	t.Run("an edit outranks the condition it has not yet cleared", func(t *testing.T) {
+		findings := diagnose(nil, nil, mother.Stale(failing()))
+
+		f := only(t, findings, engine.BlockedPDBStale)
+		if f.Severity != engine.Warning {
+			t.Errorf("severity = %s, want warning: binpack does not yet know the edit failed", f.Severity)
+		}
+		none(t, findings, engine.FindingPDBSyncFailed)
+	})
+
+	// The control: the edit is the discriminator, not the condition. A sync
+	// failure the controller has caught up with is still reported as one.
+	t.Run("a settled budget still reports the sync failure", func(t *testing.T) {
+		findings := diagnose(nil, nil, failing())
+
+		only(t, findings, engine.FindingPDBSyncFailed)
+		none(t, findings, engine.BlockedPDBStale)
+	})
 }

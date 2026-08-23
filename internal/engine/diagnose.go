@@ -202,8 +202,12 @@ var diagnoses = map[string]Diagnosis{
 		Severity: Warning,
 		Summary: "this PodDisruptionBudget was edited and its controller has not caught up, " +
 			"so the eviction API refuses disruptions until it does",
-		Fix: "usually momentary and worth re-checking. If it persists, the disruption " +
-			"controller is not running.",
+		Fix: "usually momentary and worth re-checking. If it persists, read the " +
+			"DisruptionAllowed condition — kubectl get pdb -n NS NAME -o " +
+			"jsonpath='{.status.conditions}' — because a reason of SyncFailed means the " +
+			"controller is running and cannot compute this particular budget, which an " +
+			"edit will not settle. Anything else that persists suggests it is not " +
+			"running at all.",
 	},
 	BlockedMultiplePDBs: {
 		Severity: Blocking,
@@ -444,34 +448,52 @@ func diagnoseBudgets(s Snapshot) []Finding {
 		ref := pdb.Namespace + "/" + pdb.Name
 
 		switch {
+		// The arms are ordered by what they read. This one reads the spec,
+		// which is current whatever the status is doing, so it comes before
+		// every question about whether the status can be believed.
 		case unparseableSelector(pdb):
-			// First, because a budget nothing can parse is one the disruption
-			// controller cannot sync either — getPodsForPdb parses the same
-			// selector — so it arrives carrying the sync failure below as
-			// well. Naming the field to edit beats relaying the parse error.
+			// And before the sync failure in particular, because a budget
+			// nothing can parse is one the disruption controller cannot sync
+			// either — getPodsForPdb parses the same selector — so it always
+			// arrives carrying one. Naming the field to edit beats relaying a
+			// parse error back.
 			findings = append(findings, finding(FindingPDBUnparseableSelector, ref,
 				"invalid selector: "+selectorSummary(pdb)))
 
-		case syncFailed(pdb) != nil:
-			// Before every arm that reads a counter, because failSafe forces
-			// disruptionsAllowed to zero and leaves currentHealthy,
-			// desiredHealthy and expectedPods at whatever the last successful
-			// sync wrote. Read without the condition, a budget whose
-			// controller is failing is indistinguishable from a one-replica
-			// minAvailable: 1 — and from a budget selecting nothing, when it
-			// has never synced at all and every counter is still zero.
-			//
-			// The condition cannot outlive the failure: the disruption
-			// controller rewrites it to SufficientPods or InsufficientPods on
-			// the next successful sync (component-helpers
-			// apps/poddisruptionbudget, UpdateDisruptionAllowedCondition), so
-			// the reason is what discriminates rather than the presence of a
-			// condition, which every computed budget also carries.
-			findings = append(findings, finding(FindingPDBSyncFailed, ref, syncFailed(pdb).Message))
-
+		// Then the one question about the status as a whole, before any arm
+		// that reads a field of it — the condition included. Nothing clears a
+		// condition when a spec is edited, since only the disruption
+		// controller writes status and it writes on sync, so a budget just
+		// corrected still carries the reason its previous sync failed with.
+		// Reporting that as a current failure would use a stale message to
+		// make a blocking claim binpack cannot yet support: whether the edit
+		// worked is exactly what the pending sync decides.
+		//
+		// Which is upstream's own precedence. checkAndDecrement compares
+		// observedGeneration against generation and returns 429 before it
+		// reads the condition at all, and the "check whether sync is failed
+		// first" comment beside that condition orders it ahead of the
+		// counters, not ahead of this.
 		case pdb.Status.ObservedGeneration < pdb.Generation:
 			findings = append(findings, finding(BlockedPDBStale, ref,
 				fmt.Sprintf("generation %d, observed %d", pdb.Generation, pdb.Status.ObservedGeneration)))
+
+		case syncFailed(pdb) != nil:
+			// Now the status can be believed, and this is the only field of it
+			// that is not misleading: failSafe forces disruptionsAllowed to
+			// zero and leaves currentHealthy, desiredHealthy and expectedPods
+			// at whatever the last successful sync wrote. Read by the counters
+			// alone, a budget whose controller is failing is indistinguishable
+			// from a one-replica minAvailable: 1 — and from a budget selecting
+			// nothing, when it has never synced at all and every counter is
+			// still zero. So this comes before all three.
+			//
+			// The reason discriminates rather than the presence of a
+			// condition, which every computed budget also carries: the
+			// disruption controller rewrites it to SufficientPods or
+			// InsufficientPods on each successful sync (component-helpers
+			// apps/poddisruptionbudget, UpdateDisruptionAllowedCondition).
+			findings = append(findings, finding(FindingPDBSyncFailed, ref, syncFailed(pdb).Message))
 
 		case pdb.Status.DisruptionsAllowed > 0:
 			// Healthy: it permits the disruption a drain needs.

@@ -264,9 +264,21 @@ The budget was edited and its controller has not caught up, so the eviction API 
 disruptions until it does.
 
 The eviction subresource compares `status.observedGeneration` against `metadata.generation` and
-rejects outright when the status is behind, whatever the recorded allowance says.
+rejects outright when the status is behind, whatever the recorded allowance says. binpack applies
+the same precedence, so this finding outranks every other reading of the status — including
+`pdb-sync-failed`, whose condition survives a spec edit until the next sync and can therefore be
+describing the budget as it was rather than as it is.
 
-**Fix.** Usually momentary; re-run. If it persists, the disruption controller is not running.
+**Fix.** Usually momentary; re-run. If it persists, read the condition:
+
+```bash
+kubectl get pdb -n NS NAME -o jsonpath='{.status.conditions}'
+```
+
+A `reason` of `SyncFailed` means the controller is running and cannot compute this particular
+budget — see [`pdb-sync-failed`](#pdb-sync-failed--blocking), and note that editing the budget
+will not settle it. Anything else that persists suggests the disruption controller is not running
+at all.
 
 ### `multiple-pdbs` — blocking
 
