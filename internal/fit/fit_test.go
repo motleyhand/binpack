@@ -224,6 +224,56 @@ func TestPodCountIsAResource(t *testing.T) {
 	}
 }
 
+func TestAPodRequestingExactlyWhatRemainsFits(t *testing.T) {
+	// The boundary between fits and does not, in the direction that costs a
+	// consolidation rather than causing one: read as "at least as much as
+	// remains is not enough", a node is refused for the pod it can hold
+	// exactly — which is the shape of a well-packed node and so of every node
+	// worth consolidating onto.
+	//
+	// It has to be asserted here. The differential harness cannot close it,
+	// and not because exact fits are rare — they occur in its own corpus. Its
+	// check is one-directional by design: it fails when binpack accepts a
+	// placement the scheduler refuses, and an over-conservative refusal is
+	// recorded as conservative and passes. Generating more exact fits would
+	// leave it green either way.
+	node := mother.GPUNode("node-a", 1)
+	pod := mother.Pod("default", "exact", mother.Requests("1900m", "1360Mi"),
+		mother.Requesting("nvidia.com/gpu", "1"))
+	// What the scheduler would reserve, in every dimension at once and the
+	// pod slot included, since EffectiveRequests synthesises `pods: 1`.
+	exactly := fit.EffectiveRequests(pod)
+
+	if ok, reason := fit.CanFit(pod, node, exactly, nil, nil); !ok {
+		t.Fatalf("a pod requesting exactly what remains must fit: %s", reason.Message)
+	}
+
+	// And one unit short of any of them must not, per resource kind — so the
+	// assertion above is about where the boundary sits rather than about the
+	// arithmetic having been switched off.
+	for name, unit := range map[corev1.ResourceName]string{
+		corev1.ResourceCPU:    "1m",
+		corev1.ResourceMemory: "1Ki",
+		corev1.ResourcePods:   "1",
+		"nvidia.com/gpu":      "1",
+	} {
+		t.Run(string(name)+" one unit short", func(t *testing.T) {
+			short := fit.EffectiveRequests(pod)
+			have := short[name]
+			have.Sub(resource.MustParse(unit))
+			short[name] = have
+
+			ok, reason := fit.CanFit(pod, node, short, nil, nil)
+			if ok {
+				t.Fatalf("a node one %s short of the request must refuse", name)
+			}
+			if reason.Code != fit.ReasonInsufficient {
+				t.Errorf("reason code = %q, want %q", reason.Code, fit.ReasonInsufficient)
+			}
+		})
+	}
+}
+
 func TestEffectiveRequests(t *testing.T) {
 	mem := func(rl corev1.ResourceList) string {
 		q := rl[corev1.ResourceMemory]

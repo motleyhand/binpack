@@ -440,6 +440,34 @@ func WithInlineCSIVolume(name, driver string) PodOption {
 	}
 }
 
+// WithRequiredNodeAffinity declares required node affinity on one label key —
+// the form a zone-pinning, licence-pinning or GPU-steering webhook injects
+// into a pod its controller's template knows nothing about.
+//
+// Its own builder rather than a nodeSelector, because the two are the same
+// question to some readers and different fields to others: fit evaluates both
+// through GetRequiredNodeAffinity, while the engine compares a template
+// against its running pod field by field, so a divergence written as a
+// nodeSelector never exercises the affinity arm at all.
+func WithRequiredNodeAffinity(labelKey, labelValue string) PodOption {
+	return func(p *corev1.Pod) {
+		if p.Spec.Affinity == nil {
+			p.Spec.Affinity = &corev1.Affinity{}
+		}
+		p.Spec.Affinity.NodeAffinity = &corev1.NodeAffinity{
+			RequiredDuringSchedulingIgnoredDuringExecution: &corev1.NodeSelector{
+				NodeSelectorTerms: []corev1.NodeSelectorTerm{{
+					MatchExpressions: []corev1.NodeSelectorRequirement{{
+						Key:      labelKey,
+						Operator: corev1.NodeSelectorOpIn,
+						Values:   []string{labelValue},
+					}},
+				}},
+			},
+		}
+	}
+}
+
 // WithRequiredAntiAffinity declares required pod anti-affinity at the hostname
 // topology, which is symmetric: it can reject an incoming pod as well as
 // constrain this one.
@@ -683,6 +711,28 @@ func Healthy(pdb *policyv1.PodDisruptionBudget, current, desired int32) *policyv
 	if pdb.Status.ExpectedPods < desired {
 		pdb.Status.ExpectedPods = desired
 	}
+	return pdb
+}
+
+// DesiresNothing empties a budget's health requirement the way the disruption
+// controller does for a minAvailable of 0 whose replicas are all unready:
+// desiredHealthy 0 from the spec, currentHealthy 0 because only Ready pods are
+// counted, and therefore no allowance at all, since disruptionsAllowed is
+// currentHealthy minus desiredHealthy clamped at zero (kubernetes
+// pkg/controller/disruption/disruption.go, getExpectedPodCount and
+// updatePdbStatus).
+//
+// It reads as a met budget and is not one. The eviction API charges an unready
+// pod against a budget that desires nothing, so "currentHealthy >= desiredHealthy"
+// holding as 0 >= 0 is exactly what the exemption's desiredHealthy > 0 guard
+// exists to refuse.
+func DesiresNothing(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	zero := intstr.FromInt32(0)
+	pdb.Spec.MinAvailable = &zero
+	pdb.Spec.MaxUnavailable = nil
+	pdb.Status.CurrentHealthy = 0
+	pdb.Status.DesiredHealthy = 0
+	pdb.Status.DisruptionsAllowed = 0
 	return pdb
 }
 

@@ -161,6 +161,25 @@ func kindNames(suffix string) []string {
 // the first cluster with a StatefulSet in it. Nothing else here would catch
 // that — the tests above compare the table's *names* against the chart, and a
 // misplaced closure leaves every name right.
+func TestTemplateSourcesHandsBackACopy(t *testing.T) {
+	// Callers range this list to know they have covered the set, and the list
+	// is package state. A caller writing to an entry it was handed would
+	// change the declaration for every other consumer in the process — the
+	// same hazard as the read-only rule on snapshot objects, arrived at from
+	// the other side. Nothing writes to one today, which is exactly why the
+	// copy needs a test: it is a property with no symptom until it has one.
+	first := collect.TemplateSources()
+	if len(first) == 0 {
+		t.Fatal("no template sources are declared")
+	}
+	was := first[0].Resource
+	first[0].Resource = "mutated"
+
+	if got := collect.TemplateSources()[0].Resource; got != was {
+		t.Errorf("a caller's write reached the package's own declaration: %q", got)
+	}
+}
+
 func TestEverySourcesClosuresAgreeOnItsKind(t *testing.T) {
 	for _, src := range collect.TemplateSources() {
 		obj := src.Object()

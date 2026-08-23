@@ -257,6 +257,42 @@ func TestEveryEndingHandsTheNodeBack(t *testing.T) {
 	}
 }
 
+func TestRevalidationRecordsTheBlockersOwnReason(t *testing.T) {
+	// The recorded failure is what the operator reads, on the node and in the
+	// event, and "the node is no longer drainable" is worth nothing to them.
+	// Every arm of the reason exists to say the specific thing; this is the
+	// one where the specific thing is a budget somebody can go and edit.
+	//
+	// The abandonment table above asserts that *a* reason was recorded and
+	// that it matches the step. It cannot see this, because a generic
+	// sentence satisfies both.
+	labelled := map[string]string{"app": "web"}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web-1", mother.OnNode("a"), mother.PodLabels(labelled)),
+		mother.Pod("default", "web-2", mother.OnNode("b"), mother.PodLabels(labelled)),
+	}
+	s := snapshot([]*corev1.Node{marked("a", time.Hour, time.Minute, "1"), node("b")}, pods)
+	// Edited underneath the drain: the budget that allowed this one now
+	// allows nothing.
+	s.PDBs = []*policyv1.PodDisruptionBudget{mother.PDB("default", "web", 0, labelled)}
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if !step.Failed {
+		t.Fatalf("a budget allowing nothing ends the drain, got %+v", step)
+	}
+	if !strings.Contains(step.Reason, "default/web") {
+		t.Errorf("the reason should name the budget to edit: %q", step.Reason)
+	}
+	if got := nodeFrom(t, c, "a").Annotations[engine.AnnotationLastFailure]; !strings.Contains(got, "default/web") {
+		t.Errorf("the node records a reason nobody can act on: %q", got)
+	}
+}
+
 func TestAMarkedNodeThatIsNotCordonedIsRepaired(t *testing.T) {
 	// A process that stopped between Begin's two writes. Nothing has been
 	// evicted on a bad snapshot — revalidation refuses to look at an
@@ -724,6 +760,35 @@ func TestAReplacementTheSchedulerRefusedEndsTheDrain(t *testing.T) {
 	}
 	if nodeFrom(t, c, "a").Spec.Unschedulable {
 		t.Error("the node was left cordoned")
+	}
+}
+
+func TestAReplacementTheSchedulerErroredOnIsNotRefused(t *testing.T) {
+	// Only one reason is the scheduler's verdict on this pod. PodScheduled
+	// goes False with reason SchedulerError whenever the scheduling cycle
+	// failed for any reason that is not a rejection — kubernetes
+	// pkg/scheduler/schedule_one.go, handleSchedulingFailure, which picks
+	// Unschedulable only when the framework status IsRejected and
+	// SchedulerError otherwise. Reading that as a refusal abandons a drain
+	// that was progressing, uncordons, and puts the node behind an
+	// exponential backoff over a condition the next scheduling cycle clears.
+	errored := pending("replacement", "web-rs", at.Add(-30*time.Second), true)
+	errored.Status.Conditions[0].Reason = corev1.PodReasonSchedulerError
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), errored}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Code == drain.AbandonUnschedulable || step.Failed {
+		t.Errorf("abandoned a drain over a scheduler error rather than a refusal: %+v", step)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("uncordoned a node whose drain is still in flight")
 	}
 }
 
@@ -1195,8 +1260,7 @@ func TestACompletedPodIsNotAnInFlightEviction(t *testing.T) {
 	// every evaluation while evictable pods sat there, until the drain was
 	// abandoned as stalled.
 	done := mother.Pod("default", "finished", mother.OnNode("a"),
-		mother.Terminating(at.Add(-time.Hour), time.Minute))
-	done.Status.Phase = corev1.PodSucceeded
+		mother.Terminating(at.Add(-time.Hour), time.Minute), mother.Succeeded())
 
 	pods := []*corev1.Pod{done, mother.Pod("default", "movable", mother.OnNode("a"))}
 	s := snapshot([]*corev1.Node{marked("a", time.Minute, time.Minute, "2"), node("b")}, pods)

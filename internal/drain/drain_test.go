@@ -89,6 +89,47 @@ func TestAssess(t *testing.T) {
 			mentions: "no progress for 11m",
 		},
 		{
+			// Exactly at the bound, which is the one instant the operator
+			// configured. The comparison is strict, so the timeout is the
+			// last moment a drain is still allowed to be quiet rather than
+			// the first moment it is not.
+			name: "exactly at stallTimeout is not yet a stall",
+			node: draining(10*time.Minute, "2"),
+			pods: []*corev1.Pod{mother.Pod("default", "a"), mother.Pod("default", "b")},
+			want: drain.Continue, remaining: 2,
+		},
+		{
+			// The same reading of the same kind of bound, on the branch that
+			// hands the node back to the autoscaler rather than to the
+			// scheduler.
+			name: "exactly at removalTimeout is not yet not-removed",
+			node: draining(15*time.Minute, "0"),
+			want: drain.AwaitRemoval, remaining: 0,
+		},
+		{
+			// The seam between "shutting down" and "stuck", and the two are
+			// exact complements: a pod at its deadline plus slack is on the
+			// shutting-down side, so the drain goes on waiting and counts the
+			// wait as progress. One instant later it is a finalizer problem
+			// and the drain ends. Nothing else says which side owns the
+			// boundary.
+			name: "exactly at the deadline plus slack is still shutting down",
+			node: draining(time.Minute, "1"),
+			pods: []*corev1.Pod{mother.Pod("default", "a",
+				mother.Terminating(now.Add(-7*time.Minute), 5*time.Minute))},
+			want: drain.Continue, remaining: 1, progressed: true,
+		},
+		{
+			// A finished Job pod is a real object that nothing removes on its
+			// own, so counting it would stall every drain of the node it
+			// landed on — the mirror image of the DaemonSet rows above, which
+			// are excluded for the opposite reason.
+			name: "a finished Job pod does not keep the node occupied",
+			node: draining(5*time.Minute, "1"),
+			pods: []*corev1.Pod{mother.Pod("batch", "backup-28471", mother.Succeeded())},
+			want: drain.AwaitRemoval, remaining: 0, progressed: true,
+		},
+		{
 			name: "nothing moving, but not yet for long enough",
 			node: draining(9*time.Minute, "2"),
 			pods: []*corev1.Pod{mother.Pod("default", "a"), mother.Pod("default", "b")},
@@ -164,6 +205,44 @@ func TestAssess(t *testing.T) {
 			}
 			if tc.mentions != "" && !strings.Contains(got.Reason, tc.mentions) {
 				t.Errorf("reason: got %q, want it to mention %q", got.Reason, tc.mentions)
+			}
+		})
+	}
+}
+
+func TestTheWorstStuckPodIsNamed(t *testing.T) {
+	// The reason string is this package's entire product, and a drain wedges
+	// with several pods terminating: the executor evicts sequentially, so
+	// earlier evictions are still on their way out when a later one sticks.
+	// Naming the pod that is a minute over while another is three hours over
+	// sends the operator to the wrong workload and understates the overrun by
+	// the whole difference.
+	//
+	// Run both orderings, because "the worst" and "the last" agree on
+	// whichever ordering happens to put the worst last.
+	worst := mother.Pod("monitoring", "prometheus-0",
+		mother.Terminating(now.Add(-3*time.Hour), time.Minute))
+	milder := mother.Pod("default", "a",
+		mother.Terminating(now.Add(-90*time.Minute), time.Minute))
+
+	for _, tc := range []struct {
+		name string
+		pods []*corev1.Pod
+	}{
+		{"worst first", []*corev1.Pod{worst, milder}},
+		{"worst last", []*corev1.Pod{milder, worst}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := drain.Assess(
+				drain.State{Node: draining(time.Minute, "2"), Pods: tc.pods, Now: now}, policy())
+
+			if got.Action != drain.Abandon || got.Code != drain.AbandonStuck {
+				t.Fatalf("two pods past their deadlines is a stuck drain, got %+v", got)
+			}
+			// 3h less the one-minute grace the deadline already includes, less
+			// the two minutes of slack.
+			if !strings.Contains(got.Reason, "monitoring/prometheus-0 is 2h57m") {
+				t.Errorf("reason names the wrong pod or the wrong overrun: %q", got.Reason)
 			}
 		})
 	}

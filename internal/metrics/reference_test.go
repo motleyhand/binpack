@@ -7,6 +7,7 @@ import (
 
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
@@ -76,13 +77,22 @@ func TestTheReferenceDocumentsNoMetricThatDoesNotExist(t *testing.T) {
 	}
 }
 
-func TestEveryLabelValueTheEngineCanProduceIsDocumented(t *testing.T) {
+func TestEveryLabelValueBinpackCanProduceIsDocumented(t *testing.T) {
 	// The codes are the vocabulary shared between a dashboard and an
 	// investigation. One missing from the reference is one nobody can look up
 	// when it appears on a graph at three in the morning.
+	//
+	// Named for binpack rather than the engine, because the engine is not the
+	// only package that produces one: the reason values on
+	// binpack_drains_abandoned_total are drain constants.
 	doc := referenceText(t)
 
-	for _, code := range []string{
+	// The engine's half is hand-written; the drain half is taken from the
+	// enumerator, because there is one. TestEveryAbandonReasonHasAZeroSeries
+	// already holds AbandonCodes against the *scrape*, so the reason values
+	// were published and documented and nothing joined the two — editing a
+	// row of the abandonment table left the suite green.
+	codes := []string{
 		engine.CodeDrain, engine.CodeNoAutoscaler, engine.CodeAutoscalerUnhealthy,
 		engine.CodeNoCandidates, engine.CodeNoneFeasible, engine.CodeDraining,
 		engine.VerdictSkipped, engine.VerdictInfeasible, engine.VerdictBlocked, engine.VerdictDrainable,
@@ -90,7 +100,10 @@ func TestEveryLabelValueTheEngineCanProduceIsDocumented(t *testing.T) {
 		engine.SkipCooldownAfterScaleUp, engine.SkipCooldownAfterDrain, engine.SkipPoolAtMinimum,
 		engine.SkipAnnotated, engine.SkipDrainInProgress, engine.SkipBackoff,
 		engine.SkipCordoned, engine.SkipProtectedPod, engine.SkipTooManyPods,
-	} {
+	}
+	codes = append(codes, drain.AbandonCodes()...)
+
+	for _, code := range codes {
 		if !strings.Contains(doc, "`"+code+"`") {
 			t.Errorf("label value %q is not documented", code)
 		}

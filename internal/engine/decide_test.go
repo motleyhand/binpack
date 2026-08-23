@@ -59,6 +59,20 @@ func config() engine.Config {
 	}
 }
 
+// skipReasonFor is assessmentFor for the cases that judge the sentence rather
+// than the verdict, so a failure prints the sentence instead of the whole node.
+func skipReasonFor(t *testing.T, d engine.Decision, node string) string {
+	t.Helper()
+	a := assessmentFor(d, node)
+	if a == nil {
+		t.Fatalf("every node must be accounted for; %s was not", node)
+	}
+	if !a.Skipped {
+		t.Fatalf("%s was not skipped, so it has no reason to name", node)
+	}
+	return a.SkipReason
+}
+
 func assessmentFor(d engine.Decision, node string) *engine.NodeAssessment {
 	for i := range d.Assessments {
 		if d.Assessments[i].Node.Name == node {
@@ -251,6 +265,84 @@ func TestSkipReasons(t *testing.T) {
 				t.Error("a skipped node must not be drained")
 			}
 		})
+	}
+}
+
+func TestAnExpiredBackoffIsNotASkip(t *testing.T) {
+	// Backoff is a delay, not a verdict. Nothing ever clears the annotation —
+	// the executor only writes it, and the node it is written on is by
+	// definition one binpack has decided not to drain, so it is never deleted
+	// either. Read as "carries a backoff annotation" rather than "is inside
+	// its backoff window", the node is ineligible for ever and consolidation
+	// stops on it the first time a drain fails, silently: explain prints a
+	// skip reason naming a timestamp in the past, and nothing else disagrees.
+	// ADR-0007 makes non-permanence normative.
+	//
+	// Its own test rather than a row of TestSkipReasons, because that table
+	// asserts every row *is* skipped and this is the opposite direction.
+	expired := inPool("retryable", mother.NodeAnnotations(map[string]string{
+		engine.AnnotationBackoffUntil: now.Add(-time.Minute).Format(time.RFC3339),
+		engine.AnnotationLastFailure:  "pod stuck terminating",
+	}))
+	s := cluster([]*corev1.Node{expired, inPool("healthy-1"), inPool("healthy-2")}, nil)
+
+	a := assessmentFor(engine.Decide(s, config()), "retryable")
+
+	if a == nil {
+		t.Fatal("every node must be accounted for; retryable was not")
+	}
+	if a.Skipped {
+		t.Fatalf("a backoff that expired a minute ago is not a skip: %s", a.SkipReason)
+	}
+}
+
+func TestTheBackoffReasonNamesTheFailure(t *testing.T) {
+	// Two message forms, and which one an operator gets is the difference
+	// between "binpack will retry at 13:00" and knowing why it stopped. The
+	// recorded failure is the only actionable half, so a node carrying one
+	// must say it and a node carrying none must not trail an empty clause.
+	until := now.Add(time.Hour).Format(time.RFC3339)
+	recorded := inPool("recorded", mother.NodeAnnotations(map[string]string{
+		engine.AnnotationBackoffUntil: until,
+		engine.AnnotationLastFailure:  "pod stuck terminating",
+	}))
+	silent := inPool("silent", mother.NodeAnnotations(map[string]string{
+		engine.AnnotationBackoffUntil: until,
+	}))
+
+	d := engine.Decide(cluster([]*corev1.Node{recorded, silent, inPool("healthy")}, nil), config())
+
+	if got := skipReasonFor(t, d, "recorded"); !strings.Contains(got, "after: pod stuck terminating") {
+		t.Errorf("the recorded failure is what makes the skip actionable: %q", got)
+	}
+	if got := skipReasonFor(t, d, "silent"); strings.Contains(got, "after:") {
+		t.Errorf("with nothing recorded there is nothing to say after: %q", got)
+	}
+}
+
+func TestAFinishedPodDoesNotProtectItsNode(t *testing.T) {
+	// A Succeeded pod holds no resources and nothing removes it on its own:
+	// absent a Job ttlSecondsAfterFinished or an owner deletion it sits on its
+	// node until podgc crosses its terminated-pod threshold. Counting one as
+	// occupying the node would make every node that has ever run a CronJob in
+	// an excluded namespace permanently ineligible — and the skip renders as a
+	// correct-looking sentence under a legitimate metric label, so the symptom
+	// is only that binpack consolidates less of the cluster each week.
+	pods := []*corev1.Pod{
+		mother.Pod("kube-system", "backup-28471", mother.OnNode("a"), mother.Succeeded()),
+		mother.Pod("default", "web", mother.OnNode("a")),
+	}
+	cfg := config()
+	cfg.Default.ExcludedNamespaces = []string{"kube-system"}
+
+	a := assessmentFor(engine.Decide(cluster(
+		[]*corev1.Node{inPool("a"), inPool("b"), inPool("c")}, pods), cfg), "a")
+
+	if a == nil {
+		t.Fatal("every node must be accounted for; a was not")
+	}
+	if a.Skipped {
+		t.Fatalf("a finished pod does not protect its node: %s", a.SkipReason)
 	}
 }
 

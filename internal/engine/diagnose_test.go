@@ -2,12 +2,14 @@ package engine_test
 
 import (
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
@@ -141,6 +143,13 @@ func TestDiagnoseReportsABudgetAllowingNoDisruptions(t *testing.T) {
 	if f.Subject != "default/web" {
 		t.Errorf("subject = %q, want default/web", f.Subject)
 	}
+	// The counters alone do not say which knob produced them, and the operator
+	// has to edit the knob. minAvailable and maxUnavailable can express the
+	// same budget, so naming the wrong one sends them to a field that is not
+	// there.
+	if !strings.Contains(f.Detail, "minAvailable: 2") {
+		t.Errorf("detail does not render the field an operator would edit: %s", f.Detail)
+	}
 }
 
 func TestDiagnoseSeparatesAnUnhealthyWorkloadFromAMisconfiguredBudget(t *testing.T) {
@@ -173,7 +182,31 @@ func TestDiagnoseReportsABudgetThatSelectsNothing(t *testing.T) {
 	if !strings.Contains(f.Detail, "app=gone") {
 		t.Errorf("detail does not show the selector that matched nothing: %s", f.Detail)
 	}
+	// The expression suffix is a count, so it must not appear when the count
+	// is zero: "app=gone,+0 expression(s)" tells the operator to go looking
+	// for a term that is not in the object.
+	if strings.Contains(f.Detail, "expression(s)") {
+		t.Errorf("a selector with no matchExpressions must not claim any: %s", f.Detail)
+	}
 	none(t, findings, engine.FindingPDBZero)
+}
+
+func TestABudgetSelectorSummaryCountsItsExpressions(t *testing.T) {
+	// matchExpressions cannot be rendered as key=value, so the summary counts
+	// them instead — and the count is the only sign the selector has a half
+	// the summary is not showing.
+	pdb := mother.SelectsNothing(mother.PDB("default", "web", 0, map[string]string{"app": "gone"}))
+	pdb.Spec.Selector.MatchExpressions = []metav1.LabelSelectorRequirement{{
+		Key:      "tier",
+		Operator: metav1.LabelSelectorOpIn,
+		Values:   []string{"front"},
+	}}
+
+	f := only(t, diagnose(nil, nil, pdb), engine.FindingPDBSelectsNothing)
+
+	if !strings.Contains(f.Detail, "app=gone,+1 expression(s)") {
+		t.Errorf("detail does not account for the expression half of the selector: %s", f.Detail)
+	}
 }
 
 func TestDiagnoseReportsAStaleBudget(t *testing.T) {
@@ -204,6 +237,70 @@ func TestDiagnoseReportsAPodSelectedByTwoBudgets(t *testing.T) {
 	// listed in — the same cluster must produce the same report twice.
 	if !strings.Contains(f.Detail, "by-app, by-tier") {
 		t.Errorf("detail does not name both budgets in order: %s", f.Detail)
+	}
+}
+
+func TestOneBudgetIsNotAMultipleBudgetBlock(t *testing.T) {
+	// The fixture above with one budget removed. Reported a budget early, this
+	// becomes a Blocking finding on every namespace with a single ordinary
+	// PDB — and a Blocking finding that is routinely wrong is one operators
+	// learn to scroll past, which costs the report the rest of its findings
+	// too.
+	pod := mother.Pod("default", "web-0",
+		mother.OnNode("a"),
+		mother.PodLabels(map[string]string{"app": "web", "tier": "front"}))
+	byApp := mother.PDB("default", "by-app", 1, map[string]string{"app": "web"})
+
+	none(t, diagnose(nil, []*corev1.Pod{pod}, byApp), engine.BlockedMultiplePDBs)
+}
+
+func TestAPoolThatMayScaleToZeroIsNotAtItsMinimum(t *testing.T) {
+	// minSize 0 and no nodes is a pool doing exactly what it was configured to
+	// do. Reporting it as sitting on its floor would put a permanent finding
+	// on every scale-to-zero pool, which is the shape of pool binpack is least
+	// able to help with and most likely to be asked about.
+	s := cluster([]*corev1.Node{inPool("a"), inPool("b"), inPool("c")}, nil)
+	s.Autoscaler.Groups = append(s.Autoscaler.Groups,
+		engine.NodeGroup{ID: "batch-id", MinSize: 0, MaxSize: 10, Ready: 0})
+
+	none(t, engine.Diagnose(s, config()), engine.FindingPoolAtMinimum)
+}
+
+func TestTheReportIsByteIdenticalAcrossRuns(t *testing.T) {
+	// The stated use is diffing two reports, so an unchanged cluster has to
+	// produce an unchanged report. That needs more than determinism: the
+	// comparator has to be a strict weak ordering, or SliceStable stops being
+	// stable and findings shuffle within a code — and the operator
+	// investigates a change that did not happen.
+	backoff := func(name string, until time.Time) *corev1.Node {
+		return inPool(name, mother.NodeAnnotations(map[string]string{
+			engine.AnnotationBackoffUntil: until.Format(time.RFC3339),
+			engine.AnnotationLastFailure:  "eviction refused by default/web",
+		}))
+	}
+	nodes := []*corev1.Node{
+		backoff("first", now.Add(10*time.Minute)),
+		backoff("second", now.Add(20*time.Minute)),
+		inPool("c"),
+	}
+	s := cluster(nodes, nil)
+
+	first, second := engine.Diagnose(s, config()), engine.Diagnose(s, config())
+
+	if !reflect.DeepEqual(first, second) {
+		t.Fatalf("two runs over one snapshot disagree:\n%s\n%s", render(first), render(second))
+	}
+	// Two findings sharing a code, in snapshot order. This is the half a
+	// repeat run cannot check, because a comparator that reorders equal
+	// elements reorders them the same way every time.
+	var subjects []string
+	for _, f := range first {
+		if f.Code == engine.FindingNodeInBackoff {
+			subjects = append(subjects, f.Subject)
+		}
+	}
+	if !slices.Equal(subjects, []string{"first", "second"}) {
+		t.Errorf("findings of one code do not follow snapshot order: %v", subjects)
 	}
 }
 
