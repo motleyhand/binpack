@@ -252,7 +252,7 @@ var diagnoses = map[string]Diagnosis{
 			"moved sooner or protected properly: per the autoscaler's own documentation a " +
 			"budget overrides its refusal to touch the node, and the budget then governs. If " +
 			"your autoscaler is older than 1.33 it has no such grace — set " +
-			"policy.autoscaler.blockingSystemPodDistruptionTimeout to 0 so binpack stops " +
+			"policy.autoscaler.blockingSystemPodDistruptionTimeout to 0s so binpack stops " +
 			"expecting one.",
 	},
 	BlockedSafeToEvict: {

@@ -84,17 +84,22 @@ type resolvedPoolPolicy struct {
 // here rather than in the API type, which keeps time.Duration as the Go-facing
 // value and confines presentation to the CLI.
 type policyView struct {
-	Enabled                  bool     `json:"enabled"`
-	ExpendablePriorityCutoff int32    `json:"expendablePriorityCutoff"`
-	ReserveForLargestPod     bool     `json:"reserveForLargestPod"`
-	MaxPodsPerDrain          int      `json:"maxPodsPerDrain"`
-	StallTimeout             string   `json:"stallTimeout"`
-	RemovalTimeout           string   `json:"removalTimeout"`
-	BackoffInitial           string   `json:"backoffInitial"`
-	BackoffMax               string   `json:"backoffMax"`
-	CooldownAfterScaleUp     string   `json:"cooldownAfterScaleUp"`
-	CooldownAfterDrain       string   `json:"cooldownAfterDrain"`
-	ExcludedNamespaces       []string `json:"excludedNamespaces,omitempty"`
+	Enabled                  bool  `json:"enabled"`
+	ExpendablePriorityCutoff int32 `json:"expendablePriorityCutoff"`
+	ReserveForLargestPod     bool  `json:"reserveForLargestPod"`
+
+	SkipNodesWithLocalStorage           bool   `json:"skipNodesWithLocalStorage"`
+	SkipNodesWithSystemPods             bool   `json:"skipNodesWithSystemPods"`
+	BlockingSystemPodDistruptionTimeout string `json:"blockingSystemPodDistruptionTimeout"`
+
+	MaxPodsPerDrain      int      `json:"maxPodsPerDrain"`
+	StallTimeout         string   `json:"stallTimeout"`
+	RemovalTimeout       string   `json:"removalTimeout"`
+	BackoffInitial       string   `json:"backoffInitial"`
+	BackoffMax           string   `json:"backoffMax"`
+	CooldownAfterScaleUp string   `json:"cooldownAfterScaleUp"`
+	CooldownAfterDrain   string   `json:"cooldownAfterDrain"`
+	ExcludedNamespaces   []string `json:"excludedNamespaces,omitempty"`
 }
 
 func viewOf(p v1alpha1.PoolPolicy) policyView {
@@ -102,14 +107,19 @@ func viewOf(p v1alpha1.PoolPolicy) policyView {
 		Enabled:                  p.Enabled,
 		ExpendablePriorityCutoff: p.ExpendablePriorityCutoff,
 		ReserveForLargestPod:     p.ReserveForLargestPod,
-		MaxPodsPerDrain:          p.MaxPodsPerDrain,
-		StallTimeout:             p.StallTimeout.String(),
-		RemovalTimeout:           p.RemovalTimeout.String(),
-		BackoffInitial:           p.BackoffInitial.String(),
-		BackoffMax:               p.BackoffMax.String(),
-		CooldownAfterScaleUp:     p.CooldownAfterScaleUp.String(),
-		CooldownAfterDrain:       p.CooldownAfterDrain.String(),
-		ExcludedNamespaces:       p.ExcludedNamespaces,
+
+		SkipNodesWithLocalStorage:           p.SkipNodesWithLocalStorage,
+		SkipNodesWithSystemPods:             p.SkipNodesWithSystemPods,
+		BlockingSystemPodDistruptionTimeout: p.BlockingSystemPodDistruptionTimeout.String(),
+
+		MaxPodsPerDrain:      p.MaxPodsPerDrain,
+		StallTimeout:         p.StallTimeout.String(),
+		RemovalTimeout:       p.RemovalTimeout.String(),
+		BackoffInitial:       p.BackoffInitial.String(),
+		BackoffMax:           p.BackoffMax.String(),
+		CooldownAfterScaleUp: p.CooldownAfterScaleUp.String(),
+		CooldownAfterDrain:   p.CooldownAfterDrain.String(),
+		ExcludedNamespaces:   p.ExcludedNamespaces,
 	}
 }
 
@@ -194,6 +204,20 @@ func writePolicy(p func(string, ...any), policy v1alpha1.PoolPolicy) {
 	p("  enabled:                 %t\n", policy.Enabled)
 	p("  expendable below:        priority %d\n", policy.ExpendablePriorityCutoff)
 	p("  reserve for largest pod: %t\n", policy.ReserveForLargestPod)
+	// Rendered as what binpack believes about the autoscaler rather than as
+	// three flag names, because that is the question an operator is asking
+	// this command: not "what did I write" but "what will be assumed".
+	p("  autoscaler skips nodes:  with local storage %t, with system pods %t\n",
+		policy.SkipNodesWithLocalStorage, policy.SkipNodesWithSystemPods)
+	if policy.BlockingSystemPodDistruptionTimeout == 0 {
+		// Zero is a claim about the autoscaler, not an absent value — an
+		// autoscaler older than 1.33 has no such grace — so it has to read as
+		// a statement rather than as a blank.
+		p("  system pods block for:   as long as they are there (no grace)\n")
+	} else {
+		p("  system pods block for:   %s after creation\n",
+			policy.BlockingSystemPodDistruptionTimeout)
+	}
 	if policy.MaxPodsPerDrain == 0 {
 		p("  max pods per drain:      unlimited\n")
 	} else {

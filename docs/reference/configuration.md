@@ -400,10 +400,10 @@ status ConfigMap does not report a version — so on an autoscaler older than 1.
 ```yaml
 policy:
   autoscaler:
-    blockingSystemPodDistruptionTimeout: 0
+    blockingSystemPodDistruptionTimeout: 0s
 ```
 
-`0` here means the blocker never expires, which is deliberately not what `0` means as an
+`0s` here means the blocker never expires, which is deliberately not what `0` means as an
 autoscaler flag. Upstream, a zero timeout expires the blocker immediately — but that is already
 `skipNodesWithSystemPods: false`, in both vocabularies, whereas an autoscaler with no grace at
 all has no other spelling. A negative value is rejected.

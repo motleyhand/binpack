@@ -332,7 +332,7 @@ blocks for as long as it is there. binpack cannot see which version is running, 
 ```yaml
 policy:
   autoscaler:
-    blockingSystemPodDistruptionTimeout: 0
+    blockingSystemPodDistruptionTimeout: 0s
 ```
 
 `kubectl -n kube-system get deploy cluster-autoscaler -o jsonpath='{.spec.template.spec.containers[0].image}'`
