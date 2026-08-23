@@ -231,6 +231,14 @@ func TestSnapshotReadsATemplateForEveryOwningKind(t *testing.T) {
 	// binpack places the pod a controller *would create*, so a kind whose
 	// template goes unread is a kind whose pods binpack refuses to move. All
 	// four are owners a pod can name.
+	//
+	// Written out rather than derived from [collect.TemplateSources], although
+	// everything else that needs the set now derives from it. A test that
+	// reads the declaration in order to check the declaration cannot fail:
+	// drop a kind and it ranges over one fewer, agrees with itself, and passes.
+	// So this stays a hand-written expectation, and it is what catches a row
+	// whose apiVersion is wrong — the one field the chart cannot check, since
+	// RBAC grants a group and this keys on a group *and version*.
 	r := reader(
 		&appsv1.ReplicaSet{
 			ObjectMeta: metav1.ObjectMeta{Namespace: "default", Name: "web-rs", UID: "rs-uid"},

@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -21,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/util/validation"
 	"k8s.io/client-go/tools/leaderelection"
+	"sigs.k8s.io/controller-runtime/pkg/cache"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
@@ -1400,6 +1402,56 @@ func TestControllersAreTrimmedBeforeCaching(t *testing.T) {
 	}
 	if trimmed.Annotations != nil {
 		t.Error("annotations are still cached, including last-applied-configuration")
+	}
+}
+
+func TestEveryTemplateKindIsStrippedBeforeCaching(t *testing.T) {
+	// The test above proves the trim works, on one kind. This proves it is
+	// installed on all of them — which is the half that used to be able to
+	// drift, because a kind absent from the cache's restrictions is not
+	// refused: it gets a default informer that watches the kind in full, and
+	// nothing anywhere says so. The cost lands as a resident set that grows
+	// with ReplicaSet revision history, in a tool sold on making a cluster
+	// cheaper.
+	byObject := cacheOptions(statusRef).ByObject
+
+	for _, src := range collect.TemplateSources() {
+		obj := src.Object()
+
+		var restriction cache.ByObject
+		var restricted bool
+		for key, cfg := range byObject {
+			// Map keys are pointers, so look the entry up by type rather than
+			// by identity.
+			if reflect.TypeOf(key) == reflect.TypeOf(obj) {
+				restriction, restricted = cfg, true
+			}
+		}
+		if !restricted {
+			t.Errorf("%ss are cached without restriction", src.Kind)
+			continue
+		}
+		if restriction.Transform == nil {
+			t.Errorf("%ss are cached whole", src.Kind)
+			continue
+		}
+
+		// Annotations rather than status, because reaching status needs the
+		// concrete type and this has to hold for every kind including the one
+		// somebody adds next. It is enough to tell the transforms apart:
+		// dropManagedFields, the one the untrimmed objects get, leaves them.
+		obj.SetAnnotations(map[string]string{
+			"kubectl.kubernetes.io/last-applied-configuration": "{...}",
+		})
+		out, err := restriction.Transform(obj)
+		if err != nil {
+			t.Errorf("trimming a %s: %v", src.Kind, err)
+			continue
+		}
+		if trimmed := out.(client.Object); trimmed.GetAnnotations() != nil {
+			t.Errorf("a cached %s keeps its annotations, including "+
+				"last-applied-configuration", src.Kind)
+		}
 	}
 }
 

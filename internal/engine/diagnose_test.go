@@ -1113,3 +1113,31 @@ func TestDiagnoseReportsAnEditedBudgetAsStaleEvenWhenItsLastSyncFailed(t *testin
 		none(t, findings, engine.BlockedPDBStale)
 	})
 }
+
+func TestTheNoTemplateDiagnosisNamesTheKindsBinpackReads(t *testing.T) {
+	// The one sentence in binpack that tells an operator which owners it
+	// understands. It is rendered from [engine.TemplateKinds] rather than
+	// written out, so what needs checking is the rendering — a list built
+	// correctly and formatted into an unreadable sentence is no more use than
+	// a stale one.
+	//
+	// Deliberately a literal rather than the same builder the code uses. A
+	// test that renders the phrase the way the code renders it agrees with any
+	// rendering, including a wrong one. This is also why the expectation is
+	// worth updating by hand: teaching binpack a fifth kind should make
+	// somebody look at every surface that names them, and this is one.
+	const phrase = "binpack reads templates from ReplicaSets, StatefulSets, DaemonSets and Jobs;"
+
+	var fix string
+	for _, d := range engine.Diagnoses() {
+		if d.Code == engine.FindingNoTemplate {
+			fix = d.Fix
+		}
+	}
+
+	if !strings.Contains(fix, phrase) {
+		t.Errorf("the %s diagnosis does not read %q — if a kind was added or removed, "+
+			"update this expectation deliberately and check the reference pages with it:\n\n%s",
+			engine.FindingNoTemplate, phrase, fix)
+	}
+}

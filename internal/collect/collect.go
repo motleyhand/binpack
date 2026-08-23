@@ -3,6 +3,8 @@ package collect
 import (
 	"context"
 	"fmt"
+	"slices"
+	"strings"
 	"time"
 
 	appsv1 "k8s.io/api/apps/v1"
@@ -10,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	"github.com/motleyhand/binpack/internal/engine"
@@ -102,47 +105,194 @@ func Snapshot(ctx context.Context, reader Reader, now time.Time, status StatusRe
 func templates(ctx context.Context, reader Reader) (map[engine.OwnerRef]*corev1.PodTemplateSpec, error) {
 	out := map[engine.OwnerRef]*corev1.PodTemplateSpec{}
 
-	var replicaSets appsv1.ReplicaSetList
-	if err := reader.List(ctx, &replicaSets); err != nil {
-		return nil, fmt.Errorf("listing replicasets: %w", err)
-	}
-	for i := range replicaSets.Items {
-		rs := &replicaSets.Items[i]
-		out[engine.OwnerRef{Namespace: rs.Namespace, APIVersion: "apps/v1", Kind: "ReplicaSet", Name: rs.Name, UID: rs.UID}] = &rs.Spec.Template
-	}
+	for _, kind := range engine.TemplateKinds() {
+		src, readable := sourceFor(kind)
+		if !readable {
+			// Loud, because the alternative is a kind the engine believes is
+			// understood and nothing ever reads — every pod owned by one
+			// refused, and the refusal indistinguishable from the ordinary
+			// case it is supposed to describe.
+			return nil, fmt.Errorf(
+				"no way to read a %s %s template: internal/engine names the kind and "+
+					"internal/collect has no source for it", kind.APIVersion, kind.Kind)
+		}
 
-	var statefulSets appsv1.StatefulSetList
-	if err := reader.List(ctx, &statefulSets); err != nil {
-		return nil, fmt.Errorf("listing statefulsets: %w", err)
-	}
-	for i := range statefulSets.Items {
-		sts := &statefulSets.Items[i]
-		out[engine.OwnerRef{Namespace: sts.Namespace, APIVersion: "apps/v1", Kind: "StatefulSet", Name: sts.Name, UID: sts.UID}] = &sts.Spec.Template
-	}
+		list := src.List()
+		if err := reader.List(ctx, list); err != nil {
+			return nil, fmt.Errorf("listing %s: %w", src.Resource, err)
+		}
 
-	// DaemonSet pods are node-local and never relocated, so their templates are
-	// never consulted for placement. They are read anyway because a DaemonSet
-	// is one of the kinds a pod can name as its controller, and an absent entry
-	// is indistinguishable from a kind binpack cannot read.
-	var daemonSets appsv1.DaemonSetList
-	if err := reader.List(ctx, &daemonSets); err != nil {
-		return nil, fmt.Errorf("listing daemonsets: %w", err)
-	}
-	for i := range daemonSets.Items {
-		ds := &daemonSets.Items[i]
-		out[engine.OwnerRef{Namespace: ds.Namespace, APIVersion: "apps/v1", Kind: "DaemonSet", Name: ds.Name, UID: ds.UID}] = &ds.Spec.Template
-	}
-
-	var jobs batchv1.JobList
-	if err := reader.List(ctx, &jobs); err != nil {
-		return nil, fmt.Errorf("listing jobs: %w", err)
-	}
-	for i := range jobs.Items {
-		job := &jobs.Items[i]
-		out[engine.OwnerRef{Namespace: job.Namespace, APIVersion: "batch/v1", Kind: "Job", Name: job.Name, UID: job.UID}] = &job.Spec.Template
+		// ExtractList hands back pointers *into* the list's items rather than
+		// copies — its allocating twin is a separate function for exactly that
+		// reason — so the templates below alias the objects that were listed,
+		// as they did when this read four typed slices by index. On the
+		// controller path those objects belong to the shared informer cache
+		// and are read-only, like everything else the engine is given.
+		items, err := meta.ExtractList(list)
+		if err != nil {
+			return nil, fmt.Errorf("reading the %s list: %w", src.Resource, err)
+		}
+		for _, item := range items {
+			obj, isObject := item.(client.Object)
+			if !isObject {
+				return nil, fmt.Errorf("reading the %s list: %T is not a Kubernetes object",
+					src.Resource, item)
+			}
+			out[engine.OwnerRef{
+				Namespace:  obj.GetNamespace(),
+				APIVersion: kind.APIVersion,
+				Kind:       kind.Kind,
+				Name:       obj.GetName(),
+				UID:        obj.GetUID(),
+			}] = src.Template(obj)
+		}
 	}
 
 	return out, nil
+}
+
+// TemplateSource is how one controller kind is read.
+//
+// [engine.TemplateKind] says *which* owners binpack understands; this says how
+// each of them is listed, where its template lives, and what an RBAC rule has
+// to grant to reach it. The split is by what the fact is about rather than for
+// tidiness: the set of understood owners is a property of what binpack can
+// predict and belongs with the diagnosis that reports it, while a
+// client.ObjectList is cluster machinery the engine may not hold at all.
+//
+// Between them they are the only place the set is written down. It used to be
+// five places: the four list-and-key blocks this replaces, the cache's
+// per-kind restrictions and its trim in internal/controller, and the fixture
+// in internal/mother that decides whether a test can observe a kind at all.
+// Only one of the five failed loudly when they disagreed. A kind missing from
+// the chart's RBAC produces a Forbidden on every evaluation; a kind missing
+// from the cache restrictions gets an unrestricted informer, one missing from
+// the trim is cached with its whole status, and one missing from the fixture
+// leaves every test asserting the behaviour from before the change and still
+// passing — which is the worst of the four, because it makes the work look
+// finished.
+//
+// Which kinds, and why only these, is explained where operators read it:
+// docs/reference/rbac.md, docs/reference/diagnostics.md and ADR-0006. Those
+// stay prose — they answer "why" and a generated list would not — and the
+// tests beside this file hold them to what the declaration says.
+type TemplateSource struct {
+	// The kind this reads, embedded so a source carries its own identity
+	// rather than being findable only by the position it sits in.
+	engine.TemplateKind
+
+	// Resource is the plural the API server serves the kind under, which is
+	// the name an RBAC rule grants. Stated rather than derived from Kind:
+	// pluralisation belongs to the API server, and a rule that lowercases and
+	// appends an "s" is right for these four by luck rather than by contract.
+	Resource string
+
+	// List returns an empty list to read the kind into.
+	List func() client.ObjectList
+
+	// Object returns an empty object of the kind. controller-runtime's cache
+	// takes one as the key its per-kind restrictions hang off.
+	Object func() client.Object
+
+	// Template returns the one field binpack reads — the pod template a
+	// replacement would be built from — as a pointer into the object.
+	Template func(client.Object) *corev1.PodTemplateSpec
+
+	// ClearStatus empties the object's status if it is of this kind, and
+	// reports whether it was. Status is the type-specific half of what the
+	// cache drops before storing a controller; the rest is metadata and is
+	// dropped the same way for every kind.
+	ClearStatus func(client.Object) bool
+}
+
+// Group is the API group the kind belongs to, as an RBAC rule names it.
+//
+// The core group's apiVersion is a bare version with no slash in it, so
+// splitting on the separator and taking the first half would report "v1" as a
+// group for anything that ever moves there.
+func (s TemplateSource) Group() string {
+	group, _, qualified := strings.Cut(s.APIVersion, "/")
+	if !qualified {
+		return ""
+	}
+	return group
+}
+
+// TemplateSources is how every controller kind is read, one entry per
+// [engine.TemplateKind].
+//
+// Held equal to that list by the loud failure in [templates] and by
+// TestEveryKindTheEngineNamesCanBeRead, so a caller may range this and know it
+// has covered the set.
+func TemplateSources() []TemplateSource {
+	return slices.Clone(templateSources)
+}
+
+// sourceFor returns how to read a kind, and whether anything here can.
+func sourceFor(kind engine.TemplateKind) (TemplateSource, bool) {
+	for _, src := range templateSources {
+		if src.TemplateKind == kind {
+			return src, true
+		}
+	}
+	return TemplateSource{}, false
+}
+
+// Everything that differs between the kinds. One row per [engine.TemplateKinds]
+// entry; why each kind is in that list is recorded there.
+var templateSources = []TemplateSource{
+	{
+		TemplateKind: engine.TemplateKind{APIVersion: "apps/v1", Kind: "ReplicaSet"}, Resource: "replicasets",
+		List:     func() client.ObjectList { return &appsv1.ReplicaSetList{} },
+		Object:   func() client.Object { return &appsv1.ReplicaSet{} },
+		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*appsv1.ReplicaSet).Spec.Template },
+		ClearStatus: func(o client.Object) bool {
+			obj, ok := o.(*appsv1.ReplicaSet)
+			if ok {
+				obj.Status = appsv1.ReplicaSetStatus{}
+			}
+			return ok
+		},
+	},
+	{
+		TemplateKind: engine.TemplateKind{APIVersion: "apps/v1", Kind: "StatefulSet"}, Resource: "statefulsets",
+		List:     func() client.ObjectList { return &appsv1.StatefulSetList{} },
+		Object:   func() client.Object { return &appsv1.StatefulSet{} },
+		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*appsv1.StatefulSet).Spec.Template },
+		ClearStatus: func(o client.Object) bool {
+			obj, ok := o.(*appsv1.StatefulSet)
+			if ok {
+				obj.Status = appsv1.StatefulSetStatus{}
+			}
+			return ok
+		},
+	},
+	{
+		TemplateKind: engine.TemplateKind{APIVersion: "apps/v1", Kind: "DaemonSet"}, Resource: "daemonsets",
+		List:     func() client.ObjectList { return &appsv1.DaemonSetList{} },
+		Object:   func() client.Object { return &appsv1.DaemonSet{} },
+		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*appsv1.DaemonSet).Spec.Template },
+		ClearStatus: func(o client.Object) bool {
+			obj, ok := o.(*appsv1.DaemonSet)
+			if ok {
+				obj.Status = appsv1.DaemonSetStatus{}
+			}
+			return ok
+		},
+	},
+	{
+		TemplateKind: engine.TemplateKind{APIVersion: "batch/v1", Kind: "Job"}, Resource: "jobs",
+		List:     func() client.ObjectList { return &batchv1.JobList{} },
+		Object:   func() client.Object { return &batchv1.Job{} },
+		Template: func(o client.Object) *corev1.PodTemplateSpec { return &o.(*batchv1.Job).Spec.Template },
+		ClearStatus: func(o client.Object) bool {
+			obj, ok := o.(*batchv1.Job)
+			if ok {
+				obj.Status = batchv1.JobStatus{}
+			}
+			return ok
+		},
+	},
 }
 
 // autoscaler reads the cluster-autoscaler's published status from the one

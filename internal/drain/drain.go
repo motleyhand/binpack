@@ -12,6 +12,10 @@
 // ADR-0007.
 //
 // Objects passed in come from a shared informer cache and are read-only.
+//
+// The purity half of that is held by the `purity` depguard rule rather than by
+// this sentence, which claimed it for a while with nothing behind it. The
+// read-only half cannot be linted and remains a review rule. See ADR-0008.
 package drain
 
 import (

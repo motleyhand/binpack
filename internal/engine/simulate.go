@@ -6,6 +6,7 @@ import (
 	"maps"
 	"slices"
 	"strconv"
+	"strings"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
@@ -848,6 +849,62 @@ type OwnerRef struct {
 	Kind       string
 	Name       string
 	UID        types.UID
+}
+
+// TemplateKind is a controller kind binpack can read a pod template from.
+//
+// The identity only. How each kind is listed, which field the template lives
+// in, and what an RBAC rule has to grant to reach it all belong to the package
+// that does the reading — but *which* owners binpack understands is a fact
+// about what it can predict, and so a fact about the engine. The diagnosis
+// that tells an operator their pod cannot be moved is built from this list, in
+// this package, which is what keeps the sentence and the set from parting
+// company.
+type TemplateKind struct {
+	// APIVersion and Kind are exactly what an ownerReference carries, so a
+	// kind here and the [OwnerRef] a pod produces are comparable without
+	// translation.
+	APIVersion string
+	Kind       string
+}
+
+// TemplateKinds is every controller kind binpack can read a pod template from.
+//
+// Enumerable for the same reason [SkipCodes] is: it is a closed set that
+// several things elsewhere have to agree with, and a set nothing can range
+// over is one they agree with only by inspection. The four were chosen against
+// measurement rather than guessed — see ADR-0006 — and widening the list is a
+// change `binpack diagnose` explicitly invites operators to ask for.
+func TemplateKinds() []TemplateKind {
+	return slices.Clone(templateKinds)
+}
+
+var templateKinds = []TemplateKind{
+	{APIVersion: "apps/v1", Kind: "ReplicaSet"},
+	{APIVersion: "apps/v1", Kind: "StatefulSet"},
+	// A DaemonSet pod is node-local and never relocated, so no simulation ever
+	// asks for its template — [NodeBound] recognises the kind by name, before
+	// a template is looked up. It is here because a DaemonSet is one of the
+	// kinds a pod can name as its controller, and an absent entry is
+	// indistinguishable from a kind binpack genuinely cannot read, which is
+	// the distinction the whole refusal path turns on.
+	{APIVersion: "apps/v1", Kind: "DaemonSet"},
+	{APIVersion: "batch/v1", Kind: "Job"},
+}
+
+// templateKindsProse names the readable kinds in a sentence: "ReplicaSets,
+// StatefulSets, DaemonSets and Jobs".
+//
+// Built rather than written out, because the sentence it goes into is the only
+// place an operator learns which owners binpack understands, and a hand-copied
+// list is one that goes stale silently — the reader has no way to tell.
+func templateKindsProse() string {
+	kinds := TemplateKinds()
+	names := make([]string, 0, len(kinds))
+	for _, k := range kinds {
+		names = append(names, k.Kind+"s")
+	}
+	return strings.Join(names[:len(names)-1], ", ") + " and " + names[len(names)-1]
 }
 
 // ControllerOf returns the reference to a pod's controlling owner.
