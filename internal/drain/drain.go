@@ -30,9 +30,23 @@ import (
 // Slack is how long past a pod's termination deadline binpack waits before
 // calling it stuck rather than slow.
 //
-// Enough for SIGKILL and for the API server to catch up, short enough that a
-// genuinely wedged pod is not mistaken for a slow one. Deliberately not
-// configurable: it describes how Kubernetes behaves, not a preference.
+// A calibration, not a description of Kubernetes. An earlier version of this
+// comment claimed the latter and used it to close the question of making the
+// value configurable; the claim does not survive reading the kubelet. What
+// upstream bounds is SIGKILL *delivery* — killContainer hands the remaining
+// grace period to the CRI's StopContainer. Nothing bounds the teardown after
+// it: the object survives until SyncTerminatedPod completes, and that waits
+// for volumes to unmount and then polls podVolumesExist in a loop with no
+// timeout at all (pkg/kubelet/kubelet.go). The nearest thing to a bound on
+// that path, podAttachAndMountTimeout, is 2m3s and is a retry yield rather
+// than a deadline, by its own comment.
+//
+// So the cost of this number is knowable: a pod using its full grace period
+// whose volumes need a second unmount attempt is already past it, and gets
+// reported stuck while behaving correctly. Fixed rather than configurable
+// because there is no upstream quantity to derive a better one from and a
+// config key cannot be withdrawn once shipped — a trade, not a fact. See
+// ADR-0007, which names the metric that would argue for the knob.
 const Slack = 2 * time.Minute
 
 // State is everything the judgement reads.
@@ -161,8 +175,10 @@ func (a Action) String() string {
 // and the metric names: this is what an alert keys on.
 const (
 	// AbandonStuck: a pod is past its termination deadline. The kubelet should
-	// have sent SIGKILL by now, so this is a finalizer, a volume that will not
-	// detach, or an unhealthy kubelet.
+	// have sent SIGKILL by now, so this is usually a finalizer, a volume that
+	// will not detach, or an unhealthy kubelet. Usually rather than always:
+	// Slack bounds something upstream does not, so a teardown that is merely
+	// slow reaches this code too.
 	AbandonStuck = "stuck"
 
 	// AbandonStalled: nothing has moved for stallTimeout and nothing is
