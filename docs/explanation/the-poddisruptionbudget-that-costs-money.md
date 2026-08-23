@@ -17,7 +17,10 @@ spec:
   minAvailable: 1
 ```
 
-A PDB's allowance is `currentHealthy − minAvailable`. With one replica and `minAvailable: 1`,
+A PDB's allowance is `currentHealthy − desiredHealthy`, never below zero, and zero outright when
+the budget selects nothing. `desiredHealthy` is `minAvailable` when that is written as an
+integer, and `expectedPods − maxUnavailable` when the budget is written the other way round; a
+percentage `minAvailable` is `ceil(pct × expectedPods)`. With one replica and `minAvailable: 1`,
 that is `1 − 1 = 0`.
 
 **Zero voluntary disruptions. Permanently.** Not "until things settle", not "under load" —
@@ -103,9 +106,14 @@ The reasoning goes: my Deployment has `maxSurge: 1`, so Kubernetes will start a 
 before removing the old pod, so eviction should be fine.
 
 It isn't. Surge belongs to the Deployment controller's **rollout** path, which runs when the pod
-template changes. Eviction is a **deletion**: the ReplicaSet notices a missing replica and
-creates a new one *after* the old one is gone. There is no create-first path for eviction
-anywhere in core Kubernetes.
+template changes. Eviction is a **deletion**, and the ReplicaSet stops counting a pod the moment
+its deletion is *requested* rather than when the object finally goes — `IsPodActive` in
+`k8s.io/kubernetes/pkg/controller/controller_utils.go` excludes any pod carrying a
+`deletionTimestamp`. So the replacement is created during the old pod's shutdown, and on a
+workload with a long `terminationGracePeriodSeconds` you will watch two pods run side by side
+for a while. What never happens is the replacement being created *before* the deletion, which is
+the part that matters here: the eviction has to be permitted first. There is no create-first
+path for eviction anywhere in core Kubernetes.
 
 What *is* true — and this is the part that explains the randomness — is that **during** a
 rollout there are transiently two healthy pods, so the allowance briefly becomes 1 and the PDB

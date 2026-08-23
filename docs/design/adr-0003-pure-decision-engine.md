@@ -1,7 +1,10 @@
 # ADR-0003: The decision engine is a pure function
 
 - **Status:** superseded in part by
-  [ADR-0008](adr-0008-engine-uses-api-types.md)
+  [ADR-0008](adr-0008-engine-uses-api-types.md), and **corrected in one place** where the
+  Context overstated a third-party tool: the descheduler ships `--dry-run`, so "hard to predict
+  what it will do before running it" was not true as written. The correction is marked where it
+  appears and the decision is unaffected.
 - **Date:** 2026-08-15
 
 > **The principle here still holds: the decision engine is a pure function over data, performs
@@ -22,8 +25,18 @@ controller does another. For a tool whose entire value proposition is *trust me,
 says this is safe*, that failure mode is fatal.
 
 The Kubernetes descheduler illustrates the alternative. Its plugins hold a client and evict
-inline, so behaviour is a property of a running process rather than of a value you can inspect.
-That is precisely why it is hard to predict what the descheduler will do before running it.
+inline — `HighNodeUtilization.Balance` calls `evictPodsFromSourceNodes` through the handle's
+evictor — so the decision is a side effect of a running process rather than a value. `--dry-run`
+will tell you what a run would do, but there is nothing a second frontend could read, and
+nothing two frontends could agree on.
+
+**Correction.** The last sentence previously read "That is precisely why it is hard to predict
+what the descheduler will do before running it", which is not so: `--dry-run` is a documented
+flag (`cmd/descheduler/app/options/options.go`). The structural half of the observation is
+confirmed and is the half this ADR needs; attaching it to an overstatement meant a reader who
+had operated the descheduler would discount the paragraph, and the discount would land on the
+argument that actually matters. The rest of the ADR set treats alternatives accurately, and
+this should too.
 
 ## Decision
 

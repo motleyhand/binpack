@@ -1,6 +1,14 @@
 # ADR-0001: Build a purpose-built consolidation controller
 
-- **Status:** accepted
+- **Status:** accepted, and **corrected in five places** where the text asserted something about
+  a third party that does not hold. All five are marked where they appear, and none of them
+  reaches the decision: the autoscaler has no rebalancing code path at any configuration, which
+  is the whole of the argument. (1) `LeastAllocated` is one plugin's scoring default, not the
+  default profile. (2) DOKS exposes two of the three scale-down settings this ADR said were
+  unavailable. (3) `least-waste` has been the cluster-autoscaler's default expander since 1.33, so
+  "worth setting" asserts something about the reader's cluster. (4) Karpenter's consolidation is
+  a superset only for the nodes Karpenter provisions. (5) DigitalOcean does now sell spot
+  capacity, though not for the Droplets a DOKS pool uses.
 - **Date:** 2026-08-15
 
 ## Context
@@ -15,12 +23,28 @@ produce an unambiguously empty node.
 
 Two things make that wait indefinite in practice.
 
-The default scheduler profile is `LeastAllocated`, which spreads pods towards the emptiest
-node. That is correct for availability and directly hostile to bin-packing. And most managed
-providers weld the autoscaler's dials shut: DigitalOcean Kubernetes exposes minimum nodes,
-maximum nodes and expander choice, and nothing else. `scale-down-utilization-threshold`,
-`scale-down-unneeded-time` and `scale-down-delay-after-add` are unavailable, and the control
-plane is managed so the autoscaler's logs cannot be read.
+The default scheduler profile spreads pods towards the emptiest node. That is correct for
+availability and directly hostile to bin-packing. And managed providers restrict the
+autoscaler's dials: on DigitalOcean Kubernetes, `scale-down-delay-after-add` is unavailable and
+the control plane is managed so the autoscaler's logs cannot be read.
+
+**Correction (1).** This paragraph named `LeastAllocated` as "the default scheduler profile".
+It is the default `ScoringStrategy` of one plugin — `NodeResourcesFit`, at Score weight 1 of the
+12 the default profile distributes (`pkg/scheduler/apis/config/v1/default_plugins.go` and
+`defaults.go`). The correction strengthens the premise rather than weakening it:
+`NodeResourcesBalancedAllocation` pushes the same way at equal weight, and nothing in the
+default profile rewards packing at all.
+
+**Correction (2).** This paragraph also said DOKS exposes "minimum nodes, maximum nodes and
+expander choice, and nothing else", listing `scale-down-utilization-threshold` and
+`scale-down-unneeded-time` among the unavailable. Both are in fact exposed: DigitalOcean's
+`cluster_autoscaler_configuration` carries `scale_down_utilization_threshold`,
+`scale_down_unneeded_time` and `expanders`, settable through `doctl kubernetes cluster
+create|update` (`digitalocean/doctl` `args.go`, `commands/kubernetes.go`; read 2026-08-23).
+`scale-down-delay-after-add` really is absent. The claim was also stated as a property of
+managed platforms generally, which does not hold either — where the autoscaler runs as a
+Deployment in the operator's own cluster, as on Civo, every flag is reachable with `kubectl
+edit`. Neither changes the conclusion, because the conclusion never rested on the knobs.
 
 The result is a stable, symmetric, expensive equilibrium: every node sitting at 40–70 percent
 of requested capacity, none of them clearly removable, all of them billed.
@@ -47,9 +71,18 @@ tool does.
 
 ### Tune the cluster-autoscaler
 
-Rejected: not possible. DOKS exposes minimum, maximum and expanders. The `least-waste` expander
-is worth setting if you run multiple pools, but it improves which pool a scale-**up** chooses
-and does nothing for scale-down.
+Rejected: insufficient, which is a stronger objection than unavailable. DOKS exposes minimum,
+maximum, expanders, `scale-down-utilization-threshold` and `scale-down-unneeded-time`, and those
+are worth setting on their own terms — but the expander only improves which pool a scale-**up**
+chooses, and the two thresholds only widen or hasten the removal of a node that is *already*
+nearly empty.
+
+**Correction (3).** An earlier revision recommended setting `least-waste` outright. It has been
+the cluster-autoscaler's default since 1.33 — `config/flags/flags.go` moved from
+`expander.RandomExpanderName` to `expander.LeastWasteExpanderName` at that release and has kept
+it through 1.36 — so on a current autoscaler this is likely to be no change at all. Per the
+project's own writing rule, the documentation points at the read-only command that answers it
+rather than asserting the reader's value.
 
 More fundamentally, this would not be sufficient even if the knobs were available. The
 autoscaler has no rebalancing code path at any configuration. Raising
@@ -80,8 +113,16 @@ analysis, including what it does well, is in
 ### Karpenter
 
 Architecturally the correct answer, and its consolidation feature is a strict superset of what
-this project does. Rejected because no third party can ship a provider for a managed
-Kubernetes service. See [ADR-0005](adr-0005-why-not-a-karpenter-doks-provider.md).
+this project does **on the nodes Karpenter provisions**. Rejected because no third party can
+ship a provider for a managed Kubernetes service. See
+[ADR-0005](adr-0005-why-not-a-karpenter-doks-provider.md).
+
+**Correction (4).** The superset was originally stated without that scope. Karpenter's
+disruption controller only considers nodes it owns: `ValidateNodeDisruptable`
+(`pkg/controllers/state/statenode.go`) rejects a node with no `NodeClaim` outright, with
+"node isn't managed by karpenter". On a cluster where a Karpenter NodePool runs alongside a
+cluster-autoscaler-managed or static pool — a partial migration, or a deliberate static baseline
+— the rest of the cluster gets no consolidation from Karpenter at all.
 
 ### CAST AI
 
@@ -102,7 +143,13 @@ unpredictable load. Complementary rather than competing.
 
 ### Spot or preemptible nodes
 
-Not offered by DigitalOcean.
+Not offered by DigitalOcean for the general-purpose Droplets a DOKS node pool uses.
+
+**Correction (5).** This said "Not offered by DigitalOcean" flat. Spot GPU Droplets exist, at a
+variable rate that tracks available capacity and is never above the on-demand price
+([Droplet pricing](https://docs.digitalocean.com/products/droplets/details/pricing/), read
+2026-08-23). Whether a DOKS node pool can be backed by them has not been established here, and
+should be checked rather than assumed before this alternative is reopened.
 
 ### Manual `kubectl drain`
 

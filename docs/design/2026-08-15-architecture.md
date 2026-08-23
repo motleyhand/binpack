@@ -187,8 +187,12 @@ Evaluated per run, cheapest checks first.
    has already seen that process publish. See *Data flow* above.
 2. **Scope.** Consider only nodes in autoscaling node groups. A node the autoscaler does not
    manage — a static pool, a control-plane node — must never be a candidate.
-3. **Pool floor.** Is the group above its minimum? At the minimum, the autoscaler replaces
-   whatever is drained.
+3. **Pool floor.** Is the group above its minimum? At the minimum the autoscaler will not
+   remove the node — it marks it unremovable with `NodeGroupMinSizeReached`
+   (`core/scaledown/unneeded/nodes.go`) and there is no compensating scale-up, since
+   `--enforce-node-group-min-size` is off by default and scale-up is driven only by
+   unschedulable pods. So draining there disrupts the workload, strands a cordoned node until
+   `removalTimeout`, and is recorded as a failure with backoff. No saving, and nothing replaced.
 4. **Candidate ordering.** Order in-scope nodes by allocated resources ascending and evaluate
    the least loaded first. This is an ordering, not a filter — see *No utilisation threshold*
    below.
@@ -442,8 +446,11 @@ It is worth being explicit about a common misconception, because it explains oth
 cluster behaviour. A Deployment with one replica and a PDB of `minAvailable: 1` allows zero
 voluntary disruptions **permanently** at steady state. Rolling-update `maxSurge` does not
 rescue it: surge belongs to the Deployment controller's rollout path, whereas eviction is a
-deletion, and the ReplicaSet creates a replacement only *after* the pod is gone. There is no
-create-first path for eviction anywhere in core Kubernetes.
+deletion. The ReplicaSet stops counting a pod the moment its deletion is *requested* —
+`IsPodActive` excludes anything carrying a `deletionTimestamp` — so the replacement is created
+during the old pod's shutdown, not after the object goes. What it is never created before is
+the deletion, which is the part that matters: the eviction has to be permitted first. There is
+no create-first path for eviction anywhere in core Kubernetes.
 
 What is true is that *during* a rollout there are transiently two healthy pods, so the PDB
 briefly permits one disruption. That is the "natural churn" the autoscaler waits for, and it is
@@ -804,10 +811,17 @@ unambiguously. `discovery.nodeGroups` covers what is left, which is a pool name 
 truncated or never used.
 
 **Should node sizing be recommended?** Per-node kubelet and system reservations are roughly
-fixed, so larger nodes waste proportionally less — a 4GB node loses 15–17 percent to
-reservations, an 8GB node around 9 percent. A single pool of larger nodes also pushes the
-110-pod-per-node ceiling further away, at the cost of coarser scale granularity. binpack could
-offer this advice from data it already collects, but it is not a v1 concern.
+fixed, so larger nodes waste proportionally less. The structural point is the argument; the
+figures belong to whichever platform is being discussed, and they are larger than they look.
+DigitalOcean publishes 2.5 GiB of pod-allocatable memory on a 4 GiB node and 6 GiB on an 8 GiB
+node — 37.5 and 25 percent gone, not the low teens (DOKS
+[limits](https://docs.digitalocean.com/products/kubernetes/details/limits/), read 2026-08-23).
+Upstream reserves almost nothing by comparison: kubelet leaves `kube-reserved` and
+`system-reserved` unset, so allocatable is capacity minus the default hard-eviction threshold of
+`memory.available<100Mi`. For a specific node, the read-only answer is
+`kubectl get node <name> -o jsonpath='{.status.allocatable}'`. A single pool of larger nodes
+also pushes the 110-pod-per-node ceiling further away, at the cost of coarser scale granularity.
+binpack could offer this advice from data it already collects, but it is not a v1 concern.
 
 **How much headroom should the simulation reserve?** Planning to fill the remaining nodes
 exactly leaves no room for the next pod that arrives, and would produce a cluster that scales up

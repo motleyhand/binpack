@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"io/fs"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -371,5 +373,83 @@ func TestTheChartAndTheBinaryDefaultToTheSameAutoscalerNamespace(t *testing.T) {
 	if !strings.Contains(block, "autoscalerNamespace") {
 		t.Error("the chart's config: block does not mention autoscalerNamespace, so " +
 			"nothing an operator reads says binpack looks in one namespace or which")
+	}
+}
+
+// Every `kubectl -n <ns>` example in the documentation must name a namespace
+// the reader will actually have.
+//
+// There are only two such namespaces, and they arrive by different routes.
+// binpack's own lives wherever the install put it, which the install how-to
+// fixes with `--namespace`; the cluster-autoscaler's is discovered rather than
+// chosen, and defaults to the one `v1alpha1.DefaultAutoscalerNamespace` names.
+// Anything else is a namespace nobody was told to create.
+//
+// The failure this catches is quiet in the worst way. A wrong namespace does
+// not produce a wrong answer, it produces `Error from server (NotFound):
+// deployments.apps "binpack" not found` — which reads as "binpack is not
+// installed" rather than "look in the other namespace", so the reader stops
+// trusting the install rather than the command. The one place this mattered
+// most was the reference's only documented way to ask the *deployed* binpack
+// what it decided; a reader whose copy-paste failed there falls back to
+// running the command on their laptop, which answers about built-in defaults
+// — the exact substitution that section exists to warn against.
+func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
+	install, err := os.ReadFile("../../docs/how-to/install-binpack.md")
+	if err != nil {
+		t.Fatalf("reading the install how-to: %v", err)
+	}
+
+	// The namespaces the how-to actually installs into.
+	installed := map[string]bool{}
+	for _, m := range regexp.MustCompile(
+		`--namespace\s+([A-Za-z0-9-]+)`).FindAllStringSubmatch(string(install), -1) {
+		installed[m[1]] = true
+	}
+	if len(installed) == 0 {
+		t.Fatal("found no --namespace in the install how-to; this test asserts " +
+			"nothing if it cannot read the namespaces it is comparing against")
+	}
+
+	// Plus the autoscaler's, which no install command creates because binpack
+	// does not install it — it reads one object out of it.
+	installed[v1alpha1.DefaultAutoscalerNamespace] = true
+
+	example := regexp.MustCompile(`kubectl\s+(?:-n|--namespace)\s+([A-Za-z0-9-]+)`)
+	examples := 0
+	// README.md is walked too: it is the highest-traffic surface of the lot and
+	// carries the same kind of example.
+	roots := []string{"../../docs", "../../README.md"}
+	walk := func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if d.IsDir() || !strings.HasSuffix(path, ".md") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		for i, line := range strings.Split(string(body), "\n") {
+			for _, m := range example.FindAllStringSubmatch(line, -1) {
+				examples++
+				if !installed[m[1]] {
+					t.Errorf("%s:%d uses namespace %q, which no install command in "+
+						"docs/how-to/install-binpack.md creates: %s",
+						path, i+1, m[1], strings.TrimSpace(line))
+				}
+			}
+		}
+		return nil
+	}
+	for _, root := range roots {
+		if err := filepath.WalkDir(root, walk); err != nil {
+			t.Fatalf("walking %s: %v", root, err)
+		}
+	}
+	if examples == 0 {
+		t.Fatal("found no `kubectl -n` examples under docs/; this test asserts " +
+			"nothing if its pattern has stopped matching")
 	}
 }

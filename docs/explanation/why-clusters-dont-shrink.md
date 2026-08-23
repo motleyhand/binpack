@@ -33,9 +33,12 @@ weeks.
 
 ## The scheduler is actively working against you
 
-Kubernetes schedules pods with the `LeastAllocated` strategy by default: among the nodes that
-fit, prefer the one with the most free room. This spreads load evenly, which is the right
-default — it limits the blast radius of losing any single node.
+The default scheduler profile's `NodeResourcesFit` plugin scores `LeastAllocated`: among the
+nodes that fit, prefer the one with the most free room. It is one term of the score rather than
+the whole of it — `NodeResourcesBalancedAllocation` rewards even usage across resources on top
+of that, and the stronger and simpler statement is that **nothing in the default profile rewards
+packing**. This spreads load evenly, which is the right default — it limits the blast radius of
+losing any single node.
 
 It is also precisely the opposite of bin-packing.
 
@@ -131,10 +134,21 @@ it self-corrects — but the diagnosis is confusing if the possibility hasn't oc
 
 ## Why you can't just tune your way out
 
-On a self-hosted autoscaler you can adjust every threshold above. Most managed Kubernetes
-services expose almost none of them — DigitalOcean, for instance, offers minimum nodes, maximum
-nodes and expander choice, and nothing else. The control plane is managed, so the autoscaler's
-logs aren't yours to read either.
+On a self-hosted autoscaler you can adjust every threshold above. A managed service exposes
+some subset, and how large a subset varies more than it is usually given credit for. Where the
+provider runs the autoscaler for you, its own API is the whole surface: DigitalOcean's
+`cluster_autoscaler_configuration` carries `scale_down_utilization_threshold`,
+`scale_down_unneeded_time` and `expanders`, alongside a node pool's minimum and maximum — so two
+of the thresholds above are yours to set and `scale-down-delay-after-add` is not (the
+[`doctl kubernetes cluster update`](https://docs.digitalocean.com/reference/doctl/reference/kubernetes/cluster/update/)
+flags, read 2026-08-23). Where instead the autoscaler is a Deployment in your own cluster, every
+flag it has is reachable with `kubectl edit`. Which of those you are looking at is one command:
+
+```bash
+kubectl -n kube-system get deploy cluster-autoscaler
+```
+
+Either way the control plane's own logs are not yours to read on a managed service.
 
 That is a real frustration, but it is worth being clear that the knobs are not the fundamental
 problem.

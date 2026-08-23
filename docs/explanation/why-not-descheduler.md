@@ -63,16 +63,21 @@ Leave it at 0, or omit it.
 
 ### 1. Percentages are blind to absolute capacity
 
-This is the fundamental one. Consider a mixed pool of 4GB and 8GB nodes:
+This is the fundamental one. Consider a mixed pool of 4 GiB and 8 GiB nodes. Reservations are
+roughly fixed per node, so what a pod can actually be given is a good deal less than the label
+on the pool and proportionally much less on the smaller node — DigitalOcean publishes 2.5 GiB
+allocatable on a 4 GiB node and 6 GiB on an 8 GiB one ([DOKS
+limits](https://docs.digitalocean.com/products/kubernetes/details/limits/), read 2026-08-23;
+`kubectl get node <name> -o jsonpath='{.status.allocatable}'` gives yours):
 
-| Node | Utilisation | Actual |
-|---|---|---|
-| 4GB node | 81% | ~1.1GB of requests |
-| 8GB node | 60% | ~2.7GB free |
+| Node | Allocatable | Utilisation | Actual |
+|---|---|---|---|
+| 4 GiB node | 2.5 GiB | 81% | ~2.0 GiB of requests |
+| 8 GiB node | 6 GiB | 60% | ~2.4 GiB free |
 
-The 4GB node's entire workload would fit on the 8GB node with room to spare. The consolidation
-is obvious to a human and trivially provable in bytes. But the plugin sees `81 > 80`, classifies
-the node as busy, and does nothing.
+The 4 GiB node's entire workload would fit on the 8 GiB node with room to spare. The
+consolidation is obvious to a human and trivially provable in bytes. But the plugin sees
+`81 > 80`, classifies the node as busy, and does nothing.
 
 No threshold fixes this, because the information needed — absolute quantities — is not what the
 plugin is comparing. As soon as your nodes are not all the same size, percentage classification
