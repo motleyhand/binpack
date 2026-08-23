@@ -960,3 +960,105 @@ func SafeToEvictLocalVolumes(names ...string) PodOption {
 func CreatedAt(t time.Time) PodOption {
 	return func(p *corev1.Pod) { p.CreationTimestamp = metav1.NewTime(t) }
 }
+
+// Starting is a pod bound to a node whose containers are not running yet:
+// pulling an image, attaching a volume, ContainerCreating.
+//
+// Distinct from [Pending], which is a pod no node has been chosen for. Both
+// are phase Pending and only this one occupies a node, and the distinction is
+// load-bearing for eviction: the eviction subresource ignores disruption
+// budgets entirely for a pod in that phase, so it is the phase rather than the
+// readiness that decides whether the budget is charged.
+func Starting() PodOption {
+	return func(p *corev1.Pod) {
+		p.Status.Phase = corev1.PodPending
+		p.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.PodScheduled, Status: corev1.ConditionTrue},
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+		}
+	}
+}
+
+// Succeeded is a pod that ran to completion — a Job's, most often. It holds no
+// resources, and nothing removes it: it sits on its node until somebody or a
+// TTL controller deletes it.
+func Succeeded() PodOption {
+	return terminalPhase(corev1.PodSucceeded)
+}
+
+// Failed is a pod that ran and stopped for good, as one the node evicted under
+// disk pressure has. Like [Succeeded] it holds no resources and does not leave
+// on its own.
+func Failed() PodOption {
+	return terminalPhase(corev1.PodFailed)
+}
+
+func terminalPhase(phase corev1.PodPhase) PodOption {
+	return func(p *corev1.Pod) {
+		p.Status.Phase = phase
+		p.Status.Conditions = []corev1.PodCondition{
+			{Type: corev1.PodReady, Status: corev1.ConditionFalse},
+		}
+	}
+}
+
+// SyncFailed marks a budget whose controller could not compute it, as the
+// disruption controller's failSafe leaves one: disruptionsAllowed forced to
+// zero and a DisruptionAllowed condition carrying the reason, with every other
+// status field left at whatever the last successful sync wrote.
+//
+// That combination is the point. The stale counters are what make such a
+// budget read as an ordinary misconfiguration, and the condition is the only
+// field that says otherwise.
+func SyncFailed(pdb *policyv1.PodDisruptionBudget, message string) *policyv1.PodDisruptionBudget {
+	pdb.Status.DisruptionsAllowed = 0
+	pdb.Status.Conditions = []metav1.Condition{{
+		Type:    policyv1.DisruptionAllowedCondition,
+		Status:  metav1.ConditionFalse,
+		Reason:  policyv1.SyncFailedReason,
+		Message: message,
+	}}
+	return pdb
+}
+
+// Insufficient gives a budget the DisruptionAllowed condition the disruption
+// controller writes when it has computed the budget successfully and the
+// answer is zero — the ordinary tight-budget case.
+//
+// The counterpart to [SyncFailed], and the fixture that keeps the reason
+// rather than the mere presence of a condition doing the discriminating.
+func Insufficient(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	pdb.Status.Conditions = []metav1.Condition{{
+		Type:   policyv1.DisruptionAllowedCondition,
+		Status: metav1.ConditionFalse,
+		Reason: policyv1.InsufficientPodsReason,
+	}}
+	return pdb
+}
+
+// UnparseableSelector gives a budget a selector no client can turn into a
+// label query, by way of a label value the current API server would reject.
+//
+// Such objects exist because validation grandfathers them: policy validation
+// passes AllowInvalidLabelValueInSelector, so a selector already stored by an
+// older API server survives an update.
+//
+// The sync failure comes with it, because it always does. getPodsForPdb parses
+// the same selector the eviction API does, so the disruption controller cannot
+// compute such a budget either and failSafe is the only status it ever
+// carries — a fixture that set the selector alone would describe an object no
+// cluster holds, and let a test claim the selector was doing work the
+// condition was.
+func UnparseableSelector(pdb *policyv1.PodDisruptionBudget) *policyv1.PodDisruptionBudget {
+	pdb.Spec.Selector = &metav1.LabelSelector{
+		MatchLabels: map[string]string{"app": "Not A Valid Label Value!"},
+	}
+	// The controller's own message, rather than one invented to look like it.
+	// A nil error would mean the value had become parseable and the fixture
+	// silently stopped expressing anything, which is worth a panic.
+	_, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+	if err == nil {
+		panic("mother.UnparseableSelector: the selector parses, so the fixture says nothing")
+	}
+	return SyncFailed(pdb, err.Error())
+}

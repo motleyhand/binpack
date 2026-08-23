@@ -154,6 +154,12 @@ func CheckEvictable(
 			continue
 		}
 
+		// Everything below is disruption-budget arithmetic, and the eviction
+		// API does none of it for such a pod.
+		if pdbsIgnored(pod) {
+			continue
+		}
+
 		// The eviction subresource does not arbitrate between budgets. It
 		// returns HTTP 500 — not a retryable 429 — so such a pod cannot be
 		// evicted by anything: not binpack, not kubectl drain, not the
@@ -324,13 +330,65 @@ func evictableWhileUnready(pod *corev1.Pod, pdb *policyv1.PodDisruptionBudget) b
 	if isPodReady(pod) {
 		return false
 	}
-	if policy := pdb.Spec.UnhealthyPodEvictionPolicy; policy != nil &&
-		*policy == policyv1.AlwaysAllow {
+	// An unset policy is IfHealthyBudget: policy/v1 says the empty value
+	// "corresponds to the IfHealthyBudget policy", which is also what the
+	// eviction subresource does with it.
+	policy := policyv1.IfHealthyBudget
+	if declared := pdb.Spec.UnhealthyPodEvictionPolicy; declared != nil {
+		policy = *declared
+	}
+
+	switch policy {
+	case policyv1.AlwaysAllow:
+		return true
+	case policyv1.IfHealthyBudget:
+		// Free only while the guarded application is meeting its budget.
+		return pdb.Status.CurrentHealthy >= pdb.Status.DesiredHealthy && pdb.Status.DesiredHealthy > 0
+	default:
+		// A closed set, deliberately, and deliberately not what a current API
+		// server does with a value it does not know — its own handler falls
+		// through to the IfHealthyBudget arm. policy/v1 asks clients for the
+		// opposite: "Additional policies may be added in the future. Clients
+		// making eviction decisions should disallow eviction of unhealthy
+		// pods if they encounter an unrecognized policy in this field."
+		//
+		// Validation means such a value can only come from an API server
+		// newer than the k8s.io/api binpack was built against, so the policy
+		// binpack has never seen is by construction one whose rule it cannot
+		// know. Excusing the pod would under-count the demand the API server
+		// will actually meet, approve the drain, and leave the node
+		// half-emptied on the first 429 — the one unsound direction available
+		// here. Charging costs a consolidation.
+		return false
+	}
+}
+
+// pdbsIgnored reports whether the eviction subresource would delete this pod
+// without consulting a disruption budget at all.
+//
+// Mirrors canIgnorePDB in kubernetes pkg/registry/core/pod/storage/eviction.go.
+// The gate sits above every budget in Create: getPodDisruptionBudgets, the
+// more-than-one refusal and checkAndDecrement are all downstream of it, so for
+// such a pod no budget is read, none is charged, and the two-budget HTTP 500
+// cannot happen.
+//
+// Pending is the arm that changes binpack's answer, and it is a pod bound to a
+// node whose containers have not started — an image still pulling, a volume
+// still attaching. Which is to say the wedged pod an operator most wants
+// consolidated away, and the node binpack used to refuse for ever.
+//
+// The other three arms are already filtered out before CheckEvictable sees
+// them: Occupies drops Succeeded and Failed, and Classify calls a terminating
+// pod node-bound. They are mirrored anyway rather than trimmed to what is
+// currently reachable, because the predicate is named for upstream's and a
+// caller that stopped filtering would otherwise get the arithmetic silently
+// wrong.
+func pdbsIgnored(pod *corev1.Pod) bool {
+	switch pod.Status.Phase {
+	case corev1.PodPending, corev1.PodSucceeded, corev1.PodFailed:
 		return true
 	}
-	// Default and IfHealthyBudget: free only while the guarded application is
-	// meeting its budget.
-	return pdb.Status.CurrentHealthy >= pdb.Status.DesiredHealthy && pdb.Status.DesiredHealthy > 0
+	return pod.DeletionTimestamp != nil
 }
 
 func isPodReady(pod *corev1.Pod) bool {
@@ -358,9 +416,22 @@ func matchingPDBs(pod *corev1.Pod, pdbs []*policyv1.PodDisruptionBudget) []*poli
 		}
 		selector, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
 		if err != nil {
-			// An unparseable selector is a budget nobody can reason about.
-			// Assuming it does not apply would be the unsafe direction.
-			matched = append(matched, pdb)
+			// Skipped, because the eviction subresource skips it: "This
+			// object has an invalid selector, it does not match the pod",
+			// getPodDisruptionBudgets in the same file as canIgnorePDB. The
+			// disruption controller cannot read it either, so such a budget
+			// has never had a healthy status computed for it.
+			//
+			// This used to append, on the grounds that a budget nobody can
+			// reason about should be assumed to apply. That reasoning holds
+			// for an allowance and inverts for a match: a matched set larger
+			// than the API server's is what produces the more-than-one
+			// refusal, which binpack reports as permanent and unfixable by
+			// retry. So the cautious-looking reading was the one that refused
+			// a node the API would have drained.
+			//
+			// The object is not dropped, only disarmed — diagnose reports it
+			// as pdb-unparseable-selector.
 			continue
 		}
 		if selector.Matches(labels.Set(pod.Labels)) {

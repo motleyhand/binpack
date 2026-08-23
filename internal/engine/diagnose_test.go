@@ -455,6 +455,9 @@ func TestEveryFindingCarriesItsGuidance(t *testing.T) {
 		mother.Healthy(mother.PDB("default", "sick", 0, map[string]string{"app": "sick"}), 1, 2),
 		mother.SelectsNothing(mother.PDB("default", "empty", 0, map[string]string{"app": "gone"})),
 		mother.Stale(mother.PDB("default", "edited", 1, map[string]string{"app": "edited"})),
+		mother.SyncFailed(mother.PDB("default", "unsyncable", 0, map[string]string{"app": "orphaned"}),
+			`found no controllers for pod "orphaned-0"`),
+		mother.UnparseableSelector(mother.PDB("default", "grandfathered", 1, nil)),
 	}
 
 	s := cluster(nodes, pods)
@@ -502,6 +505,7 @@ func TestEveryFindingCarriesItsGuidance(t *testing.T) {
 		engine.FindingNoCandidates, engine.FindingPoolNotAutoscaled, engine.FindingPoolAtMinimum,
 		engine.FindingPDBZero, engine.FindingPDBUnhealthy, engine.FindingPDBSelectsNothing,
 		engine.FindingPriorityBelow, engine.FindingAbandonedDrain, engine.FindingNodeInBackoff,
+		engine.FindingPDBSyncFailed, engine.FindingPDBUnparseableSelector,
 		engine.BlockedPDBStale, engine.BlockedMultiplePDBs, engine.BlockedBarePod,
 		engine.BlockedLocalStorage, engine.BlockedSystemPod, engine.BlockedSafeToEvict,
 	}
@@ -871,4 +875,183 @@ func TestDiagnoseDoesNotReportASystemPodTheAutoscalerWouldAlreadyEvict(t *testin
 	fresh := mother.Pod("kube-system", "konnectivity-agent", mother.OnNode("a"),
 		mother.CreatedAt(now.Add(-5*time.Minute)))
 	only(t, diagnose(nil, []*corev1.Pod{fresh}), engine.BlockedSystemPod)
+}
+
+// TestDiagnoseDoesNotBlameABudgetWhoseControllerFailedToSync separates a
+// budget that is wrong from one nobody could compute.
+//
+// When trySync fails the disruption controller calls failSafe, which forces
+// disruptionsAllowed to zero and records the reason on the DisruptionAllowed
+// condition — and touches nothing else, so currentHealthy, desiredHealthy and
+// expectedPods keep whatever the last successful sync wrote. Read without the
+// condition, such a budget is indistinguishable from a one-replica
+// minAvailable: 1, and binpack told the operator to run another replica. That
+// changes nothing, and the operator's next conclusion is that binpack is
+// wrong.
+func TestDiagnoseDoesNotBlameABudgetWhoseControllerFailedToSync(t *testing.T) {
+	// The commonest cause, and the one whose message says the most: a pod
+	// whose controlling owner exposes no scale subresource, or has been
+	// deleted out from under it.
+	const message = `found no controllers for pod "web-0"`
+
+	labelled := map[string]string{"app": "web"}
+	budget := func() *policyv1.PodDisruptionBudget {
+		return mother.PDB("default", "web", 0, labelled)
+	}
+
+	// One subtest per arm the sync-failed check has to precede, because the
+	// stale counters can be left in any of these shapes and each one has its
+	// own wrong answer. Testing a single shape pins the check's existence and
+	// not its position, and position is the whole of it.
+	misread := []struct {
+		name    string
+		pdb     *policyv1.PodDisruptionBudget
+		instead string
+	}{
+		{"a budget whose last sync found every replica up",
+			mother.Replicas(mother.Healthy(budget(), 3, 2), 3), engine.FindingPDBZero},
+		{"a budget whose last sync found one missing",
+			mother.Replicas(mother.Healthy(budget(), 2, 2), 3), engine.FindingPDBUnhealthy},
+		// Before the first successful sync every counter is zero, which is
+		// also exactly what a selector matching no pods looks like.
+		{"a budget that has never synced at all",
+			mother.SelectsNothing(budget()), engine.FindingPDBSelectsNothing},
+	}
+
+	for _, tc := range misread {
+		t.Run(tc.name, func(t *testing.T) {
+			findings := diagnose(nil, nil, mother.SyncFailed(tc.pdb, message))
+
+			f := only(t, findings, engine.FindingPDBSyncFailed)
+			if f.Severity != engine.Blocking {
+				t.Errorf("severity = %s, want blocking: nothing can be evicted meanwhile", f.Severity)
+			}
+			if !strings.Contains(f.Detail, "found no controllers") {
+				t.Errorf("detail does not carry the controller's own reason: %s", f.Detail)
+			}
+			none(t, findings, tc.instead)
+		})
+	}
+
+	// The control, and the direction that must not move: the reason does the
+	// discriminating, not the presence of a condition. An ordinary tight
+	// budget carries one too — InsufficientPods, written by the same helper on
+	// every successful sync — and must still be blamed.
+	t.Run("an ordinary zero-allowance budget is still blamed", func(t *testing.T) {
+		pdb := mother.Insufficient(budget())
+
+		findings := diagnose(nil, nil, pdb)
+
+		only(t, findings, engine.FindingPDBZero)
+		none(t, findings, engine.FindingPDBSyncFailed)
+	})
+}
+
+// TestDiagnoseReportsAnUnparseableSelectorRatherThanDroppingIt keeps the
+// object visible now that it no longer drives a refusal.
+//
+// The eviction subresource skips such a budget, so binpack must too — but
+// silently skipping it would lose the one thing worth saying about it, which
+// is that somebody believes a workload is protected and no API server agrees.
+func TestDiagnoseReportsAnUnparseableSelectorRatherThanDroppingIt(t *testing.T) {
+	pdb := mother.UnparseableSelector(mother.PDB("default", "grandfathered", 1, nil))
+
+	findings := diagnose(nil, nil, pdb)
+
+	f := only(t, findings, engine.FindingPDBUnparseableSelector)
+	if f.Severity != engine.Warning {
+		t.Errorf("severity = %s, want warning: it blocks nothing", f.Severity)
+	}
+	if f.Subject != "default/grandfathered" {
+		t.Errorf("subject = %q, want default/grandfathered", f.Subject)
+	}
+	// The value is the whole of the fix, and it is the one thing a reader
+	// cannot get from the code: kubectl shows the object without saying which
+	// part of it no client can read.
+	if !strings.Contains(f.Detail, "Not A Valid Label Value!") {
+		t.Errorf("detail does not show the selector that will not parse: %s", f.Detail)
+	}
+
+	// And it outranks the staleness an edit creates, unlike every other budget
+	// finding. This one reads the spec, which is current whatever the status
+	// is doing — and the pending sync will not settle it, since that sync
+	// fails on the same unparseable selector.
+	t.Run("an edit does not demote it to staleness", func(t *testing.T) {
+		findings := diagnose(nil, nil,
+			mother.Stale(mother.UnparseableSelector(mother.PDB("default", "grandfathered", 1, nil))))
+
+		only(t, findings, engine.FindingPDBUnparseableSelector)
+		none(t, findings, engine.BlockedPDBStale)
+	})
+}
+
+// TestDiagnoseDoesNotSendAnOperatorAfterAStartingPodsBudgets is the report's
+// half of the canIgnorePDB gate.
+//
+// diagnoseWorkloads counts matched budgets itself rather than going through
+// CheckEvictable, so the two can disagree — and the disagreement is the
+// expensive direction: multiple-pdbs is documented as unfixable by anything,
+// so the report would send somebody to rewrite selectors over a pod the API
+// server deletes without reading either budget.
+func TestDiagnoseDoesNotSendAnOperatorAfterAStartingPodsBudgets(t *testing.T) {
+	labelled := map[string]string{"app": "web", "tier": "front"}
+	pdbs := []*policyv1.PodDisruptionBudget{
+		mother.PDB("default", "by-app", 1, map[string]string{"app": "web"}),
+		mother.PDB("default", "by-tier", 1, map[string]string{"tier": "front"}),
+	}
+
+	starting := mother.Pod("default", "web-0", mother.OnNode("a"),
+		mother.PodLabels(labelled), mother.Starting())
+
+	none(t, diagnose(nil, []*corev1.Pod{starting}, pdbs...), engine.BlockedMultiplePDBs)
+
+	// The control: a running pod under the same pair is still reported, or
+	// the gate has silenced the finding rather than narrowed it.
+	running := mother.Pod("default", "web-0", mother.OnNode("a"), mother.PodLabels(labelled))
+
+	only(t, diagnose(nil, []*corev1.Pod{running}, pdbs...), engine.BlockedMultiplePDBs)
+}
+
+// TestDiagnoseReportsAnEditedBudgetAsStaleEvenWhenItsLastSyncFailed settles
+// which of two status-derived findings wins while the status is behind the
+// spec, and the answer is neither of them: the staleness does.
+//
+// Nothing clears a condition when a spec is edited — only the disruption
+// controller writes status, and it writes on sync — so a budget that was
+// failing and has just been corrected still carries the old SyncFailed
+// condition and its old message, with observedGeneration behind generation
+// until the next sync. That window is the state an operator creates by acting
+// on pdb-sync-failed, so it is common rather than exotic, and during it binpack
+// does not yet know whether the edit worked.
+//
+// This is upstream's own precedence: checkAndDecrement compares
+// observedGeneration against generation and returns 429 before it reads the
+// condition at all. The rule is uniform — a status behind its spec is
+// untrustworthy in every field, the condition included, which is the same
+// reasoning that makes the counters untrustworthy under a sync failure.
+func TestDiagnoseReportsAnEditedBudgetAsStaleEvenWhenItsLastSyncFailed(t *testing.T) {
+	labelled := map[string]string{"app": "web"}
+	failing := func() *policyv1.PodDisruptionBudget {
+		return mother.SyncFailed(mother.PDB("default", "web", 0, labelled),
+			`found no controllers for pod "web-0"`)
+	}
+
+	t.Run("an edit outranks the condition it has not yet cleared", func(t *testing.T) {
+		findings := diagnose(nil, nil, mother.Stale(failing()))
+
+		f := only(t, findings, engine.BlockedPDBStale)
+		if f.Severity != engine.Warning {
+			t.Errorf("severity = %s, want warning: binpack does not yet know the edit failed", f.Severity)
+		}
+		none(t, findings, engine.FindingPDBSyncFailed)
+	})
+
+	// The control: the edit is the discriminator, not the condition. A sync
+	// failure the controller has caught up with is still reported as one.
+	t.Run("a settled budget still reports the sync failure", func(t *testing.T) {
+		findings := diagnose(nil, nil, failing())
+
+		only(t, findings, engine.FindingPDBSyncFailed)
+		none(t, findings, engine.BlockedPDBStale)
+	})
 }
