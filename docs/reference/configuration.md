@@ -321,16 +321,25 @@ configuration is impossible on the managed control planes
 [ADR-0004](../design/adr-0004-provider-agnostic-no-cloud-api.md) targets. So this is stated
 rather than detected.
 
-Whether it applies to you is a question you can answer without binpack, and mostly by knowing
-which kind of cluster you have. Where the control plane is managed for you, the scheduler's
-configuration is generally not something you can reach — and not reaching it means nobody has
-edited it. Where you run the control plane, the profile is a file or a ConfigMap you gave it, and
+Whether it applies to you depends on who wrote your scheduler's profile, and that is a different
+question from who can read it. Where you run the control plane, you wrote it: it is the file or
+ConfigMap `kube-scheduler` was started against, and
 
 ```bash
 kubectl -n kube-system get cm
 ```
 
-is where a `KubeSchedulerConfiguration` would show up if one is held that way.
+is where a `KubeSchedulerConfiguration` shows up if one is held that way.
+
+Where the control plane is managed for you, your provider wrote it, and not being able to read it
+is not evidence that it is stock — the provider chooses those arguments exactly as you would on
+your own cluster. Treat the profile as **unknown** unless your provider documents it or confirms
+it on request. What you have instead of a guarantee is detection. If a hidden argument refuses a
+destination binpack accepted, the replacement for the pod binpack evicted goes Pending and the
+autoscaler adds a node — the outcome binpack exists to prevent, and the one
+[ADR-0006](../design/adr-0006-scheduler-fidelity.md) already says binpack makes unlikely and
+immediately detectable rather than impossible. Because evictions are sequential with
+revalidation between each, that surfaces after the first pod rather than after a whole node.
 
 The differential harness shares the assumption rather than testing it: its oracle constructs
 `NodeAffinity` with empty arguments and does not construct `PodTopologySpread` at all.
