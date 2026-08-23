@@ -739,7 +739,7 @@ func drainable(s Snapshot, a *NodeAssessment, policy Policy, committed bool) boo
 	}
 
 	evicting := append(append([]*corev1.Pod{}, podsOf(simulation.Relocated)...), simulation.Evicted...)
-	if blockers := CheckEvictable(evicting, s.PDBs, policy.Evict); len(blockers) > 0 {
+	if blockers := CheckEvictable(evicting, s.PDBs, policy.Evict, s.Now); len(blockers) > 0 {
 		a.Blockers = blockers
 		return false
 	}

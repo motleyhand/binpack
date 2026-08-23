@@ -132,6 +132,7 @@ type Policy struct {
 	Enabled *bool `json:"enabled,omitempty"`
 
 	Feasibility Feasibility `json:"feasibility"`
+	Autoscaler  Autoscaler  `json:"autoscaler"`
 	Drain       Drain       `json:"drain"`
 	Backoff     Backoff     `json:"backoff"`
 	Cooldown    Cooldown    `json:"cooldown"`
@@ -176,6 +177,61 @@ type Feasibility struct {
 	// cluster is full" but "the next pod that restarts cannot be placed",
 	// which is a question about bytes.
 	ReserveForLargestPod *bool `json:"reserveForLargestPod,omitempty"`
+}
+
+// Autoscaler states what the cluster-autoscaler in this cluster is configured
+// to do, where that differs from upstream's defaults.
+//
+// Not settings for binpack: nothing here changes what binpack is willing to
+// do, only what it predicts the autoscaler will do once a node is empty.
+// Getting one wrong is not unsafe, it is wrong in one of two directions —
+// too strict and binpack refuses nodes the autoscaler would have removed, too
+// loose and it drains a node the autoscaler then declines to remove, which the
+// drain verification catches and backs off from.
+//
+// These are per-pool for the same reason
+// [Feasibility.ExpendablePriorityCutoff] is, which mirrors a process-global
+// flag too: the resolved policy is the unit every other setting travels in,
+// and one section that could not be overridden would be a shape nothing else
+// here has.
+//
+// Nested under policy rather than discovery because discovery is about finding
+// the autoscaler's status document, and this is about the flags it was started
+// with — which that document does not report, and which nothing binpack can
+// read will tell it.
+type Autoscaler struct {
+	// SkipNodesWithLocalStorage mirrors --skip-nodes-with-local-storage,
+	// default true. Under it a pod with a hostPath or disk-backed emptyDir
+	// volume blocks the node's removal.
+	//
+	// Worth setting where the platform ships something else: AKS's
+	// cluster-autoscaler profile exposes this flag and defaults it to false.
+	SkipNodesWithLocalStorage *bool `json:"skipNodesWithLocalStorage,omitempty"`
+
+	// SkipNodesWithSystemPods mirrors --skip-nodes-with-system-pods,
+	// default true. Under it a kube-system pod with no PodDisruptionBudget
+	// blocks the node's removal — for BlockingSystemPodDistruptionTimeout
+	// after that pod was created.
+	SkipNodesWithSystemPods *bool `json:"skipNodesWithSystemPods,omitempty"`
+
+	// BlockingSystemPodDistruptionTimeout mirrors
+	// --blocking-system-pod-distruption-timeout, default one hour. The
+	// misspelling is upstream's, kept so the two names can be grepped
+	// together; correcting it here would hide the next divergence between
+	// them behind a difference that is only spelling.
+	//
+	// It has meaning only while SkipNodesWithSystemPods is true, and it is
+	// the one field here whose default is not true of every autoscaler
+	// binpack supports: the grace arrived in cluster-autoscaler 1.33, and
+	// 1.30 to 1.32 block on such a pod for as long as it is there. Zero says
+	// exactly that — the blocker never expires — which is deliberately *not*
+	// what zero means upstream, where it would expire the blocker
+	// immediately. Upstream needs no such value: expiring immediately is
+	// already spelled skipNodesWithSystemPods: false, in both vocabularies,
+	// while "no grace at all" is a supported autoscaler that the flag cannot
+	// describe. Reading zero upstream's way would also make an unset field
+	// switch the whole rule off, which is the direction that accepts.
+	BlockingSystemPodDistruptionTimeout *Duration `json:"blockingSystemPodDistruptionTimeout,omitempty"`
 }
 
 // Drain governs how a node is emptied.
@@ -254,17 +310,20 @@ type Exclusions struct {
 // It uses plain time.Duration rather than the wire Duration type: this is a
 // Go-facing value, and how it renders is the caller's concern.
 type PoolPolicy struct {
-	Enabled                  bool
-	ExpendablePriorityCutoff int32
-	ReserveForLargestPod     bool
-	MaxPodsPerDrain          int
-	StallTimeout             time.Duration
-	RemovalTimeout           time.Duration
-	BackoffInitial           time.Duration
-	BackoffMax               time.Duration
-	CooldownAfterScaleUp     time.Duration
-	CooldownAfterDrain       time.Duration
-	ExcludedNamespaces       []string
+	Enabled                             bool
+	ExpendablePriorityCutoff            int32
+	ReserveForLargestPod                bool
+	SkipNodesWithLocalStorage           bool
+	SkipNodesWithSystemPods             bool
+	BlockingSystemPodDistruptionTimeout time.Duration
+	MaxPodsPerDrain                     int
+	StallTimeout                        time.Duration
+	RemovalTimeout                      time.Duration
+	BackoffInitial                      time.Duration
+	BackoffMax                          time.Duration
+	CooldownAfterScaleUp                time.Duration
+	CooldownAfterDrain                  time.Duration
+	ExcludedNamespaces                  []string
 }
 
 // NodeGroupJoin resolves Discovery.NodeGroups into the lookup the engine

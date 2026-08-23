@@ -284,17 +284,61 @@ by default in case the contents matter.
 The report names the volume, because that is what makes the decision possible: `wasm-cache`
 answers "is this disposable?" and `data` does not.
 
-**Fix.** Annotate the pod `cluster-autoscaler.kubernetes.io/safe-to-evict=true` when the volume
-holds nothing that must survive — a cache, a scratch directory, a rendered config. That is the
-common case and it is a one-line change.
+Two kinds of volume are **not** reported here, because the autoscaler does not block on them
+either. A tmpfs volume — `emptyDir` with `medium: Memory` — is RAM with a filesystem over it,
+and nothing of it reaches the node's disk; this is the volume Istio and Linkerd inject into
+every pod they mesh. And any volume already named in the pod's
+`cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes` annotation.
+
+**Fix.** Annotate the pod `cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes` with
+the volume names whose contents need not survive, comma-separated — a cache, a scratch
+directory, a rendered config:
+
+```yaml
+metadata:
+  annotations:
+    cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes: "cache,tmp"
+```
+
+That is the autoscaler's own recommendation, and it says exactly what is meant and nothing
+else. The names must match the pod's `volumes[].name` entries exactly: the autoscaler splits
+the value on commas and compares the pieces, so `"cache, tmp"` exempts `cache` and a volume
+called `" tmp"`, which is to say nothing. binpack reads the annotation the same way rather than
+the forgiving way, so that its answer and the autoscaler's are the same answer.
+
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "true"` also works and covers the whole pod
+instead — including the `bare-pod`, `system-pod` and storage protections together. Reach for it
+when that is what you mean.
 
 ### `system-pod` — warning
 
-kube-system pods with no PodDisruptionBudget. The autoscaler will not remove a node running
-one.
+kube-system pods with no PodDisruptionBudget, which are younger than the grace the autoscaler
+gives one.
 
-**Fix.** Give the workload a PodDisruptionBudget. Per the autoscaler's own documentation, a
-budget overrides its refusal to touch the node — and the budget then governs, like any other.
+Since cluster-autoscaler **1.33** the refusal expires: `--blocking-system-pod-distruption-timeout`
+(one hour by default; the misspelling is upstream's) is measured from the pod's creation, and
+past it the autoscaler evicts the pod and removes the node. So a pod appears here only while it
+is new, and a steady-state cluster reports none — which is the opposite of how it reads.
+
+**Fix.** Usually nothing: wait, and the node becomes a candidate on its own.
+
+Give the workload a PodDisruptionBudget if you want it moved sooner, or protected properly
+rather than only briefly. Per the autoscaler's own documentation a budget overrides its refusal
+to touch the node, and the budget then governs, like any other.
+
+If your cluster-autoscaler is older than 1.33 it has no such grace and a blocking system pod
+blocks for as long as it is there. binpack cannot see which version is running, so tell it:
+
+```yaml
+policy:
+  autoscaler:
+    blockingSystemPodDistruptionTimeout: 0s
+```
+
+`kubectl -n kube-system get deploy cluster-autoscaler -o jsonpath='{.spec.template.spec.containers[0].image}'`
+prints the version where the autoscaler runs as a workload you can see. On a platform that runs
+it in the control plane it usually tracks the cluster's own minor version, which
+`kubectl version` reports.
 
 ### `unreadable-template` — warning
 

@@ -3,10 +3,15 @@ package cli
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/motleyhand/binpack/api/v1alpha1"
 )
 
 func runWithStdin(t *testing.T, stdin string, args ...string) (string, error) {
@@ -157,4 +162,109 @@ func TestConfigValidateSaysWhereTheAutoscalerStatusIsRead(t *testing.T) {
 	if strings.Contains(out, "cluster-autoscaler-status") {
 		t.Errorf("the summary prints the default name over the configured one:\n%s", out)
 	}
+}
+
+// TestConfigValidateRendersEveryResolvedField is the reporting half of the seam
+// TestEnginePolicyCarriesEveryResolvedPolicyField holds for the acting half.
+//
+// `binpack config validate` exists to answer "what will actually be used", and
+// the configuration reference sends operators to it for exactly that. A field
+// it omits is one the schema accepts, the defaults fill in and the engine acts
+// on — which an operator then cannot confirm, and which reads identically
+// whether they set it or not. Both renderings are asserted, because JSON and
+// text are written separately and either can be forgotten alone.
+//
+// Distinct values throughout, so a field rendered from its neighbour fails as
+// loudly as one rendered from nothing.
+func TestConfigValidateRendersEveryResolvedField(t *testing.T) {
+	resolved := v1alpha1.PoolPolicy{
+		Enabled:                             true,
+		ExpendablePriorityCutoff:            -7,
+		ReserveForLargestPod:                true,
+		SkipNodesWithLocalStorage:           false,
+		SkipNodesWithSystemPods:             true,
+		BlockingSystemPodDistruptionTimeout: 90 * time.Minute,
+		MaxPodsPerDrain:                     3,
+		StallTimeout:                        11 * time.Minute,
+		RemovalTimeout:                      17 * time.Minute,
+		BackoffInitial:                      5 * time.Minute,
+		BackoffMax:                          72 * time.Hour,
+		CooldownAfterScaleUp:                13 * time.Minute,
+		CooldownAfterDrain:                  19 * time.Minute,
+		ExcludedNamespaces:                  []string{"kube-system"},
+	}
+
+	// Counted from the struct rather than taken on trust, the same guard the
+	// engine seam carries — and the one this renderer did not have, which is
+	// how three fields reached the engine while `config validate` stayed
+	// silent about them.
+	const rendered = 14
+	if n := reflect.TypeFor[v1alpha1.PoolPolicy]().NumField(); n != rendered {
+		t.Fatalf("PoolPolicy has %d fields and this test asserts %d: render the new one "+
+			"in both viewOf and writePolicy and assert it here, or say here why it is not "+
+			"rendered", n, rendered)
+	}
+
+	t.Run("json", func(t *testing.T) {
+		encoded, err := json.Marshal(viewOf(resolved))
+		if err != nil {
+			t.Fatalf("marshalling the view: %v", err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal(encoded, &got); err != nil {
+			t.Fatalf("decoding the view: %v", err)
+		}
+
+		for _, tc := range []struct {
+			key  string
+			want any
+		}{
+			{"enabled", true},
+			{"expendablePriorityCutoff", float64(-7)},
+			{"reserveForLargestPod", true},
+			{"skipNodesWithLocalStorage", false},
+			{"skipNodesWithSystemPods", true},
+			{"blockingSystemPodDistruptionTimeout", "1h30m0s"},
+			{"maxPodsPerDrain", float64(3)},
+			{"stallTimeout", "11m0s"},
+			{"removalTimeout", "17m0s"},
+			{"backoffInitial", "5m0s"},
+			{"backoffMax", "72h0m0s"},
+			{"cooldownAfterScaleUp", "13m0s"},
+			{"cooldownAfterDrain", "19m0s"},
+			{"excludedNamespaces", []any{"kube-system"}},
+		} {
+			v, ok := got[tc.key]
+			if !ok {
+				t.Errorf("%s is missing from the JSON rendering", tc.key)
+				continue
+			}
+			if !reflect.DeepEqual(v, tc.want) {
+				t.Errorf("%s = %v, want the configured %v", tc.key, v, tc.want)
+			}
+		}
+	})
+
+	t.Run("text", func(t *testing.T) {
+		var buf bytes.Buffer
+		writePolicy(func(format string, args ...any) {
+			fmt.Fprintf(&buf, format, args...)
+		}, resolved)
+		out := buf.String()
+
+		// The values, not the labels: prose is not public and a label may be
+		// reworded, but a number an operator cannot find is the defect.
+		for _, want := range []string{
+			"priority -7", "3", "11m0s", "17m0s", "5m0s", "72h0m0s", "13m0s", "19m0s",
+			"kube-system", "1h30m0s",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("%q does not appear in the text rendering:\n%s", want, out)
+			}
+		}
+		// The two skip flags differ, so a crossed pair cannot read as correct.
+		if !strings.Contains(out, "local storage") || !strings.Contains(out, "system pods") {
+			t.Errorf("the autoscaler's two skip flags are not rendered:\n%s", out)
+		}
+	})
 }

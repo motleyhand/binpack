@@ -66,20 +66,44 @@ cleverness required.
 Tools exist for this — `kube-downscaler` and similar. It only works where the quiet windows are
 predictable, which for test environments they usually are even when production traffic isn't.
 
-## 4. Annotate scratch-only `emptyDir` pods as safe to evict
+## 4. Name your scratch volumes as safe to evict
 
 A pod using `emptyDir` or `hostPath` blocks eviction, because the autoscaler cannot know whether
 the data matters. If it doesn't — a cache, a scratch directory, a working area rebuilt on start
-— say so:
+— say so, naming the volumes:
 
 ```yaml
 metadata:
   annotations:
-    cluster-autoscaler.kubernetes.io/safe-to-evict: "true"
+    cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes: "cache,tmp"
 ```
 
-Check the volume is genuinely disposable before adding this. The annotation is a promise that
-losing its contents is acceptable.
+The names are `volumes[].name` entries from the same pod, comma-separated. Match them exactly:
+the autoscaler splits on commas and compares the pieces, so `"cache, tmp"` exempts a volume
+called `" tmp"` and therefore nothing. Check each volume is genuinely disposable first — the
+annotation is a promise that losing its contents is acceptable.
+
+`cluster-autoscaler.kubernetes.io/safe-to-evict: "true"` is the broader version, and worth
+knowing the difference. It covers the whole pod rather than named volumes, and it also waives
+the autoscaler's refusal to evict a pod with no controller and its refusal to touch a
+kube-system pod with no PodDisruptionBudget. Where the storage is what is in the way, the
+per-volume annotation says that and nothing else.
+
+**One case needs neither.** An `emptyDir` with `medium: Memory` is tmpfs — RAM with a
+filesystem over it, nothing reaching the node's disk — and every cluster-autoscaler binpack
+supports excludes it from what counts as local storage. Service meshes inject exactly that volume into every pod they mesh, so if
+your cluster runs Istio or Linkerd, most of what looks like an `emptyDir` problem is not one:
+
+```bash
+kubectl get pods -A -o json | jq -r '
+  .items[]
+  | select(.spec.volumes[]? | (.hostPath != null)
+      or (.emptyDir != null and .emptyDir.medium != "Memory"))
+  | "\(.metadata.namespace)/\(.metadata.name)"' | sort -u
+```
+
+lists the pods where it actually is — every pod holding a volume that does block, and none of
+the ones that only look like it.
 
 ## 5. Set the `least-waste` expander, if you run multiple pools
 

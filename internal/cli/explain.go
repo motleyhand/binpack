@@ -338,7 +338,11 @@ func enginePolicy(p v1alpha1.PoolPolicy) engine.Policy {
 			ExpendablePriorityCutoff: p.ExpendablePriorityCutoff,
 			ReserveForLargestPod:     p.ReserveForLargestPod,
 		},
-		Evict:                engine.DefaultEvictConfig(),
+		Evict: engine.EvictConfig{
+			SkipNodesWithLocalStorage:           p.SkipNodesWithLocalStorage,
+			SkipNodesWithSystemPods:             p.SkipNodesWithSystemPods,
+			BlockingSystemPodDistruptionTimeout: p.BlockingSystemPodDistruptionTimeout,
+		},
 		MaxPodsPerDrain:      p.MaxPodsPerDrain,
 		CooldownAfterScaleUp: p.CooldownAfterScaleUp,
 		CooldownAfterDrain:   p.CooldownAfterDrain,

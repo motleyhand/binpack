@@ -172,6 +172,11 @@ func TestValidation(t *testing.T) {
 			wantErr: "above 0",
 		},
 		{
+			name:    "negative blocking system pod timeout",
+			yaml:    "policy:\n  autoscaler:\n    blockingSystemPodDistruptionTimeout: -5m",
+			wantErr: "must not be negative",
+		},
+		{
 			name:    "negative maxPodsPerDrain",
 			yaml:    "policy:\n  drain:\n    maxPodsPerDrain: -1",
 			wantErr: "negative",
@@ -515,4 +520,74 @@ func TestRemovalTimeoutCoversTheAutoscalersOwnDelays(t *testing.T) {
 			DefaultRemovalTimeout, floor,
 			DefaultScaleDownUnneededTime, DefaultCooldownAfterScaleUp)
 	}
+}
+
+// TestAutoscalerPolicyIsWhatADocumentSays is the half of TestDrainableEvictConfig
+// that failed: the engine has always read EvictConfig, and until now no
+// configuration document could produce one that differed from the built-in
+// literal. An operator whose autoscaler runs --skip-nodes-with-local-storage=false
+// — the AKS default — had no way to say so.
+func TestAutoscalerPolicyIsWhatADocumentSays(t *testing.T) {
+	t.Run("an empty document mirrors the autoscaler's own defaults", func(t *testing.T) {
+		p := mustLoad(t, "").PolicyFor("any-pool")
+
+		if !p.SkipNodesWithLocalStorage || !p.SkipNodesWithSystemPods {
+			t.Errorf("skip flags = %v/%v, want both true: upstream defaults both to true",
+				p.SkipNodesWithLocalStorage, p.SkipNodesWithSystemPods)
+		}
+		if p.BlockingSystemPodDistruptionTimeout != DefaultBlockingSystemPodDistruptionTimeout {
+			t.Errorf("blockingSystemPodDistruptionTimeout = %s, want %s",
+				p.BlockingSystemPodDistruptionTimeout, DefaultBlockingSystemPodDistruptionTimeout)
+		}
+	})
+
+	cfg := mustLoad(t, `
+apiVersion: binpack.motleyhand.com/v1alpha1
+kind: BinpackConfig
+policy:
+  autoscaler:
+    skipNodesWithLocalStorage: false
+    blockingSystemPodDistruptionTimeout: 0s
+pools:
+  - name: pool-4g
+    autoscaler:
+      skipNodesWithSystemPods: false
+`)
+
+	t.Run("explicit false is honoured, not read as unset", func(t *testing.T) {
+		// The reason every field on the wire is a pointer: false is the value
+		// an operator writes here, and a plain bool cannot tell it from a
+		// field nobody mentioned.
+		p := cfg.PolicyFor("pool-other")
+		if p.SkipNodesWithLocalStorage {
+			t.Error("skipNodesWithLocalStorage: false must resolve to false")
+		}
+		if !p.SkipNodesWithSystemPods {
+			t.Error("skipNodesWithSystemPods was not set globally and must still be true")
+		}
+	})
+
+	t.Run("zero is a grace of none rather than an absent field", func(t *testing.T) {
+		// How an operator says their autoscaler is older than 1.33, where a
+		// blocking system pod blocks for as long as it is there. Unset would
+		// give them the one-hour grace their autoscaler does not have.
+		//
+		// That the document above loaded at all is half the assertion: Load
+		// validates, and the neighbouring durations all refuse a zero. This
+		// one must not, because here zero is a supported autoscaler rather
+		// than an unbounded wait.
+		if got := cfg.PolicyFor("pool-other").BlockingSystemPodDistruptionTimeout; got != 0 {
+			t.Errorf("blockingSystemPodDistruptionTimeout = %s, want 0", got)
+		}
+	})
+
+	t.Run("a pool override wins field by field", func(t *testing.T) {
+		p := cfg.PolicyFor("pool-4g")
+		if p.SkipNodesWithSystemPods {
+			t.Error("the pool sets skipNodesWithSystemPods: false and must resolve to false")
+		}
+		if p.SkipNodesWithLocalStorage {
+			t.Error("the pool overrides one field; the global false must still stand for the other")
+		}
+	})
 }

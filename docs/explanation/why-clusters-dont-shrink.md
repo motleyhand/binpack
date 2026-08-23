@@ -88,15 +88,26 @@ why it belongs on the [quick wins](../how-to/quick-wins-before-installing-binpac
 This is where things get genuinely stuck. A pod blocks eviction if it:
 
 - has no controller — a bare pod, with nothing to recreate it
-- uses `emptyDir` or `hostPath` without
-  `cluster-autoscaler.kubernetes.io/safe-to-evict: "true"`
+- uses a disk-backed `emptyDir` or a `hostPath`, without either
+  `cluster-autoscaler.kubernetes.io/safe-to-evict-local-volumes` naming the volume or
+  `cluster-autoscaler.kubernetes.io/safe-to-evict: "true"` covering the whole pod
 - carries `cluster-autoscaler.kubernetes.io/safe-to-evict: "false"`
 - is covered by a PodDisruptionBudget currently permitting zero disruptions
 - has a node selector or affinity that only this node satisfies
-- runs in `kube-system` without a PDB permitting voluntary disruption
+- runs in `kube-system` without a PDB permitting voluntary disruption, and is younger than
+  `--blocking-system-pod-distruption-timeout` — an hour by default, measured from when the pod
+  was created
 
 The fourth of those is, in practice, the most common and the most expensive. It has
 [its own page](the-poddisruptionbudget-that-costs-money.md).
+
+Two of them are narrower than they look. An `emptyDir` with `medium: Memory` is tmpfs rather
+than disk and does not block at all,
+which matters because that is the volume Istio and Linkerd put in every pod they mesh. And the
+kube-system rule expires: since cluster-autoscaler 1.33 the timeout above runs from the pod's
+creation, so in a cluster that has been up an hour it has already passed for everything in
+`kube-system`. Before 1.33 there was no timeout and such a pod blocked for as long as it was
+there.
 
 ## The delay that quietly cancels everything
 
