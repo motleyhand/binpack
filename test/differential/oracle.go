@@ -112,12 +112,22 @@ type Oracle struct {
 // SidecarContainers feature is disabled". That was the oracle, not binpack:
 // zero-valued gates model a cluster where native sidecars do not exist, while
 // component-helpers computes sidecar-aware requests because real clusters have
-// had that feature on by default since 1.33.
+// had that feature on by default since 1.29 — Beta and Default: true there,
+// and GA with LockToDefault only at 1.33 (k8s.io/kubernetes v1.36.3
+// pkg/features/kube_features.go, SidecarContainers). Four releases separate
+// the two dates, and getting them the wrong way round is how a 1.29 cluster
+// gets modelled as sidecar-unaware.
 //
 // The lesson generalises past sidecars. A hand-maintained gate list is a set
 // of guesses about someone else's defaults, and a wrong guess here does not
 // fail loudly — it produces confident, wrong disagreement reports. Deriving
 // them means the oracle tracks the pinned Kubernetes release by construction.
+//
+// The gate table itself is not a reliable thing to reason from either. Its
+// entry for SidecarContainers carries the comment "GA in 1.33 remove in 1.36",
+// and at 1.36.3 the gate is still there and still surfaced by
+// NewSchedulerFeaturesFromGates — so even a list copied faithfully from
+// upstream's own annotations would have been wrong about this one.
 func NewOracle() (*Oracle, error) {
 	ctx := context.Background()
 	features := feature.NewSchedulerFeaturesFromGates(utilfeature.DefaultFeatureGate)

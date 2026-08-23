@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
+	"os"
+	"path/filepath"
 	"reflect"
 	"regexp"
 	"strings"
@@ -432,6 +435,68 @@ func TestARefusalReadsTheSameOnEveryEvaluation(t *testing.T) {
 		t.Errorf("the note depends on the mode, splitting one series in two:\n%s\n%s",
 			deciding[0], acting[0])
 	}
+}
+
+func TestReportNoteDoesNotVaryWithRelocatableCount(t *testing.T) {
+	// Same property [TestARefusalReadsTheSameOnEveryEvaluation] asserts for
+	// the refusal note, on the surface that still varied: the aggregation key
+	// covers the object, the action and the reason, and not the note
+	// (client-go v0.36.3, tools/events/event_broadcaster.go getKey). A second
+	// event whose key matches one already seen is not recorded — recordToSink
+	// bumps the cached series and patches only that — so the note the API
+	// server holds is the one the *first* event carried, and every later one
+	// is dropped. A note counting pods therefore freezes at whatever the
+	// count was when the series opened, under a lastObservedTime that keeps
+	// advancing. Pods land on and leave a node binpack keeps choosing, which
+	// is the ordinary case, not a corner of one.
+	var log captured
+	rec := &fakeRecorder{}
+	ev := newEvaluator(t, &log, rec, inPool("a"), statusConfigMap())
+
+	// Two decisions differing in nothing but the count. Hand-built rather
+	// than evaluated, because the property is that the count cannot reach the
+	// note at all, and a fixture that produced the counts by moving pods
+	// would be asserting something weaker — that these two particular
+	// clusters agree.
+	notes := make([]string, 0, 2)
+	for _, relocated := range []int{1, 7} {
+		rec.events = nil
+		node := inPool("a")
+		d := engine.Decision{
+			Action: engine.Drain,
+			Node:   node,
+			Assessments: []engine.NodeAssessment{{
+				Node:       node,
+				Chosen:     true,
+				Simulation: &engine.Simulation{Feasible: true, Relocated: placements(relocated)},
+			}},
+		}
+		if err := ev.report(context.Background(), engine.Snapshot{}, d); err != nil {
+			t.Fatalf("report with %d relocatable pods: %v", relocated, err)
+		}
+		if len(rec.events) != 1 {
+			t.Fatalf("got %d events for %d relocatable pods, want one", len(rec.events), relocated)
+		}
+		notes = append(notes, rec.events[0].note)
+	}
+
+	if notes[0] != notes[1] {
+		t.Errorf("the note carries the relocatable count, so the first one sticks:\n%s\n%s",
+			notes[0], notes[1])
+	}
+}
+
+// placements builds n destinations for a simulation whose only interesting
+// property is how many there are.
+func placements(n int) []engine.Placement {
+	out := make([]engine.Placement, n)
+	for i := range out {
+		out[i] = engine.Placement{
+			Pod:  mother.Pod("default", fmt.Sprintf("web-%d", i), mother.OnNode("a")),
+			Node: inPool("b"),
+		}
+	}
+	return out
 }
 
 func TestADrainInProgressIsNotReportedAsChoosingNothing(t *testing.T) {
@@ -922,6 +987,69 @@ func TestTheCacheDoesNotWatchEveryConfigMapInTheCluster(t *testing.T) {
 		!strings.Contains(scoped.FieldSelector.String(), collect.StatusConfigMapName) {
 		t.Errorf("the cache is not narrowed to %s: %v",
 			collect.StatusConfigMapName, scoped.FieldSelector)
+	}
+}
+
+func TestCacheOptionsDoNotDisableDeepCopy(t *testing.T) {
+	// The only executable form CLAUDE.md's read-only rule has.
+	//
+	// That rule is about what one Snapshot's pointers are shared with, not
+	// about the informer cache: controller-runtime's cache reader deep-copies
+	// every object out of the indexer, so binpack's snapshot does not alias
+	// the cache at all (sigs.k8s.io/controller-runtime@v0.24.1,
+	// pkg/cache/internal/cache_reader.go, Get at :88 and List at :171 — both
+	// branch on disableDeepCopy first). Setting UnsafeDisableDeepCopy is what
+	// would make the stated hazard real, and it is settable in two places:
+	// per-kind on cache.ByObject, and per-call as a ListOption. Neither is a
+	// thing a reviewer would notice going in, which is why it is asserted
+	// rather than reviewed.
+	for obj, by := range cacheOptions(statusRef).ByObject {
+		if by.UnsafeDisableDeepCopy != nil && *by.UnsafeDisableDeepCopy {
+			t.Errorf("%T is cached without deep copy: the engine would then hold "+
+				"pointers into the informer cache and a write would corrupt it for "+
+				"every consumer in the process", obj)
+		}
+	}
+
+	// And the per-call route, which the options above cannot see. A source
+	// scan rather than a behavioural assertion, because there is no observable
+	// difference until something mutates — at which point the damage is
+	// already done and lands somewhere else entirely.
+	scanned := 0
+	walk := func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		// Non-test source only. A test that disabled deep copy would alias
+		// its own fixtures and nothing else; the hazard is a production read
+		// handing the engine a pointer somebody else also holds. Excluding
+		// them is also what stops this file matching itself.
+		if d.IsDir() || !strings.HasSuffix(path, ".go") ||
+			strings.HasSuffix(path, "_test.go") {
+			return nil
+		}
+		body, err := os.ReadFile(path)
+		if err != nil {
+			return err
+		}
+		scanned++
+		for i, line := range strings.Split(string(body), "\n") {
+			if strings.Contains(line, "UnsafeDisableDeepCopy") {
+				t.Errorf("%s:%d names UnsafeDisableDeepCopy: %s",
+					path, i+1, strings.TrimSpace(line))
+			}
+		}
+		return nil
+	}
+	for _, root := range []string{"../../api", "../../cmd", "../../internal"} {
+		if err := filepath.WalkDir(root, walk); err != nil {
+			t.Fatalf("walking %s: %v", root, err)
+		}
+	}
+	// A negative assertion passes for free if the walk found nothing to read,
+	// which a moved package or a wrong root would do silently.
+	if scanned == 0 {
+		t.Fatal("scanned no Go source at all; this test asserts nothing")
 	}
 }
 

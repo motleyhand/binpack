@@ -112,12 +112,24 @@ linters:
 
   exclusions:
     presets:
-      - comments
       - std-error-handling
     rules:
       - path: _test\.go
         linters:
           - errcheck
+      # revive's `exported` rule bundles two checks under one name, and the
+      # `comments` preset switched both off. Only the second was wanted: a
+      # doc comment on every exported symbol is not a rule this project keeps,
+      # and re-arming it would newly fail on ones deliberately left bare.
+      # The first — "should be of the form <Name> ..." — is the
+      # only automated guard against a doc comment that runs into the next
+      # declaration with no blank `//` between them, at which point Go
+      # attaches the whole block to the later symbol and `go doc` describes
+      # the wrong one. Three had done exactly that, silently, for as long as
+      # the preset had been on.
+      - linters:
+          - revive
+        text: should have comment or be unexported
 
 formatters:
   enable:

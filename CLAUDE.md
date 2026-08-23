@@ -59,9 +59,17 @@ sees one hop and an unguarded intermediary is otherwise a way round the rule. Ra
 no-Kubernetes-imports rule of [ADR-0003](docs/design/adr-0003-pure-decision-engine.md) — that
 rule was a proxy, and the mirror types it required caused most of the defects found in review.
 
-**Objects handed to the engine are strictly read-only.** The controller path passes pointers
-into a shared informer cache; writing to a Node or Pod corrupts it for every other consumer in
-the process. Copy before modifying, always. This cannot be linted — it is a review rule.
+**Objects handed to the engine are strictly read-only.** One `Snapshot`'s pointers are shared by
+every candidate assessment, by `internal/fit`'s destination checks and by the executor — so
+writing to a Node or Pod changes what a later step of the *same evaluation* sees, from a source
+no single-node test reproduces. Copy before modifying, always. This cannot be linted — it is a
+review rule, and `controller.TestCacheOptionsDoNotDisableDeepCopy` is the nearest executable
+form of it.
+
+Note what the rule is *not* about, because getting that wrong is how it gets relaxed:
+controller-runtime's cache reader deep-copies on both Get and List, so the informer cache itself
+is not reachable from a Snapshot and is safe. That stops being true the moment anyone sets
+`UnsafeDisableDeepCopy`, which is what the test above forbids.
 
 **`internal/fit` is the high-risk package**, not a boring adapter. Every defect found in design
 review was the same shape: a resource type unaccounted for, a pod class unrecognised, a request
@@ -80,9 +88,12 @@ fail, and it does.
 
 **The differential harness's feature gates come from `NewSchedulerFeaturesFromGates`, never a
 hand-written list.** Its first run reported 171 unsound placements, all one message: sidecar
-containers disabled. That was the oracle modelling a cluster that has not existed since 1.33,
-not a defect in `fit`. A hand-maintained gate list is a set of guesses about someone else's
-defaults, and a wrong guess produces confident, wrong disagreement reports rather than an error.
+containers disabled. That was the oracle modelling a cluster that has not existed since 1.29 —
+`SidecarContainers` has been Beta and on by default since then, and GA only at 1.33 — not a
+defect in `fit`. A hand-maintained gate list is a set of guesses about someone else's defaults,
+and a wrong guess produces confident, wrong disagreement reports rather than an error. Upstream's
+own annotation is no safer to copy: the gate's comment says "remove in 1.36" and at 1.36.3 it is
+still there.
 
 **Test fixtures use object mothers plus builders.** Mothers name archetypes —
 `mother.SmallNode()`, `mother.DaemonSetPod()` — so a test says what it needs in three words and
@@ -119,8 +130,9 @@ cutoff are excluded.
 
 **`pods` is in `status.allocatable` but never in a pod's requests.** A uniform
 subtract-request-from-remaining loop never consumes a pod slot, so the simulation would pack
-unlimited pods onto a node capped at 110. `internal/collect` synthesises `pods: 1` into every
-pod's request map.
+unlimited pods onto a node capped at 110. `internal/fit.EffectiveRequests` synthesises `pods: 1`
+into every pod's request map, at the point of use. Not `internal/collect`, which transforms
+nothing — that was ADR-0003's design and ADR-0008 replaced it.
 
 **Effective requests ≠ container requests.** The scheduler reserves the larger of the
 regular-container sum and the init-container peak, keeps native sidecars in the running total,

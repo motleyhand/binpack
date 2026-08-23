@@ -149,8 +149,6 @@ type Options struct {
 	ProbeAddress   string
 }
 
-// Run starts binpack and blocks until ctx is cancelled, or until one
-// evaluation completes when Options.Once is set.
 // cooldownIsUnenforceable reports the pool whose after-drain cooldown a
 // one-shot run could not honour, if there is one.
 //
@@ -173,6 +171,8 @@ func cooldownIsUnenforceable(opts Options) (string, time.Duration, bool) {
 	return engine.CooldownAfterDrain(opts.Engine)
 }
 
+// Run starts binpack and blocks until ctx is cancelled, or until one
+// evaluation completes when Options.Once is set.
 func Run(ctx context.Context, opts Options) error {
 	// Refused rather than left to fail deeper: client-go rejects these
 	// orderings too, but from inside the manager, with a message about a
@@ -409,10 +409,20 @@ func cacheOptions(status collect.StatusRef) cache.Options {
 // keepTemplateOnly strips a controller down to what binpack reads: its
 // identity and its pod template.
 //
-// A cluster keeps ten ReplicaSet revisions per Deployment by default, and
-// binpack looks at exactly one field of each. Holding their full status and
-// annotations — which include the last-applied-configuration of the whole
-// workload — would make the cache grow with revision history for no benefit.
+// A cluster keeps ten ReplicaSet revisions per Deployment by default
+// (k8s.io/kubernetes v1.36.3 pkg/apis/apps/v1/defaults.go), and binpack looks
+// at exactly one field of each. Holding their full status and annotations
+// would make the cache grow with revision history for no benefit.
+//
+// Not, however, ten copies of the workload's last-applied-configuration: the
+// Deployment controller lists that annotation first in annotationsToSkip, so a
+// ReplicaSet does not inherit it (ibid,
+// pkg/controller/deployment/util/deployment_util.go — "Note that apply and
+// revision annotations are not copied"). A directly applied StatefulSet,
+// DaemonSet or Job does carry it, and those are the other three kinds this
+// transform handles. Worth stating precisely, because anyone re-measuring the
+// saving against the largest item named here would find it absent and not know
+// whether the transform or the measurement was wrong.
 //
 // Only status is type-specific, so only status comes from the source; the
 // annotations go the same way whatever the kind. An object matching no source

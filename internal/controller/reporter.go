@@ -23,11 +23,20 @@ const reportingController = "binpack"
 // things from an event and neither can serve both.
 //
 // The controller runs for weeks and re-decides every minute, so it wants the
-// event recorder's aggregation: repeats of an identical event collapse into a
-// single object carrying a count and a first and last timestamp, and a
-// decision that holds for an hour reads as one line saying so. It pays for
-// that with asynchrony — the recorder hands each event to a goroutine and
-// returns, and nothing waits for the write.
+// event recorder's aggregation: events sharing a key collapse into a single
+// object carrying a count and a first and last timestamp, and a decision that
+// holds for an hour reads as one line saying so. It pays for that with
+// asynchrony — the recorder hands each event to a goroutine and returns, and
+// nothing waits for the write.
+//
+// The key is the type, action, reason, reporting controller and instance, and
+// the object the event is about — and not the note
+// (k8s.io/client-go@v0.36.3, tools/events/event_broadcaster.go, getKey). So
+// "identical" is a weaker condition than it sounds, and a note is written
+// once per series and never refreshed: every later event of the series is
+// dropped in favour of bumping the count. Both [report] and [refusal] are
+// written to that constraint, which is why neither note carries anything that
+// moves.
 //
 // A --once run exits in milliseconds, and there fire-and-forget means
 // forgotten: the process is gone before that goroutine posts anything, so the

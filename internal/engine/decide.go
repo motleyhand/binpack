@@ -453,7 +453,7 @@ func CooldownAfterDrain(cfg Config) (where string, d time.Duration, set bool) {
 type Action int
 
 const (
-	// None: nothing to do, and Decision.Reason says why.
+	// None means nothing to do, and Decision.Reason says why.
 	None Action = iota
 	// Drain the named node.
 	Drain
@@ -1246,8 +1246,6 @@ func commonestSkip(assessments []NodeAssessment) (reason string, n int) {
 	return first.SkipReason, bestN
 }
 
-// summarise turns a set of rejections into one sentence. "Nothing to do" is
-// not an answer; an operator wants to know which wall was hit.
 // Considered counts the nodes that were actually assessed as candidates,
 // which is fewer than the nodes looked at: those ruled out before any
 // simulation ran were never candidates.
@@ -1266,6 +1264,8 @@ func Considered(assessments []NodeAssessment) int {
 	return n
 }
 
+// summarise turns a set of rejections into one sentence. "Nothing to do" is
+// not an answer; an operator wants to know which wall was hit.
 func summarise(assessments []NodeAssessment) string {
 	considered := Considered(assessments)
 	var infeasible, blocked int

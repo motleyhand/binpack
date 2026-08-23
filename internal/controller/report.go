@@ -103,25 +103,41 @@ func (e *evaluator) report(ctx context.Context, s engine.Snapshot, d engine.Deci
 		"podsToRelocate", relocating,
 		"dryRun", e.opts.DryRun)
 
-	// The note is kept stable for a given cluster state on purpose. The event
-	// recorder aggregates repeats into one Event carrying a count and a first
-	// and last timestamp, so a decision that holds for an hour reads as one
-	// line saying so rather than sixty saying the same thing — and the note is
-	// not part of what it compares, so a note that moved would not open a
-	// second Event but leave the first sentence under a fresh timestamp. See
-	// [refusalNote], which has the upstream citation.
+	// The note carries nothing that can move while the series holds, and the
+	// relocatable count is the thing that moves most. Aggregation is keyed on
+	// the type, action, reason, reporting controller and instance, and the
+	// object the event is about — and not the note (k8s.io/client-go@v0.36.3,
+	// tools/events/event_broadcaster.go, getKey). An event whose key matches
+	// one already seen is not recorded at all: recordToSink bumps the cached
+	// series count and observed time and drops the new event, and the patch
+	// it then sends carries only the series. So the note the API server holds
+	// is the one the *first* event of the series carried, and a series ends
+	// only after finishTime — six minutes — with nothing observed. binpack
+	// re-decides every minute by default, so while it keeps choosing this
+	// node the series never ends and the note never moves.
+	//
+	// So a note reading "all 3 of its relocatable pods fit elsewhere" — which
+	// is what this said — would keep saying 3 as pods landed on the node and
+	// left it, under a lastObservedTime advancing every minute. Stale would be
+	// tolerable; stale under a fresh timestamp is a confident lie, which is
+	// the same reason [refusal] puts the wall in the reason rather than the
+	// note. The count lives where it can move instead: the log line above and
+	// `binpack explain`, both of which are rendered fresh every time they are
+	// read. Same rule and the same citation as [refusal], which states it at
+	// length.
+	//
 	// The note is chosen by mode, not decorated with it. An event reading
 	// "No action taken — dry run" while pods are being evicted is worse than
 	// no event at all: it is the one surface a cluster user reliably has, and
 	// it would be telling them the opposite of what is happening.
-	reason, note := ReasonWouldDrain, fmt.Sprintf(
-		"binpack would drain this node: %s. No action taken — dry run",
-		engine.RelocationSummary(relocating))
+	reason, note := ReasonWouldDrain,
+		"binpack would drain this node: every pod that would have to move fits "+
+			"elsewhere. No action taken — dry run"
 	if !e.opts.DryRun {
-		reason, note = ReasonDraining, fmt.Sprintf(
-			"binpack is draining this node: %s. Pods are evicted one at a time, and the "+
-				"cluster-autoscaler removes the node once it is empty",
-			engine.RelocationSummary(relocating))
+		reason, note = ReasonDraining,
+			"binpack is draining this node: every pod that would have to move fits "+
+				"elsewhere. Pods are evicted one at a time, and the cluster-autoscaler "+
+				"removes the node once it is empty"
 	}
 
 	// Returned rather than logged here: whether a lost report is fatal depends
@@ -162,7 +178,7 @@ func (e *evaluator) reportRefusal(ctx context.Context, d engine.Decision) error 
 	// refusing, so there are no assessments and this writes nothing. That is
 	// right twice over — there is no node the answer is about, and the
 	// sentence it would carry is the one in the vocabulary that counts up on
-	// its own, which this surface cannot hold (see [refusalNote]). What that
+	// its own, which this surface cannot hold (see [refusal]). What that
 	// condition has instead is binpack_autoscaler_up, which the metrics
 	// reference already ranks second of the three things to alert on.
 	reason, note := refusal(d)

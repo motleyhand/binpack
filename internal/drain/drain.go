@@ -147,16 +147,16 @@ type Policy struct {
 type Action int
 
 const (
-	// Continue: pods remain and the drain is alive. Evict the next one when
-	// nothing is in flight.
+	// Continue means pods remain and the drain is alive. Evict the next one
+	// when nothing is in flight.
 	Continue Action = iota
 
-	// AwaitRemoval: nothing left to evict. The node is now the
+	// AwaitRemoval means there is nothing left to evict. The node is now the
 	// cluster-autoscaler's to delete.
 	AwaitRemoval
 
-	// Abandon: give up. Uncordon, clear the markers, record backoff. Code and
-	// Reason say why.
+	// Abandon means give up: uncordon, clear the markers, record backoff.
+	// Code and Reason say why.
 	Abandon
 )
 

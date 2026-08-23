@@ -18,9 +18,14 @@ were one design pressure appearing repeatedly: **the gap between "the resources 
 Hand-rolling a scheduler model is a losing game. The rules are numerous, subtle, and change
 between releases.
 
-Neither of the serious tools in this space plays it. Cluster-autoscaler imports the scheduler
-framework and runs the real Filter plugins against a simulated snapshot. Karpenter does the
-same. This ADR decides how far binpack should follow.
+The two serious tools in this space took opposite routes. Cluster-autoscaler imports the
+scheduler framework and runs the real Filter plugins against a simulated snapshot, at the cost of
+depending on `k8s.io/kubernetes` and restating thirty-odd `replace` directives to do it.
+Karpenter hand-rolls: it models the constraints it needs on top of staging helpers, in its own
+`pkg/controllers/provisioning/scheduling`, imports no part of the scheduler framework, and
+carries no `replace` block at all. Both are serious. The difference is what each is willing to
+pay, and this ADR decides where binpack sits between them — which is also why it needs a
+differential harness rather than an appeal to precedent.
 
 ## The asymmetry that makes this tractable
 
@@ -196,6 +201,19 @@ Stage 1 models the constraints corresponding to these scheduler Filter plugins:
 `NodeUnschedulable`, `NodeName`, `NodeAffinity` (including `nodeSelector`), `NodeResourcesFit`,
 `TaintToleration` and `NodeDeclaredFeatures`.
 
+`internal/fit` has one more refusal code than that list has plugins, and the extra one is
+deliberate conservatism rather than fidelity. **`node-not-ready` has no plugin behind it**:
+there is no `NodeReady` Filter, in the 1.36 default profile or anywhere under
+`pkg/scheduler/framework/plugins`. A NotReady node is repelled because the node-lifecycle
+controller taints it `node.kubernetes.io/not-ready:NoSchedule` from the condition, and
+`TaintToleration` — already in the list — enforces that. So a pod tolerating that key is one
+the scheduler would place on a NotReady node, and binpack refuses it anyway: a destination
+binpack picks has to be able to receive the replacement, and a node whose kubelet has stopped
+reporting cannot. `fit.isReady` answers false for an absent NodeReady condition too, for the
+same reason. The cost is a missed consolidation across a transient NotReady blip; the code is
+listed here so that an audit against upstream's plugin set finds the fifth code explained rather
+than unaccounted for.
+
 Everything else triggers a refusal. That includes, non-exhaustively: `hostPort` (`NodePorts`);
 any persistent volume claim, since deciding whether a volume can follow the pod means modelling
 `VolumeBinding`, `VolumeZone`, `VolumeRestrictions` and per-node CSI attachment limits; required
@@ -205,6 +223,28 @@ one an admission webhook attaches, which reaches neither); and dynamic resource 
 
 The point of the allowlist is that this paragraph does not have to be exhaustive for the design
 to be sound. An unrecognised feature refuses by default.
+
+**The allowlist closes over pod fields, and not over scheduler configuration.** Refusing a pod
+whose `spec.schedulerName` is not `default-scheduler` reads as "binpack models the default
+scheduler"; what it models is the default scheduler *at stock plugin arguments*, which is a
+weaker statement and a load-bearing one. Two arguments of the default profile make the scheduler
+strictly stricter than `fit`. `NodeAffinity.addedAffinity` applies a required node selector to
+every pod the profile schedules, on top of the pod's own — and `fit` evaluates only the pod's,
+through `GetRequiredNodeAffinity`. `PodTopologySpread.defaultConstraints` supplies constraints to
+pods that declare none, which is exactly the population `UnsupportedPod`'s topology-spread check
+lets through; the stock system defaults are both `ScheduleAnyway` and so inert, but an
+admin-supplied `DoNotSchedule` entry is not.
+
+Neither is visible in the API objects binpack reads: the pod looks unconstrained because the
+constraint lives in a `KubeSchedulerConfiguration` binpack never sees and, on the managed control
+planes [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md) targets, could not. Both are
+therefore limitations to state rather than bugs to fix — refusing on the possibility would refuse
+every cluster — and they are stated in
+[the configuration reference](../reference/configuration.md#supported-scheduler-configuration).
+The differential harness shares the assumption rather than testing it: the oracle constructs
+`NodeAffinity` with empty arguments and does not construct `PodTopologySpread` at all. Both are
+also unlike the unmodelled *pod* features above in the direction they fail — an unrecognised
+feature refuses, while an unread scheduler argument accepts.
 
 That was the intent, and for a while it was not what the code did. `firstConstrainingVolume` is
 a `switch` whose `default` refuses, so an unknown volume source really does refuse; the pod-field

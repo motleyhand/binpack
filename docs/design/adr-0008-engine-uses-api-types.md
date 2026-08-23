@@ -88,10 +88,19 @@ The I/O-capable corners of the standard library — `os`, `os/exec`, `net`, `net
 arithmetic and formatting the engine genuinely needs. That is still a `depguard` rule, still
 fails CI, and now expresses the invariant instead of standing in for it.
 
-**Inputs are strictly read-only.** Informers hand back pointers into a shared cache, and mutating
-one corrupts it for every other consumer in the process. The engine must never write to a Node,
-Pod or PDB it is given. This is the one hazard the change introduces that the mirror types made
-impossible, and it cannot be linted — it is a review rule, recorded in `CLAUDE.md`.
+**Inputs are strictly read-only.** `collect.Snapshot` appends `&pods.Items[i]` into one slice
+that the engine iterates once per candidate node, that `internal/fit` reads again for a
+destination's residents, and that the executor reads after that. Mutating a Node, Pod or PDB
+therefore changes what a later step of the same evaluation sees — a wrong drain decision from a
+source no single-node test reproduces. This is the one hazard the change introduces that the
+mirror types made impossible, and it cannot be linted — it is a review rule, recorded in
+`CLAUDE.md`.
+
+It is *not* a hazard to the informer cache, and saying so would invite the rule to be dropped by
+the first contributor who checks. controller-runtime's `CacheReader` deep-copies every object out
+of the indexer on both `Get` and `List` — `cache_reader.go` says so in a comment — so a
+Snapshot does not alias the cache at all. The exception is `UnsafeDisableDeepCopy`, which
+binpack sets nowhere and `controller.TestCacheOptionsDoNotDisableDeepCopy` keeps unset.
 
 ## Consequences
 

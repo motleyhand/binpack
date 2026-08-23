@@ -54,7 +54,10 @@ rather than usually-right. See
 
 Only the pod template is read. The cache drops status and annotations before storing, which
 matters because a cluster keeps ten ReplicaSet revisions per Deployment by default and binpack
-looks at one field of each.
+looks at one field of each. (A ReplicaSet does not inherit its Deployment's
+`last-applied-configuration` — the Deployment controller skips that annotation — so the saving
+there is status and the revision bookkeeping. A StatefulSet, DaemonSet or Job you applied
+directly does carry it.)
 
 Pods owned by a controller binpack cannot read a template for — an operator's own CRD — are not
 moved at all, rather than being sized from the running pod.
@@ -122,8 +125,13 @@ rules:
 
 **Both events APIs are in use, for different reasons.** binpack writes its own decisions through
 the modern `events.k8s.io` API, so a rule granting `""/events` alone will not let it report
-anything. `update` and `patch` are there because the recorder aggregates repeats of an identical
-event into one object with a count rather than writing a new one each time.
+anything. `patch` is there because the recorder aggregates repeats into one object with a count
+rather than writing a new one each time, and it applies that count with a patch.
+
+`update` is not used. client-go's event sink declares an `Update` method and the broadcaster
+never calls it — `recordEvent` tries `Patch` and falls back to `Create`. The verb is granted
+defensively, against a future client-go that does; if you are minimising the grant, it is the one
+to drop, and nothing binpack does today will notice.
 
 Leader election is the other way round: it announces itself on the Lease through client-go's
 legacy recorder, which writes to the **core** group. That grant is on the leader-election Role

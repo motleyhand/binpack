@@ -41,6 +41,21 @@ func TestCanFit(t *testing.T) {
 			wantCode: fit.ReasonNodeNotReady,
 		},
 		{
+			// The one place binpack is deliberately stricter than the
+			// scheduler, asserted so the divergence is a decision rather than
+			// a discovery. There is no NodeReady Filter plugin; a NotReady
+			// node is repelled by node.kubernetes.io/not-ready:NoSchedule,
+			// which the node-lifecycle controller writes from the condition —
+			// so the scheduler *would* place this pod here, and binpack still
+			// will not. Costs a consolidation, never a wrong placement.
+			name: "not-ready node is refused even when the pod tolerates the taint",
+			pod: mother.Pod("default", "web",
+				mother.Tolerating("node.kubernetes.io/not-ready", corev1.TaintEffectNoSchedule)),
+			node: mother.SmallNode("node-a", mother.NotReady(),
+				mother.Tainted("node.kubernetes.io/not-ready", "", corev1.TaintEffectNoSchedule)),
+			wantCode: fit.ReasonNodeNotReady,
+		},
+		{
 			name:     "untolerated NoSchedule taint",
 			pod:      mother.Pod("default", "web"),
 			node:     mother.SmallNode("node-a", mother.Tainted("dedicated", "db", corev1.TaintEffectNoSchedule)),
@@ -253,6 +268,36 @@ func TestEffectiveRequests(t *testing.T) {
 		got := fit.EffectiveRequests(mother.Pod("default", "web"))[corev1.ResourcePods]
 		if got.Value() != 1 {
 			t.Errorf("pods = %d, want 1", got.Value())
+		}
+	})
+
+	t.Run("a pod-level request overrides one name, not the whole map", func(t *testing.T) {
+		// PodRequests computes the container aggregate first and then
+		// overrides only the pod-level-supported names actually present in
+		// spec.resources.requests (k8s.io/component-helpers v0.36.3
+		// resource/helpers.go). Every other name keeps its container-aggregate
+		// value.
+		//
+		// The cpu assertion is the one that settles it. "The scheduler
+		// reserves the pod-level figure in place of the container aggregate"
+		// — which is what this fixture's comment said — predicts no cpu entry
+		// at all, because the pod names only memory. A memory-only assertion
+		// agrees with both readings and would have let the wrong one stand.
+		pod := mother.Pod("default", "web",
+			mother.Requests("500m", "1Gi"),
+			mother.WithPodLevelResources("", "2Gi"),
+		)
+		got := fit.EffectiveRequests(pod)
+
+		if cpu := got[corev1.ResourceCPU]; cpu.String() != "500m" {
+			t.Errorf("cpu = %s, want 500m from the container aggregate: the pod "+
+				"names only memory, so cpu is not overridden", cpu.String())
+		}
+		if mem := got[corev1.ResourceMemory]; mem.String() != "2Gi" {
+			t.Errorf("memory = %s, want 2Gi from the pod level", mem.String())
+		}
+		if pods := got[corev1.ResourcePods]; pods.Value() != 1 {
+			t.Errorf("pods = %d, want 1", pods.Value())
 		}
 	})
 }
