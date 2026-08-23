@@ -129,7 +129,7 @@ investigation use one vocabulary.
 
 | Code | Meaning |
 |---|---|
-| `stuck` | A pod is past its termination deadline — a finalizer, a volume that will not detach, or an unhealthy kubelet |
+| `stuck` | A pod is past its termination deadline — usually a finalizer, a volume that will not detach, or an unhealthy kubelet, but a teardown that is merely slow can reach it too |
 | `stalled` | Nothing moved for `stallTimeout`, and nothing was shutting down |
 | `not-removed` | The node was emptied but the autoscaler did not remove it within `removalTimeout` |
 | `replacement-unschedulable` | A pod that moved off the node could not be placed anywhere |

@@ -1,6 +1,14 @@
 # ADR-0007: Abandon drains on lack of progress, not on elapsed time
 
-- **Status:** accepted
+- **Status:** accepted, and **corrected in two places** where the text stated something the
+  decision never intended. Both corrections are marked where they appear. (1) The termination
+  deadline was written as `deletionTimestamp + terminationGracePeriodSeconds + slack`; the
+  deletion timestamp *is* the moment the grace period expires, so adding the grace period again
+  doubles every deadline. (2) The two-minute slack was justified as a description of how
+  Kubernetes behaves; upstream bounds SIGKILL delivery and bounds nothing after it, so the value
+  is a calibration. Neither is a reversal — the decision below, bound the *absence of progress*
+  and detect stuck positively, stands unchanged, and so does the implementation, which never
+  followed the arithmetic in (1).
 - **Date:** 2026-08-15
 
 ## Context
@@ -37,8 +45,18 @@ keeps it alive:
 
 1. The count of relocatable pods on the node decreased.
 2. A pod on the node acquired a `deletionTimestamp`.
-3. A pod on the node is terminating and still **within** its
-   `deletionTimestamp + terminationGracePeriodSeconds + slack`.
+3. A pod on the node is terminating and still **within** `deletionTimestamp + slack`.
+
+**Correction (1).** There is no grace-period term in the third, and an earlier revision of this
+ADR wrongly wrote one. `deletionTimestamp` does not record when deletion was requested: the API
+server sets it to the moment the grace period *expires* — `now + gracePeriod` at the point of
+the request — and preserves that invariant when a second delete shortens the period, moving the
+timestamp back by the old grace and forward by the new. See `BeforeDelete` in
+`k8s.io/apiserver/pkg/registry/rest/delete.go`. Adding the grace period to it therefore counts
+that period twice: a pod wedged on a finalizer with an hour's grace would read as healthy for a
+second hour while its node stayed cordoned. The implementation has always used the timestamp
+alone, and `TestTheDeletionTimestampIsTheDeadline` in `internal/drain` is the executable form of
+this paragraph — under the arithmetic printed here before the correction, it returns `continue`.
 
 The third is the important one, and it is a *state* rather than an event: while a pod is
 legitimately shutting down, the stall clock does not run. A pod with an hour-long grace period
@@ -69,17 +87,48 @@ back as a fresh departure, which is the same clock reset arrived at more slowly.
 
 ### Stuck is detected, not inferred
 
-A pod that still exists past `deletionTimestamp + terminationGracePeriodSeconds + slack` is not
-slow. The kubelet should have sent SIGKILL and the pod should be gone, so something is wrong:
-a finalizer that never completes, a volume that will not detach, or an unhealthy kubelet.
+A pod that still exists past `deletionTimestamp + slack` is not slow. The kubelet should have
+sent SIGKILL and the pod should be gone, so something is usually wrong: a finalizer that never
+completes, a volume that will not detach, or an unhealthy kubelet. Usually rather than always —
+correction (2) below says what else reaches this line and what it costs.
 
 binpack reports that as what it is, naming the pod and how far past its deadline it is, rather
 than as "the drain timed out". A timeout tells an operator nothing; "pod X is 12 minutes past
 its termination deadline, check its finalizers" tells them where to look.
 
-Slack is a fixed two minutes — enough for SIGKILL and the API server to catch up, short enough
-that a genuinely stuck pod is not mistaken for a slow one. It is deliberately not configurable:
-it describes how Kubernetes behaves, not a preference.
+Slack is a fixed two minutes: long enough for SIGKILL to land and the API server to catch up,
+short enough that a wedged pod does not hold a drain open for long.
+
+**Correction (2).** An earlier revision of this ADR called that a description of how Kubernetes
+behaves rather than a preference, and used it to close the question of configurability. The claim
+does not survive reading the kubelet. What upstream bounds is SIGKILL *delivery*: `killContainer`
+passes the remaining grace period to the CRI's `StopContainer`
+(`pkg/kubelet/kuberuntime/kuberuntime_container.go`). Nothing bounds the teardown after it. The
+pod object survives until the status manager sees `podIsFinished`, which is set only when
+`SyncTerminatedPod` completes (`canBeDeleted`, `pkg/kubelet/status/status_manager.go`) — and
+`SyncTerminatedPod` (`pkg/kubelet/kubelet.go`) waits for volumes to unmount and then polls
+`podVolumesExist` in a loop with **no timeout at all**, ending only when its context is cancelled.
+The one constant in that path that looks like a bound is not one: `podAttachAndMountTimeout` is
+2m3s, and its own comment gives the reason as "kubelet will retry in the next sync iteration" —
+on error the pod worker requeues with backoff (`completeWork`, `pkg/kubelet/pod_workers.go`).
+That shape is identical in every release branch from 1.31 to 1.36.
+
+So two minutes is a **calibration**: a judgement about how long teardown may take, made where
+upstream offers no quantity to derive one from. Its cost is knowable rather than hypothetical. A
+pod that uses its full grace period begins teardown at about its deletion timestamp, so a single
+unmount attempt that runs to that 2m3s timeout is *already* longer than binpack waits. Such a pod
+is reported as stuck while behaving correctly: the drain is abandoned, the node uncordoned after
+some of its pods were evicted for nothing, and per-node backoff recorded. PVC-backed StatefulSets
+on a busy CSI driver are the workload most likely to meet it.
+
+It stays a constant rather than becoming `drain.terminationSlack`, for now, and that is a trade
+rather than a fact. There is nothing upstream to derive a better number from — which is what the
+paragraph above establishes — so a knob would move the guess from binpack to an operator with no
+more to go on; and a configuration key is public API from the release that ships it, easy to add
+once evidence arrives and impossible to withdraw. The evidence that would settle it is already
+published: `binpack_drains_abandoned_total{reason="stuck"}` counts exactly this case, and the
+node's `last-failure` annotation names the pod and how far past its deadline it was. A cluster
+where that counter climbs against pods that were merely slow is the argument for the knob.
 
 ### Three bounds, because they measure different things
 
@@ -161,7 +210,7 @@ abandonment through the back door, in the one situation the design is meant to h
 
 So on startup or on acquiring leadership, for each node carrying a drain marker:
 
-1. If a pod on it is terminating and still within its grace period plus slack, **resume** —
+1. If a pod on it is terminating and still within `deletionTimestamp + slack`, **resume** —
    the drain is demonstrably alive.
 2. If fewer pods remain than `drain-pods-remaining` records, progress happened while binpack was
    away, so **resume** and refresh the markers.

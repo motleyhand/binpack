@@ -529,8 +529,9 @@ So `stallTimeout` bounds the **absence of progress**. Any of these keeps a drain
 
 - the count of relocatable pods on the node decreased
 - a pod acquired a `deletionTimestamp`
-- a pod is terminating and still within `deletionTimestamp + terminationGracePeriodSeconds`
-  plus a small fixed slack
+- a pod is terminating and still within `deletionTimestamp` plus a small fixed slack — the
+  deletion timestamp is when the grace period *expires*, not when deletion was asked for, so
+  there is no second grace-period term to add
 
 The last is a state rather than an event, which is what makes long grace periods work without
 configuration: while a pod is legitimately shutting down, the stall clock does not run.
@@ -542,10 +543,14 @@ bind — and a pod tolerating the cordon can be evicted straight back onto the n
 from, which is that failure made real. See [ADR-0007](adr-0007-drain-progress-not-deadlines.md).
 
 Being stuck is then **detected**, not inferred. A pod still present past its termination
-deadline plus slack is not slow — the kubelet should have sent SIGKILL — so something is wrong:
-a finalizer, a volume that will not detach, an unhealthy kubelet. binpack names the pod and how
-far past its deadline it is. "Pod monitoring/prometheus-0 is 12 minutes past its termination
-deadline" tells an operator where to look; "the drain timed out" does not.
+deadline plus slack is not slow — the kubelet should have sent SIGKILL — so something is usually
+wrong: a finalizer, a volume that will not detach, an unhealthy kubelet. Usually rather than
+always, because the slack is a calibration and not a bound Kubernetes offers: upstream bounds
+SIGKILL delivery and nothing after it, so a teardown that is merely slow crosses the same line.
+[ADR-0007](adr-0007-drain-progress-not-deadlines.md) states the trade and what would settle it.
+binpack names the pod and how far past its deadline it is. "Pod monitoring/prometheus-0 is 12
+minutes past its termination deadline" tells an operator where to look; "the drain timed out"
+does not.
 
 ### A failed drain must not be retried immediately
 
