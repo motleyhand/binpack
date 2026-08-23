@@ -8,6 +8,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	policyv1 "k8s.io/api/policy/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -47,17 +48,19 @@ func (s Severity) String() string {
 // conditions, so a blocker `explain` reports and the same condition `diagnose`
 // finds are recognisably one thing.
 const (
-	FindingNoAutoscaler      = "no-autoscaler"
-	FindingNoCandidates      = "autoscaler-no-candidates"
-	FindingPoolNotAutoscaled = "pool-not-autoscaling"
-	FindingPoolAtMinimum     = "pool-at-minimum"
-	FindingPDBZero           = "pdb-zero-disruptions"
-	FindingPDBUnhealthy      = "pdb-workload-unhealthy"
-	FindingPDBSelectsNothing = "pdb-selects-nothing"
-	FindingPriorityBelow     = "priority-below-cutoff"
-	FindingAbandonedDrain    = "abandoned-drain"
-	FindingNodeInBackoff     = "node-in-backoff"
-	FindingNoTemplate        = "unreadable-template"
+	FindingNoAutoscaler           = "no-autoscaler"
+	FindingNoCandidates           = "autoscaler-no-candidates"
+	FindingPoolNotAutoscaled      = "pool-not-autoscaling"
+	FindingPoolAtMinimum          = "pool-at-minimum"
+	FindingPDBZero                = "pdb-zero-disruptions"
+	FindingPDBUnhealthy           = "pdb-workload-unhealthy"
+	FindingPDBSelectsNothing      = "pdb-selects-nothing"
+	FindingPDBSyncFailed          = "pdb-sync-failed"
+	FindingPDBUnparseableSelector = "pdb-unparseable-selector"
+	FindingPriorityBelow          = "priority-below-cutoff"
+	FindingAbandonedDrain         = "abandoned-drain"
+	FindingNodeInBackoff          = "node-in-backoff"
+	FindingNoTemplate             = "unreadable-template"
 )
 
 // Diagnosis is one class of finding: how much it matters, what it means and
@@ -174,6 +177,26 @@ var diagnoses = map[string]Diagnosis{
 		Fix: "almost always a selector that does not match the workload's labels — a rename, " +
 			"or a chart whose pod labels changed. Correct the selector, or delete the budget " +
 			"if the workload is gone.",
+	},
+	FindingPDBSyncFailed: {
+		Severity: Blocking,
+		Summary: "this PodDisruptionBudget's controller could not compute it, so it is " +
+			"reported as allowing no disruption whatever the budget actually says",
+		Fix: "the budget itself is usually correct and editing it changes nothing. The " +
+			"disruption controller records why on the DisruptionAllowed condition — read it " +
+			"with kubectl get pdb -n NS NAME -o jsonpath='{.status.conditions}'. It most " +
+			"often names a pod whose controlling owner it cannot resolve a replica count " +
+			"from, because the owner is gone or its custom resource has no scale " +
+			"subresource.",
+	},
+	FindingPDBUnparseableSelector: {
+		Severity: Warning,
+		Summary: "this PodDisruptionBudget's selector cannot be parsed, so the eviction API " +
+			"skips it and it protects nothing",
+		Fix: "an invalid label value in the selector, kept by an API server that grandfathers " +
+			"one already stored. Nothing is blocked by it and nothing is guarded by it " +
+			"either, so correct the value or delete the budget — but check first whether the " +
+			"workload it was meant to cover is protected by anything else.",
 	},
 	BlockedPDBStale: {
 		Severity: Warning,
@@ -421,6 +444,31 @@ func diagnoseBudgets(s Snapshot) []Finding {
 		ref := pdb.Namespace + "/" + pdb.Name
 
 		switch {
+		case unparseableSelector(pdb):
+			// First, because a budget nothing can parse is one the disruption
+			// controller cannot sync either — getPodsForPdb parses the same
+			// selector — so it arrives carrying the sync failure below as
+			// well. Naming the field to edit beats relaying the parse error.
+			findings = append(findings, finding(FindingPDBUnparseableSelector, ref,
+				"invalid selector: "+selectorSummary(pdb)))
+
+		case syncFailed(pdb) != nil:
+			// Before every arm that reads a counter, because failSafe forces
+			// disruptionsAllowed to zero and leaves currentHealthy,
+			// desiredHealthy and expectedPods at whatever the last successful
+			// sync wrote. Read without the condition, a budget whose
+			// controller is failing is indistinguishable from a one-replica
+			// minAvailable: 1 — and from a budget selecting nothing, when it
+			// has never synced at all and every counter is still zero.
+			//
+			// The condition cannot outlive the failure: the disruption
+			// controller rewrites it to SufficientPods or InsufficientPods on
+			// the next successful sync (component-helpers
+			// apps/poddisruptionbudget, UpdateDisruptionAllowedCondition), so
+			// the reason is what discriminates rather than the presence of a
+			// condition, which every computed budget also carries.
+			findings = append(findings, finding(FindingPDBSyncFailed, ref, syncFailed(pdb).Message))
+
 		case pdb.Status.ObservedGeneration < pdb.Generation:
 			findings = append(findings, finding(BlockedPDBStale, ref,
 				fmt.Sprintf("generation %d, observed %d", pdb.Generation, pdb.Status.ObservedGeneration)))
@@ -463,6 +511,32 @@ func diagnoseBudgets(s Snapshot) []Finding {
 	}
 
 	return findings
+}
+
+// syncFailed returns the condition saying the disruption controller could not
+// compute this budget, or nil.
+//
+// policyv1's own constants rather than the strings: the condition type and the
+// reason are both exported by k8s.io/api, and a literal here would silently
+// stop matching if either were ever renamed.
+func syncFailed(pdb *policyv1.PodDisruptionBudget) *metav1.Condition {
+	c := meta.FindStatusCondition(pdb.Status.Conditions, policyv1.DisruptionAllowedCondition)
+	if c == nil || c.Status != metav1.ConditionFalse || c.Reason != policyv1.SyncFailedReason {
+		return nil
+	}
+	return c
+}
+
+// unparseableSelector reports whether no client can turn this budget's
+// selector into a label query — the state the eviction subresource responds to
+// by skipping the budget entirely.
+//
+// A null selector is not one of these: LabelSelectorAsSelector answers it with
+// labels.Nothing and no error, which is the "matches no pods" that policy/v1
+// specifies and a separate diagnosis already covers.
+func unparseableSelector(pdb *policyv1.PodDisruptionBudget) bool {
+	_, err := metav1.LabelSelectorAsSelector(pdb.Spec.Selector)
+	return err != nil
 }
 
 // budgetSpec renders the field an operator would edit, since the numbers alone
@@ -560,7 +634,10 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 			g.add(pod, b.Code, blockerDetail(pod, b.Code))
 		}
 
-		if len(matched) > 1 {
+		// The same gate CheckEvictable applies, so the report does not send an
+		// operator to rewrite selectors over a pod the API server would delete
+		// without reading either budget.
+		if len(matched) > 1 && !pdbsIgnored(pod) {
 			names := make([]string, len(matched))
 			for i, p := range matched {
 				names[i] = p.Name

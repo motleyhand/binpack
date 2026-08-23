@@ -504,3 +504,237 @@ func TestCheckEvictableDoesNotBlockOnAKubeSystemPodPastTheAutoscalersGrace(t *te
 			codes(got), engine.BlockedSystemPod)
 	}
 }
+
+// TestPendingPodsBypassBudgetsAsTheEvictionAPIDoes pins the phase, not the
+// readiness, as what decides whether a budget is consulted at all.
+//
+// The eviction subresource asks canIgnorePDB before it looks a budget up
+// (kubernetes pkg/registry/core/pod/storage/eviction.go, Create): for a pod
+// that is Pending, Succeeded, Failed or already terminating it deletes the pod
+// outright, and getPodDisruptionBudgets, the more-than-one refusal and
+// checkAndDecrement are all downstream of that gate. A pod wedged in
+// ContainerCreating is the case that matters — it is exactly the pod an
+// operator wants consolidated away, and binpack used to refuse its node.
+func TestPendingPodsBypassBudgetsAsTheEvictionAPIDoes(t *testing.T) {
+	labelled := map[string]string{"app": "web", "team": "platform"}
+
+	// Short of its desired health, so evictableWhileUnready does not excuse
+	// the pod first and the assertion is about the phase rather than about
+	// the readiness that comes with it.
+	tight := func() *policyv1.PodDisruptionBudget {
+		return mother.Healthy(mother.PDB("default", "web", 0, map[string]string{"app": "web"}), 1, 2)
+	}
+	both := func() []*policyv1.PodDisruptionBudget {
+		return []*policyv1.PodDisruptionBudget{
+			mother.PDB("default", "team-wide", 5, map[string]string{"team": "platform"}),
+			mother.PDB("default", "api-specific", 5, map[string]string{"app": "web"}),
+		}
+	}
+
+	ignored := []struct {
+		name string
+		pod  *corev1.Pod
+	}{
+		{"starting", mother.Pod("default", "web-0", mother.OnNode("a"),
+			mother.PodLabels(labelled), mother.Starting())},
+		{"succeeded", mother.Pod("default", "web-0", mother.OnNode("a"),
+			mother.PodLabels(labelled), mother.Succeeded())},
+		{"failed", mother.Pod("default", "web-0", mother.OnNode("a"),
+			mother.PodLabels(labelled), mother.Failed())},
+		{"terminating", mother.Pod("default", "web-0", mother.OnNode("a"),
+			mother.PodLabels(labelled), mother.Terminating(now, 30*time.Second))},
+	}
+
+	for _, tc := range ignored {
+		t.Run(tc.name+" is charged no budget", func(t *testing.T) {
+			got := engine.CheckEvictable([]*corev1.Pod{tc.pod},
+				[]*policyv1.PodDisruptionBudget{tight()}, engine.DefaultEvictConfig(), now)
+
+			if len(got) != 0 {
+				t.Errorf("the eviction API deletes such a pod without consulting a budget, got %v", codes(got))
+			}
+		})
+
+		t.Run(tc.name+" does not trigger the permanent two-budget refusal", func(t *testing.T) {
+			// The worse half: multiple-pdbs is reported as unfixable by
+			// anything, so diagnose sends an operator to rewrite selectors
+			// that the API server would never have looked at.
+			got := engine.CheckEvictable([]*corev1.Pod{tc.pod}, both(), engine.DefaultEvictConfig(), now)
+
+			if len(got) != 0 {
+				t.Errorf("the two-budget refusal is downstream of canIgnorePDB, got %v", codes(got))
+			}
+		})
+	}
+
+	// The control, and the direction that must not move: a Running pod is
+	// still charged, and still permanently refused under two budgets.
+	running := mother.Pod("default", "web-0", mother.OnNode("a"), mother.PodLabels(labelled))
+
+	t.Run("a running pod is still charged", func(t *testing.T) {
+		got := engine.CheckEvictable([]*corev1.Pod{running},
+			[]*policyv1.PodDisruptionBudget{tight()}, engine.DefaultEvictConfig(), now)
+
+		if len(got) != 1 || got[0].Code != engine.BlockedPDBInsufficint {
+			t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedPDBInsufficint)
+		}
+	})
+
+	t.Run("a running pod under two budgets is still permanently stuck", func(t *testing.T) {
+		got := engine.CheckEvictable([]*corev1.Pod{running}, both(), engine.DefaultEvictConfig(), now)
+
+		if len(got) != 1 || got[0].Code != engine.BlockedMultiplePDBs {
+			t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedMultiplePDBs)
+		}
+	})
+
+	// The second control, and the reason the gate sits below checkPod rather
+	// than above it. What canIgnorePDB governs is the eviction API's budget
+	// arithmetic and nothing else; the refusals in checkPod are the
+	// cluster-autoscaler's, and the autoscaler does not read a pod's phase
+	// before declining to remove its node. Hoisting the gate would have
+	// binpack approve a drain the autoscaler then refuses to finish, which is
+	// the one direction that costs more than a consolidation.
+	autoscalerRules := []struct {
+		name string
+		pod  *corev1.Pod
+		code string
+	}{
+		{"bare", mother.Pod("default", "web-0", mother.OnNode("a"), mother.PodLabels(labelled),
+			mother.Starting(), mother.Bare()), engine.BlockedBarePod},
+		{"local storage", mother.Pod("default", "web-0", mother.OnNode("a"), mother.PodLabels(labelled),
+			mother.Starting(), mother.WithHostPathVolume("state", "/var/lib/state")), engine.BlockedLocalStorage},
+		{"refused outright", mother.Pod("default", "web-0", mother.OnNode("a"), mother.PodLabels(labelled),
+			mother.Starting(), mother.SafeToEvict("false")), engine.BlockedSafeToEvict},
+	}
+
+	for _, tc := range autoscalerRules {
+		t.Run("a starting pod is still refused for being "+tc.name, func(t *testing.T) {
+			got := engine.CheckEvictable([]*corev1.Pod{tc.pod},
+				[]*policyv1.PodDisruptionBudget{tight()}, engine.DefaultEvictConfig(), now)
+
+			if len(got) != 1 || got[0].Code != tc.code {
+				t.Fatalf("codes = %v, want [%s]", codes(got), tc.code)
+			}
+		})
+	}
+}
+
+// TestUnparseableSelectorIsSkippedAsTheEvictionAPISkipsIt reverses the
+// direction binpack's comment reached for.
+//
+// getPodDisruptionBudgets skips a budget whose selector will not parse — "This
+// object has an invalid selector, it does not match the pod" — so treating it
+// as matching makes binpack's matched set a superset of the API server's.
+// Being wrong that way is not conservative: matching more budgets is precisely
+// what produces the more-than-one refusal, which binpack reports as permanent.
+func TestUnparseableSelectorIsSkippedAsTheEvictionAPISkipsIt(t *testing.T) {
+	labelled := map[string]string{"app": "web"}
+	pod := mother.Pod("default", "web-0", mother.PodLabels(labelled))
+
+	broken := mother.UnparseableSelector(mother.PDB("default", "grandfathered", 0, nil))
+	valid := mother.PDB("default", "web", 5, labelled)
+
+	t.Run("it does not make a second budget into a pair", func(t *testing.T) {
+		got := engine.CheckEvictable([]*corev1.Pod{pod},
+			[]*policyv1.PodDisruptionBudget{broken, valid}, engine.DefaultEvictConfig(), now)
+
+		if len(got) != 0 {
+			t.Errorf("a budget the API server skips cannot make a pod doubly covered, got %v", codes(got))
+		}
+	})
+
+	t.Run("it is charged no demand on its own", func(t *testing.T) {
+		got := engine.CheckEvictable([]*corev1.Pod{pod},
+			[]*policyv1.PodDisruptionBudget{broken}, engine.DefaultEvictConfig(), now)
+
+		if len(got) != 0 {
+			t.Errorf("an allowance the API server never consults cannot block, got %v", codes(got))
+		}
+	})
+
+	// The control: a valid selector that matches must still match, or the fix
+	// has stopped binpack seeing budgets rather than stopped it inventing one.
+	t.Run("two valid selectors are still a pair", func(t *testing.T) {
+		second := mother.PDB("default", "team-wide", 5, labelled)
+
+		got := engine.CheckEvictable([]*corev1.Pod{pod},
+			[]*policyv1.PodDisruptionBudget{valid, second}, engine.DefaultEvictConfig(), now)
+
+		if len(got) != 1 || got[0].Code != engine.BlockedMultiplePDBs {
+			t.Fatalf("codes = %v, want [%s]", codes(got), engine.BlockedMultiplePDBs)
+		}
+	})
+}
+
+// TestAnUnrecognisedEvictionPolicyChargesTheBudget applies CLAUDE.md's
+// allowlist rule to unhealthyPodEvictionPolicy, which is where policy/v1 asks
+// for it too: "Clients making eviction decisions should disallow eviction of
+// unhealthy pods if they encounter an unrecognized policy in this field."
+//
+// Every policy is asserted against a budget in both states, because that is
+// what separates the arms. AlwaysAllow and IfHealthyBudget agree while the
+// application is healthy; IfHealthyBudget and an unrecognised value agree
+// while it is not. A table covering one state per policy would pass whichever
+// arm was deleted.
+//
+// The unrecognised value is invented rather than borrowed. Asserting against a
+// policy that exists would let the test agree with the code by construction —
+// and the hazard here is by definition a value nobody has written yet.
+func TestAnUnrecognisedEvictionPolicyChargesTheBudget(t *testing.T) {
+	labelled := map[string]string{"app": "web"}
+	broken := mother.Pod("default", "web-1", mother.PodLabels(labelled), mother.Unready())
+
+	// Two replicas, both up, minAvailable 2: no slack, and nothing wrong.
+	healthy := func() *policyv1.PodDisruptionBudget {
+		return mother.PDB("default", "web", 0, labelled)
+	}
+	// The same budget a replica short, so the application it guards is
+	// currently disrupted.
+	short := func() *policyv1.PodDisruptionBudget {
+		return mother.Healthy(mother.PDB("default", "web", 0, labelled), 1, 2)
+	}
+	withPolicy := func(pdb *policyv1.PodDisruptionBudget,
+		p policyv1.UnhealthyPodEvictionPolicyType,
+	) *policyv1.PodDisruptionBudget {
+		pdb.Spec.UnhealthyPodEvictionPolicy = &p
+		return pdb
+	}
+	const future = policyv1.UnhealthyPodEvictionPolicyType("EvictionRequestOnly")
+
+	tests := []struct {
+		name   string
+		pdb    *policyv1.PodDisruptionBudget
+		charge bool
+	}{
+		{"AlwaysAllow frees it while the application is healthy",
+			withPolicy(healthy(), policyv1.AlwaysAllow), false},
+		{"AlwaysAllow frees it while the application is not",
+			withPolicy(short(), policyv1.AlwaysAllow), false},
+
+		{"IfHealthyBudget frees it while the application is healthy",
+			withPolicy(healthy(), policyv1.IfHealthyBudget), false},
+		{"IfHealthyBudget charges it while the application is not",
+			withPolicy(short(), policyv1.IfHealthyBudget), true},
+
+		{"an absent policy is IfHealthyBudget while healthy", healthy(), false},
+		{"an absent policy is IfHealthyBudget while not", short(), true},
+
+		{"an unrecognised policy charges it even while healthy",
+			withPolicy(healthy(), future), true},
+		{"an unrecognised policy charges it while not",
+			withPolicy(short(), future), true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got := engine.CheckEvictable([]*corev1.Pod{broken},
+				[]*policyv1.PodDisruptionBudget{tc.pdb}, engine.DefaultEvictConfig(), now)
+
+			charged := len(got) == 1 && got[0].Code == engine.BlockedPDBInsufficint
+			if charged != tc.charge {
+				t.Errorf("charged = %v, want %v (codes %v)", charged, tc.charge, codes(got))
+			}
+		})
+	}
+}

@@ -205,6 +205,59 @@ a workload is protected when nothing is. Invisible from the object itself unless
 chart whose pod labels changed. Correct the selector, or delete the budget if the workload is
 gone.
 
+### `pdb-unparseable-selector` — warning
+
+The budget's `spec.selector` cannot be turned into a label query, so the eviction API skips it
+and it guards nothing.
+
+An invalid label value is the usual cause — a space, a `!`, or anything else outside the
+character set labels allow. Such an object can be stored because policy validation grandfathers
+a selector that is already there, so a budget written against an older API server survives
+edits that never touch the selector.
+
+Nothing is blocked by it. `getPodDisruptionBudgets` in the eviction subresource skips a budget
+whose selector will not parse, and the disruption controller cannot read it either, so it never
+gets a computed status. That combination is what makes it hard to see from the object: `kubectl
+get pdb` shows `ALLOWED DISRUPTIONS: 0`, which reads as a budget doing its job.
+
+**Fix.** Correct the label value, or delete the budget. Before you do, it is worth knowing
+whether the workload it was meant to cover is protected by anything else — `kubectl get pdb -n
+NS` lists every budget in the namespace, and `binpack diagnose` reports the ones that select
+nothing separately.
+
+### `pdb-sync-failed` — blocking
+
+The disruption controller could not compute this budget, so it reports zero allowed disruptions
+whatever the budget itself says.
+
+When a sync fails the controller calls `failSafe`, which forces `status.disruptionsAllowed` to
+zero and records the reason on the `DisruptionAllowed` condition. It changes nothing else, so
+`currentHealthy`, `desiredHealthy` and `expectedPods` keep the values the last successful sync
+wrote — and a budget that has never synced keeps zeros. Read without the condition, the first
+looks like a budget with no slack and the second like a selector matching nothing.
+
+The condition is the only field that distinguishes them:
+
+```bash
+kubectl get pdb -n NS NAME -o jsonpath='{.status.conditions}'
+```
+
+A `reason` of `SyncFailed` is this finding; `InsufficientPods` or `SufficientPods` means the
+controller computed the budget and the numbers are to be trusted. binpack reports the
+controller's `message` verbatim, and it usually names the cause. The two commonest are a pod
+whose controlling owner cannot be resolved to a replica count — `found no controllers for pod
+"..."` — and an owner whose custom resource exposes no `scale` subresource, which the message
+names by group and kind.
+
+Blocking, because while it lasts nothing can evict a pod the budget selects: the eviction API
+reads the same zero and returns 429.
+
+**Fix.** Usually not in the budget. Read the condition, and fix what its message names — most
+often a workload whose controller was deleted while its pods stayed, or a controller whose CRD
+needs a `scale` subresource for the disruption controller to size it. If the message points at
+RBAC, the disruption controller's scale client is being denied and the effect is cluster-wide
+rather than confined to this budget.
+
 ### `pdb-stale` — warning
 
 The budget was edited and its controller has not caught up, so the eviction API refuses
