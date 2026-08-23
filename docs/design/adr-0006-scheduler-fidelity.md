@@ -334,10 +334,23 @@ as "no readable controller template" — the same code, the same metric, the sam
 made the report contradict itself, since it named the ReplicaSet it had just read the template
 from and then asked for a bug report because binpack cannot read ReplicaSets. The two are
 different findings addressed to different people. An unreadable kind is a gap in binpack and
-widens on evidence; a constraint admission added is a fact about that cluster, and no widening
-reaches it — putting the constraint in the workload's own template does, and nothing else. They
-are reported as `unreadable-template` and `admission-divergence`, and counted as the two arms of
-`binpack_nodes_unmodelled`.
+widens on evidence; a template the running pods disagree with is a fact about that cluster, and no
+widening reaches it. They are reported as `unreadable-template` and `template-divergence`, and
+counted as the two arms of `binpack_nodes_unmodelled`.
+
+**The second is named for the observation and not for a cause, deliberately.** The obvious name
+was `admission-divergence`, and it would have been a claim binpack cannot support. Admission is
+the common cause and the only one with a remedy, but it is not the only one: binpack reads a
+StatefulSet's template from the StatefulSet itself, so a rollout held by `updateStrategy.type:
+OnDelete` or by a `rollingUpdate.partition` leaves the template ahead of the pods still on the old
+revision — for as long as the operator leaves it there, and by design. That is the same divergence
+with nothing wrong and nothing to fix, and a code that named admission would send its reader
+hunting a webhook that does not exist. Deployment pods do not reach it, since their controller is
+a ReplicaSet whose template is fixed for the life of the revision.
+
+The refusal is right in both, and for opposite reasons: in the admission case the template
+understates where the replacement may go, and in the rollout case the pods are the stale side.
+binpack cannot tell which it is looking at, so it declines to predict and says what it saw.
 
 **The gap was not bounded, and this ADR previously said it was.** The reasoning given — that the
 scheduler rejects the pod, so the drain stalls and backs off — does not hold. Once a pod is
@@ -399,10 +412,11 @@ from `k8s.io/kubernetes/pkg/scheduler/framework/plugins`, behind the same `CanFi
 
 The measurement has to be able to answer that question, which is why
 `binpack_nodes_unmodelled` carries a `cause` label. Only the `unreadable-template` arm argues for
-escalating: it counts the workloads a wider allowlist would reach. `admission-divergence` counts
+escalating: it counts the workloads a wider allowlist would reach. `template-divergence` counts
 workloads no allowlist reaches, so a single number adding them together would read as evidence
-for a change that would not have helped — and it is the arm more likely to be non-zero, since a
-mutating webhook is ordinary and a controller outside the four readable kinds is not.
+for a change that would not have helped — and it is the arm more likely to be non-zero, since both
+a mutating webhook and a held rollout are ordinary while a controller outside the four readable
+kinds is not.
 
 That is deliberately deferred rather than rejected. It buys exact fidelity, and it costs a
 dependency on the main Kubernetes repository: replace directives across every staging module, a

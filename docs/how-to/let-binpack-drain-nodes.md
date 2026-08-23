@@ -43,9 +43,9 @@ finding a wall in your cluster — and they are the places where your cluster do
 does not understand, so they are worth reading before it starts acting anywhere. The first is
 counted by `binpack_nodes_unmodelled`, and [`binpack diagnose`](../reference/diagnostics.md)
 reports it per workload under `unreadable-template` — binpack found no template to read — or
-`admission-divergence`, where it read one and something had added a placement constraint to the
-running pod afterwards. The metric's `cause` label carries the same distinction, which is worth
-keeping: the first widens on a bug report, and the second is answered in your own cluster.
+`template-divergence`, where it read one and the running pods disagree with it. The metric's
+`cause` label carries the same distinction, which is worth keeping: the first widens on a bug
+report, and the second is answered in your own cluster.
 
 ### Decide what you do not want touched
 

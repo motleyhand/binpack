@@ -49,7 +49,7 @@ type Blocked struct {
 	// Unmodelled marks the refusal as "binpack could not predict what the
 	// replacement would be" rather than "it did not fit", and names which of
 	// the two causes it was — [FindingNoTemplate] or
-	// [FindingAdmissionDivergence]. Empty for an ordinary shortfall.
+	// [FindingTemplateDivergence]. Empty for an ordinary shortfall.
 	//
 	// The distinction from a shortfall is the older one: "the workload does
 	// not fit" is a fact about the cluster and "binpack cannot tell what the
@@ -58,12 +58,11 @@ type Blocked struct {
 	// A cause rather than a flag because that reasoning goes one level
 	// further, and stopping at the flag made both surfaces say the wrong
 	// thing. An unreadable template is a gap in binpack's controller allowlist
-	// and widens on evidence; a constraint admission added to the pod and not
-	// to its template is a fact about *this* cluster that no widening reaches.
-	// Reported as one, the report contradicts itself — it names a ReplicaSet
-	// and then says binpack cannot read ReplicaSets — and it asks the operator
-	// to file a bug about a controller when what to change is their own
-	// webhook.
+	// and widens on evidence; a template the running pod disagrees with is a
+	// fact about *this* cluster that no widening reaches. Reported as one, the
+	// report contradicts itself — it names a ReplicaSet and then says binpack
+	// cannot read ReplicaSets — and it asks the operator to file a bug about a
+	// controller when the answer is in their own cluster.
 	//
 	// The values are the diagnosis codes, so the metric arm, the diagnosis and
 	// the reference documentation are one vocabulary rather than three.
@@ -940,13 +939,16 @@ func replacement(
 }
 
 // unpredictable is the refusal for a pod whose replacement binpack cannot
-// predict, in whichever of the two vocabularies fits the cause.
+// predict, in whichever of the two vocabularies fits what was observed.
 //
-// One function rather than two call sites, because keeping the pair together
-// is what stops the second being written as a variation on the first — which
-// is how it went wrong before: the divergence case borrowed the unreadable
-// case's whole vocabulary, and told operators to report a controller binpack
-// reads perfectly well.
+// Observed, and not diagnosed: a divergence is reported as a divergence and
+// not as admission's work, because binpack cannot establish that and admission
+// is not the only cause. See [FindingTemplateDivergence]'s catalogue entry.
+//
+// One function because the two summaries are the same sentence about different
+// facts, and because keeping them apart is what previously drifted: the
+// divergence case borrowed the other's wording and told operators to report a
+// controller that binpack reads perfectly well.
 func unpredictable(pod *corev1.Pod, diverged string) *Blocked {
 	if diverged == "" {
 		return &Blocked{
@@ -963,7 +965,7 @@ func unpredictable(pod *corev1.Pod, diverged string) *Blocked {
 			"%s/%s carries a %s its controller template does not, so binpack cannot tell "+
 				"where its replacement would be allowed to go",
 			pod.Namespace, pod.Name, diverged),
-		Unmodelled: FindingAdmissionDivergence,
+		Unmodelled: FindingTemplateDivergence,
 	}
 }
 

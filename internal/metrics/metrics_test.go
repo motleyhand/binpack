@@ -453,16 +453,16 @@ func TestTheTwoUnmodelledCausesAreCountedApart(t *testing.T) {
 	// ADR-0006 settles the controller allowlist against measurement, and this
 	// gauge is the measurement. Two quite different conditions reach it: a
 	// controller kind binpack has no reader for, which is a gap in binpack and
-	// widens on evidence, and a webhook in this cluster that mutates pods it
-	// does not mutate templates, which binpack cannot widen its way out of at
-	// all. A single number that adds them together answers neither question —
-	// and the second is much the commoner, so it would be the one drowning out
-	// the evidence the ADR asked for.
+	// widens on evidence, and a template this cluster's running pods disagree
+	// with, which binpack cannot widen its way out of at all. A single number
+	// that adds them together answers neither question — and the second is
+	// much the commoner, so it would be the one drowning out the evidence the
+	// ADR asked for.
 	// An owner kind collect reads no template from, so there is no entry.
 	exotic := mother.Pod("default", "shard-0", mother.OnNode("candidate"),
 		mother.OwnedBy("KafkaCluster", "events"))
 
-	// A readable template that a webhook diverged from at CREATE.
+	// A readable template the running pod diverges from.
 	mutated := mother.Pod("default", "web", mother.OnNode("candidate"),
 		mother.WithNodeSelector("tier", "app"))
 	diverging := mother.Templates(mutated)
@@ -479,8 +479,8 @@ func TestTheTwoUnmodelledCausesAreCountedApart(t *testing.T) {
 	if got := unmodelledFor(engine.FindingNoTemplate); got != 1 {
 		t.Errorf("unreadable-template arm = %v, want 1", got)
 	}
-	if got := unmodelledFor(engine.FindingAdmissionDivergence); got != 1 {
-		t.Errorf("admission-divergence arm = %v, want 1", got)
+	if got := unmodelledFor(engine.FindingTemplateDivergence); got != 1 {
+		t.Errorf("template-divergence arm = %v, want 1", got)
 	}
 }
 
@@ -505,7 +505,7 @@ func TestBothUnmodelledCausesHaveAZeroSeries(t *testing.T) {
 	// the same list the code publishes from cannot notice the list shrinking,
 	// which is the failure it exists to catch.
 	scrape := gather(t)
-	for _, cause := range []string{"unreadable-template", "admission-divergence"} {
+	for _, cause := range []string{"unreadable-template", "template-divergence"} {
 		want := `binpack_nodes_unmodelled{cause="` + cause + `"}`
 		if !strings.Contains(scrape, want) {
 			t.Errorf("%s is not published:\n%s", want, scrape)

@@ -421,7 +421,7 @@ is the inference that is unsound (see
 evidence rather than guesswork. `binpack_nodes_unmodelled{cause="unreadable-template"}` counts the
 same thing as a metric.
 
-### `admission-divergence` — warning
+### `template-divergence` — warning
 
 The pods carry a placement constraint their controller's template does not, so binpack cannot
 tell where their replacements would be allowed to run and will not move them.
@@ -435,25 +435,40 @@ Assuming the replacement is as free to move as its template says would approve a
 scheduler then refuses, which is the one direction binpack will not err in
 (see [ADR-0006](../design/adr-0006-scheduler-fidelity.md)).
 
-Something adds the constraint when the pod is created rather than in the workload's own template.
-Two common sources are a mutating admission webhook, and — on a cluster whose API server enables
-the in-tree `PodNodeSelector` admission plugin — the namespace's
-`scheduler.alpha.kubernetes.io/node-selector` annotation, which that plugin merges into
-`pod.spec.nodeSelector` and not into any template. The finding's detail names the field, and these
-say which namespaces and which webhooks are in play:
+Two quite different things produce that gap, and binpack cannot tell them apart — which is why
+this code is named for what it observed rather than for a cause. The finding's detail names the
+field; comparing it against the controller's own template says which case you are looking at:
 
 ```bash
-kubectl get namespace <namespace> -o jsonpath='{.metadata.annotations}'
+kubectl get statefulset <name> -o jsonpath='{.spec.template.spec.nodeSelector}{"\n"}{.spec.updateStrategy}'
 ```
+
+**Something adds the constraint after the template.** A mutating admission webhook, or — on a
+cluster whose API server enables the in-tree `PodNodeSelector` admission plugin — the namespace's
+`scheduler.alpha.kubernetes.io/node-selector` annotation, which that plugin merges into
+`pod.spec.nodeSelector` and into no template. These say which webhooks and which namespace
+defaults are in play:
 
 ```bash
 kubectl get mutatingwebhookconfigurations
 ```
 
-**Fix.** Put the same constraint in the workload's own pod template. binpack can then see where
-the replacement would go, and the pod becomes movable again — nothing about where it actually
-runs changes. `binpack_nodes_unmodelled{cause="admission-divergence"}` counts the same thing as a
-metric.
+```bash
+kubectl get namespace <namespace> -o jsonpath='{.metadata.annotations}'
+```
+
+**Or the template is newer than the pods.** binpack reads a StatefulSet's template from the
+StatefulSet itself, so an update the rollout has not reached yet diverges from the pods still
+running the old revision. `updateStrategy.type: OnDelete` holds that state until you delete the
+pods yourself, and `rollingUpdate.partition` holds it for every ordinal below the partition, both
+indefinitely and both deliberately. (Deployment pods are not affected: their controller is a
+ReplicaSet, whose template is fixed for the life of that revision.)
+
+**Fix.** In the first case, put the same constraint in the workload's own pod template — binpack
+can then see where the replacement would go, and the constraint is the same one, so where the pod
+actually runs does not change. In the second there is nothing to fix: the pods become movable as
+the rollout reaches them. `binpack_nodes_unmodelled{cause="template-divergence"}` counts the same
+thing as a metric.
 
 ### `mirror-pod` — blocking
 

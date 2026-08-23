@@ -837,27 +837,36 @@ func replacementFor(
 			continue
 		}
 		pendingPod = pod
+
+		// Read from the spec, and deliberately not from the condition the API
+		// server stamps beside it. PrepareForCreate writes {PodScheduled:
+		// False, reason: SchedulingGated} on any pod created with gates
+		// (kubernetes pkg/registry/core/pod/strategy.go,
+		// applySchedulingGatedCondition) — but PrepareForUpdate is
+		// `newPod.Status = oldPod.Status`, so when the gating controller
+		// admits the pod by removing spec.schedulingGates that condition
+		// stays standing until the scheduler reaches the pod and writes a new
+		// one. A drain evaluating inside that window would read a healthy
+		// replacement that is about to be placed as one nothing will place,
+		// and hand the node back at the moment it was about to succeed. The
+		// spec cannot lag: it is what the SchedulingGates PreEnqueue plugin
+		// itself reads, and validateOnlyDeletedSchedulingGates allows gates to
+		// be removed and never added.
+		//
+		// Not returned on sight, unlike a refusal: a refusal is the
+		// scheduler's own verdict on this pod, and a gate is a fact about the
+		// workload that a sibling may already have got past.
+		if len(pod.Spec.SchedulingGates) > 0 {
+			gatedPod = pod
+			// A gated pod never enters the active queue, so no Filter has run
+			// on it and the conditions below cannot say anything about it.
+			continue
+		}
+
 		for _, c := range pod.Status.Conditions {
-			if c.Type != corev1.PodScheduled || c.Status != corev1.ConditionFalse {
-				continue
-			}
-			switch c.Reason {
-			case corev1.PodReasonUnschedulable:
+			if c.Type == corev1.PodScheduled && c.Status == corev1.ConditionFalse &&
+				c.Reason == corev1.PodReasonUnschedulable {
 				return refused, pod
-			// Written by the API server at CREATE, not by the scheduler:
-			// PrepareForCreate stamps it on any pod with a non-empty
-			// spec.schedulingGates (kubernetes pkg/registry/core/pod/
-			// strategy.go, applySchedulingGatedCondition). It is the only
-			// condition such a pod gets, because the SchedulingGates
-			// PreEnqueue plugin keeps it out of the scheduler's active queue
-			// entirely — so no Filter runs on it and nothing ever writes
-			// Unschedulable over this.
-			//
-			// Not returned on sight, unlike a refusal: a refusal is the
-			// scheduler's own verdict on this pod, and a gate is a fact about
-			// the workload that a sibling may already have got past.
-			case corev1.PodReasonSchedulingGated:
-				gatedPod = pod
 			}
 		}
 	}

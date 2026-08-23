@@ -780,8 +780,8 @@ func TestRestrictiveConstraintsAddedByAdmissionBlockTheSimulation(t *testing.T) 
 			if sim.Feasible {
 				t.Errorf("planned a move from a template missing the pod's %s", tc.name)
 			}
-			if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
-				t.Errorf("not counted as an admission divergence: %q", sim.Blocked.Unmodelled)
+			if sim.Blocked.Unmodelled != engine.FindingTemplateDivergence {
+				t.Errorf("not counted as a template divergence: %q", sim.Blocked.Unmodelled)
 			}
 		})
 	}
@@ -1077,8 +1077,8 @@ func TestAVolumeRewrittenUnderTheSameNameIsRefused(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("kept the template's emptyDir over the claim the pod actually has")
 	}
-	if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
-		t.Errorf("not counted as an admission divergence: %q", sim.Blocked.Unmodelled)
+	if sim.Blocked.Unmodelled != engine.FindingTemplateDivergence {
+		t.Errorf("not counted as a template divergence: %q", sim.Blocked.Unmodelled)
 	}
 }
 
@@ -1130,8 +1130,8 @@ func TestRelocatingThatSamePodIsStillRefused(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("planned to move a pod whose template is missing its selector")
 	}
-	if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
-		t.Errorf("not counted as an admission divergence: %q", sim.Blocked.Unmodelled)
+	if sim.Blocked.Unmodelled != engine.FindingTemplateDivergence {
+		t.Errorf("not counted as a template divergence: %q", sim.Blocked.Unmodelled)
 	}
 }
 
@@ -1958,9 +1958,9 @@ func TestAdmissionAddedNodeSelectorIsNotReportedAsAnUnreadableTemplate(t *testin
 	if sim.Feasible {
 		t.Fatal("planned to move a pod whose template is missing its selector")
 	}
-	if sim.Blocked.Unmodelled != engine.FindingAdmissionDivergence {
+	if sim.Blocked.Unmodelled != engine.FindingTemplateDivergence {
 		t.Errorf("a template binpack read is reported as %q, want %q",
-			sim.Blocked.Unmodelled, engine.FindingAdmissionDivergence)
+			sim.Blocked.Unmodelled, engine.FindingTemplateDivergence)
 	}
 	if !strings.Contains(sim.Blocked.Summary, "nodeSelector") {
 		t.Errorf("summary does not name the diverging field: %s", sim.Blocked.Summary)

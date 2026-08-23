@@ -227,7 +227,7 @@ controller. Two quite different things stop it, and `cause` says which:
 | `cause` | What binpack could not do |
 |---|---|
 | `unreadable-template` | Find a template at all — the pod's controller is a kind binpack reads none from |
-| `admission-divergence` | Trust the template it read — the running pod carries a placement constraint the template does not |
+| `template-divergence` | Trust the template it read — the running pod carries a placement constraint the template does not |
 
 Both arms are always published, so a zero reads as zero rather than as a series that has not
 appeared yet.
@@ -240,11 +240,14 @@ on every cluster measured so far. Persistently above zero means the four readabl
 so — [ADR-0006](../design/adr-0006-scheduler-fidelity.md) settles the allowlist against
 measurement, and this is the measurement.
 
-**`admission-divergence`** is not a gap widening that allowlist would close: the template was
-read, and something added a constraint to the pod after it. Widening the list of readable kinds
-would not change the answer, so this arm is evidence about the cluster rather than about binpack
-— which is why the two are counted apart, and why summing them would answer neither question.
-[`binpack diagnose`](diagnostics.md#admission-divergence--warning) names the field and the pods.
+**`template-divergence`** is not a gap widening that allowlist would close: the template was read,
+and the running pods disagree with it. Widening the list of readable kinds would not change the
+answer, so this arm is evidence about the cluster rather than about binpack — which is why the two
+are counted apart, and why summing them would answer neither question. It has two causes with
+opposite remedies — a webhook adding a constraint the template lacks, or a StatefulSet rollout the
+template is ahead of — and binpack does not claim to know which;
+[`binpack diagnose`](diagnostics.md#template-divergence--warning) names the field and the pods so
+you can tell.
 
 Both are deliberately separate from the ordinary infeasible count: "the workload does not fit"
 is a fact about your cluster, and "binpack cannot tell what the workload is" is not.

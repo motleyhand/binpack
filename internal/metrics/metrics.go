@@ -119,11 +119,10 @@ var (
 	unmodelled = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "binpack_nodes_unmodelled",
 		Help: "Nodes refused because binpack could not predict what a pod's replacement " +
-			"would be, by cause. A gap in what binpack models rather than a fact about the " +
-			"cluster — but the two causes are gaps in different things: unreadable-template " +
+			"would be, by cause. The two are gaps in different things: unreadable-template " +
 			"persistently above zero means binpack's controller allowlist is too narrow for " +
-			"this cluster, and admission-divergence means a webhook here mutates pods it does " +
-			"not mutate templates.",
+			"this cluster, which is a gap in binpack; template-divergence means running pods " +
+			"disagree with their controller's template, which no change to binpack reaches.",
 	}, []string{"cause"})
 
 	drainable = prometheus.NewGauge(prometheus.GaugeOpts{
@@ -267,7 +266,7 @@ func Observe(s engine.Snapshot, d engine.Decision, cfg engine.Config, took float
 			// Seeded even so, because a leader that restarts mid-drain opens the
 			// gate here without ever having counted anything, and an absent
 			// series reads as "binpack is not reporting" rather than as zero.
-			seedNodeSeries()
+			seedVerdicts()
 		} else {
 			observeNodes(d)
 		}
@@ -298,7 +297,7 @@ func observeNodes(d engine.Decision) {
 	nodes.Reset()
 	skipped.Reset()
 
-	seedNodeSeries()
+	seedVerdicts()
 
 	var canDrain float64
 	cannotModel := map[string]float64{}
@@ -318,15 +317,8 @@ func observeNodes(d engine.Decision) {
 			// fit" is a fact about the cluster and "binpack cannot tell what
 			// the workload is" is a gap in binpack, and they call for
 			// completely different responses.
-			//
-			// And apart from each other, by the cause the engine decided,
-			// because that reasoning applies again one level down: only one of
-			// the two is a gap a wider allowlist would close, and it is the
-			// rarer one. See [engine.Blocked].
-			if a.Simulation != nil && a.Simulation.Blocked != nil {
-				if cause := a.Simulation.Blocked.Unmodelled; cause != "" {
-					cannotModel[cause]++
-				}
+			if a.Simulation != nil && a.Simulation.Blocked != nil && a.Simulation.Blocked.Unmodelled != "" {
+				cannotModel[a.Simulation.Blocked.Unmodelled]++
 			}
 		}
 	}
@@ -336,14 +328,8 @@ func observeNodes(d engine.Decision) {
 	}
 }
 
-// unmodelledCauses is the closed set of reasons binpack could not predict a
-// pod's replacement, and so the label values binpack_nodes_unmodelled
-// publishes. They are the diagnosis codes, because `binpack diagnose` reports
-// the same two conditions per workload and one vocabulary is better than two.
-var unmodelledCauses = []string{engine.FindingNoTemplate, engine.FindingAdmissionDivergence}
-
-// seedNodeSeries makes sure every verdict and every unmodelled cause has a
-// series, without disturbing one that already has a count.
+// seedVerdicts makes sure every verdict has a series, without disturbing one
+// that already has a count.
 //
 // A verdict nobody currently holds must report zero rather than vanishing: to
 // an alert, "no drainable nodes" and "binpack is not reporting" must not look
@@ -351,12 +337,15 @@ var unmodelledCauses = []string{engine.FindingNoTemplate, engine.FindingAdmissio
 // creates a child at zero on first sight and returns the existing one
 // afterwards — so this seeds a fresh process and leaves a draining tick's
 // inherited counts alone, from the one line.
+// unmodelledCauses is the closed set of reasons binpack could not predict a
+// replacement, and so the label values binpack_nodes_unmodelled publishes.
 //
-// The causes are here for the same reason and one further one: they exist to
-// be compared with each other, and a comparison against a series that has not
-// appeared yet is not a comparison. On the ordinary path they are written
-// anyway; this is what covers the leader that restarts into a drain.
-func seedNodeSeries() {
+// Both are always published, for the same reason every verdict is: an absent
+// series reads as "binpack is not reporting", and these two are the ones an
+// operator is meant to compare.
+var unmodelledCauses = []string{engine.FindingNoTemplate, engine.FindingTemplateDivergence}
+
+func seedVerdicts() {
 	for _, cause := range unmodelledCauses {
 		unmodelled.WithLabelValues(cause)
 	}

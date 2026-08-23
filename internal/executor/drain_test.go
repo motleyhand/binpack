@@ -755,6 +755,40 @@ func TestOneRefusedReplacementEndsTheDrainWhateverItsSiblingsDid(t *testing.T) {
 	}
 }
 
+func TestAJustAdmittedReplacementIsWaitedForRatherThanAbandoned(t *testing.T) {
+	// The window the gate detection must not fire in. A gating controller
+	// admits a pod by removing spec.schedulingGates, and the API server keeps
+	// the old status wholesale on a spec update — PrepareForUpdate is
+	// `newPod.Status = oldPod.Status` — so the {PodScheduled: False, reason:
+	// SchedulingGated} condition it stamped at CREATE stays standing until the
+	// scheduler gets round to the pod and writes a new one.
+	//
+	// An evaluation landing in that window sees a healthy replacement about to
+	// be placed. Reading the condition would abandon the drain and uncordon
+	// at the exact moment it was about to succeed, which is worse than the
+	// wait this detection replaced: the wait ended correctly, just late.
+	admitted := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+	mother.Gated("kueue.x-k8s.io/admission")(admitted)
+	// What admission does, and all it does. The condition is left behind.
+	admitted.Spec.SchedulingGates = nil
+
+	pods := []*corev1.Pod{mother.Pod("default", "stayer", mother.OnNode("a")), admitted}
+	s := snapshot([]*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Done || step.Failed {
+		t.Errorf("abandoned a drain whose replacement had just been admitted: %+v", step)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("uncordoned a node whose drain is still in flight")
+	}
+}
+
 func TestOneGatedReplacementEndsTheDrainWhateverItsSiblingsDid(t *testing.T) {
 	// The same ordering rule as the refusal above, and it needs stating
 	// separately because it is the case where the two readings disagree: a

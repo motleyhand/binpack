@@ -830,12 +830,7 @@ func WithResourceClaim(name string) PodOption {
 //
 // The node assignment is dropped for the same reason: ValidatePodCreate
 // forbids spec.nodeName while any gate remains (pkg/apis/core/validation),
-// so a bound gated pod is an object no cluster ever held. That line is a
-// guard rather than a behaviour — nothing composes this with OnNode today, so
-// a mutation sweep reports it as surviving. It stays because the object it
-// forbids is one a reader would find plausible: a fixture pinning a gated pod
-// to a node reads as "landed" everywhere binpack asks, and the test built on
-// it would agree with the code about a state neither will ever meet.
+// so a bound gated pod is an object no cluster ever held.
 func Gated(name string) PodOption {
 	return func(p *corev1.Pod) {
 		p.Spec.SchedulingGates = append(p.Spec.SchedulingGates,
