@@ -20,10 +20,22 @@ would.
 
 ## Is this for you?
 
-**Yes, if** you run Kubernetes on a managed service that constrains the cluster-autoscaler —
-DigitalOcean DOKS, Linode LKE, Vultr, Scaleway, Civo, OVH — and your node count drifts upward
-after load spikes and stays there. On these platforms the alternatives are thin: the descheduler
-helps only in narrow cases, and everything else is commercial.
+**Yes, if** your provider runs the cluster-autoscaler for you and does not expose its
+scale-down settings, and your node count drifts upward after load spikes and stays there. To see
+which side of that you are on, look for the autoscaler in your own cluster. Its name and
+namespace both vary by install — the upstream chart names it after the release and the cloud
+provider — so match on the substring rather than guessing at either:
+
+```bash
+kubectl get deploy -A | grep cluster-autoscaler
+```
+
+A Deployment here is yours to edit, and tuning it comes before adding anything. Nothing here
+points at your provider's control plane instead, where only what their API exposes is tunable —
+DigitalOcean DOKS and Linode LKE are the worked examples. It points rather than proves, so if
+this comes back quiet, your provider's console is the next place to look, not the last.
+Either way the alternatives here are thin: the descheduler helps only in narrow cases, and
+everything else is commercial.
 
 **Also worth considering if** you run EKS, GKE or AKS. [Karpenter][karpenter] is the more
 complete answer on those platforms: it provisions right-sized nodes and treats consolidation as
@@ -33,9 +45,12 @@ management, new failure modes to learn, and ongoing operational surface.
 
 binpack does one thing and cooperates with the autoscaler you already run. If what you want is
 lower node count rather than a new provisioning model, that is a reasonable trade to make
-deliberately, on any platform. [ADR-0005](docs/design/adr-0005-why-not-a-karpenter-doks-provider.md)
-sets out the comparison honestly, including why binpack exists at all given that Karpenter's
-consolidation is a superset of it.
+deliberately, on any platform. Note also that Karpenter consolidates only the nodes it
+provisions, so a cluster running a Karpenter NodePool beside a static or
+cluster-autoscaler-managed pool still has the rest of itself to think about.
+[ADR-0005](docs/design/adr-0005-why-not-a-karpenter-doks-provider.md) sets out the comparison
+honestly, including why binpack exists at all given that Karpenter's consolidation is a superset
+of it on the nodes it owns.
 
 **Either way, binpack needs a cluster-autoscaler** publishing a `cluster-autoscaler-status`
 ConfigMap — it drains a node, and the autoscaler is what removes it. The autoscaler writes that
@@ -87,7 +102,7 @@ watch, and how to uninstall it without stranding a node.
 | Document | What it covers |
 |---|---|
 | [Why your cluster doesn't shrink](docs/explanation/why-clusters-dont-shrink.md) | What the autoscaler actually does, why the scheduler works against you, and the three conditions a node must meet before removal |
-| [Quick wins before installing binpack](docs/how-to/quick-wins-before-installing-binpack.md) | Seven fixes worth doing regardless. Do these first |
+| [Quick wins before installing binpack](docs/how-to/quick-wins-before-installing-binpack.md) | Eight fixes worth doing regardless. Do these first |
 | [Install binpack](docs/how-to/install-binpack.md) | The chart, its defaults, and the read-only path to try first |
 | [Diagnose scale-down blockers](docs/how-to/diagnose-scale-down-blockers.md) | Read-only commands for working out why a node is still there, by hand |
 | [Diagnostics reference](docs/reference/diagnostics.md) | Every code `binpack diagnose` reports, what it means, and what to change |

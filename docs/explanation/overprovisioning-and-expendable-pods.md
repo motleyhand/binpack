@@ -74,7 +74,11 @@ Two requirements, and any configuration satisfying both is fine:
    first.
 2. At or above -10, so the autoscaler still replenishes the buffer.
 
-The canonical upstream example uses `-1` for overprovisioning with the default class at `0`.
+The cluster-autoscaler FAQ's own example puts overprovisioning at `value: -10` with
+`globalDefault: false`, relying on unclassed pods defaulting to `0`. That is not an arbitrary
+number: it is exactly `--expendable-pods-priority-cutoff`, so it is the lowest value that still
+replenishes the buffer. The FAQ says as much beside the manifest — "Priority -10 will be
+reserved for overprovisioning pods as it is the lowest priority that triggers scaling clusters."
 A default class at `1` with overprovisioning at `0` works equally well.
 
 One trap worth spelling out, because the class involved looks redundant and is not.

@@ -1,6 +1,12 @@
 # ADR-0005: Why not write a Karpenter provider instead
 
-- **Status:** accepted
+- **Status:** accepted, and **corrected in three places** where a claim about a third party has
+  not survived re-checking. All three are marked where they appear, and the decision — build
+  binpack, do not attempt a Karpenter provider for DOKS — rests on the bootstrapping mechanism,
+  which is untouched. (1) The superset claim holds only for the nodes Karpenter provisions.
+  (2) "There is no counterexample" has one: an actively maintained third-party Karpenter
+  provider for GKE. (3) The audience list asserted a constraint per platform that is false for
+  at least one of the platforms named.
 - **Date:** 2026-08-15
 
 ## Context
@@ -14,8 +20,17 @@ instance type would fit them most cheaply, and provisions that instance directly
 is first-class: it continuously evaluates whether the current set of nodes could be replaced by
 a cheaper set, including replacing one large node with a smaller one.
 
-Karpenter's consolidation is a **strict superset** of what binpack does. On any cluster running
-Karpenter, binpack has nothing useful to contribute.
+Karpenter's consolidation is a **strict superset** of what binpack does for the nodes Karpenter
+provisions. On a cluster where Karpenter owns every node, binpack has nothing to add.
+
+**Correction (1).** Both sentences were originally unscoped — "on any cluster running
+Karpenter". Karpenter's disruption loop only considers nodes it owns: `ValidateNodeDisruptable`
+(`pkg/controllers/state/statenode.go`) rejects a node with no `NodeClaim` before anything else,
+with "node isn't managed by karpenter", and the candidate scan is over Karpenter's own
+`StateNode` set. A cluster running a Karpenter NodePool beside a cluster-autoscaler-managed or
+static pool — a partial migration, or a deliberate static baseline — gets no consolidation from
+Karpenter on the rest of it. That is the shape binpack is otherwise built for, so the unscoped
+version argued against the project's own applicability.
 
 So the question is real: is binpack merely a workaround for Karpenter's absence, and would a
 DigitalOcean provider make it redundant?
@@ -51,12 +66,29 @@ Surveying the Karpenter providers that exist (August 2026):
 | AWS (~7.7k ★) | AWS | own platform |
 | Azure / AKS (~554 ★) | Microsoft | own platform |
 | Alibaba Cloud, Tencent TKE, Oracle OCI | the vendor | own platform |
-| GCP, IBM Cloud | third party / SIG | |
+| GCP / GKE (~325 ★) | third party (cloudpilot-ai) | managed — reuses an existing pool's bootstrap metadata |
+| Linode / LKE (~4 ★) | Linode | own platform, alpha |
+| IBM Cloud | third party / SIG | |
 | Proxmox, Hetzner, Cluster API | third party | **self-managed control planes** |
 
-Every provider for a *managed* Kubernetes service was written by that service's vendor. Every
-third-party provider targets an environment where the operator controls node bootstrapping.
-There is no counterexample.
+Star counts and repository state are a snapshot taken 2026-08-23 and will age; the mechanism
+below will not.
+
+A third-party provider for a managed service works only where the platform exposes reusable
+bootstrap material. cloudpilot-ai's GKE provider is the one that does it, and its own
+documentation says how: "Karpenter requires a GKE node pool to read bootstrap metadata
+(instance templates and kubelet settings)", which it discovers and reuses from an existing
+cluster pool, patching that pool's `kube-env` metadata when it needs a different OS or
+architecture. DOKS exposes no such material: worker-node changes are reverted by the reconciler
+and no join path is published. That is the distinction that decides this ADR.
+
+**Correction (2).** This section previously generalised instead: "Every provider for a
+*managed* Kubernetes service was written by that service's vendor... There is no counterexample."
+The GKE provider is one, it is actively maintained rather than abandoned, and it solves the
+problem this ADR calls insurmountable — by a technique DOKS happens not to permit. The table's
+own blank Environment cell for GCP had already recorded the contradiction. Stating the mechanism
+costs nothing and does not age; the universal was the strongest-sounding sentence here and the
+only one a reader could falsify.
 
 The one existing attempt at a DOKS provider, `k8ubeify/karpenter-provider-doks`, was created on
 29 January 2025 and last pushed eight minutes later. No releases, no subsequent commits.
@@ -73,9 +105,20 @@ Two independent reasons.
 **Scope of audience.** Karpenter *replaces* node provisioning; binpack *cooperates* with the
 autoscaler already running. That is the difference between "re-architect your node lifecycle"
 and "install something that drains one node when the arithmetic says it is safe." binpack
-targets every managed Kubernetes service with a constrained autoscaler — DOKS, Linode LKE,
-Vultr, Scaleway, Civo, OVH — plus GKE and EKS users who have not adopted Karpenter, for a small
-fraction of the engineering effort of a single provider.
+targets anyone whose provider runs the cluster-autoscaler for them and does not expose its
+scale-down settings — DOKS and Linode LKE are the worked examples — plus GKE and EKS users who
+have not adopted Karpenter, for a small fraction of the engineering effort of a single provider.
+
+**Correction (3).** The audience was previously a list of six platforms asserted to have
+"a constrained autoscaler", Civo among them. On Civo the autoscaler is a marketplace application
+running in the operator's own cluster, reconfigured by editing its Deployment — Civo's
+documentation gives `kubectl edit deployment cluster-autoscaler -n kube-system` and the
+`--nodes=min:max:workers` flag as the worked example — so every flag is available. Vultr,
+Scaleway and OVH were not checked either way and should not be named again until they are. The
+durable form of the claim is not a list but the command that answers it on the reader's own
+cluster, `kubectl get deploy -A | grep cluster-autoscaler` — matched by substring across all
+namespaces, because both the name and the namespace vary by install, and read as evidence rather
+than proof. The architectural argument below holds for everyone regardless of the answer.
 
 **Permanence of the gap.** binpack is not a workaround for DigitalOcean hiding
 `scale-down-utilization-threshold`. Even a fully tunable cluster-autoscaler never rebalances;

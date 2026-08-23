@@ -105,17 +105,53 @@ kubectl get pods -A -o json | jq -r '
 lists the pods where it actually is — every pod holding a volume that does block, and none of
 the ones that only look like it.
 
-## 5. Set the `least-waste` expander, if you run multiple pools
+## 5. Check what your provider lets you set on the autoscaler
+
+Less is welded shut than the reputation suggests. DigitalOcean's cluster autoscaler
+configuration carries `scale-down-utilization-threshold` and `scale-down-unneeded-time` as well
+as a pool's minimum and maximum, so two of the three scale-down dials are yours
+([`doctl kubernetes cluster update`](https://docs.digitalocean.com/reference/doctl/reference/kubernetes/cluster/update/),
+read 2026-08-23); `scale-down-delay-after-add` is the one that is not. Read yours before
+changing anything:
+
+```bash
+doctl kubernetes cluster get <name>
+```
+
+Raising `scale-down-utilization-threshold` widens the net — a node qualifies for removal when
+its utilisation is **below** it, so the dial goes *up* if you want more scale-down. Shortening
+`scale-down-unneeded-time` makes the autoscaler act sooner on a node that already qualifies.
+Neither makes it rebalance, which is the gap binpack exists for, but both are free and neither
+needs a new component.
+
+If your autoscaler is instead a Deployment in your own cluster, every flag is reachable directly
+and none of this applies. Its name and namespace vary by install, so look for it by substring:
+
+```bash
+kubectl get deploy -A | grep cluster-autoscaler
+```
+
+## 6. Check the expander, if you run multiple pools
+
+`least-waste` picks the pool whose new node wastes the least capacity for the pending pods, and
+it has been the cluster-autoscaler's own default since 1.33 — it was `random` before that. So
+you may already have it, and this may be nothing to do. What your cluster is set to is a
+read-only question; on DigitalOcean:
+
+```bash
+doctl kubernetes cluster get <name>
+```
+
+If it is not what you want:
 
 ```bash
 doctl kubernetes cluster update <name> --expanders least-waste
 ```
 
-This affects scale-**up** only: it picks the pool whose new node wastes the least capacity for
-the pending pods. It does nothing for scale-down, so it will not fix the problem this project
-addresses — but it is a free improvement and takes seconds.
+Either way this affects scale-**up** only: it does nothing for scale-down, so it will not fix
+the problem this project addresses.
 
-## 6. Add topology spread constraints where you need spreading
+## 7. Add topology spread constraints where you need spreading
 
 If you are spreading replicas across nodes for availability, say so declaratively rather than
 relying on a cluster-wide heuristic or on the scheduler's default behaviour:
@@ -138,7 +174,7 @@ than guessing.
 If you add these, drop `RemoveDuplicates` from any descheduler policy you run; it does the same
 job more bluntly and causes avoidable churn.
 
-## 7. Fix your Metrics API if `kubectl top` is broken
+## 8. Fix your Metrics API if `kubectl top` is broken
 
 ```bash
 kubectl top nodes

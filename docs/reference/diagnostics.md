@@ -148,8 +148,16 @@ removes nodes that are *already* nearly empty; it never rebalances to create one
 The pool is at its configured minimum size, so no node will be removed from it whatever the
 utilisation.
 
-**Fix.** Lower the pool's minimum if it is set higher than you need. binpack will not drain a
-node out of a pool at its minimum either — that would cause an immediate scale-up.
+**Fix.** Lower the pool's minimum if it is set higher than you need.
+
+binpack will not drain a node out of a pool at its minimum either, and the reason is worth being
+precise about, because it is not the one you would guess. At the minimum the autoscaler does not
+remove-and-replace: it marks the node unremovable with `NodeGroupMinSizeReached` and stops
+there, and nothing scales up to compensate — `--enforce-node-group-min-size` is off by default
+and scale-up is driven only by unschedulable pods. So a drain at the floor would strand an
+emptied, cordoned node for the whole `removalTimeout` and then hand it back with a backoff
+recorded. The evidence to look for if the guard is ever bypassed is
+`binpack_drains_abandoned_total` and a node in backoff, not a scale-up.
 
 ### `pool-not-autoscaling` — info
 

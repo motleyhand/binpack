@@ -364,9 +364,11 @@ drain verification catches and backs off from.
 Whether they are yours to set depends on where your autoscaler runs. They are ordinary flags on
 the autoscaler binary, so anywhere it is a Deployment in your own cluster — EKS, kOps, Rancher,
 any self-hosted install — they are whatever its manifest says. AKS exposes both through the
-cluster-autoscaler profile and ships `skip-nodes-with-local-storage=false`. Platforms that run
-the autoscaler in a control plane you cannot reach — DOKS, LKE, Vultr, Scaleway — leave you with
-upstream's defaults, which is what these fields default to.
+cluster-autoscaler profile and ships `skip-nodes-with-local-storage=false`. Where instead the
+autoscaler runs in a control plane you cannot reach — DOKS and LKE are the cases checked here —
+you get upstream's defaults, which is what these fields default to. Which of those describes
+your cluster is the command below rather than a list: a platform that runs the autoscaler for
+you today may expose it tomorrow, and several that are assumed to hide it do not.
 
 To read what yours is actually running, where the autoscaler is visible:
 
@@ -425,12 +427,16 @@ This is not a limit on how long a drain may take. A pod that is terminating with
 grace period drains happily under the 10-minute default — the stall clock does not run while a
 pod is legitimately shutting down.
 
-Other progress signals: an eviction being accepted, the node's pod count dropping, a pod
-entering `Terminating`.
+The other progress signals are the node's pod count dropping and a pod acquiring a
+`deletionTimestamp`. An eviction being *accepted* is deliberately not one of them: it is the
+only signal binpack produces rather than observes, so a bound resting on its absence is not a
+bound. See [ADR-0007](../design/adr-0007-drain-progress-not-deadlines.md), which sets out the
+case that forced the withdrawal.
 
 Being genuinely stuck is detected separately and does not wait for this timeout. A pod still
-present past its termination deadline is reported as such, naming the pod, because that is a
-finalizer or a stuck volume rather than a slow shutdown.
+present past its termination deadline is reported as such, naming the pod, because something is
+usually wrong by then — a finalizer, a volume that will not detach, an unhealthy kubelet — but
+a teardown that is merely slow can reach the same line.
 
 Raise it if your cluster has workloads that pause between shutdown phases for longer than ten
 minutes without any observable change. Must be positive.
@@ -675,7 +681,7 @@ mounts it, so this inside the pod answers about the binpack running beside it ra
 one configured with defaults:
 
 ```bash
-kubectl -n binpack exec deploy/binpack -- binpack explain
+kubectl -n binpack-system exec deploy/binpack -- binpack explain
 ```
 
 The two answer different questions, and before the source was reported nothing in the output

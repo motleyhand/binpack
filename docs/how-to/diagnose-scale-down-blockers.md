@@ -130,7 +130,16 @@ kubectl get pods -A -o json | jq -r '
     elif test("Mi$") then (rtrimstr("Mi")|tonumber)*1048576
     elif test("Gi$") then (rtrimstr("Gi")|tonumber)*1073741824
     elif test("Ti$") then (rtrimstr("Ti")|tonumber)*1099511627776
-    else (tonumber? // 0) end;
+    elif test("Pi$") then (rtrimstr("Pi")|tonumber)*1125899906842624
+    elif test("Ei$") then (rtrimstr("Ei")|tonumber)*1152921504606846976
+    elif test("k$")  then (rtrimstr("k")|tonumber)*1000
+    elif test("M$")  then (rtrimstr("M")|tonumber)*1000000
+    elif test("G$")  then (rtrimstr("G")|tonumber)*1000000000
+    elif test("T$")  then (rtrimstr("T")|tonumber)*1000000000000
+    elif test("P$")  then (rtrimstr("P")|tonumber)*1000000000000000
+    elif test("E$")  then (rtrimstr("E")|tonumber)*1000000000000000000
+    elif test("[num]$") then 0
+    else (tonumber? // 1e30) end;
   .items[] | . as $p
   | [ $p.spec.containers[]?.resources.requests.memory | to_bytes ] as $reg
   | [ $p.spec.initContainers[]? | select(.restartPolicy == "Always")
@@ -144,18 +153,39 @@ kubectl get pods -A -o json | jq -r '
 ' | sort -rn | head -20
 ```
 
-This is a close approximation rather than the exact upstream calculation, and it is deliberately
-biased towards overstating rather than understating. `binpack explain` computes the real figure
-using the same library the scheduler does.
+Both suffix families are handled, because both appear in real manifests: `8G` is 8,000,000,000
+bytes and `8Gi` is 8,589,934,592, and a listing that understood only the binary spellings scored
+every decimal one as zero — which sorted the largest request in the cluster to the bottom of a
+listing whose whole job is to surface it. A quantity this expression cannot parse at all is
+reported as an absurd size rather than as zero, so it lands at the top where you will see it.
+The suffixes are the ones `k8s.io/apimachinery/pkg/api/resource` accepts: `Ki` through `Ei`
+binary, `k` through `E` decimal — kilo is lower-case, because `K` is not a suffix Kubernetes
+takes. `n`, `u` and `m` are legal too and round to nothing here.
+
+Two caveats on the arithmetic. It is a close approximation rather than the exact upstream
+calculation, and it is biased towards overstating rather than understating: the init/sidecar
+peak it computes is an upper bound on what the scheduler reserves. And it reads only
+per-container requests, so on a cluster using pod-level `spec.resources` it understates by
+whatever that block adds — the API server requires the pod-level request to be at least the
+container aggregate, and `PodRequests` in `k8s.io/component-helpers` takes the pod-level figure
+in preference. `binpack explain` computes the real figure using that same library.
 
 ## 7. Count pods per node
 
 ```bash
-kubectl get pods -A -o wide --no-headers | awk '{print $8}' | sort | uniq -c
+kubectl get pods -A -o custom-columns=NODE:.spec.nodeName --no-headers | sort | uniq -c | sort -rn
 ```
 
 The kubelet's default ceiling is 110. A node at that limit is unschedulable regardless of how
 much CPU and memory it has free, and no CPU/memory dashboard will show you this.
+
+Address the field rather than a column position. Once a pod has restarted, kubectl prints its
+RESTARTS cell as `3 (5m ago)` — three whitespace-separated tokens instead of one — so every
+column after it shifts, and `-o wide | awk '{print $8}'` reads AGE for those pods and NODE for
+the rest. The counts come out wrong in the worst possible direction: restarts cluster on the
+busiest nodes, so the node nearest the 110 ceiling is the one most likely to be under-counted,
+and the miscounted pods land in plausible-looking buckets keyed on durations. The same trap
+applies to any `-o wide | awk` recipe.
 
 ## 8. Check for pods matched by more than one PDB
 

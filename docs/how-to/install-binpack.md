@@ -125,6 +125,17 @@ The logs carry the same decisions:
 kubectl -n binpack-system logs -l app.kubernetes.io/name=binpack -f
 ```
 
+To ask the running binpack rather than a fresh one, run `explain` inside the pod. It reads the
+mounted ConfigMap, so it answers about the configuration this install is actually using:
+
+```bash
+kubectl -n binpack-system exec deploy/binpack -- binpack explain
+```
+
+The same command on your laptop, with no `-f`, answers about built-in defaults instead — every
+command reports which configuration it read, and the [configuration
+reference](../reference/configuration.md) explains that line.
+
 ## Metrics
 
 The endpoint is served by default; discovery is opt-in, because a chart that creates a monitor
