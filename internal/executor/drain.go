@@ -101,7 +101,7 @@ func Advance(
 		return Step{Code: StepRemoved, Done: true,
 			Reason: "the cluster-autoscaler removed the node"}, nil
 
-	case engine.BeingRemoved(a.Node) && a.SkipCode != engine.SkipNotAutoscaled:
+	case engine.BeingRemoved(a.Node) && engine.AutoscalerCanFinish(a.SkipCode):
 		// The taint asked of the node directly rather than read from the skip
 		// code, because eligibility reports one reason and a node can satisfy
 		// several. The likeliest overlap is the one this must survive: the
@@ -123,12 +123,21 @@ func Advance(
 		// short-circuits every evaluation to this function while a drain is
 		// marked, binpack stops consolidating anywhere in the cluster.
 		//
-		// SkipNotAutoscaled is that question already answered, in the place
-		// that answers it for everything else: revalidation sets it when the
-		// status is too stale to vouch for the process, eligibility when the
-		// node's pool is not one the autoscaler manages. Both are readings of
-		// the autoscaler's own published status. What is deliberately not read
-		// is the taint's value, which is the Unix second it was applied:
+		// [engine.AutoscalerCanFinish] is that question already answered, in
+		// the place that answers it for everything else: revalidation reports
+		// autoscaler-not-live when the status is too stale to vouch for the
+		// process, eligibility not-autoscaled when the node's pool is not one
+		// the autoscaler manages. Both are readings of the autoscaler's own
+		// published status, and the predicate covers both because either
+		// leaves this hand-over with nothing to finish it. Asked through the
+		// predicate rather than by comparing one code, because that is what
+		// this branch was doing when the two conditions shared a spelling —
+		// and splitting them without it would have made the dead-autoscaler
+		// case fall in here and wait for ever, which is the one thing this
+		// condition exists to prevent.
+		//
+		// What is deliberately not read is the taint's value, which is the
+		// Unix second it was applied:
 		// elapsed time cannot tell a dead autoscaler from a slow deletion, and
 		// guessing wrong uncordons a node mid-delete. Falling through hands
 		// the node back under the reason revalidation already computed.

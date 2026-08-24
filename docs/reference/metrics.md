@@ -71,7 +71,7 @@ alerts rather than being folded into this one:
 | `drain` | A node was chosen |
 | `no-autoscaler` | Nothing binpack found would remove a drained node: no status object where it looked, one carrying no status, an `autoscalerStatus` other than `Running`, or a probe time absent or older than five minutes |
 | `autoscaler-unhealthy` | The cluster-autoscaler is alive and reporting, and reports the cluster as unhealthy — so it has stopped scaling in both directions |
-| `no-candidates` | Every node was ruled out before any simulation ran |
+| `no-candidates` | Every node was ruled out |
 | `none-feasible` | Nodes were simulated and none could be emptied |
 | `draining` | A drain was already under way, so no new node was chosen: binpack advanced that drain, or — under `dryRun: true` — reported it and carried on |
 
@@ -83,7 +83,7 @@ is a capacity one.
 | Metric | Type | Labels | Meaning |
 |---|---|---|---|
 | `binpack_nodes` | gauge | `verdict` | Nodes by verdict at the last evaluation |
-| `binpack_nodes_skipped` | gauge | `code` | Nodes ruled out before simulation, by reason |
+| `binpack_nodes_skipped` | gauge | `code` | Nodes ruled out without a drain being attempted, by reason |
 | `binpack_drainable_nodes` | gauge | — | Nodes whose whole workload was shown to fit elsewhere |
 | `binpack_nodes_unmodelled` | gauge | `cause` | Nodes refused because binpack could not predict what a pod's replacement would be |
 
@@ -110,7 +110,19 @@ the last evaluation: see [During a drain](#during-a-drain) and
 | `backoff` | A previous drain failed; binpack is waiting before retrying |
 | `cordoned` | Already cordoned by somebody else |
 | `protected-pod` | The node runs a pod binpack must not evict |
+| `being-removed` | The cluster-autoscaler has committed to deleting this node and is emptying it itself |
 | `too-many-pods` | The drain would exceed `maxPodsPerDrain` |
+
+Most of these are reached before any simulation runs, and `too-many-pods` is the exception: it
+is set on a node whose simulation came back *feasible*, once the count of pods that would have
+to move exceeds the cap. So a cluster where every candidate exceeds `maxPodsPerDrain` reports
+`no-candidates` having simulated every node — which is why neither this gauge nor that code says
+"before simulation".
+
+Three further skip codes exist and can never appear here: `gone`, `uncordoned` and
+`autoscaler-not-live`. They are set only when binpack re-asks whether a drain already under way
+should continue, which is a question about one node rather than a pass over the cluster. They
+appear on `binpack_drains_abandoned_total` instead.
 
 These are the same codes `binpack explain --output json` reports per node, so a dashboard and an
 investigation use one vocabulary.
@@ -135,16 +147,22 @@ investigation use one vocabulary.
 | `replacement-unschedulable` | A pod that moved off the node could not be placed anywhere |
 | `unaccounted-pods` | Pods remained that the simulation had not accounted for |
 
-Any of the skip codes above can also appear, when the cluster changed underneath a drain and
-revalidation stopped it — a pool reaching its minimum, an operator annotating the node, the
-cluster growing before anything had moved. So can `infeasible` and `blocked`, for the two outcomes that carry no skip
-code: the remaining pods stopped fitting elsewhere, and a disruption budget stopped allowing
-their eviction.
+Skip codes can also appear, when the cluster changed underneath a drain and revalidation stopped
+it — a pool reaching its minimum, an operator annotating the node, the cluster growing before
+anything had moved. Not all of them: `gone`, `uncordoned` and `being-removed` are each handled
+before the abandonment path, as a completed drain, a re-cordon and a hand-over respectively, and
+`cordoned` and `drain-in-progress` are only ever reached by a pass over the cluster rather than
+by revalidation. Those five have a series here, at zero, and it stays at zero.
 
-`not-autoscaled` is worth reading carefully in this position. On `binpack_nodes_skipped` it means
-what the table says; as an abandonment it also covers the cluster-autoscaler's status having gone
-stale mid-drain, including while binpack was waiting for the autoscaler to remove a node it had
-tainted itself. The note on the `DrainAbandoned` event says which.
+`autoscaler-not-live` is the one that only appears here. It means there was no cluster-autoscaler
+in a state to finish the drain — absent, its status too stale to vouch for, or reporting the
+cluster unhealthy — where `not-autoscaled` keeps its own meaning of a node whose pool the
+autoscaler does not manage. The two were one code until v0.3.0, so an alert that matched
+`reason="not-autoscaled"` to catch a dead autoscaler must now match both.
+
+`infeasible` and `blocked` appear too, for the two outcomes that carry no skip code: the
+remaining pods stopped fitting elsewhere, and a disruption budget stopped allowing their
+eviction.
 
 `scale-up-in-progress` and `cooldown-after-scale-up` are narrower here than the table above
 suggests. As an abandonment, either means the cluster grew **between the cordon and the first
@@ -186,6 +204,14 @@ repeatedly — is answered without them. `binpack diagnose` names the node.
 | `binpack_pool_min_nodes` | gauge | `pool` | The pool's configured minimum |
 | `binpack_pool_max_nodes` | gauge | `pool` | The pool's configured maximum |
 
+The `pool` label is the only one on this surface whose values come from your cluster rather than
+from a set fixed at compile time: it is the readable pool name where your nodes carry one, and
+the node group's identifier otherwise. What bounds it is the reporting, not the labelling — all
+three series are cleared and rewritten on every evaluation, one per node group the autoscaler
+publishes, so the live series count is your pool count however the nodes are labelled. If two
+nodes of one group disagree about the readable name, which of them the label shows is not
+defined.
+
 `binpack_pool_nodes` counts nodes that are **registered and ready**, which is what you are
 paying for. It is deliberately not the number binpack compares against the floor: that is the
 lower of ready and the autoscaler's current target, and the two differ exactly while a
@@ -211,8 +237,11 @@ Pools that no longer exist stop being reported rather than freezing at their fin
 
 ## Notes on cardinality
 
-Every label value is drawn from a bounded set: the verdicts, skip codes, outcome codes and the
-two unmodelled causes above, plus pool names, which are counted in single digits.
+Every label value but one is drawn from a set fixed when binpack is built: the verdicts, skip
+codes, outcome codes, abandonment reasons and the two unmodelled causes above. The exception is
+`pool`, whose values come from your cluster — and what bounds it is that the pool series are
+cleared and rewritten each evaluation, one per node group, rather than any assumption about how
+many pools you have or how your nodes are labelled.
 
 The engine's prose reasons are deliberately **not** exposed as labels. They name individual
 nodes and pods — "no destination would accept a pod the size of

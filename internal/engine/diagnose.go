@@ -238,13 +238,6 @@ var diagnoses = map[string]Diagnosis{
 			"safe-to-evict=true annotation does override this, and means what it says: the " +
 			"pod is deleted and nothing brings it back.",
 	},
-	BlockedMirrorPod: {
-		Severity: Blocking,
-		Summary: "these are static pods, created by the kubelet from an on-disk manifest, " +
-			"and cannot be evicted",
-		Fix: "nothing to change from inside the cluster. The node cannot be drained while a " +
-			"static pod runs on it.",
-	},
 	BlockedLocalStorage: {
 		Severity: Warning,
 		Summary: "these pods use local storage, which the cluster-autoscaler will not disturb " +
@@ -440,7 +433,7 @@ func diagnosePools(s Snapshot, cfg Config) []Finding {
 	// more completely than anything else here, and is trivially checkable.
 	for _, g := range s.Autoscaler.Groups {
 		if g.MinSize > 0 && g.Size() <= g.MinSize {
-			findings = append(findings, finding(FindingPoolAtMinimum, poolLabel(names[g.ID], g.ID),
+			findings = append(findings, finding(FindingPoolAtMinimum, names.Label(g.ID),
 				fmt.Sprintf("%d node(s), minimum %d", g.Size(), g.MinSize)))
 		}
 	}
@@ -464,18 +457,11 @@ func diagnosePools(s Snapshot, cfg Config) []Finding {
 		counts[id]++
 	}
 	for _, id := range order {
-		findings = append(findings, finding(FindingPoolNotAutoscaled, poolLabel(names[id], id),
+		findings = append(findings, finding(FindingPoolNotAutoscaled, names.Label(id),
 			fmt.Sprintf("%d node(s)", counts[id])))
 	}
 
 	return findings
-}
-
-func poolLabel(name, id string) string {
-	if name == "" {
-		return id
-	}
-	return name
 }
 
 func diagnoseBudgets(s Snapshot) []Finding {

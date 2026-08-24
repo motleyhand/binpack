@@ -4,10 +4,17 @@
 // people build alerts on these, and an alert that stops firing because a
 // series was renamed is worse than no alert at all.
 //
-// Labels are drawn only from bounded sets — the engine's verdicts, skip codes
-// and decision codes. The prose reasons are deliberately not exported here.
-// They contain node and pod names, and a label whose values are unbounded
-// turns a monitoring system into an outage.
+// Label values come from compile-time sets — the engine's verdicts, skip
+// codes, decision codes and diagnosis codes, and the drain's abandon codes —
+// with one exception, `pool`, which is a value read off a node label and so
+// comes from the cluster. It is bounded mechanically rather than by trust: the
+// pool vectors are Reset on every evaluation and written once per node group,
+// so the live series count is the number of groups the autoscaler publishes,
+// whatever anybody has labelled their nodes.
+//
+// The prose reasons are deliberately not exported here. They contain node and
+// pod names, and a label whose values are unbounded turns a monitoring system
+// into an outage.
 package metrics
 
 import (
@@ -113,7 +120,7 @@ var (
 
 	skipped = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: "binpack_nodes_skipped",
-		Help: "Nodes ruled out before simulation at the last evaluation, by reason code.",
+		Help: "Nodes ruled out without a drain being attempted at the last evaluation, by reason code.",
 	}, []string{"code"})
 
 	unmodelled = prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -365,15 +372,16 @@ func observePools(s engine.Snapshot, cfg engine.Config) {
 	poolMax.Reset()
 
 	// The readable pool name rather than the provider identifier: nobody
-	// recognises a UUID on a dashboard or in an alert. Bounded either way —
-	// pools are counted in single digits.
+	// recognises a UUID on a dashboard or in an alert.
+	//
+	// Bounded either way, and mechanically so rather than by any assumption
+	// about how many pools the reader has: the three vectors are Reset above
+	// and written once per group below, so the live series count is the
+	// autoscaler's group count whatever the label values are.
 	names := engine.PoolNames(s, cfg)
 
 	for _, g := range s.Autoscaler.Groups {
-		label := names[g.ID]
-		if label == "" {
-			label = g.ID
-		}
+		label := names.Label(g.ID)
 		// Ready, not Size(). They differ while a scale-down is in progress —
 		// Size() is the lower of ready and the autoscaler's target, which is
 		// the number binpack compares against the floor — and a series called

@@ -38,7 +38,14 @@ import (
 
 // Reason explains a refusal. The zero value means no objection.
 type Reason struct {
-	// Code is stable and machine-readable, for metrics and tests.
+	// Code is stable and machine-readable. It is what
+	// `binpack explain --output json` publishes as refusals[].code, which is
+	// public surface; the message beside it is not, and may be reworded.
+	//
+	// It said "for metrics and tests" and that was false about metrics: until
+	// v0.3.0 nothing outside this package's own tests read it, so the
+	// evidence ADR-0006 says the allowlist should be widened on was being
+	// discarded one line after it was computed.
 	Code string
 	// Message names the specific thing that caused the refusal, for humans
 	// reading `binpack explain`.
@@ -53,7 +60,8 @@ func (r Reason) String() string {
 	return r.Message
 }
 
-// Refusal codes. Stable identifiers, since metrics and tests key on them.
+// Refusal codes. Stable identifiers: `binpack explain --output json` publishes
+// them as refusals[].code.
 const (
 	ReasonUnschedulable    = "node-unschedulable"
 	ReasonNodeNotReady     = "node-not-ready"
@@ -61,7 +69,23 @@ const (
 	ReasonNodeAffinity     = "node-affinity"
 	ReasonInsufficient     = "insufficient-resources"
 	ReasonUnsupportedPod   = "unsupported-pod-feature"
-	ReasonUnsupportedNode  = "unsupported-node-feature"
+
+	// ReasonAntiAffinity: some pod's required anti-affinity could reject this
+	// one here — a resident of the node, or a pod anywhere in a topology
+	// domain the node is in.
+	//
+	// Its own code rather than ReasonUnsupportedNode, which carried it until
+	// v0.3.0. Nothing read either until then, so the two had never had to be
+	// told apart; the moment the code became something a consumer branches on,
+	// a name saying "node feature" about a refusal that is not about the node
+	// and not about a feature stopped being tenable. The remedies differ too:
+	// this one is answered by reading the anti-affinity terms in your own
+	// workloads, and that one by looking at a kubelet.
+	ReasonAntiAffinity = "pod-anti-affinity"
+
+	// ReasonUnsupportedNode: the node has not declared a feature the pod
+	// requires, or binpack could not work out which features it requires.
+	ReasonUnsupportedNode = "unsupported-node-feature"
 )
 
 // CanFit reports whether pod could be placed on node, given the capacity still

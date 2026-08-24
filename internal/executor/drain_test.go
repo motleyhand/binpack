@@ -192,7 +192,7 @@ func TestEveryEndingHandsTheNodeBack(t *testing.T) {
 			// only a live autoscaler ever clears the taint that says it is
 			// trying.
 			name: "the autoscaler stopped without finishing the deletion it began",
-			code: engine.SkipNotAutoscaled,
+			code: engine.SkipAutoscalerNotLive,
 			pods: []*corev1.Pod{mother.Pod("default", "left", mother.OnNode("a"))},
 			to: func(s *engine.Snapshot) {
 				s.Nodes[0].Spec.Taints = append(s.Nodes[0].Spec.Taints, corev1.Taint{
@@ -1600,8 +1600,8 @@ func TestAdvanceAbandonsAHandOverTheAutoscalerNeverFinishes(t *testing.T) {
 	// here: what ended this drain is that nothing would remove the node, which
 	// is the same fact under the same name whether a drain was in flight or
 	// not.
-	if step.Code != engine.SkipNotAutoscaled {
-		t.Errorf("abandon code = %q, want %q", step.Code, engine.SkipNotAutoscaled)
+	if step.Code != engine.SkipAutoscalerNotLive {
+		t.Errorf("abandon code = %q, want %q", step.Code, engine.SkipAutoscalerNotLive)
 	}
 
 	after := nodeFrom(t, c, "a")
@@ -2832,7 +2832,7 @@ func TestAnEmptiedNodeWaitsThroughAScaleUpButNotThroughADeadAutoscaler(t *testin
 			name:       "an autoscaler that has stopped ends the wait, scale-up or no",
 			probeAgo:   30 * time.Minute,
 			scaleUpAgo: 2 * time.Minute,
-			wantCode:   engine.SkipNotAutoscaled,
+			wantCode:   engine.SkipAutoscalerNotLive,
 			wantEnded:  true,
 		},
 		{
@@ -2848,7 +2848,7 @@ func TestAnEmptiedNodeWaitsThroughAScaleUpButNotThroughADeadAutoscaler(t *testin
 			probeAgo:   30 * time.Minute,
 			scaleUpAgo: 2 * time.Minute,
 			inProgress: true,
-			wantCode:   engine.SkipNotAutoscaled,
+			wantCode:   engine.SkipAutoscalerNotLive,
 			wantEnded:  true,
 		},
 	} {

@@ -33,6 +33,7 @@ implementation:
 | Surface | Example |
 |---|---|
 | API group | `binpack.motleyhand.com/v1alpha1` |
+| CLI commands, flags and flag values | `binpack diagnose --fail-on blocking` |
 | Configuration fields | `policy.feasibility.reserveForLargestPod` |
 | Node annotations and labels | `binpack.motleyhand.com/skip`, `binpack.motleyhand.com/draining` |
 | Metric names and label values | `binpack_drainable_nodes`, `verdict="infeasible"` |
@@ -40,6 +41,17 @@ implementation:
 | Event reasons and actions | `WouldDrain`, `Consolidate` |
 | `--output json` field names | `code`, `verdict`, `freesNothing` |
 | Exit codes | `0`, `1`, `2` from `diagnose --fail-on` |
+
+The CLI row's enumeration is [cli.md](cli.md) — every command, every flag and its default, the
+exit codes, the JSON, and the Events. It is listed here because the last two rows exist only as
+products of it: an exit code is something a command returns and a JSON field name is something a
+command prints. Promising those while saying nothing about the command or the flag that produces
+them left a CI job built on `binpack diagnose --fail-on blocking --output json` covered in two of
+its six moving parts.
+
+Flag **values** are covered as well as flag names, because a documented example depends on them:
+`--fail-on blocking` and `--output json` are vocabularies, and renaming a value breaks a
+pipeline exactly as renaming the flag would.
 
 An alert that silently stops firing because a series was renamed is worse than no alert, so a
 rename is a breaking change even when nothing else about the behaviour moves.

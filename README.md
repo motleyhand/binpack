@@ -119,6 +119,7 @@ watch, and how to uninstall it without stranding a node.
 
 | Document | What it covers |
 |---|---|
+| [CLI](docs/reference/cli.md) | Every command and flag, the exit codes, the JSON, and the Events binpack writes |
 | [Configuration](docs/reference/configuration.md) | Every field, what it does, and why headroom is not a percentage |
 | [Diagnostics](docs/reference/diagnostics.md) | Every `binpack diagnose` code, its severity, and the fix |
 | [Versioning](docs/reference/versioning.md) | What a version number covers, what is public API, and what 0.x means |

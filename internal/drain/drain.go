@@ -459,7 +459,7 @@ func Assess(s State, policy Policy) Assessment {
 // frozen mid-scale-up by an autoscaler that then died would read InProgress for
 // ever. What bounds that is what bounds every other wait on this component, and
 // it is why nothing new is needed here: revalidation stops believing a document
-// that has stopped being refreshed, reports SkipNotAutoscaled, and the executor
+// that has stopped being refreshed, reports SkipAutoscalerNotLive, and the executor
 // hands the node back on the verdict before it reaches this assessment at all.
 func scaleDownPaused(s State, policy Policy) bool {
 	if s.ScaleUpInProgress {

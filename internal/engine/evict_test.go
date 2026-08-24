@@ -80,11 +80,11 @@ func TestCheckEvictablePerPod(t *testing.T) {
 			pod: mother.Pod("kube-system", "coredns", mother.SafeToEvict("true"),
 				mother.CreatedAt(now.Add(-5*time.Minute))),
 		},
-		{
-			name: "mirror pod cannot be evicted at all",
-			pod:  mother.MirrorPod("kube-system", "static"),
-			want: engine.BlockedMirrorPod,
-		},
+		// Deliberately no mirror-pod case. This function's contract is that
+		// it is handed relocatable and expendable pods, never node-local
+		// ones, and a case here calling it with a static pod was the only
+		// thing exercising a branch neither caller could reach.
+		// TestAStaticPodDoesNotBlockADrain asserts what production does.
 		{
 			// A refusal must win over a permission, or the annotation could
 			// be used to override the kubelet, which it cannot.

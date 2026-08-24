@@ -44,7 +44,17 @@ type Blocked struct {
 	// PerNode maps node name to the reason that node refused, so `explain`
 	// can show that three nodes were short of memory and a fourth had a
 	// taint.
-	PerNode map[string]string
+	//
+	// The whole [fit.Reason] rather than its message, because the message is
+	// the half that is not public: docs/reference/versioning.md reserves the
+	// right to reword every sentence binpack prints, "which is exactly why
+	// every one of them has a stable code beside it". These sentences had no
+	// code beside them anywhere — not in a metric, not in a log field, not in
+	// `explain --output json` — so ADR-0006's promise to widen the allowlist
+	// "on evidence" had no evidence to widen on, and a consumer wanting to
+	// separate "untolerated taint" from "insufficient memory" had to match
+	// English.
+	PerNode map[string]fit.Reason
 	// Summary is a one-line description.
 	Summary string
 	// Unmodelled marks the refusal as "binpack could not predict what the
@@ -271,7 +281,7 @@ func place(
 	remaining map[string]corev1.ResourceList,
 	residents map[string][]*corev1.Pod,
 	domains fit.AntiAffinityDomains,
-) (*corev1.Node, fit.Reason, map[string]string) {
+) (*corev1.Node, fit.Reason, map[string]fit.Reason) {
 	// Asked once, above the loop, because it is a verdict about the pod alone:
 	// fit reaches it before reading a single node property. Left inside, it
 	// wrote the identical sentence under every destination's name — asserting
@@ -296,13 +306,13 @@ func place(
 		)
 	})
 
-	refusals := make(map[string]string, len(ordered))
+	refusals := make(map[string]fit.Reason, len(ordered))
 	for _, node := range ordered {
 		ok, reason := fit.CanFit(pod, node, remaining[node.Name], residents[node.Name], domains)
 		if ok {
 			return node, fit.Reason{}, nil
 		}
-		refusals[node.Name] = reason.Message
+		refusals[node.Name] = reason
 	}
 	return nil, fit.Reason{}, refusals
 }
@@ -360,7 +370,7 @@ func checkHeadroom(
 		// What was observed, rather than what it would mean. Every destination
 		// refusing is not the same as the cluster being full: three of them may
 		// be cordoned.
-		refusals := make(map[string]string, len(destinations))
+		refusals := make(map[string]fit.Reason, len(destinations))
 		accepted := false
 		for _, node := range destinations {
 			// Neither an anti-affinity index nor the destination's residents,
@@ -698,11 +708,16 @@ func sameTolerations(a, b headroomShape) bool {
 // asked for, because that is the whole of what this check is about — and it
 // names the pod, because there is more than one shape being asked about and
 // "the largest" would not say which.
-func headroomRefusal(r fit.Reason, running *corev1.Pod) string {
+// headroomRefusal says the same refusal about a probe rather than about a pod.
+//
+// The code is untouched and only the sentence gains the pod it is about: the
+// probe carries no identity of its own, so "insufficient memory" alone reads
+// as a fact about a pod the reader cannot find.
+func headroomRefusal(r fit.Reason, running *corev1.Pod) fit.Reason {
 	if r.Code == fit.ReasonInsufficient {
-		return r.Message + " for a pod the size of " + podRef(running)
+		r.Message += " for a pod the size of " + podRef(running)
 	}
-	return r.Message
+	return r
 }
 
 // RelocationSummary says what draining a node would move, in one clause.

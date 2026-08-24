@@ -11,6 +11,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/motleyhand/binpack/internal/engine"
+	"github.com/motleyhand/binpack/internal/fit"
 	"github.com/motleyhand/binpack/internal/mother"
 )
 
@@ -1084,7 +1085,7 @@ func TestAZoneAntiAffinityRefusesEveryNodeInTheZone(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("accepted a destination in a zone whose anti-affinity rejects the replacement")
 	}
-	if got := sim.Blocked.PerNode["bare"]; !strings.Contains(got, zone+"=z1") {
+	if got := sim.Blocked.PerNode["bare"].Message; !strings.Contains(got, zone+"=z1") {
 		t.Errorf("the empty node in the zone should be refused for the domain it is in, got: %q", got)
 	}
 }
@@ -1250,8 +1251,9 @@ func TestHeadroomNamesWhyEachDestinationRefused(t *testing.T) {
 	if sim.Feasible {
 		t.Fatal("packing the cluster to the last byte leaves nowhere for the next pod that restarts")
 	}
-	if got := sim.Blocked.PerNode["roomy"]; !strings.Contains(got, "gpu") {
-		t.Errorf("roomy refused with %q, want the taint that actually stopped it — "+
+	if got := sim.Blocked.PerNode["roomy"]; got.Code != fit.ReasonUntoleratedTaint ||
+		!strings.Contains(got.Message, "gpu") {
+		t.Errorf("roomy refused with %+v, want the taint that actually stopped it — "+
 			"it has 64Gi free and nothing about it is short of room", got)
 	}
 
@@ -1261,7 +1263,7 @@ func TestHeadroomNamesWhyEachDestinationRefused(t *testing.T) {
 	// which is the number the reserve is about. It names the pod rather than
 	// saying "the largest", because the reserve asks about every maximal shape
 	// in the cluster and there is generally more than one.
-	short := sim.Blocked.PerNode["tight"]
+	short := sim.Blocked.PerNode["tight"].Message
 	if !strings.Contains(short, "memory") {
 		t.Errorf("tight refused with %q, want the resource it ran out of", short)
 	}
@@ -1271,9 +1273,9 @@ func TestHeadroomNamesWhyEachDestinationRefused(t *testing.T) {
 	// And only there. A node that refused for a taint refused whatever size
 	// was being asked for, so pinning the reserve's question onto its sentence
 	// would put a capacity claim back on a node with 64Gi free.
-	if strings.Contains(sim.Blocked.PerNode["roomy"], "a pod the size of") {
+	if strings.Contains(sim.Blocked.PerNode["roomy"].Message, "a pod the size of") {
 		t.Errorf("roomy refused with %q, which reads as a shortfall and is not one",
-			sim.Blocked.PerNode["roomy"])
+			sim.Blocked.PerNode["roomy"].Message)
 	}
 }
 
@@ -1837,8 +1839,9 @@ func TestTheReserveHoldsAPodSlotToo(t *testing.T) {
 		t.Fatal("reserved room on a node with no pod slot left, so the pod it promised " +
 			"room for could not be admitted there")
 	}
-	if got := sim.Blocked.PerNode["destination"]; !strings.Contains(got, "insufficient pods") {
-		t.Errorf("destination refused with %q, want the pod cap — it has 14Gi free and "+
+	if got := sim.Blocked.PerNode["destination"]; got.Code != fit.ReasonInsufficient ||
+		!strings.Contains(got.Message, "insufficient pods") {
+		t.Errorf("destination refused with %+v, want the pod cap — it has 14Gi free and "+
 			"nothing about it is short of memory", got)
 	}
 }
