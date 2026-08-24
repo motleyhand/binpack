@@ -58,6 +58,14 @@ complete.
 
 ### Security
 
+- **Released binaries and the container image are now built with a patched Go toolchain.** `go.mod`
+  pins `toolchain go1.26.7`; before this, CI resolved the compiler from the `go` directive and so
+  built every artifact with go1.26.0 — the exact patch `k8s.io/*` v0.36 pushed that directive to.
+  `govulncheck` run under go1.26.0 reports 19 standard-library advisories reachable from binpack's
+  own code, among them `crypto/x509` certificate verification on the eviction path and `net/url`
+  parsing in the client config; under 1.26.7 it reports none. Nothing else would have found this:
+  the standard library is not in the dependency graph, so a Dependabot alert cannot exist for it.
+  **Upgrade to get the rebuilt image**; there is no configuration change.
 - The ClusterRole no longer requests `update` on `events.k8s.io/events`. binpack never issued
   one; `patch` is what the recorder uses to aggregate a repeated event, and `create` is the first
   write and the fallback. An externally managed role can drop the verb with no change in

@@ -5,9 +5,19 @@ easy to trust.
 
 ## Getting started
 
-Requires Go 1.26.0 or newer — the floor `go.mod` sets, raised there by `k8s.io/*` v0.36 — and
-[golangci-lint](https://golangci-lint.run) v2.12.2, which is the version both workflows install.
-`make lint` says so if the one you have installed is a different build.
+Requires Go 1.26.0 or newer and [golangci-lint](https://golangci-lint.run) v2.12.2, which is the
+version both workflows install — `make lint` says so if the one you have installed is a different
+build.
+
+Both numbers live in the tree rather than on this page. `go.mod` sets the Go floor at 1.26.0,
+raised there by `k8s.io/*` v0.36, and separately pins `toolchain go1.26.7` — the compiler that
+builds every released binary, because `actions/setup-go` prefers the `toolchain` directive to the
+`go` one.
+
+You do not need 1.26.7 installed. Under the default `GOTOOLCHAIN=auto` the go command fetches the
+pinned toolchain for you; only the 1.26.0 floor is enforced against what you have. With
+`GOTOOLCHAIN=local` the pin is ignored entirely and you build with whatever you have, which is
+fine for working on binpack and is not what a release is built with.
 
 ```bash
 make check      # lint, test, build, smoke test — what CI runs

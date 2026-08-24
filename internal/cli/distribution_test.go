@@ -336,43 +336,76 @@ func TestTheChangelogVersioningPromisesExists(t *testing.T) {
 	}
 }
 
-// TestContributingStatesTheGoVersionGoModRequires is a drift guard rather than
-// a correction: CONTRIBUTING.md and go.mod agree today, and nothing was
-// holding them there.
+// goVersions reads the two version directives a module can carry. They answer
+// different questions and both are worth stating.
 //
-// The drift is invisible where it is introduced. Every setup-go step in both
-// workflows uses `go-version-file: go.mod`, so CI runs whatever go.mod says
-// and never reads CONTRIBUTING.md; and under the default GOTOOLCHAIN=auto a
-// contributor on an older Go downloads the newer toolchain and never sees a
-// problem either. It surfaces only where GOTOOLCHAIN is `local` or pinned —
+// `go` is the floor, and under GOTOOLCHAIN=local it is the only thing
+// enforced. Measured against a scratch module on go1.26.7: `go 1.99.0` gives
+// `go: go.mod requires go >= 1.99.0 (running go 1.26.7; GOTOOLCHAIN=local)`,
+// while `toolchain go1.99.0` beside `go 1.26.0` builds without complaint. So a
+// toolchain line raises nothing for a contributor who has switched downloads
+// off — the intuition that it is the stricter of the two is wrong.
+//
+// `toolchain` is what actually compiles the artifacts. Under the default
+// GOTOOLCHAIN=auto it is fetched and used, and actions/setup-go installs it in
+// preference to the go directive: "if the `toolchain` directive is present,
+// its version is used" (actions/setup-go v7 README). Without one, CI built
+// every release with the exact patch the `go` directive happened to name.
+func goVersions(t *testing.T, path string) (floor, toolchain string) {
+	t.Helper()
+
+	mod := readRepoFile(t, path)
+	m := regexp.MustCompile(`(?m)^go (\S+)$`).FindStringSubmatch(mod)
+	if m == nil {
+		t.Fatalf("%s has no go directive; this test would assert nothing", path)
+	}
+	floor = m[1]
+	if m := regexp.MustCompile(`(?m)^toolchain go(\S+)$`).FindStringSubmatch(mod); m != nil {
+		toolchain = m[1]
+	}
+	return floor, toolchain
+}
+
+// TestContributingStatesTheGoVersionGoModRequires holds the one page in the
+// repository that states a Go version to what the modules actually declare.
+//
+// The drift is invisible where it is introduced. Every setup-go step resolves
+// the version from go.mod, so CI never reads CONTRIBUTING.md, and under the
+// default GOTOOLCHAIN=auto a contributor on an older Go silently gets what
+// go.mod asks for. It surfaces only where GOTOOLCHAIN is `local` or pinned —
 // distribution packages that suppress toolchain downloads, and corporate
 // environments — as `go: go.mod requires go >= …` on the first command the
-// file gives them.
+// page gives them.
 //
-// Both modules, and the exact string. `1.26` would satisfy a prefix match
-// against `1.26.0` while understating the floor the moment the directive
-// gains a patch component, which is the only way this can go wrong quietly.
+// Both numbers are asserted, because the page has to answer two questions:
+// what a contributor must have installed, which is the `go` directive, and
+// what compiles the binaries other people run, which is the `toolchain`. See
+// [goVersions] for why neither substitutes for the other.
+//
+// Both modules, and the exact strings. `1.26` would satisfy a prefix match
+// against `1.26.0` while understating the floor the moment the version gains a
+// patch component, which is the only way this can go wrong quietly.
 func TestContributingStatesTheGoVersionGoModRequires(t *testing.T) {
-	directive := regexp.MustCompile(`(?m)^go (\S+)$`)
+	floor, toolchain := goVersions(t, mainGoMod)
+	harnessFloor, harnessToolchain := goVersions(t, harnessGoMod)
 
-	required := map[string]string{}
-	for _, path := range []string{mainGoMod, harnessGoMod} {
-		m := directive.FindStringSubmatch(readRepoFile(t, path))
-		if m == nil {
-			t.Fatalf("%s has no go directive; this test would assert nothing", path)
-		}
-		required[path] = m[1]
-	}
-	if required[mainGoMod] != required[harnessGoMod] {
-		t.Errorf("go.mod requires Go %s and the differential harness requires %s, so "+
-			"one sentence in CONTRIBUTING.md cannot state the floor for both",
-			required[mainGoMod], required[harnessGoMod])
+	if floor != harnessFloor || toolchain != harnessToolchain {
+		t.Errorf("go.mod declares go %s / toolchain %q and the differential harness "+
+			"declares go %s / toolchain %q: one page cannot state both, and the "+
+			"harness would be compiled by a different toolchain from the one whose "+
+			"answers it exists to check",
+			floor, toolchain, harnessFloor, harnessToolchain)
 	}
 
-	if doc := readRepoFile(t, contributing); !strings.Contains(doc, required[mainGoMod]) {
+	doc := readRepoFile(t, contributing)
+	if !strings.Contains(doc, floor) {
 		t.Errorf("go.mod requires Go %s and CONTRIBUTING.md does not say so; it is "+
 			"the only place in the repository that states a Go version, and CI "+
-			"reads the version from go.mod so it can never notice",
-			required[mainGoMod])
+			"resolves the version from go.mod so it can never notice", floor)
+	}
+	if toolchain != "" && !strings.Contains(doc, toolchain) {
+		t.Errorf("go.mod pins `toolchain go%s`, which is what setup-go installs and "+
+			"therefore what every released binary is compiled by, and CONTRIBUTING.md "+
+			"does not mention it", toolchain)
 	}
 }
