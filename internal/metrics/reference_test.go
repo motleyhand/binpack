@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"os"
+	"slices"
 	"strings"
 	"testing"
 
@@ -87,25 +88,132 @@ func TestEveryLabelValueBinpackCanProduceIsDocumented(t *testing.T) {
 	// binpack_drains_abandoned_total are drain constants.
 	doc := referenceText(t)
 
-	// The engine's half is hand-written; the drain half is taken from the
-	// enumerator, because there is one. TestEveryAbandonReasonHasAZeroSeries
-	// already holds AbandonCodes against the *scrape*, so the reason values
-	// were published and documented and nothing joined the two — editing a
-	// row of the abandonment table left the suite green.
-	codes := []string{
-		engine.CodeDrain, engine.CodeNoAutoscaler, engine.CodeAutoscalerUnhealthy,
-		engine.CodeNoCandidates, engine.CodeNoneFeasible, engine.CodeDraining,
-		engine.VerdictSkipped, engine.VerdictInfeasible, engine.VerdictBlocked, engine.VerdictDrainable,
-		engine.SkipNotAutoscaled, engine.SkipPoolDisabled, engine.SkipScaleUpInProgress,
-		engine.SkipCooldownAfterScaleUp, engine.SkipCooldownAfterDrain, engine.SkipPoolAtMinimum,
-		engine.SkipAnnotated, engine.SkipDrainInProgress, engine.SkipBackoff,
-		engine.SkipCordoned, engine.SkipProtectedPod, engine.SkipTooManyPods,
-	}
+	// Every one of these comes from an enumerator, and that is the whole
+	// point. This list was hand-written, and a hand-written copy of a set is
+	// a copy that drifts: three values binpack published — `being-removed`,
+	// `gone` and `uncordoned` — were absent from the reference while this
+	// test was green, because they were absent from the list too. The one
+	// enumerator it did use, drain.AbandonCodes(), is the half that never
+	// drifted.
+	var codes []string
+	codes = append(codes, engine.DecisionCodes()...)
+	codes = append(codes, engine.Verdicts()...)
+	codes = append(codes, engine.SkipCodes()...)
 	codes = append(codes, drain.AbandonCodes()...)
+	codes = append(codes, unmodelledCauses...)
 
 	for _, code := range codes {
 		if !strings.Contains(doc, "`"+code+"`") {
 			t.Errorf("label value %q is not documented", code)
 		}
+	}
+}
+
+// codeTables are the reference's closed-set tables, each named by the line
+// that introduces it, and the enumerator each one is a rendering of.
+//
+// Keyed on the introducing line rather than on position so that inserting a
+// section moves nothing here, and so that a table which loses its preamble
+// fails loudly instead of being skipped.
+func codeTables() []struct {
+	anchor  string
+	allowed []string
+} {
+	return []struct {
+		anchor  string
+		allowed []string
+	}{
+		{"`code` is one of:", engine.DecisionCodes()},
+		{"`code` on `binpack_nodes_skipped` is one of:", engine.SkipCodes()},
+		// The abandonment table lists the drain's own codes; the skip codes
+		// and the two verdicts reach the counter through revalidation and are
+		// described in the prose beneath it rather than repeated as rows.
+		{"`reason` is one of:", append(append(append([]string{},
+			drain.AbandonCodes()...), engine.SkipCodes()...), engine.Verdicts()...)},
+		{"| `cause` | What binpack could not do |", unmodelledCauses},
+	}
+}
+
+// TestTheReferenceDocumentsNoLabelValueBinpackCannotProduce is the direction
+// the metrics reference never had, and it is the one that catches a rename.
+//
+// Adding a code and forgetting the doc fails the test above. Renaming one
+// fails neither, because the new spelling gets documented and the old row is
+// simply left behind — describing a series that will never appear again, in
+// the one document an operator consults when a value shows up on a graph they
+// do not recognise. internal/cli/diagnostics_doc_test.go has had both
+// directions since the catalogue existed; this is the metric vocabulary
+// catching up.
+func TestTheReferenceDocumentsNoLabelValueBinpackCannotProduce(t *testing.T) {
+	doc := referenceText(t)
+
+	for _, table := range codeTables() {
+		rows := tableTokens(t, doc, table.anchor)
+		if len(rows) == 0 {
+			t.Errorf("no table found under %q: the reference's shape moved and this "+
+				"check silently stopped reading it", table.anchor)
+			continue
+		}
+		for _, code := range rows {
+			if !slices.Contains(table.allowed, code) {
+				t.Errorf("the reference documents %q under %q, and binpack cannot produce it",
+					code, table.anchor)
+			}
+		}
+	}
+}
+
+// tableTokens returns the first backticked cell of every row of the Markdown
+// table that follows anchor.
+func tableTokens(t *testing.T, doc, anchor string) []string {
+	t.Helper()
+
+	lines := strings.Split(doc, "\n")
+	at := slices.Index(lines, anchor)
+	if at < 0 {
+		return nil
+	}
+
+	var out []string
+	for _, line := range lines[at+1:] {
+		if !strings.HasPrefix(line, "|") {
+			// Blank lines separate the anchor from its table; anything else
+			// ends it.
+			if strings.TrimSpace(line) == "" && len(out) == 0 {
+				continue
+			}
+			break
+		}
+		cell := strings.SplitN(line, "|", 3)
+		if len(cell) < 3 {
+			continue
+		}
+		// The header separator and the header row itself carry no backticks.
+		if code := strings.Trim(strings.TrimSpace(cell[1]), "`"); strings.Contains(cell[1], "`") {
+			out = append(out, code)
+		}
+	}
+	return out
+}
+
+// TestTheVerdictSentenceListsEveryVerdict pins the one closed set the
+// reference states inline rather than as a table.
+//
+// Four values fit in a sentence and a four-row table would be worse to read,
+// so the sentence stays — but it is still the vocabulary of a public label,
+// and a fifth verdict added without touching it would leave the reference
+// asserting a set that is no longer complete.
+func TestTheVerdictSentenceListsEveryVerdict(t *testing.T) {
+	doc := referenceText(t)
+
+	var quoted []string
+	for _, v := range engine.Verdicts() {
+		quoted = append(quoted, "`"+v+"`")
+	}
+	sentence := "`verdict` is one of " + strings.Join(quoted, ", ") + "."
+
+	if !strings.Contains(doc, sentence) {
+		t.Errorf("the reference does not say %q, so its verdict vocabulary is not the engine's",
+			sentence)
 	}
 }

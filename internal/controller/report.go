@@ -11,10 +11,15 @@ import (
 // first release, like the metric names and the annotations: people alert on
 // these.
 //
-// The events.k8s.io API separates the two: the action is the operation being
-// reported on, and the reason is what happened to it. Every binpack event
-// about consolidating a node therefore shares one action and differs in
-// reason, which is what makes them filterable as a group.
+// The events.k8s.io API separates the two, and its own field documentation
+// puts them the other way round from how everybody uses them: `action` is
+// "what action was taken/failed regarding to the regarding object,
+// machine-readable" and `reason` is "why the action was taken,
+// human-readable" (k8s.io/api events/v1/types.go). Read literally that makes
+// the reason the prose field, which nothing in the ecosystem treats it as —
+// kubectl filters on it and so do people. binpack follows the ecosystem: one
+// action naming the operation, Consolidate, and a bounded reason per outcome,
+// which is what makes these filterable as a group.
 const (
 	ActionConsolidate = "Consolidate"
 
@@ -64,6 +69,20 @@ const (
 	ReasonDrained        = "Drained"
 	ReasonDrainAbandoned = "DrainAbandoned"
 )
+
+// EventReasons is every reason binpack writes, all of them under
+// [ActionConsolidate].
+//
+// Enumerable for the reason the engine's code sets are: these are what an
+// operator filters on, and a set that exists only as eight constants and two
+// prose tables is one a reference page falls behind silently.
+func EventReasons() []string {
+	return []string{
+		ReasonWouldDrain, ReasonDraining, ReasonWouldAdvanceDrain,
+		ReasonDrained, ReasonDrainAbandoned,
+		ReasonNoCandidates, ReasonNoneFeasible, ReasonNoNodeChosen,
+	}
+}
 
 // report records a decision where somebody will find it.
 //
@@ -254,5 +273,9 @@ func poolOf(a *engine.NodeAssessment) string {
 	if a == nil {
 		return ""
 	}
-	return a.Pool
+	// Through the shared resolver, not off the label: on a cluster whose
+	// provider publishes no readable pool name this line logged the empty
+	// string while the metric and `binpack diagnose` both named the pool by
+	// its identifier.
+	return a.PoolLabel()
 }

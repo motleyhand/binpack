@@ -64,76 +64,107 @@ func readConfigInput(path string, stdin io.Reader) ([]byte, error) {
 	return data, nil
 }
 
-// resolvedConfig is what both output formats report: the effective settings,
-// not the sparse document that produced them. Echoing the input back would
-// tell an operator nothing they did not already type.
+// resolvedConfig is what `--output json` reports: the effective settings, not
+// the sparse document that produced them. Echoing the input back would tell an
+// operator nothing they did not already type.
+//
+// A configuration document all the same, in the document's own vocabulary,
+// with every value that was inherited or defaulted written out explicitly. It
+// used to be a parallel one: `defaultPolicy.backoffInitial` where the document
+// says `policy.backoff.initial`, and a `pools[].policy` object where the
+// document inlines the policy into the pool entry. Two public spellings of one
+// concept, in a surface docs/reference/versioning.md declares stable, and
+// nothing was gained by the second — the same object already spelled
+// `interval`, `dryRun` and the whole `discovery` block exactly as the document
+// does, because those parts embed the API type and the policy part did not.
+//
+// The API types rather than a view struct is what makes the names right by
+// construction rather than by transcription. Durations render as strings
+// through [v1alpha1.Duration]'s own marshaller, so time.Duration stays the
+// Go-facing value.
 type resolvedConfig struct {
-	Interval      string               `json:"interval"`
-	DryRun        bool                 `json:"dryRun"`
-	Discovery     v1alpha1.Discovery   `json:"discovery"`
-	DefaultPolicy policyView           `json:"defaultPolicy"`
-	Pools         []resolvedPoolPolicy `json:"pools,omitempty"`
+	APIVersion string             `json:"apiVersion"`
+	Kind       string             `json:"kind"`
+	Interval   *v1alpha1.Duration `json:"interval"`
+	DryRun     bool               `json:"dryRun"`
+	Discovery  v1alpha1.Discovery `json:"discovery"`
+	// Policy is the resolved default: what every discovered pool gets unless
+	// an entry below overrides it.
+	Policy v1alpha1.Policy `json:"policy"`
+	// Pools carries each override already resolved against that default, so a
+	// reader need not apply the inheritance themselves. Inlined exactly as
+	// v1alpha1.PoolOverride inlines it: the document has no `policy` key under
+	// a pool entry.
+	Pools []v1alpha1.PoolOverride `json:"pools,omitempty"`
 }
 
-type resolvedPoolPolicy struct {
-	Name   string     `json:"name"`
-	Policy policyView `json:"policy"`
-}
-
-// policyView renders a resolved policy for output. Durations become strings
-// here rather than in the API type, which keeps time.Duration as the Go-facing
-// value and confines presentation to the CLI.
-type policyView struct {
-	Enabled                  bool  `json:"enabled"`
-	ExpendablePriorityCutoff int32 `json:"expendablePriorityCutoff"`
-	ReserveForLargestPod     bool  `json:"reserveForLargestPod"`
-
-	SkipNodesWithLocalStorage           bool   `json:"skipNodesWithLocalStorage"`
-	SkipNodesWithSystemPods             bool   `json:"skipNodesWithSystemPods"`
-	BlockingSystemPodDistruptionTimeout string `json:"blockingSystemPodDistruptionTimeout"`
-
-	MaxPodsPerDrain      int      `json:"maxPodsPerDrain"`
-	StallTimeout         string   `json:"stallTimeout"`
-	RemovalTimeout       string   `json:"removalTimeout"`
-	BackoffInitial       string   `json:"backoffInitial"`
-	BackoffMax           string   `json:"backoffMax"`
-	CooldownAfterScaleUp string   `json:"cooldownAfterScaleUp"`
-	CooldownAfterDrain   string   `json:"cooldownAfterDrain"`
-	ExcludedNamespaces   []string `json:"excludedNamespaces,omitempty"`
-}
-
-func viewOf(p v1alpha1.PoolPolicy) policyView {
-	return policyView{
-		Enabled:                  p.Enabled,
-		ExpendablePriorityCutoff: p.ExpendablePriorityCutoff,
-		ReserveForLargestPod:     p.ReserveForLargestPod,
-
-		SkipNodesWithLocalStorage:           p.SkipNodesWithLocalStorage,
-		SkipNodesWithSystemPods:             p.SkipNodesWithSystemPods,
-		BlockingSystemPodDistruptionTimeout: p.BlockingSystemPodDistruptionTimeout.String(),
-
-		MaxPodsPerDrain:      p.MaxPodsPerDrain,
-		StallTimeout:         p.StallTimeout.String(),
-		RemovalTimeout:       p.RemovalTimeout.String(),
-		BackoffInitial:       p.BackoffInitial.String(),
-		BackoffMax:           p.BackoffMax.String(),
-		CooldownAfterScaleUp: p.CooldownAfterScaleUp.String(),
-		CooldownAfterDrain:   p.CooldownAfterDrain.String(),
-		ExcludedNamespaces:   p.ExcludedNamespaces,
+// explicit renders a resolved policy as the document that would produce it,
+// with nothing left to inherit.
+//
+// Every field is written, including the ones that happen to equal a default.
+// The point of the report is to say what binpack will actually do, and a
+// document that omits a value on the grounds that it is the current default
+// stops being that the day the default moves.
+func explicit(p v1alpha1.PoolPolicy) v1alpha1.Policy {
+	// Never nil, and this is the one field where that matters. Every other
+	// setting here is a scalar behind a pointer, where "set" and "unset" are
+	// the pointer's own business; this one is a slice, and a nil one marshals
+	// to JSON null, which reloads as an absent pointer and therefore as
+	// "inherit". A pool that had cleared the global exclusions with
+	// `namespaces: []` would come back excluding them again.
+	//
+	// Resolution cannot tell the two apart on binpack's behalf: SetDefaults
+	// applies an override with `append([]string(nil), ...)`, and appending
+	// nothing to nil is nil, so a cleared list and an unset one are the same
+	// value by the time they reach here. What settles it is that this report
+	// is the effective settings written out explicitly — "nothing is
+	// excluded" is a fact about this binpack either way, and `[]` says it
+	// while null asks the reader to guess.
+	namespaces := p.ExcludedNamespaces
+	if namespaces == nil {
+		namespaces = []string{}
+	}
+	return v1alpha1.Policy{
+		Enabled: &p.Enabled,
+		Feasibility: v1alpha1.Feasibility{
+			ExpendablePriorityCutoff: &p.ExpendablePriorityCutoff,
+			ReserveForLargestPod:     &p.ReserveForLargestPod,
+		},
+		Autoscaler: v1alpha1.Autoscaler{
+			SkipNodesWithLocalStorage:           &p.SkipNodesWithLocalStorage,
+			SkipNodesWithSystemPods:             &p.SkipNodesWithSystemPods,
+			BlockingSystemPodDistruptionTimeout: v1alpha1.NewDuration(p.BlockingSystemPodDistruptionTimeout),
+		},
+		Drain: v1alpha1.Drain{
+			MaxPodsPerDrain: &p.MaxPodsPerDrain,
+			StallTimeout:    v1alpha1.NewDuration(p.StallTimeout),
+			RemovalTimeout:  v1alpha1.NewDuration(p.RemovalTimeout),
+		},
+		Backoff: v1alpha1.Backoff{
+			Initial: v1alpha1.NewDuration(p.BackoffInitial),
+			Max:     v1alpha1.NewDuration(p.BackoffMax),
+		},
+		Cooldown: v1alpha1.Cooldown{
+			AfterScaleUp: v1alpha1.NewDuration(p.CooldownAfterScaleUp),
+			AfterDrain:   v1alpha1.NewDuration(p.CooldownAfterDrain),
+		},
+		Exclusions: v1alpha1.Exclusions{Namespaces: &namespaces},
 	}
 }
 
 func resolve(cfg *v1alpha1.Config) resolvedConfig {
 	r := resolvedConfig{
-		Interval:      cfg.Interval.String(),
-		DryRun:        *cfg.DryRun,
-		Discovery:     cfg.Discovery,
-		DefaultPolicy: viewOf(cfg.PolicyFor()),
+		APIVersion: v1alpha1.GroupVersion,
+		Kind:       v1alpha1.Kind,
+		Interval:   cfg.Interval,
+		DryRun:     *cfg.DryRun,
+		Discovery:  cfg.Discovery,
+		Policy:     explicit(cfg.PolicyFor()),
 	}
 	for _, pool := range cfg.Pools {
-		r.Pools = append(r.Pools, resolvedPoolPolicy{
+		r.Pools = append(r.Pools, v1alpha1.PoolOverride{
 			Name:   pool.Name,
-			Policy: viewOf(cfg.PolicyFor(pool.Name)),
+			Policy: explicit(cfg.PolicyFor(pool.Name)),
 		})
 	}
 	return r

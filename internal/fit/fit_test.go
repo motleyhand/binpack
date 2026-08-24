@@ -128,7 +128,7 @@ func TestCanFit(t *testing.T) {
 			residents: []*corev1.Pod{
 				mother.Pod("default", "sharded", mother.WithRequiredAntiAffinity("app", "sharded")),
 			},
-			wantCode: fit.ReasonUnsupportedNode,
+			wantCode: fit.ReasonAntiAffinity,
 		},
 		{
 			// The CNI case. Cilium's agent has anti-affinity to itself so it

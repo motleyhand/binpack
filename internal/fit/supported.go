@@ -199,14 +199,14 @@ func UnsupportedDestination(
 
 	for _, resident := range residents {
 		if antiAffinityCouldReject(resident, pod) {
-			return Reason{ReasonUnsupportedNode,
+			return Reason{ReasonAntiAffinity,
 				"node " + node.Name + " hosts " + podRef(resident) +
 					", whose required pod anti-affinity could reject " + podRef(pod)}
 		}
 	}
 
 	if declarer, domain, rejected := domains.rejects(pod, node); rejected {
-		return Reason{ReasonUnsupportedNode,
+		return Reason{ReasonAntiAffinity,
 			"node " + node.Name + " is in " + domain + " with " + podRef(declarer) +
 				", whose required pod anti-affinity could reject " + podRef(pod)}
 	}

@@ -21,8 +21,63 @@ tags after both had stopped being true.
 This section is filled in as changes land and finalised when the tag is cut. It is not yet
 complete.
 
+### Breaking
+
+Every one of these is a rename or a reshape of a public name, and they are all in this release on
+purpose: 0.x is the last cheap moment to move them, and a break spread over six releases is worse
+for an adopter than one break in a single tag.
+
+- **`binpack_drains_abandoned_total{reason="not-autoscaled"}` has split in two.** It meant both
+  "there is no cluster-autoscaler in a state to finish this drain" and "this node's pool is not
+  one the autoscaler manages", which are different problems with different remedies. The first is
+  now `reason="autoscaler-not-live"`; `not-autoscaled` keeps the second. **An alert matching
+  `not-autoscaled` to catch a dead autoscaler must add `autoscaler-not-live`.** On
+  `binpack_nodes_skipped` nothing changes: neither of these can appear there.
+- **`binpack explain --output json` reshapes `nodes[].refusals` and `nodes[].blockers`.** Both
+  carried a bare sentence, which
+  [versioning.md](docs/reference/versioning.md) says may be reworded at any time; both now carry
+  `{"code", "message"}`, so a consumer has something bounded to branch on.
+  `refusals` goes from `{"node-b": "…"}` to `{"node-b": {"code": "…", "message": "…"}}` and
+  `blockers` from `["…"]` to `[{"code": "…", "message": "…"}]`. Reshaped now rather than given a
+  parallel `refusalCodes` map later, which would have frozen two maps that must stay in step.
+  One of the codes it publishes is new: a destination refused because some pod's required
+  anti-affinity could reject the one being moved is `pod-anti-affinity`, where it shared
+  `unsupported-node-feature` with a node that has not declared a feature the pod requires. Those
+  are different problems with different remedies, and nothing outside binpack could read either
+  until this release.
+- **`binpack config validate --output json` now emits the configuration document's own field
+  names.** It published a second spelling of every policy field —
+  `defaultPolicy.backoffInitial` where the document says `policy.backoff.initial`, and a
+  `pools[].policy` object where the document inlines the policy into the pool entry — while
+  spelling `interval`, `dryRun` and the whole `discovery` block exactly as the document does.
+  The report is now a valid configuration document: it gains `apiVersion` and `kind`, and feeding
+  it back through `-f` resolves to the same settings. **Anything reading `defaultPolicy` or a flat
+  policy key must move to the nested path**, which is the one already in
+  [configuration.md](docs/reference/configuration.md).
+- **`binpack explain --output json` always emits arrays for `nodes` and `autoscaler.pools`.** They
+  were `null` whenever binpack found no live cluster-autoscaler — including the up-to-five-minute
+  window on every autoscaler restart — so `jq '.nodes[]'` failed on the one cluster state most
+  worth reporting. `binpack diagnose` has always emitted `[]` here. Consumers with a null check
+  can drop it; consumers without one stop failing.
+- **The `mirror-pod` diagnosis is removed.** `binpack diagnose` could not emit it: a static pod is
+  node-local, so binpack neither relocates nor evicts it and drains the node without comment. The
+  reference documented it at `blocking` severity, a class it defines as nodes that cannot be
+  removed by anything, which is not true of a static pod for binpack or for the cluster-autoscaler.
+  Nothing to do: the code never appeared in a report or in `--fail-on`'s count.
+
 ### Added
 
+- `binpack explain --output json` gains `autoscaler.pools[].name` and `nodes[].group`, so the two
+  halves of the report can be joined. The pools were keyed by the provider's node-group
+  identifier and the nodes by the readable pool label, with no field carrying the other spelling.
+- `binpack_nodes_skipped{code="being-removed"}` is documented. It has been published since v0.2.1,
+  on any cluster where the autoscaler is removing a node while binpack evaluates, and appeared in
+  no reference page.
+- [docs/reference/cli.md](docs/reference/cli.md), the reference the CLI never had: every command,
+  every flag and its default, the three exit codes, the JSON each command emits, and the eight
+  Event reasons binpack writes. `versioning.md` now lists CLI commands, flags and flag values as
+  public surface — an exit code and a JSON field name were already promised, and both exist only
+  as products of a command nothing promised.
 - `discovery.autoscalerNamespace`, so the cluster-autoscaler's status ConfigMap is read from the
   namespace the autoscaler actually runs in rather than from `kube-system` by assumption. The
   chart's Role is bound in the same namespace.
@@ -45,6 +100,11 @@ complete.
   minutes and was told it had got five.
 - `policy.drain.removalTimeout` defaults to 25 minutes rather than 15, which is the
   cluster-autoscaler's own worst case rather than a guess at it.
+- `binpack explain --output json`'s `nodes[].pool` names the node group's identifier where the
+  cluster carries no readable pool name, rather than omitting the field. binpack's log line does
+  the same. On EKS, AKS and most GKE installs one evaluation used to name a pool three ways: by
+  its identifier in the metric and in `binpack diagnose`, by the empty string in the log, and not
+  at all in the JSON.
 
 ### Fixed
 

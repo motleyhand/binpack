@@ -174,9 +174,10 @@ func (c Config) PolicyForNode(node *corev1.Node) Policy {
 // wants the first.
 //
 // A pool with no nodes has nothing to take a name from and is absent here, so
-// callers fall back to the identifier.
-func PoolNames(s Snapshot, cfg Config) map[string]string {
-	names := map[string]string{}
+// callers fall back to the identifier — through [PoolNaming.Label], which is
+// that fallback written once.
+func PoolNames(s Snapshot, cfg Config) PoolNaming {
+	names := PoolNaming{}
 	for _, node := range s.Nodes {
 		id := cfg.GroupOf(node)
 		name := node.Labels[cfg.PoolNameLabel]
@@ -185,6 +186,23 @@ func PoolNames(s Snapshot, cfg Config) map[string]string {
 		}
 	}
 	return names
+}
+
+// PoolNaming resolves a node group's identifier to what a person should see.
+//
+// A type with a method rather than a bare map, so that the fallback every
+// caller needs has one implementation. It had three, plus two callers that
+// skipped it — see [NodeAssessment.PoolLabel], which answers the same question
+// for a caller holding an assessment.
+type PoolNaming map[string]string
+
+// Label is the readable name for a group, or the identifier where the cluster
+// carries no readable name for it.
+func (n PoolNaming) Label(id string) string {
+	if name := n[id]; name != "" {
+		return name
+	}
+	return id
 }
 
 // NodeGroupLabelSuggestion is the label binpack recommends where nothing a

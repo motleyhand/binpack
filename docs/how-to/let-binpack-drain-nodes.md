@@ -128,6 +128,10 @@ In dry run the first of these is `WouldDrain` instead, and says so in its note. 
 differs rather than only the wording, so nothing filtering events can confuse a drain that
 happened with one that was merely decided on.
 
+These four are the per-drain events. binpack writes four more when it decides *nothing*, which
+are not about a particular node; all eight are listed together in
+[the CLI reference](../reference/cli.md#events).
+
 The metrics worth watching are `binpack_drains_completed_total` against
 `binpack_drains_abandoned_total`, and `binpack_drain_attempts_max`. A cluster where abandonments
 outnumber completions is one where binpack keeps starting work it cannot finish; the `reason`

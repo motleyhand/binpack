@@ -201,46 +201,49 @@ func TestConfigValidateRendersEveryResolvedField(t *testing.T) {
 	const rendered = 14
 	if n := reflect.TypeFor[v1alpha1.PoolPolicy]().NumField(); n != rendered {
 		t.Fatalf("PoolPolicy has %d fields and this test asserts %d: render the new one "+
-			"in both viewOf and writePolicy and assert it here, or say here why it is not "+
+			"in both explicit and writePolicy and assert it here, or say here why it is not "+
 			"rendered", n, rendered)
 	}
 
 	t.Run("json", func(t *testing.T) {
-		encoded, err := json.Marshal(viewOf(resolved))
+		encoded, err := json.Marshal(explicit(resolved))
 		if err != nil {
-			t.Fatalf("marshalling the view: %v", err)
+			t.Fatalf("marshalling the resolved policy: %v", err)
 		}
 		var got map[string]any
 		if err := json.Unmarshal(encoded, &got); err != nil {
-			t.Fatalf("decoding the view: %v", err)
+			t.Fatalf("decoding the resolved policy: %v", err)
 		}
 
+		// The document's own paths, which is the point of the shape: the same
+		// string an operator would write in their ConfigMap to set the value
+		// the report is showing them.
 		for _, tc := range []struct {
-			key  string
+			path string
 			want any
 		}{
 			{"enabled", true},
-			{"expendablePriorityCutoff", float64(-7)},
-			{"reserveForLargestPod", true},
-			{"skipNodesWithLocalStorage", false},
-			{"skipNodesWithSystemPods", true},
-			{"blockingSystemPodDistruptionTimeout", "1h30m0s"},
-			{"maxPodsPerDrain", float64(3)},
-			{"stallTimeout", "11m0s"},
-			{"removalTimeout", "17m0s"},
-			{"backoffInitial", "5m0s"},
-			{"backoffMax", "72h0m0s"},
-			{"cooldownAfterScaleUp", "13m0s"},
-			{"cooldownAfterDrain", "19m0s"},
-			{"excludedNamespaces", []any{"kube-system"}},
+			{"feasibility.expendablePriorityCutoff", float64(-7)},
+			{"feasibility.reserveForLargestPod", true},
+			{"autoscaler.skipNodesWithLocalStorage", false},
+			{"autoscaler.skipNodesWithSystemPods", true},
+			{"autoscaler.blockingSystemPodDistruptionTimeout", "1h30m0s"},
+			{"drain.maxPodsPerDrain", float64(3)},
+			{"drain.stallTimeout", "11m0s"},
+			{"drain.removalTimeout", "17m0s"},
+			{"backoff.initial", "5m0s"},
+			{"backoff.max", "72h0m0s"},
+			{"cooldown.afterScaleUp", "13m0s"},
+			{"cooldown.afterDrain", "19m0s"},
+			{"exclusions.namespaces", []any{"kube-system"}},
 		} {
-			v, ok := got[tc.key]
+			v, ok := at(got, tc.path)
 			if !ok {
-				t.Errorf("%s is missing from the JSON rendering", tc.key)
+				t.Errorf("%s is missing from the JSON rendering: %s", tc.path, encoded)
 				continue
 			}
 			if !reflect.DeepEqual(v, tc.want) {
-				t.Errorf("%s = %v, want the configured %v", tc.key, v, tc.want)
+				t.Errorf("%s = %v, want the configured %v", tc.path, v, tc.want)
 			}
 		}
 	})
@@ -267,4 +270,18 @@ func TestConfigValidateRendersEveryResolvedField(t *testing.T) {
 			t.Errorf("the autoscaler's two skip flags are not rendered:\n%s", out)
 		}
 	})
+}
+
+// at walks a dotted path into a decoded JSON object.
+func at(doc map[string]any, path string) (any, bool) {
+	head, rest, nested := strings.Cut(path, ".")
+	v, ok := doc[head]
+	if !ok || !nested {
+		return v, ok
+	}
+	child, ok := v.(map[string]any)
+	if !ok {
+		return nil, false
+	}
+	return at(child, rest)
 }

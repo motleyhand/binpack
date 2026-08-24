@@ -357,14 +357,9 @@ func enginePolicy(p v1alpha1.PoolPolicy) engine.Policy {
 // explainView is the machine-readable rendering.
 type explainView struct {
 	Autoscaler struct {
-		Running         bool   `json:"running"`
-		ScaleDownStatus string `json:"scaleDownStatus,omitempty"`
-		Pools           []struct {
-			ID    string `json:"id"`
-			Min   int    `json:"min"`
-			Max   int    `json:"max"`
-			Ready int    `json:"ready"`
-		} `json:"pools"`
+		Running         bool         `json:"running"`
+		ScaleDownStatus string       `json:"scaleDownStatus,omitempty"`
+		Pools           []poolReport `json:"pools"`
 	} `json:"autoscaler"`
 	// Pools is how nodes were joined to those pools. Reported as data because
 	// it decides *scope* — which nodes binpack considers its own — and on most
@@ -398,6 +393,26 @@ type explainView struct {
 	Nodes []nodeReport `json:"nodes"`
 }
 
+// poolReport is one autoscaling pool as the autoscaler reports it, under both
+// of the names one can have.
+//
+// Both, because the two halves of this document used to carry one each: the
+// pools were keyed by the provider's identifier and the nodes by the readable
+// label value, so on a DOKS cluster the report printed a UUID above and
+// "pool-4g" below with no field connecting them. Nothing was missing from
+// binpack — `PoolNames` already resolves one to the other for the metrics —
+// only from the report.
+type poolReport struct {
+	ID string `json:"id"`
+	// Name is the readable pool name, absent where the cluster carries none.
+	// Never a substitute for ID: this is the field a person reads and that one
+	// is the field a join uses.
+	Name  string `json:"name,omitempty"`
+	Min   int    `json:"min"`
+	Max   int    `json:"max"`
+	Ready int    `json:"ready"`
+}
+
 // poolsView is the join, for machines.
 type poolsView struct {
 	// Source is the MappingSource sentence: short, and the thing to branch on.
@@ -414,8 +429,18 @@ type poolsView struct {
 }
 
 type nodeReport struct {
-	Name   string `json:"name"`
-	Pool   string `json:"pool,omitempty"`
+	Name string `json:"name"`
+	// Pool is what to call this node's pool: the readable name where the
+	// cluster carries one, the node group's identifier otherwise. Resolved
+	// through [engine.NodeAssessment.PoolLabel] rather than read off the
+	// label, so that this report, the drain log line, the metrics and
+	// `binpack diagnose` cannot disagree about a pool's name — which they
+	// did, three ways, on any cluster whose provider publishes no readable
+	// name.
+	Pool string `json:"pool,omitempty"`
+	// Group is the identifier the cluster-autoscaler publishes for that pool,
+	// and the key that joins this row to autoscaler.pools[].
+	Group  string `json:"group,omitempty"`
 	Chosen bool   `json:"chosen,omitempty"`
 	// Draining marks the node binpack is part-way through emptying. Its
 	// verdict is the one revalidation reached, not the one selection would —
@@ -425,10 +450,18 @@ type nodeReport struct {
 	// Code names why a node was skipped, from the engine's bounded set. The
 	// detail says it in prose; this is what a consumer can branch on without
 	// matching a sentence that may be reworded.
-	Code      string   `json:"code,omitempty"`
-	Detail    string   `json:"detail,omitempty"`
-	Relocates int      `json:"relocates,omitempty"`
-	Blockers  []string `json:"blockers,omitempty"`
+	Code      string `json:"code,omitempty"`
+	Detail    string `json:"detail,omitempty"`
+	Relocates int    `json:"relocates,omitempty"`
+	// Blockers is why each pod that would have to be evicted cannot be, code
+	// and sentence together. Six of the seven codes are also diagnosis codes
+	// reachable through `binpack diagnose --output json`; carrying them here
+	// is what makes a blocked node classifiable without a second command and
+	// a per-workload join. The seventh, pdb-insufficient, reaches no other
+	// machine-readable surface at all — it is a property of one drain rather
+	// than a static cluster condition, so diagnose has nothing to say it
+	// about.
+	Blockers []reasonReport `json:"blockers,omitempty"`
 	// Unmodelled marks a refusal binpack made because it could not predict
 	// what the replacement would be, rather than because the cluster is full.
 	// Exactly the set binpack_nodes_unmodelled counts, and named the same way,
@@ -442,7 +475,22 @@ type nodeReport struct {
 	// Refusals maps each destination to why it would not take the pod that
 	// could not be placed. Without it, "nowhere to go" is unactionable: the
 	// useful question is always which wall each node hit.
-	Refusals map[string]string `json:"refusals,omitempty"`
+	Refusals map[string]reasonReport `json:"refusals,omitempty"`
+}
+
+// reasonReport is a refusal in both registers at once.
+//
+// An object rather than a second parallel map keyed the same way, and that
+// choice is the reason this shape landed before v1 rather than after: adding
+// `refusalCodes` beside `refusals` would have frozen two maps that must stay
+// in step for ever, and nothing would notice the day they stopped.
+type reasonReport struct {
+	// Code is the bounded value to branch on — a fit refusal code for a
+	// destination, an eviction blocker code for a pod.
+	Code string `json:"code"`
+	// Message is the sentence for a person, and it is explicitly not public:
+	// docs/reference/versioning.md reserves the right to reword it.
+	Message string `json:"message"`
 }
 
 func renderExplain(opts *options, s engine.Snapshot, out explainOutput) error {
@@ -468,13 +516,20 @@ func buildView(s engine.Snapshot, out explainOutput) explainView {
 	live, _, _ := s.Autoscaler.Live(s.Now)
 	v.Autoscaler.Running = live
 	v.Autoscaler.ScaleDownStatus = s.Autoscaler.ScaleDownStatus
+
+	// Made rather than appended to, matching `binpack diagnose`, which does
+	// the same under a comment saying why: an empty slice renders as [] and a
+	// nil one as null, and the cluster states that produce an empty one here —
+	// no autoscaler, a status too stale to vouch for, a live autoscaler
+	// managing no groups — are precisely the ones a consumer most needs to
+	// read. `jq '.nodes[]'` raises "Cannot iterate over null".
+	names := engine.PoolNames(s, out.Config)
+	v.Autoscaler.Pools = make([]poolReport, 0, len(s.Autoscaler.Groups))
 	for _, g := range s.Autoscaler.Groups {
-		v.Autoscaler.Pools = append(v.Autoscaler.Pools, struct {
-			ID    string `json:"id"`
-			Min   int    `json:"min"`
-			Max   int    `json:"max"`
-			Ready int    `json:"ready"`
-		}{g.ID, g.MinSize, g.MaxSize, g.Ready})
+		v.Autoscaler.Pools = append(v.Autoscaler.Pools, poolReport{
+			ID: g.ID, Name: names[g.ID],
+			Min: g.MinSize, Max: g.MaxSize, Ready: g.Ready,
+		})
 	}
 
 	v.Pools = poolsView{
@@ -494,6 +549,7 @@ func buildView(s engine.Snapshot, out explainOutput) explainView {
 		v.Node = d.Node.Name
 	}
 
+	v.Nodes = make([]nodeReport, 0, len(out.Nodes))
 	for _, a := range out.Nodes {
 		v.Nodes = append(v.Nodes, reportFor(a, d))
 	}
@@ -505,7 +561,7 @@ func reportFor(a engine.NodeAssessment, d engine.Decision) nodeReport {
 	// Two implementations of "what happened to this node" is one more than
 	// can be kept in step, and the metrics read the same one.
 	r := nodeReport{
-		Name: a.Node.Name, Pool: a.Pool, Chosen: a.Chosen,
+		Name: a.Node.Name, Pool: a.PoolLabel(), Group: a.Group, Chosen: a.Chosen,
 		Verdict: a.Verdict(), Code: a.SkipCode,
 		Draining: d.Code == engine.CodeDraining && d.Node != nil && a.Node.Name == d.Node.Name,
 	}
@@ -516,12 +572,15 @@ func reportFor(a engine.NodeAssessment, d engine.Decision) nodeReport {
 	case engine.VerdictBlocked:
 		r.Detail = "its workload fits elsewhere, but some pods cannot be evicted"
 		for _, b := range a.Blockers {
-			r.Blockers = append(r.Blockers, b.Message)
+			r.Blockers = append(r.Blockers, reasonReport{Code: b.Code, Message: b.Message})
 		}
 	case engine.VerdictInfeasible:
 		if a.Simulation.Blocked != nil {
 			r.Detail = a.Simulation.Blocked.Summary
-			r.Refusals = a.Simulation.Blocked.PerNode
+			r.Refusals = make(map[string]reasonReport, len(a.Simulation.Blocked.PerNode))
+			for node, reason := range a.Simulation.Blocked.PerNode {
+				r.Refusals[node] = reasonReport{Code: reason.Code, Message: reason.Message}
+			}
 			r.Unmodelled = a.Simulation.Blocked.Unmodelled != ""
 		}
 	default:
@@ -646,7 +705,7 @@ func writeExplainText(opts *options, s engine.Snapshot, d engine.Decision, v exp
 		}
 		p("%s %-42s %-11s %s\n", marker, name, r.Verdict, detail)
 		for _, b := range r.Blockers {
-			p("    - %s\n", b)
+			p("    - %s\n", b.Message)
 		}
 		for _, line := range refusalLines(r.Refusals, maxRefusalLines) {
 			p("    - %s\n", line)
@@ -675,7 +734,7 @@ const maxRefusalLines = 3
 // an operator came here about is exactly the one a silent cap would drop.
 // `--output json` carries every entry, uncapped, since a machine reading the
 // report has no trouble with the volume and no way to ask for more.
-func refusalLines(refusals map[string]string, limit int) []string {
+func refusalLines(refusals map[string]reasonReport, limit int) []string {
 	names := sortedKeys(refusals)
 
 	out := make([]string, 0, min(len(names), limit))
@@ -686,7 +745,7 @@ func refusalLines(refusals map[string]string, limit int) []string {
 				len(names)-len(out)))
 			break
 		}
-		out = append(out, dest+": "+refusals[dest])
+		out = append(out, dest+": "+refusals[dest].Message)
 	}
 	return out
 }
@@ -796,7 +855,7 @@ func writeDrain(p func(string, ...any), r *drainReport) {
 	p("%s\n", r.WouldHappen)
 }
 
-func sortedKeys(m map[string]string) []string {
+func sortedKeys[V any](m map[string]V) []string {
 	out := make([]string, 0, len(m))
 	for k := range m {
 		out = append(out, k)

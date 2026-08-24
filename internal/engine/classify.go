@@ -107,6 +107,14 @@ func NodeBound(pod *corev1.Pod) bool {
 	// it from the on-disk manifest and the static pod itself never stopped
 	// running. It does not leave the node, which is the property this
 	// predicate is about.
+	//
+	// So a static pod does not block a drain, and there is deliberately no
+	// diagnosis saying it does. It dies with the node, exactly as a DaemonSet
+	// pod does: binpack never asks for a destination for it and never evicts
+	// it, and the cluster-autoscaler exempts mirror pods from the kube-system
+	// rule that would otherwise hold the node. The reference documented the
+	// opposite at Blocking severity for three releases, describing a finding
+	// nothing could emit.
 	_, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]
 	return mirror
 }

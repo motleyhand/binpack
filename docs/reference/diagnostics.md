@@ -478,18 +478,6 @@ actually runs does not change. In the second there is nothing to fix: the pods b
 the rollout reaches them. `binpack_nodes_unmodelled{cause="template-divergence"}` counts the same
 thing as a metric.
 
-### `mirror-pod` — blocking
-
-Static pods, created by the kubelet from an on-disk manifest.
-
-Evicting one is not refused — the eviction API has no mirror-pod case, so the request succeeds
-and the mirror object is deleted. Nothing moves: the static pod itself never stopped, and the
-kubelet recreates the mirror from the manifest a moment later. So the pod cannot be *removed*
-from the node even though it can be evicted, which is why binpack does not try.
-
-**Fix.** Nothing from inside the cluster. The node cannot be drained while a static pod runs on
-it. Rare on managed Kubernetes, where the control plane is not yours.
-
 ### `safe-to-evict-false` — info
 
 The pods are annotated `cluster-autoscaler.kubernetes.io/safe-to-evict=false`.

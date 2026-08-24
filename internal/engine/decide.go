@@ -226,8 +226,10 @@ const HealthUnhealthy = "Unhealthy"
 // The code is a decision code rather than a skip code. Every one of these
 // refusals is about the cluster, not about a node, and the one caller that
 // needs a per-node code has its own answer for that: revalidation reports
-// SkipNotAutoscaled whichever of these fired, because to a drain in flight
-// they are one fact — nothing is going to finish it.
+// [SkipAutoscalerNotLive] whichever of these fired, because to a drain in
+// flight they are one fact — nothing is going to finish it. That code covers
+// exactly this function's refusals and no others, which is why it is not the
+// same one eligibility uses for a node whose pool is unmanaged.
 func (a Autoscaler) Live(now time.Time) (live bool, code, why string) {
 	if !a.Running {
 		return false, CodeNoAutoscaler, a.absence()
@@ -469,12 +471,60 @@ func (a Action) String() string {
 // SkipCodes is every reason a node can be ruled out. Enumerable because these
 // are metric label values: a counter that only appears once it has fired makes
 // a rate() alert silently useless until the first occurrence.
+//
+// Every reason, and it has to stay that way: this is the enumerator the
+// reference documentation is pinned to, so a code missing here is a code
+// binpack publishes and nothing documents. Two were, for a release —
+// `being-removed` because it was added to the constant block and to no list,
+// and `autoscaler-not-live` because it did not exist and its condition
+// borrowed another code's name.
+//
+// Three of these can only be reached through [Revalidate], so they are
+// abandonment reasons and never appear on binpack_nodes_skipped. Enumerated
+// all the same: what this set answers is "what can binpack call a ruled-out
+// node", and splitting it by which counter each value reaches would put the
+// documentation guard back on a hand-written list.
 func SkipCodes() []string {
 	return []string{
 		SkipNotAutoscaled, SkipPoolDisabled, SkipScaleUpInProgress,
 		SkipCooldownAfterScaleUp, SkipCooldownAfterDrain, SkipPoolAtMinimum,
 		SkipAnnotated, SkipDrainInProgress, SkipGone, SkipUncordoned,
+		SkipAutoscalerNotLive, SkipBeingRemoved,
 		SkipBackoff, SkipCordoned, SkipProtectedPod, SkipTooManyPods,
+	}
+}
+
+// AutoscalerCanFinish reports whether a skip code leaves open the possibility
+// that the cluster-autoscaler completes a removal it has already started.
+//
+// Both codes here are readings of the autoscaler's own published status, and
+// they are separate because the operator's next step differs: one says the
+// component is not answering, the other says this node's pool was never in its
+// scope. To a hand-over already under way they are the same fact, which is why
+// they are asked as one question rather than compared one at a time — a caller
+// that tested for a single code kept waiting when the other one fired, and a
+// wait for an autoscaler that is not coming is unbounded. Only a live
+// autoscaler ever clears its own deletion taint.
+func AutoscalerCanFinish(skipCode string) bool {
+	return skipCode != SkipAutoscalerNotLive && skipCode != SkipNotAutoscaled
+}
+
+// Verdicts is every conclusion binpack can reach about one node, and
+// DecisionCodes every outcome a whole evaluation can have.
+//
+// Enumerable for the reason [SkipCodes] is, and written here beside the
+// constants for a second one: a hand-written copy of a closed set in the test
+// that pins it to the reference documentation is not a guard, it is a fourth
+// place to forget. Three values were published and undocumented for a release
+// with that test green.
+func Verdicts() []string {
+	return []string{VerdictSkipped, VerdictInfeasible, VerdictBlocked, VerdictDrainable}
+}
+
+func DecisionCodes() []string {
+	return []string{
+		CodeDrain, CodeDraining, CodeNoAutoscaler, CodeAutoscalerUnhealthy,
+		CodeNoCandidates, CodeNoneFeasible,
 	}
 }
 
@@ -507,6 +557,20 @@ const (
 	// SkipUncordoned: a drain is marked on the node but the node is
 	// schedulable, so it is still accepting pods.
 	SkipUncordoned = "uncordoned"
+	// SkipAutoscalerNotLive: there is no cluster-autoscaler in a state to
+	// finish what a drain of this node started — it is absent, its status is
+	// too stale to vouch for it, or it reports the cluster unhealthy and has
+	// stopped scaling.
+	//
+	// Distinct from SkipNotAutoscaled, which is about the node's pool rather
+	// than about the autoscaler, and the two used to share that spelling. They
+	// need different answers from whoever reads the alert: one says go and look
+	// at the cluster-autoscaler, the other says check which node group this
+	// node is in. Named for [Autoscaler.Live] rather than after the
+	// no-autoscaler decision code because it is the union of every way that
+	// function can say no, unhealthy included — a name that claimed the
+	// autoscaler was absent would be wrong in that case.
+	SkipAutoscalerNotLive = "autoscaler-not-live"
 	// SkipBeingRemoved: the cluster-autoscaler has committed to deleting the
 	// node and is draining it itself.
 	SkipBeingRemoved = "being-removed"
@@ -784,7 +848,14 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 		// One skip code for every way the answer is no, and the code is what
 		// the executor reads to decide whether a hand-over to the autoscaler
 		// can still complete. That question has one answer here: it cannot.
-		a.Skipped, a.SkipCode, a.SkipReason = true, SkipNotAutoscaled, why
+		//
+		// Its own code, not the one eligibility uses for a node whose pool is
+		// unmanaged. Both mean no hand-over will finish — which is why
+		// [AutoscalerCanFinish] asks about them together — but they are
+		// published as binpack_drains_abandoned_total{reason=…}, where they
+		// are the difference between "go and look at the cluster-autoscaler"
+		// and "check this node's group membership".
+		a.Skipped, a.SkipCode, a.SkipReason = true, SkipAutoscalerNotLive, why
 		return a
 	}
 
@@ -1036,7 +1107,7 @@ func eligibility(
 	case group.Size() <= group.MinSize:
 		a.Skipped, a.SkipCode = true, SkipPoolAtMinimum
 		a.SkipReason = fmt.Sprintf(
-			"pool %s is at its minimum size (%d)", displayPool(a), group.MinSize)
+			"pool %s is at its minimum size (%d)", a.PoolLabel(), group.MinSize)
 
 	case node.Annotations[AnnotationSkip] == "true":
 		a.Skipped, a.SkipCode, a.SkipReason = true, SkipAnnotated, "annotated "+AnnotationSkip
@@ -1183,7 +1254,21 @@ func podsOf(placements []Placement) []*corev1.Pod {
 	return out
 }
 
-func displayPool(a NodeAssessment) string {
+// PoolLabel is what to call this node's pool, in one place.
+//
+// The readable name where the cluster carries one, the node group's
+// identifier otherwise. Trivial, and it was written out three times and
+// omitted twice — so within one evaluation on a cluster with no readable pool
+// label, binpack_pool_nodes named a pool by its identifier, `binpack diagnose`
+// named it the same way, the drain log line logged the empty string, and
+// `explain --output json` omitted the field. An operator correlating a
+// dashboard series against the log entry that recorded the drain had nothing
+// to join on.
+//
+// A method on the assessment because that is where both spellings already
+// are; [PoolNaming.Label] is the same rule for a caller holding a group
+// identifier instead.
+func (a NodeAssessment) PoolLabel() string {
 	if a.Pool != "" {
 		return a.Pool
 	}

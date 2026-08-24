@@ -88,7 +88,6 @@ const (
 	BlockedBarePod        = "bare-pod"
 	BlockedSafeToEvict    = "safe-to-evict-false"
 	BlockedLocalStorage   = "local-storage"
-	BlockedMirrorPod      = "mirror-pod"
 	BlockedSystemPod      = "system-pod"
 	BlockedMultiplePDBs   = "multiple-pdbs"
 	BlockedPDBInsufficint = "pdb-insufficient"
@@ -208,12 +207,12 @@ func checkPod(pod *corev1.Pod, matched []*policyv1.PodDisruptionBudget, cfg Evic
 	// operator says a scratch volume is disposable.
 	permitted := pod.Annotations[safeToEvict] == "true"
 
-	if _, mirror := pod.Annotations[corev1.MirrorPodAnnotationKey]; mirror {
-		return &EvictionBlocker{Pod: pod, Code: BlockedMirrorPod,
-			Message: fmt.Sprintf("%s is a static pod — the kubelet recreates it from an "+
-				"on-disk manifest, so evicting it moves nothing and the drain would never "+
-				"finish", podRef(pod))}
-	}
+	// No mirror-pod branch, deliberately. A static pod is node-local — see
+	// [NodeBound] — so it is neither relocated nor evicted, and both callers
+	// of this function filter node-local pods out before reaching it. The
+	// branch that used to sit here declared one Blocking, and it could not
+	// fire: a node carrying nothing but a static pod is drained without
+	// comment, by binpack and by the cluster-autoscaler alike.
 
 	// A pod with no *controlling* owner is not recreated after eviction, so
 	// evicting it destroys it. The autoscaler refuses for the same reason.

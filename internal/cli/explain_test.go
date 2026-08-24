@@ -182,8 +182,14 @@ func TestExplainShowsTheRevalidationVerdictForTheNodeBeingDrained(t *testing.T) 
 	if len(row.Blockers) == 0 {
 		t.Fatal("node-a reports no blocker, so nothing says why the drain is about to be abandoned")
 	}
-	if !strings.Contains(strings.Join(row.Blockers, " "), "default/web") {
+	if !strings.Contains(blockerMessages(row.Blockers), "default/web") {
 		t.Errorf("blockers = %v, want the pod the budget refuses", row.Blockers)
+	}
+	for _, b := range row.Blockers {
+		if b.Code == "" {
+			t.Errorf("blocker %q carries no code, so a consumer can only match the sentence",
+				b.Message)
+		}
 	}
 
 	// Marked, in both renderings. This row answers a different question from
@@ -362,6 +368,29 @@ func TestEnginePolicyCarriesEveryResolvedPolicyField(t *testing.T) {
 			"here why it is not carried", n, carried)
 	}
 
+	// And the same count on the receiving side, which is the half this was
+	// missing. Counting only the source catches a configuration field wired
+	// to nothing; it does not catch a field added to engine.Policy — or to
+	// either struct nested in it — and fed from nothing, which reaches every
+	// decision as its zero value with the suite green. That is how
+	// engine.Policy.Evict came to be built from DefaultEvictConfig() rather
+	// than from the operator's configuration at all.
+	for _, tc := range []struct {
+		what   string
+		fields int
+		want   int
+	}{
+		{"engine.Policy", reflect.TypeFor[engine.Policy]().NumField(), 11},
+		{"engine.SimConfig", reflect.TypeFor[engine.SimConfig]().NumField(), 2},
+		{"engine.EvictConfig", reflect.TypeFor[engine.EvictConfig]().NumField(), 3},
+	} {
+		if tc.fields != tc.want {
+			t.Fatalf("%s has %d fields and this test asserts %d: feed the new one from "+
+				"the resolved policy and assert it below, or say here why it is not fed "+
+				"from configuration", tc.what, tc.fields, tc.want)
+		}
+	}
+
 	got := enginePolicy(resolved)
 
 	for _, tc := range []struct {
@@ -445,6 +474,16 @@ func TestAnUnconfiguredBackoffStillWaitsTheDocumentedDefault(t *testing.T) {
 // renderedExplainIn is renderedExplain with the command's own options in
 // scope, for the two questions that are about the deployed binpack rather than
 // about the cluster: which configuration was read, and whether it acts.
+// blockerMessages is the blocker sentences alone, for the assertions that are
+// about what a node said rather than about which code it said it under.
+func blockerMessages(blockers []reasonReport) string {
+	var out []string
+	for _, b := range blockers {
+		out = append(out, b.Message)
+	}
+	return strings.Join(out, " ")
+}
+
 func renderedExplainIn(t *testing.T, opts *options, s engine.Snapshot, cfg engine.Config) string {
 	t.Helper()
 	var buf bytes.Buffer

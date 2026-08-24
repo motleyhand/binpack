@@ -112,7 +112,10 @@ func TestRevalidateStopsADrainTheClusterHasOvertaken(t *testing.T) {
 		{"the pool reached its minimum", engine.SkipPoolAtMinimum, func(s *engine.Snapshot) {
 			s.Autoscaler.Groups[0].MinSize = 3
 		}},
-		{"the autoscaler stopped reporting", engine.SkipNotAutoscaled, func(s *engine.Snapshot) {
+		// Its own code rather than not-autoscaled, which is about the node's
+		// pool. Both end a drain in flight; they send the operator to
+		// different places.
+		{"the autoscaler stopped reporting", engine.SkipAutoscalerNotLive, func(s *engine.Snapshot) {
 			s.Autoscaler.LastProbe = now.Add(-time.Hour)
 		}},
 		{"an operator asked binpack to leave the node alone", engine.SkipAnnotated,

@@ -164,7 +164,7 @@ the elapsed time keeps running underneath, so a node already past its bound is h
 first evaluation after the pause lifts. That distinction is what keeps the wait bounded, and it
 is the same reason ADR-0007 withdrew "an eviction was accepted" from its progress signals: a
 keep-alive that resets the clock every interval is not a bound. An autoscaler that has stopped
-still ends the wait at once, under `not-autoscaled`, whatever it published on its way out.
+still ends the wait at once, under `autoscaler-not-live`, whatever it published on its way out.
 
 That direction is [ADR-0007](adr-0007-drain-progress-not-deadlines.md)'s shape applied one level
 up. ADR-0007 bounds the absence of progress rather than the wall clock, because a clock cannot
