@@ -32,3 +32,14 @@ updates:
     schedule:
       interval: monthly
     open-pull-requests-limit: 5
+
+  # The Dockerfile's base image, which is pinned by digest. Without this entry
+  # the pin is a freeze: `nonroot` is not a version tag, so nothing else would
+  # ever propose the new digest, and the CA bundle and tzdata that base carries
+  # would age indefinitely. dependabot proposes a digest bump under an
+  # unchanged tag only for a non-version tag, which is exactly this one.
+  - package-ecosystem: docker
+    directory: /
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3

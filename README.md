@@ -122,6 +122,8 @@ watch, and how to uninstall it without stranding a node.
 | [Configuration](docs/reference/configuration.md) | Every field, what it does, and why headroom is not a percentage |
 | [Diagnostics](docs/reference/diagnostics.md) | Every `binpack diagnose` code, its severity, and the fix |
 | [Versioning](docs/reference/versioning.md) | What a version number covers, what is public API, and what 0.x means |
+| [Changelog](CHANGELOG.md) | What changed in each release, and which of it is a break |
+| [Security policy](SECURITY.md) | How to report a vulnerability privately, and what is in scope |
 | [Metrics](docs/reference/metrics.md) | Every `binpack_` series, what to alert on, and why prose is never a label |
 | [Annotations and labels](docs/reference/annotations.md) | The one you set, the seven binpack writes, the label that says it is draining, and how to hand a stuck node back |
 | [Helm chart](charts/binpack) | Values, RBAC, and what each permission is for |

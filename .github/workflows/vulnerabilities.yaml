@@ -1,0 +1,45 @@
+name: vulnerabilities
+
+# Its own workflow, and deliberately not on pull_request.
+#
+# govulncheck's verdict is a function of the advisory database at the moment it
+# runs, not of the tree it is pointed at — so the same commit passes today and
+# fails tomorrow because somebody else published a disclosure. Wired into the
+# pull request that would make every contributor's first change wait on a fix
+# they have nothing to do with, and wired into `make check` it would do the
+# same to a release, since release.yaml runs `make check` on every tag.
+#
+# So it runs on a schedule, which is also the only trigger that can catch the
+# case that matters most: an advisory published against code that has not
+# changed produces no event at all. The push to main catches the other
+# direction — a dependency arriving with a known vulnerability — at the first
+# moment nobody's pull request is blocked by saying so.
+on:
+  schedule:
+    # Off the hour: scheduled jobs on the hour queue behind everybody else's.
+    - cron: "17 6 * * 1"
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  govulncheck:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # The module binpack ships. test/differential is not scanned: it is a
+      # separate module that produces no artefact and runs only in CI, and it
+      # depends on k8s.io/kubernetes, whose advisories are about a control
+      # plane nobody is running from this repository.
+      - name: Scan the dependencies and the toolchain
+        run: make vuln

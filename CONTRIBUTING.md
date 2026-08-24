@@ -5,7 +5,9 @@ easy to trust.
 
 ## Getting started
 
-Requires Go 1.26 or newer and [golangci-lint](https://golangci-lint.run) v2.
+Requires Go 1.26.0 or newer — the floor `go.mod` sets, raised there by `k8s.io/*` v0.36 — and
+[golangci-lint](https://golangci-lint.run) v2.12.2, which is the version both workflows install.
+`make lint` says so if the one you have installed is a different build.
 
 ```bash
 make check      # lint, test, build, smoke test — what CI runs

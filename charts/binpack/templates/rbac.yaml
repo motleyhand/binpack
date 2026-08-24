@@ -29,9 +29,15 @@ rules:
   # through the modern events API, so a rule granting only ""/events would let
   # it report nothing. Leader election is the other way round and is granted
   # separately below — the two APIs are both in use, for different reasons.
+  #
+  # `patch` is the aggregation: repeats of one decision become a count on the
+  # existing event rather than a new object, and client-go applies that count
+  # as a strategic-merge patch. `update` was granted too and never issued —
+  # see internal/controller's TestTheEventRecorderNeverIssuesAnUpdate, which is
+  # what would notice if a client-go release started issuing one.
   - apiGroups: ["events.k8s.io"]
     resources: [events]
-    verbs: [create, patch, update]
+    verbs: [create, patch]
 {{- if .Values.rbac.allowDraining }}
 
   # Cordon, uncordon, and the drain marker annotations. The only mutating verb
