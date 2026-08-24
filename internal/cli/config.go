@@ -106,7 +106,24 @@ type resolvedConfig struct {
 // document that omits a value on the grounds that it is the current default
 // stops being that the day the default moves.
 func explicit(p v1alpha1.PoolPolicy) v1alpha1.Policy {
+	// Never nil, and this is the one field where that matters. Every other
+	// setting here is a scalar behind a pointer, where "set" and "unset" are
+	// the pointer's own business; this one is a slice, and a nil one marshals
+	// to JSON null, which reloads as an absent pointer and therefore as
+	// "inherit". A pool that had cleared the global exclusions with
+	// `namespaces: []` would come back excluding them again.
+	//
+	// Resolution cannot tell the two apart on binpack's behalf: SetDefaults
+	// applies an override with `append([]string(nil), ...)`, and appending
+	// nothing to nil is nil, so a cleared list and an unset one are the same
+	// value by the time they reach here. What settles it is that this report
+	// is the effective settings written out explicitly — "nothing is
+	// excluded" is a fact about this binpack either way, and `[]` says it
+	// while null asks the reader to guess.
 	namespaces := p.ExcludedNamespaces
+	if namespaces == nil {
+		namespaces = []string{}
+	}
 	return v1alpha1.Policy{
 		Enabled: &p.Enabled,
 		Feasibility: v1alpha1.Feasibility{
@@ -131,9 +148,6 @@ func explicit(p v1alpha1.PoolPolicy) v1alpha1.Policy {
 			AfterScaleUp: v1alpha1.NewDuration(p.CooldownAfterScaleUp),
 			AfterDrain:   v1alpha1.NewDuration(p.CooldownAfterDrain),
 		},
-		// A nil slice would render as null and reload as "explicitly empty",
-		// which is a different setting from "none excluded" only in that one
-		// of them is a claim.
 		Exclusions: v1alpha1.Exclusions{Namespaces: &namespaces},
 	}
 }

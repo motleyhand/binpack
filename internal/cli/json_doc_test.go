@@ -316,6 +316,8 @@ pools:
   - name: pool-4g
     drain:
       maxPodsPerDrain: 5
+    exclusions:
+      namespaces: []
 `
 
 	cfg, err := v1alpha1.Load([]byte(document))
@@ -336,6 +338,14 @@ pools:
 
 	// Same binpack, not merely a document that parses: every resolved value
 	// has to survive the trip, including the pool override.
+	//
+	// The pool clearing `exclusions.namespaces` is the case worth spelling
+	// out. It is the one setting whose resolved Go value cannot distinguish
+	// "cleared" from "unset" on its own — both are a nil []string, since
+	// SetDefaults resolves an override with `append([]string(nil), ...)` and
+	// appending nothing to nil yields nil. Rendered as JSON null that reads
+	// back as "inherit", so a pool that had deliberately opted out of the
+	// global exclusions would silently opt back in.
 	for _, pool := range []string{"", "pool-4g"} {
 		if got, want := reloaded.PolicyFor(pool), cfg.PolicyFor(pool); !reflect.DeepEqual(got, want) {
 			t.Errorf("policy for %q resolves differently after a round trip:\n got %+v\nwant %+v",
