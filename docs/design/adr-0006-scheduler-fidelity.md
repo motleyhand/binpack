@@ -241,10 +241,13 @@ planes [ADR-0004](adr-0004-provider-agnostic-no-cloud-api.md) targets, could not
 therefore limitations to state rather than bugs to fix — refusing on the possibility would refuse
 every cluster — and they are stated in
 [the configuration reference](../reference/configuration.md#supported-scheduler-configuration).
-The differential harness shares the assumption rather than testing it: the oracle constructs
-`NodeAffinity` with empty arguments and does not construct `PodTopologySpread` at all. Both are
-also unlike the unmodelled *pod* features above in the direction they fail — an unrecognised
-feature refuses, while an unread scheduler argument accepts.
+The differential harness shares the assumption rather than testing it: its oracle builds every
+plugin with the arguments the release's own default profile carries, which is the stock
+configuration and not an operator's. It cannot do otherwise — the whole population of
+administrator-supplied arguments is not something a test can enumerate — so what the harness
+establishes is fidelity to the default profile, which is the assumption stated rather than a
+check on it. Both arguments are also unlike the unmodelled *pod* features above in the direction
+they fail: an unrecognised feature refuses, while an unread scheduler argument accepts.
 
 That was the intent, and for a while it was not what the code did. `firstConstrainingVolume` is
 a `switch` whose `default` refuses, so an unknown volume source really does refuse; the pod-field
@@ -433,8 +436,15 @@ stop everywhere.
 Widening what `CanFit` takes is a deliberate move and it stays inside ADR-0008's rule: the index
 is built from Kubernetes API objects passed as data, holds no client, does no I/O, and can be
 written in a test literal. An empty index is a legitimate value meaning the caller has no view
-wider than the node in front of it — which is what the differential harness, whose oracle also
-models a single node, necessarily passes.
+wider than the node in front of it.
+
+The differential harness passed exactly that for a while, because its oracle modelled a cluster
+of one node — and a harness that can only pose single-node scenarios cannot adjudicate a
+disagreement whose whole substance is that the domain is wider than the node. It could report
+that `internal/fit` still refused the case, which is binpack asserting about binpack; it could
+not report what the scheduler said. The oracle now takes the candidate cluster and runs
+`InterPodAffinity` and `PodTopologySpread` against a snapshot of it, so the zone-keyed case is
+settled by the scheduler refusing rather than by a witness this project wrote.
 
 The soft counterparts of these constraints — `preferredDuringSchedulingIgnoredDuringExecution`,
 `whenUnsatisfiable: ScheduleAnyway` — are ignored rather than refused, because they affect only
@@ -504,22 +514,29 @@ if the refusal it rests on is deleted. A release that adds a Filter plugin now f
 plugin's name rather than passing quietly.
 
 The exemptions are the honest reading of "an unmodelled constraint is a bounded limitation": each
-one is a limitation, written down, somewhere a test can contradict it. Six of the seven rest on
-the allowlist refusing a whole class of pod — every pod with a volume, with resource claims, with
-a hard spread constraint. The seventh, InterPodAffinity, rests on two refusals, and only the
-first is of that kind: a pod declaring required affinity terms of its own is refused outright,
-while the symmetric direction — a resident's term rejecting the pod arriving beside it — is
-checked node by node where the plugin counts across a whole topology domain. A term keyed on the
-zone therefore rejects nodes that hold no matching pod of their own, and binpack approves them.
+one is a limitation, written down, somewhere a test can contradict it. The ones that remain all
+rest on the allowlist refusing a whole class of pod — every pod with a volume, every pod with
+resource claims — so each is a refusal a test can run and watch fail if it is ever deleted.
 
-That shortfall is carried in the map as an input, not as a sentence, because a sentence cannot
-stop a green test from reading as coverage. The exemption names the pod-and-node arrangement
-binpack accepts and the plugin refuses, the test asserts it is still accepted, and the run logs it
-on every pass. Two things follow, and both are the point: a gap cannot be declared where none
-exists, and the day the refusal is widened to the topology domain the assertion fails and the
-record has to be deleted rather than left behind as a false statement about a package that has
-moved on. An exemption narrower than its plugin is a defect with a name, not a limitation
-somebody has decided to live with.
+The two that decide across nodes were exempted for a worse reason, and correcting it is the
+second instance of the same lesson. `InterPodAffinity` and `PodTopologySpread` will not construct
+without a scheduler `Handle` carrying a snapshot of every node, and the oracle modelled a cluster
+of one — so they were exempt by construction rather than by judgement, and the exemption that
+recorded it was one nothing could contradict. That is exactly the shape this section warns
+against one paragraph up: a plugin the oracle does not run cannot produce a disagreement. It was
+also the worst possible plugin to leave in that state, because the symmetric anti-affinity
+direction is the one place binpack asks a node-local question where upstream asks a domain-wide
+one. The oracle now takes the candidate cluster, builds a snapshot from it and runs both.
+
+The mechanism the InterPodAffinity exemption used while it lasted is kept even though nothing
+needs it. Where an exemption's refusal is narrower than the plugin it stands in for, the shortfall
+is carried in the map as an *input* rather than as a sentence, because a sentence cannot stop a
+green test from reading as coverage: the exemption names the arrangement binpack accepts and the
+plugin refuses, the test asserts it is still accepted, and the run logs it on every pass. Two
+things follow, and both are the point — a gap cannot be declared where none exists, and the day
+the refusal is widened the assertion fails and the record has to be deleted rather than left
+behind as a false statement about a package that has moved on. An exemption narrower than its
+plugin is a defect with a name, not a limitation somebody has decided to live with.
 
 ## Consequences
 

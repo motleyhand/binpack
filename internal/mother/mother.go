@@ -102,6 +102,33 @@ func GPUNode(name string, count int64, opts ...NodeOption) *corev1.Node {
 	}, opts...)...)
 }
 
+// CappedNode is a node whose pod ceiling binds long before its CPU and memory
+// do: three slots against the CPU and memory of a [LargeNode].
+//
+// The ceiling is the dimension `pods` exists for, and it is the one a
+// subtract-request-from-remaining loop silently never consumes, because `pods`
+// appears in a node's allocatable and never in a pod's requests. A fixture
+// whose ceiling cannot be reached tests that arithmetic vacuously — every node
+// mother above advertises 110 slots, which is the kubelet's own default
+// (k8s.io/kubernetes pkg/kubelet/apis/config/v1beta1/defaults.go, MaxPods),
+// and no test table places anything like that many pods.
+//
+// Three rather than four so that the ceiling is reachable at all: fixtures put
+// at most a handful of residents on a node, and a ceiling one above the most
+// they place can only ever be approached. Real clusters get there from the
+// other end — a kubelet started with a `--max-pods` well below the default,
+// which is how a node's addressing rather than its size ends up limiting what
+// it holds.
+func CappedNode(name string, opts ...NodeOption) *corev1.Node {
+	return Node(name, append([]NodeOption{
+		Allocatable(corev1.ResourceList{
+			corev1.ResourceCPU:    resource.MustParse("3900m"),
+			corev1.ResourceMemory: resource.MustParse("6800Mi"),
+			corev1.ResourcePods:   resource.MustParse("3"),
+		}),
+	}, opts...)...)
+}
+
 // Allocatable replaces a node's allocatable resources outright.
 func Allocatable(rl corev1.ResourceList) NodeOption {
 	return func(n *corev1.Node) { n.Status.Allocatable = rl.DeepCopy() }
