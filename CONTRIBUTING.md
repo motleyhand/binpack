@@ -24,6 +24,17 @@ CI additionally verifies that `go.mod` and `go.sum` are tidy, and runs GoRelease
 mode so a broken release config fails on the pull request rather than on a tag.
 
 ```bash
+make vuln       # govulncheck over the dependencies and the toolchain
+```
+
+That one is deliberately **not** part of `make check`, and it is not run on your pull request. Its
+answer comes from the vulnerability database as it stands at the moment it runs rather than from
+the tree, so wiring it in would fail your change for a disclosure published against something you
+did not touch — and `make check` is what a release tag runs, so it would block releases the same
+way. It runs weekly and on every push to `main` instead. Run it yourself if you are changing a
+dependency.
+
+```bash
 make test-differential   # check the fit predicate against the real scheduler
 ```
 
