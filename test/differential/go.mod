@@ -71,11 +71,11 @@ replace k8s.io/sample-apiserver => k8s.io/sample-apiserver v0.36.3
 
 require (
 	github.com/motleyhand/binpack v0.0.0-00010101000000-000000000000
-	k8s.io/api v0.36.3
-	k8s.io/apimachinery v0.36.3
+	k8s.io/api v0.36.4
+	k8s.io/apimachinery v0.36.4
 	k8s.io/apiserver v0.36.3
-	k8s.io/client-go v0.36.3
-	k8s.io/component-helpers v0.36.3
+	k8s.io/client-go v0.36.4
+	k8s.io/component-helpers v0.36.4
 	k8s.io/kube-scheduler v0.0.0
 	k8s.io/kubernetes v1.36.3
 )
