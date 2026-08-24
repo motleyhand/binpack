@@ -196,9 +196,18 @@ jobs:
           go mod tidy
           git diff --exit-code -- go.mod go.sum
 
+      # -count=1 disables the test result cache, and it is load-bearing rather
+      # than belt-and-braces. TestHarnessTracksTheShippedLibraries compares this
+      # module's replace block against the main module's go.mod, which is
+      # outside this module — and Go's test cache keys a package only on files
+      # inside it, so a bump that touches the main module and nothing here
+      # replays a stale PASS. That is exactly the change the test exists to
+      # catch. It cost two merges of a green-but-blind harness in v0.3.0's
+      # development; the whole suite runs in under a second, so caching it
+      # saves nothing worth this.
       - name: Compare fit against the scheduler's own Filter plugins
         working-directory: test/differential
-        run: go test -v ./...
+        run: go test -count=1 -v ./...
 
   release-config:
     name: validate release config

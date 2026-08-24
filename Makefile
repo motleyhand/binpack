@@ -67,7 +67,10 @@ smoke: build ## Run the built binary once
 
 .PHONY: test-differential
 test-differential: ## Check the fit predicate against the real scheduler
-	cd test/differential && go test ./...
+	# -count=1 for the reason ci.yaml gives at the same step: this suite's
+	# version guard reads the main module's go.mod, which the test cache cannot
+	# see, so a cached PASS can outlive the bump it was meant to catch.
+	cd test/differential && go test -count=1 ./...
 
 .PHONY: vuln
 vuln: ## Check the dependencies and the toolchain against the Go vulnerability database

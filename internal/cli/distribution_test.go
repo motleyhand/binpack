@@ -409,3 +409,42 @@ func TestContributingStatesTheGoVersionGoModRequires(t *testing.T) {
 			"does not mention it", toolchain)
 	}
 }
+
+// TestTheDifferentialSuiteRunsUncached holds a one-flag invariant that a green
+// pipeline depends on and nothing else can see.
+//
+// TestHarnessTracksTheShippedLibraries compares the harness module's replace
+// block against the main module's go.mod. That file is outside the harness
+// module, and Go's test cache keys a package only on the files inside it — an
+// os.ReadFile of a path above the module root is not recorded as an input, as
+// a probe confirmed. So a dependency bump that touches the main module and
+// nothing under test/differential leaves the harness's cached PASS valid, and
+// the one test written to catch that bump replays a result from before it.
+//
+// It is not hypothetical. A grouped bump moved k8s.io/api, apimachinery,
+// client-go and component-helpers from v0.36.3 to v0.36.4 in the main module;
+// the harness went on building against v0.36.3, and CI was green across that
+// merge and the next. It went red only on an unrelated bump that happened to
+// touch the harness's own go.mod and so invalidated the cache — which read as
+// that bump's fault, and it was reverted.
+//
+// Asserted in both files because either alone is a gap: CI is what gates a
+// pull request, and `make test-differential` is what a maintainer runs before
+// opening one.
+func TestTheDifferentialSuiteRunsUncached(t *testing.T) {
+	for _, tc := range []struct {
+		what string
+		path string
+		want string
+	}{
+		{"the CI workflow", ciWorkflowPath, "go test -count=1 -v ./..."},
+		{"the Makefile", makefilePath, "cd test/differential && go test -count=1 ./..."},
+	} {
+		if !strings.Contains(readRepoFile(t, tc.path), tc.want) {
+			t.Errorf("%s does not run the differential suite as %q.\n"+
+				"Without -count=1 the harness's version guard can report a cached PASS "+
+				"from before the bump it exists to catch, because its inputs are outside "+
+				"the module the cache keys on.", tc.what, tc.want)
+		}
+	}
+}
