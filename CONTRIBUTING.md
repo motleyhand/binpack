@@ -5,7 +5,19 @@ easy to trust.
 
 ## Getting started
 
-Requires Go 1.26 or newer and [golangci-lint](https://golangci-lint.run) v2.
+Requires Go 1.26.0 or newer and [golangci-lint](https://golangci-lint.run) v2.12.2, which is the
+version both workflows install — `make lint` says so if the one you have installed is a different
+build.
+
+Both numbers live in the tree rather than on this page. `go.mod` sets the Go floor at 1.26.0,
+raised there by `k8s.io/*` v0.36, and separately pins `toolchain go1.26.7` — the compiler that
+builds every released binary, because `actions/setup-go` prefers the `toolchain` directive to the
+`go` one.
+
+You do not need 1.26.7 installed. Under the default `GOTOOLCHAIN=auto` the go command fetches the
+pinned toolchain for you; only the 1.26.0 floor is enforced against what you have. With
+`GOTOOLCHAIN=local` the pin is ignored entirely and you build with whatever you have, which is
+fine for working on binpack and is not what a release is built with.
 
 ```bash
 make check      # lint, test, build, smoke test — what CI runs
@@ -20,6 +32,17 @@ make help       # list every target
 
 CI additionally verifies that `go.mod` and `go.sum` are tidy, and runs GoReleaser in snapshot
 mode so a broken release config fails on the pull request rather than on a tag.
+
+```bash
+make vuln       # govulncheck over the dependencies and the toolchain
+```
+
+That one is deliberately **not** part of `make check`, and it is not run on your pull request. Its
+answer comes from the vulnerability database as it stands at the moment it runs rather than from
+the tree, so wiring it in would fail your change for a disclosure published against something you
+did not touch — and `make check` is what a release tag runs, so it would block releases the same
+way. It runs weekly and on every push to `main` instead. Run it yourself if you are changing a
+dependency.
 
 ```bash
 make test-differential   # check the fit predicate against the real scheduler

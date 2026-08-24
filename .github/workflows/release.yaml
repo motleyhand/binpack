@@ -7,14 +7,20 @@ on:
 # The tag is the trigger and the source of every version number: the binary's,
 # the image's, the chart's and its appVersion. Nothing is edited by hand at
 # release time, so there is no way for them to disagree.
-permissions:
-  contents: write
-  packages: write
+#
+# Permissions are declared per job rather than here, because a workflow-scope
+# block is inherited by every job whether it needs it or not. hack/check-workflows.py
+# refuses a write granted at this level.
 
 jobs:
   release:
     name: release
     runs-on: ubuntu-latest
+    # goreleaser creates the GitHub release (contents) and pushes the image
+    # (packages). Both are genuinely this job's.
+    permissions:
+      contents: write
+      packages: write
     steps:
       - uses: actions/checkout@v7
         with:
@@ -119,6 +125,15 @@ jobs:
   chart:
     name: chart
     runs-on: ubuntu-latest
+    # This job reads the chart and publishes it; it writes nothing back to the
+    # repository. The narrowing is worth exactly one action — azure/setup-helm
+    # and the helm binary it fetches are the only third-party code that runs
+    # here and not in `release`, which holds `contents: write` legitimately. It
+    # keeps `packages: write`, so it can still publish to ghcr.io; what it can
+    # no longer do is push a commit or rewrite a release asset.
+    permissions:
+      contents: read
+      packages: write
     # After the image exists. A chart whose default image cannot be pulled is
     # an install that fails at the last step, having already created the RBAC.
     needs: release

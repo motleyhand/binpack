@@ -106,7 +106,7 @@ rules:
   # Explaining decisions on the Node object itself.
   - apiGroups: ["events.k8s.io"]
     resources: [events]
-    verbs: [create, patch, update]
+    verbs: [create, patch]
 ```
 
 ```yaml
@@ -115,6 +115,12 @@ rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: [leases]
     verbs: [get, list, watch, create, update, patch]
+
+  # client-go's LeaseLock uses get, create and update (resourcelock/leaselock.go
+  # at v0.36.3); list, watch and patch are the conventional set and are not
+  # exercised. Left as they are:
+  # this Role is namespaced to binpack's own namespace, and nothing else here
+  # holds a Lease.
 
   # Leader election announces itself on the Lease through the *core* events
   # API, not the one binpack reports decisions through. Both are needed.
@@ -128,10 +134,16 @@ the modern `events.k8s.io` API, so a rule granting `""/events` alone will not le
 anything. `patch` is there because the recorder aggregates repeats into one object with a count
 rather than writing a new one each time, and it applies that count with a patch.
 
-`update` is not used. client-go's event sink declares an `Update` method and the broadcaster
-never calls it — `recordEvent` tries `Patch` and falls back to `Create`. The verb is granted
-defensively, against a future client-go that does; if you are minimising the grant, it is the one
-to drop, and nothing binpack does today will notice.
+`update` is not granted. It was, up to and including v0.2.2, and the reason attached to it was
+not the reason: the page said aggregation needed it, and aggregation is the patch. client-go's
+event sink declares an `Update` method and the broadcaster never calls it — `recordEvent` tries
+`Patch` and falls back to `Create`.
+
+Dropping it removes no capability, because `patch` on the same resource already subsumes anything
+`update` could do to an existing event. **If you manage this role yourself you can drop the verb,
+and there is nothing to do if you keep it.** binpack's own test asserts the recorder issues
+`Create` and `Patch` and never `Update`, so a client-go release that started issuing one would
+fail the build rather than 403 on your cluster.
 
 Leader election is the other way round: it announces itself on the Lease through client-go's
 legacy recorder, which writes to the **core** group. That grant is on the leader-election Role

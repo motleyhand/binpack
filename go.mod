@@ -2,6 +2,15 @@ module github.com/motleyhand/binpack
 
 go 1.26.0
 
+// The compiler, which the `go` directive above does not decide: setup-go
+// installs the toolchain version when one is declared and falls back to the go
+// directive otherwise, so without this line CI built every release with
+// go1.26.0 — the exact patch k8s.io/* pushed the directive to. govulncheck run
+// under go1.26.0 reports 19 standard-library advisories reachable from
+// binpack's own code, including crypto/x509 verification on the eviction path;
+// under 1.26.7 it reports none. Bump it when `make vuln` says to.
+toolchain go1.26.7
+
 require (
 	github.com/go-logr/logr v1.4.4
 	github.com/prometheus/client_golang v1.24.1

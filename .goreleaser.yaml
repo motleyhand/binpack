@@ -96,3 +96,9 @@ release:
     ```
 
     Dry run by default. See [the install guide](https://github.com/motleyhand/binpack/blob/main/docs/how-to/install-binpack.md).
+
+    The list above is generated from commit subjects. What a name change means,
+    and every deprecation, is in
+    [CHANGELOG.md](https://github.com/motleyhand/binpack/blob/main/CHANGELOG.md),
+    which [versioning](https://github.com/motleyhand/binpack/blob/main/docs/reference/versioning.md)
+    makes the normative record.

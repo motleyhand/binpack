@@ -53,9 +53,9 @@ While the major version is zero, a **minor** bump may break any of the above, an
 bump may not.
 
 That is not semver's letter — semver says 0.x may break anything — but it is what the number is
-being used to mean here, and the changelog says which. In practice the surfaces above are
-already documented in detail and tested in both directions against their references, so breaking
-one is a decision rather than an accident.
+being used to mean here, and [the changelog](../../CHANGELOG.md) says which. In practice the
+surfaces above are already documented in detail and tested in both directions against their
+references, so breaking one is a decision rather than an accident.
 
 The version stays at 0.x until binpack can act on its own decisions and has done so on somebody
 else's cluster. A tool that cannot yet do the thing it is named for should not be claiming
@@ -64,8 +64,14 @@ compatibility guarantees.
 ## Deprecation
 
 A public name that is going away is kept working for at least one minor release, emitted
-alongside its replacement, and listed in the changelog under a heading that says so. Nothing is
+alongside its replacement, and listed in [the changelog](../../CHANGELOG.md) under a **Deprecated**
+heading. A name that has gone appears under **Breaking**, with what to do instead. Nothing is
 removed in a patch.
+
+The changelog is [CHANGELOG.md](../../CHANGELOG.md) in the repository root, and it is the
+normative record: it is written as the change lands, in the pull request that makes it. The
+GitHub release body is generated from commit subjects and is a convenience, not the promise —
+a subject line is not a heading that says a name is going away.
 
 Where a name is superseded by a different design rather than renamed, the decision is recorded as
 an ADR in [`docs/design/`](../design/) and the old name's entry points at it. Contradicting an
