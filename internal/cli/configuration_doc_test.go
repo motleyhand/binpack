@@ -1,10 +1,17 @@
 package cli
 
 import (
+	"fmt"
+	"maps"
 	"os"
+	"path/filepath"
+	"reflect"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/motleyhand/binpack/api/v1alpha1"
 )
@@ -74,4 +81,226 @@ func dedent(s string) string {
 		}
 	}
 	return strings.Join(lines, "\n")
+}
+
+// The task pages are where an operator copies a configuration fragment from,
+// so they are the pages a field name that does not exist does the most damage
+// on. The reference pages are excluded deliberately rather than by oversight:
+// cli.md documents `pools.source` and friends, which are `diagnose --output
+// json` fields and not configuration at all, and the ADRs name `pools[].minSize`
+// and `pools[].nodeSelector` — designs that were considered and rejected, so a
+// path resolving there would be the failure.
+const howToDirectory = "../../docs/how-to"
+
+// Two ways a path is named in Markdown, and both are load-bearing. A fenced
+// block is what gets copied; backticked prose is what gets typed from memory.
+var backtickRE = regexp.MustCompile("`([^`\n]+)`")
+
+// A path may name one entry of a list — `pools[]`, or `pools[0]` — and the
+// index says nothing about the field.
+var pathIndexRE = regexp.MustCompile(`\[[^\]]*\]$`)
+
+// TestEveryConfigurationPathInTheTaskPagesIsAField resolves every
+// configuration path the how-to pages name against the wire type.
+//
+// This exists because nothing held the documentation to the type, and the
+// documentation drifted off it: one page instructed the reader to disable a
+// pool with `policy.byPool.<name>.enabled`, a field binpack has never had.
+// That is the worst shape a documentation error takes here, because the loader
+// rejects unknown fields — so the reader who follows the page gets a binpack
+// that will not start, with an error naming their file rather than ours, and
+// no reason to suspect the page.
+//
+// The prose half cannot recognise a path whose *first* segment is invented,
+// since nothing distinguishes `byPool.<name>` from any other backticked word.
+// It anchors on a real top-level field and checks the rest, which is where the
+// invented segments have actually appeared.
+func TestEveryConfigurationPathInTheTaskPagesIsAField(t *testing.T) {
+	entries, err := os.ReadDir(howToDirectory)
+	if err != nil {
+		t.Fatalf("reading the how-to directory: %v", err)
+	}
+
+	// A guard over a corpus it failed to extract anything from passes for the
+	// wrong reason. Both extractions are counted, because either one silently
+	// finding nothing would leave half the rule unenforced.
+	fenced, prose := 0, 0
+
+	for _, entry := range entries {
+		if entry.IsDir() || filepath.Ext(entry.Name()) != ".md" {
+			continue
+		}
+
+		data, err := os.ReadFile(filepath.Join(howToDirectory, entry.Name()))
+		if err != nil {
+			t.Fatalf("reading %s: %v", entry.Name(), err)
+		}
+
+		yamlPaths := fencedConfigurationPaths(string(data))
+		prosePaths := backtickedConfigurationPaths(string(data))
+		fenced += len(yamlPaths)
+		prose += len(prosePaths)
+
+		t.Run(entry.Name(), func(t *testing.T) {
+			for _, path := range slices.Concat(yamlPaths, prosePaths) {
+				if err := resolveConfigurationPath(path); err != nil {
+					t.Errorf("this page names %s: %v", path, err)
+				}
+			}
+		})
+	}
+
+	if fenced == 0 {
+		t.Error("no configuration paths found in any fenced block: the extraction is wrong, not the pages")
+	}
+	if prose == 0 {
+		t.Error("no configuration paths found in backticks: the extraction is wrong, not the pages")
+	}
+}
+
+// fencedConfigurationPaths returns every path a page's YAML examples name.
+//
+// Only two block shapes are a configuration document. A raw one declares the
+// apiVersion, or leads with a section of the policy; a chart values block
+// carries the whole document under `config`, which the chart writes into the
+// ConfigMap with `toYaml` and no filtering — so every key under it is a field
+// of this type, not only the ones under policy. Everything else on these pages
+// is a Kubernetes manifest or another chart's values, and belongs to nobody
+// here.
+func fencedConfigurationPaths(doc string) []string {
+	var paths []string
+
+	for _, match := range yamlBlockRE.FindAllStringSubmatch(doc, -1) {
+		var block map[string]any
+		if err := yaml.Unmarshal([]byte(dedent(match[1])), &block); err != nil {
+			continue
+		}
+
+		root := block
+		switch nested, wrapped := block["config"].(map[string]any); {
+		case wrapped:
+			root = nested
+		case block["apiVersion"] == v1alpha1.GroupVersion:
+		case block["policy"] != nil || block["pools"] != nil:
+		default:
+			continue
+		}
+
+		paths = append(paths, keyPaths("", root)...)
+	}
+
+	slices.Sort(paths)
+	return slices.Compact(paths)
+}
+
+// keyPaths flattens a decoded document into the dotted paths its keys spell.
+func keyPaths(prefix string, node map[string]any) []string {
+	var paths []string
+
+	for key, value := range node {
+		path := key
+		if prefix != "" {
+			path = prefix + "." + key
+		}
+
+		switch value := value.(type) {
+		case map[string]any:
+			paths = append(paths, keyPaths(path, value)...)
+		case []any:
+			paths = append(paths, path)
+			for _, element := range value {
+				if element, ok := element.(map[string]any); ok {
+					paths = append(paths, keyPaths(path+"[]", element)...)
+				}
+			}
+		default:
+			paths = append(paths, path)
+		}
+	}
+
+	return paths
+}
+
+// backtickedConfigurationPaths returns every path a page names in prose.
+//
+// A backticked span is a configuration path when its first segment is a
+// top-level field of the document — the only anchor available, since prose has
+// no syntax that says "this is configuration". A trailing value is dropped, so
+// `dryRun: false` names the field `dryRun`.
+func backtickedConfigurationPaths(doc string) []string {
+	top := jsonFields(reflect.TypeFor[v1alpha1.Config]())
+
+	var paths []string
+	for _, match := range backtickRE.FindAllStringSubmatch(doc, -1) {
+		path, _, _ := strings.Cut(match[1], ":")
+		path = strings.TrimSpace(path)
+
+		if path == "" || strings.ContainsAny(path, " \t/=") {
+			continue
+		}
+		head, _, _ := strings.Cut(path, ".")
+		if _, ok := top[pathIndexRE.ReplaceAllString(head, "")]; !ok {
+			continue
+		}
+
+		paths = append(paths, path)
+	}
+
+	slices.Sort(paths)
+	return slices.Compact(paths)
+}
+
+// resolveConfigurationPath walks a dotted path down the wire type by JSON tag,
+// which is the name an operator writes rather than the Go one.
+func resolveConfigurationPath(path string) error {
+	typ := reflect.TypeFor[v1alpha1.Config]()
+
+	for _, segment := range strings.Split(path, ".") {
+		name := pathIndexRE.ReplaceAllString(segment, "")
+
+		typ = underlying(typ)
+		if typ.Kind() != reflect.Struct {
+			return fmt.Errorf("%q has no fields under it", strings.TrimSuffix(path, "."+segment))
+		}
+
+		fields := jsonFields(typ)
+		field, ok := fields[name]
+		if !ok {
+			known := slices.Sorted(maps.Keys(fields))
+			return fmt.Errorf("%q is not a field of %s, which has %s",
+				name, typ.Name(), strings.Join(known, ", "))
+		}
+		typ = field
+	}
+
+	return nil
+}
+
+// jsonFields maps a struct's JSON field names to their types, flattening the
+// inline ones. PoolOverride inlines Policy, so a pool entry spells a policy
+// field at its own level: `pools[].enabled`, never `pools[].policy.enabled`.
+func jsonFields(typ reflect.Type) map[string]reflect.Type {
+	fields := map[string]reflect.Type{}
+
+	for field := range typ.Fields() {
+		name, _, _ := strings.Cut(field.Tag.Get("json"), ",")
+
+		switch {
+		case name == "" && field.Anonymous:
+			maps.Copy(fields, jsonFields(underlying(field.Type)))
+		case name == "" || name == "-":
+		default:
+			fields[name] = field.Type
+		}
+	}
+
+	return fields
+}
+
+// underlying strips the pointers and slices a path segment does not spell.
+func underlying(typ reflect.Type) reflect.Type {
+	for typ.Kind() == reflect.Pointer || typ.Kind() == reflect.Slice {
+		typ = typ.Elem()
+	}
+	return typ
 }

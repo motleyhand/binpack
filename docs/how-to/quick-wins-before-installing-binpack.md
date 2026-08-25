@@ -1,6 +1,6 @@
 # Quick wins before installing binpack
 
-Seven fixes worth doing regardless of whether you ever run this tool. Several of them recover
+Eight fixes worth doing regardless of whether you ever run this tool. Several of them recover
 more capacity than binpack can, because they remove *permanent* blocks rather than optimising
 around them. All of them make the cluster-autoscaler you already run work the way you assumed
 it did.
@@ -52,7 +52,7 @@ Then read its recommendations against your current requests.
 **Check `kubectl top nodes` works first.** The VPA recommender reads usage samples from the
 resource Metrics API, so a broken `metrics.k8s.io` leaves it with nothing to recommend from —
 and it fails quietly, producing no recommendations rather than an error. If `kubectl top` is
-empty, do [fix 7](#7-fix-your-metrics-api-if-kubectl-top-is-broken) before this one.
+empty, do [fix 8](#8-fix-your-metrics-api-if-kubectl-top-is-broken) before this one.
 
 This is the highest-leverage *structural* fix available, and it improves scheduling density,
 scale-down behaviour and cost simultaneously.
