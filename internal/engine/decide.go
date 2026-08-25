@@ -392,23 +392,6 @@ type Config struct {
 	ByPool  map[string]Policy
 }
 
-// policyFor resolves the policy for a pool, matching on any of its names.
-//
-// Unexported, and reached only through [Config.PolicyForNode]: which names a
-// node answers to is the question that went wrong once, so there is one
-// answer to it rather than one per caller.
-func (c Config) policyFor(names ...string) Policy {
-	for _, name := range names {
-		if name == "" {
-			continue
-		}
-		if p, ok := c.ByPool[name]; ok {
-			return p
-		}
-	}
-	return c.Default
-}
-
 // NoDrainToMeasureFrom is why an after-drain cooldown cannot be enforced by a
 // process that did not perform the drain.
 //

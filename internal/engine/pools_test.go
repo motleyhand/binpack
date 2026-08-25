@@ -749,18 +749,21 @@ func TestAStatedJoinMayNameAPoolScaledToZero(t *testing.T) {
 // pool drainable, which is the exact failure ADR-0012's override check exists
 // to prevent.
 //
-// Both names, because preflight accepts both: the label the join reads, and
-// the one `discovery.nodeGroupIDLabel` configures. Accepting a name at
-// validation and ignoring it at resolution is worse than refusing it.
+// All four names, because preflight accepts all four: the identifier the
+// autoscaler publishes, the value of the label the join reads, the value of
+// the one `discovery.nodeGroupIDLabel` configures, and the readable pool name.
+// Accepting a name at validation and ignoring it at resolution is worse than
+// refusing it.
 func TestAnOverrideNamedByAnyLabelTheJoinReadsTakesEffect(t *testing.T) {
 	build := func() engine.Snapshot {
 		s := derivable("eks.amazonaws.com/nodegroup", []pool{
 			{id: "eks-workers-a2c1d3e4", value: "workers", nodes: 2}})
-		// Also carrying the configured key, holding something no published
-		// group answers to — so the join is still derived, and the two keys
-		// are two different strings.
+		// Also carrying the configured key and the readable-name key, each
+		// holding something no published group answers to — so the join is
+		// still derived, and all four names are four different strings.
 		for _, node := range s.Nodes {
 			node.Labels["doks.digitalocean.com/node-pool-id"] = "the-configured-name"
+			node.Labels["doks.digitalocean.com/node-pool"] = "the-readable-name"
 		}
 		return s
 	}
@@ -769,6 +772,7 @@ func TestAnOverrideNamedByAnyLabelTheJoinReadsTakesEffect(t *testing.T) {
 		"eks-workers-a2c1d3e4", // the identifier the autoscaler publishes
 		"workers",              // the value of the label the join reads
 		"the-configured-name",  // the value of discovery.nodeGroupIDLabel
+		"the-readable-name",    // the value of discovery.poolNameLabel
 	} {
 		t.Run(name, func(t *testing.T) {
 			s := build()
@@ -784,6 +788,65 @@ func TestAnOverrideNamedByAnyLabelTheJoinReadsTakesEffect(t *testing.T) {
 					t.Errorf("%s was assessed %q, so an override written as %q did not "+
 						"reach the decision", a.Node.Name, a.SkipCode, name)
 				}
+			}
+		})
+	}
+}
+
+// TestEveryPoolOverrideSpellingIsAcceptedByBoth is the closure of the test
+// above, and the reason the four names have one implementation rather than two.
+//
+// Which names a `pools[]` entry may be written as was stated twice: once by
+// [engine.Config.PolicyForNode], which resolves an override, and once by
+// [engine.ResolvePools], which validates one, six hundred lines apart in the
+// same file with nothing pointing either at the other. Two enumerations of one
+// set drift in two directions and only one of them is loud. Adding a fifth
+// spelling to the validation makes preflight accept an override the engine then
+// ignores — an operator told their configuration is valid, watching binpack go
+// on draining a pool they believe they switched off — and that is the failure
+// PolicyForNode's own doc records having already happened once.
+//
+// So the property is a biconditional, not a list: for every name this node
+// could plausibly be overridden by, preflight accepts it exactly when the
+// engine honours it. Ranged over the node's own labels rather than over a
+// written-out set, because a written-out set is a third enumeration to keep in
+// step — a fifth spelling reaching only one of the two sites fails this without
+// the test having been told about it.
+func TestEveryPoolOverrideSpellingIsAcceptedByBoth(t *testing.T) {
+	s := derivable("eks.amazonaws.com/nodegroup", []pool{
+		{id: "eks-workers-a2c1d3e4", value: "workers", nodes: 1}})
+	node := s.Nodes[0]
+	node.Labels["doks.digitalocean.com/node-pool-id"] = "the-configured-name"
+	node.Labels["doks.digitalocean.com/node-pool"] = "the-readable-name"
+
+	// Every value the node carries, plus the identifier the autoscaler
+	// publishes — the one name in the set that is not a node's. Sorted, so a
+	// failure names the same spelling on every run.
+	//
+	// kubernetes.io/os is in here too and is meant to be: a label value that
+	// names no pool must be refused by preflight *and* ignored by resolution,
+	// which is the same biconditional read in the other direction.
+	spellings := []string{"eks-workers-a2c1d3e4"}
+	for _, value := range node.Labels {
+		spellings = append(spellings, value)
+	}
+	slices.Sort(spellings)
+
+	for _, name := range slices.Compact(spellings) {
+		t.Run(name, func(t *testing.T) {
+			cfg := config()
+			cfg.ByPool = map[string]engine.Policy{name: {Enabled: false}}
+
+			resolved, err := engine.ResolvePools(s, cfg)
+			accepted := err == nil
+			honoured := !resolved.PolicyForNode(node).Enabled
+
+			if accepted != honoured {
+				what := "accepted an override the engine then ignores"
+				if honoured {
+					what = "rejected an override the engine would have honoured"
+				}
+				t.Errorf("preflight %s: %q", what, name)
 			}
 		})
 	}
