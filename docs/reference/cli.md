@@ -261,6 +261,12 @@ declared, so there is nothing an operator must supply.
 |---|---|---|
 | `--file`, `-f` | standard input | Configuration file to read |
 
+A `pools[]` entry is resolved and printed like any other, and **its name is not checked here**:
+this command reads a document, not a cluster. `binpack explain`, `binpack diagnose` and the
+controller each check a name against the pools the cluster has and refuse one that is not there,
+so the summary says underneath the overrides that it has not. Only when there are overrides —
+there is nothing to disclose about a document that has none.
+
 `apiVersion` and `kind` are emitted so the report is a document rather than a report *about* a
 document — see below.
 
@@ -285,7 +291,8 @@ the same settings.
 }
 ```
 
-Every key is a configuration field and is documented in
+Every key is a configuration field — including no disclosure line, which would make the report
+unloadable — and is documented in
 [configuration.md](configuration.md) — `policy` is the resolved default, and each `pools[]` entry
 is that pool's policy already resolved against it, inlined exactly as the document inlines it.
 `interval` and every other duration is a string such as `"1m0s"`.

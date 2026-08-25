@@ -147,8 +147,14 @@ func (c *Config) Settings() Settings {
 // by field. Names are matched against the pool name label value or the node
 // group identifier, whichever the operator wrote.
 //
-// Unknown pool names are a validation error rather than a silent no-op, so a
-// name reaching here has already been checked against discovery.
+// It resolves what the document says and checks nothing. A name matching no
+// pool in the cluster yields exactly the policy an absent override would, and
+// what refuses such a configuration is the engine's pool preflight — which
+// runs *downstream* of every caller of this rather than upstream of any:
+// `explain` passes the configuration this resolved into it, and
+// `binpack config validate` has no cluster to run it against at all. That is
+// why validate discloses the name as unchecked rather than letting a fully
+// resolved override read as a name it verified.
 func (c *Config) PolicyFor(names ...string) PoolPolicy {
 	p := PoolPolicy{
 		Enabled:                  DefaultEnabled,

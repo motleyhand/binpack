@@ -64,6 +64,22 @@ func readConfigInput(path string, stdin io.Reader) ([]byte, error) {
 	return data, nil
 }
 
+// poolNamesNotChecked is the one thing this command knowingly leaves
+// unverified, in the sentence the summary prints for it — the disclosure
+// pattern explain already has for controls it cannot evaluate.
+//
+// The summary only, deliberately. `--output json` reports a configuration
+// document: apiVersion, kind, and every key a configuration field, so that
+// feeding it back through -f is valid and resolves to the same settings. The
+// loader rejects unknown fields, so a disclosure key there would make the
+// report unloadable for precisely the documents this sentence is about. And
+// there is nothing to disclose to that reader: the JSON never says the
+// configuration is valid, it says what the document resolves to, which is
+// true of an override whether or not its pool exists.
+const poolNamesNotChecked = "pools[].name is not checked here: this command reads a document, " +
+	"not a cluster. explain, diagnose and run check each name against the pools this cluster " +
+	"has, and refuse one that is not there."
+
 // resolvedConfig is what `--output json` reports: the effective settings, not
 // the sparse document that produced them. Echoing the input back would tell an
 // operator nothing they did not already type.
@@ -226,6 +242,15 @@ func writeConfigSummary(opts *options, cfg *v1alpha1.Config) error {
 	for _, pool := range cfg.Pools {
 		p("\noverride for pool %q:\n", pool.Name)
 		writePolicy(p, cfg.PolicyFor(pool.Name))
+	}
+	// Under the overrides, because it is about them, and because the block
+	// above is what makes the disclosure necessary: a misspelt name renders
+	// exactly like a real one, fully resolved, down to the `enabled` an
+	// operator switched off. The deployed binpack refuses to start on that
+	// same document, so the command that exists to say what a document
+	// resolves to must not be the one that reads as a clean bill of health.
+	if len(cfg.Pools) > 0 {
+		p("\n%s\n", poolNamesNotChecked)
 	}
 
 	return errors.Join(errs...)

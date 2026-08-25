@@ -690,7 +690,10 @@ Two things to know:
 
   Omitting the field means "inherit"; `[]` means "none". They are different.
 - **Pools are discovered, never declared.** An entry here adjusts a pool that discovery found;
-  it does not create one. Naming a pool that does not exist is a configuration error.
+  it does not create one. Naming a pool that does not exist is a configuration error — one
+  `binpack explain`, `binpack diagnose` and the controller detect, and one `binpack config
+  validate` cannot, having no cluster to check the name against. It resolves and prints such an
+  override like any other, and says underneath that it did not check the name.
 
 ## Notes on parsing
 

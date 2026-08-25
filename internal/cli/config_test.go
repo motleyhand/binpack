@@ -63,6 +63,80 @@ pools:
 	}
 }
 
+// TestConfigValidateSaysAPoolNameIsNotCheckedHere stops two binpack commands
+// giving opposite verdicts on one document.
+//
+// `pools[].name` is checked for emptiness and duplication at load time, and
+// against the cluster only in [engine.ResolvePools] — which needs a cluster.
+// This command has none, so a misspelt or stale name got `configuration is
+// valid` followed by its override rendered field by field, while the deployed
+// controller refuses to start on the same file with "configuration overrides
+// pools that do not exist in this cluster" and evaluates nothing. The command
+// whose whole job is to say what a document resolves to was the one that was
+// wrong, and it was wrong in the reassuring direction.
+//
+// The text summary only, and the JSON half below says why that is the right
+// place rather than an omission.
+func TestConfigValidateSaysAPoolNameIsNotCheckedHere(t *testing.T) {
+	const overriding = "pools:\n  - name: does-not-exist\n"
+
+	out, err := runWithStdin(t, overriding, "config", "validate")
+	if err != nil {
+		t.Fatalf("config validate: %v", err)
+	}
+	// The field and the admission, not the sentence around them. What has to
+	// survive a rewording is that the report names the thing it did not check
+	// and says it did not check it.
+	for _, want := range []string{"pools[].name", "not checked"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("the summary renders an override without saying the name is unchecked (%q missing):\n%s",
+				want, out)
+		}
+	}
+
+	// And not in the JSON, which is deliberate and is the reason this half is
+	// here at all. That report is a configuration document — `apiVersion`,
+	// `kind`, every key a configuration field — and docs/reference/cli.md
+	// promises feeding it back through `-f` is valid. The loader rejects
+	// unknown fields, so a top-level `notEvaluated` would make the report
+	// unloadable for exactly the documents this disclosure is about: the ones
+	// with overrides. TestValidateJSONRoundTrips is what fails if it is added.
+	//
+	// Nothing is lost by leaving it out. The JSON rendering never claims the
+	// configuration is valid — that sentence is the text summary's — it
+	// resolves a document, and what it says about an override is true whether
+	// or not the pool exists.
+	if _, ok := at(validateJSON(t, overriding), "notEvaluated"); ok {
+		t.Errorf("the JSON report carries a key that is not a configuration field, " +
+			"so it no longer round-trips through -f")
+	}
+
+	// The negative half. A disclosure printed whatever the document says is
+	// noise, and noise is what teaches a reader to skip the line that matters:
+	// a configuration with no overrides has no unchecked name to disclose.
+	out, err = runWithStdin(t, "interval: 45s\n", "config", "validate")
+	if err != nil {
+		t.Fatalf("config validate: %v", err)
+	}
+	if strings.Contains(out, "pools[].name") {
+		t.Errorf("the summary disclosed a pool name nobody configured:\n%s", out)
+	}
+}
+
+// validateJSON runs `config validate --output json` and decodes the result.
+func validateJSON(t *testing.T, stdin string) map[string]any {
+	t.Helper()
+	out, err := runWithStdin(t, stdin, "config", "validate", "--output", "json")
+	if err != nil {
+		t.Fatalf("config validate --output json: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	return got
+}
+
 func TestConfigValidateFromFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "binpack.yaml")
