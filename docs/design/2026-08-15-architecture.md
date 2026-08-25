@@ -37,8 +37,9 @@ one thing to search for, and no possibility of two clusters disagreeing about wh
 node.
 
 The list is exhaustive and a test keeps it that way: `TestEveryNodeKeyBinpackDeclaresIsInTheConventions`
-parses the constant block in `internal/engine/decide.go` and fails if a key binpack declares is
-missing from the table above. It parses rather than enumerating by hand because the commit that
+parses the constant declarations in `internal/engine` and fails if a key binpack declares is
+missing from the table above. It parses the package rather than a named file, so that a key moving
+between files stays covered; and it parses rather than enumerating by hand because the commit that
 adds a key and forgets this document is the same commit that would forget a hand-written list. It
 reads the table itself rather than the file, because several of these keys are named again in the
 prose below — and a check satisfied by a passing mention is one that stays green when a row is
