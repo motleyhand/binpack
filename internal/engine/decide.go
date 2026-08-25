@@ -1053,9 +1053,23 @@ func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []
 	return candidates, ruledOut
 }
 
+// groupsByID indexes the published groups for the managed check, which is a
+// lookup of [Config.GroupOf]'s answer.
+//
+// The empty identifier is skipped, and that is the check rather than a
+// tidiness: GroupOf answers "" for every node carrying no join label, so a
+// group indexed under "" would be matched by every static node in the cluster
+// — each then reported as pool-managed, drained by a binpack no autoscaler
+// will follow, and governed by a floor and an `enabled` from a pool it is not
+// in. The collector already drops such a group where it parses the status
+// document, and this is the same refusal for a Snapshot built by hand, which
+// is what every test holds.
 func groupsByID(s Snapshot) map[string]NodeGroup {
 	groups := make(map[string]NodeGroup, len(s.Autoscaler.Groups))
 	for _, g := range s.Autoscaler.Groups {
+		if g.ID == "" {
+			continue
+		}
 		groups[g.ID] = g
 	}
 	return groups

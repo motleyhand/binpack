@@ -451,6 +451,42 @@ func TestPoolAtMinimumIsLeftAlone(t *testing.T) {
 	}
 }
 
+// TestAnUnnamedNodeGroupClaimsNoNodes is the closure of the join's one
+// unguarded direction: an identifier that matches by being absent.
+//
+// [engine.Config.GroupOf] answers "" for a node carrying no join label, which
+// is every static node on every cluster — a self-managed box, a pool the
+// autoscaler was never told about. The managed gate is a lookup of that answer
+// in the published groups, so one group the status names with an empty string
+// makes groups[""] exist and every one of those nodes pass. `name` is
+// omitempty in the autoscaler's own status type, so the value is
+// representable rather than hypothetical.
+//
+// What follows is worse than a mislabelled report. The node stops being
+// reported not-autoscaled, becomes an ordinary drain candidate that no
+// autoscaler will ever reap — so the cordon is stranded — and takes its policy
+// from a pool it is not in, including `enabled: false`. `diagnose` stops
+// listing it as static at the same moment, so the operator loses the signal
+// too.
+func TestAnUnnamedNodeGroupClaimsNoNodes(t *testing.T) {
+	// Carrying neither label: the ordinary static node, and the one an
+	// unnamed group would claim.
+	s := cluster([]*corev1.Node{sized("static", "4Gi")}, nil)
+	s.Autoscaler.Groups = []engine.NodeGroup{{ID: "", MinSize: 1, Ready: 1}}
+
+	d := engine.Decide(s, config())
+
+	a := assessmentFor(d, "static")
+	if a == nil {
+		t.Fatal("every node must be accounted for; static was not")
+	}
+	if a.SkipCode != engine.SkipNotAutoscaled {
+		t.Errorf("static was assessed %q, want %q: a group published with no name "+
+			"has claimed a node that is in no pool at all",
+			a.SkipCode, engine.SkipNotAutoscaled)
+	}
+}
+
 // TestThePoolNameIsTheSameInTheMetricAndInTheDrainEvent closes the join
 // between the two reports an operator has to correlate.
 //

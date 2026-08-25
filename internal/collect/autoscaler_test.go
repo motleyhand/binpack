@@ -135,6 +135,32 @@ func TestAbsentTargetIsDistinguishableFromZero(t *testing.T) {
 	}
 }
 
+// TestAGroupWithNoNameNeverReachesTheSnapshot is the collector's half of the
+// engine's TestAnUnnamedNodeGroupClaimsNoNodes.
+//
+// `name` is omitempty in the autoscaler's own status type, so a group without
+// one is representable — a provider returning an empty Id(), a status object
+// written by hand or half-written, or a future release that renames the field,
+// which would send every group to the empty identifier at once. Downstream,
+// the identifier is what a node's join label is matched against and a node in
+// no pool answers "", so an unnamed group is one that claims every static node
+// in the cluster.
+//
+// Dropped here rather than checked at each consumer, because here there is one
+// of them.
+func TestAGroupWithNoNameNeverReachesTheSnapshot(t *testing.T) {
+	got, err := collect.ParseAutoscalerStatus(
+		"autoscalerStatus: Running\nnodeGroups:\n- health:\n    minSize: 1\n" +
+			"- name: real\n  health:\n    minSize: 1\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got.Groups) != 1 || got.Groups[0].ID != "real" {
+		t.Fatalf("groups = %+v, want only the named one: a group with no name "+
+			"is one every unlabelled node matches", got.Groups)
+	}
+}
+
 func TestNonRunningAutoscalerIsNotRunning(t *testing.T) {
 	got, err := collect.ParseAutoscalerStatus("autoscalerStatus: Unhealthy\n")
 	if err != nil {
