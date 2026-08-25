@@ -111,9 +111,17 @@ translated — so the engine cannot tell them apart, which is what makes `explai
 `run` rather than a second implementation of it.
 
 Order is returned too, and the two readers do not agree on it: the cache walks a Go map, the
-one-shot client is ordered by storage key. So "cannot tell them apart" is a property the engine
-has to hold up rather than one the shared `Snapshot` confers — every ordering in it is total,
-breaking ties on object names, so no answer depends on the order objects were listed in.
+one-shot client is ordered by storage key. So "cannot tell them apart" is a property the code
+has to hold up rather than one the shared `Snapshot` confers — every ordering is total, breaking
+ties on object names, so no answer depends on the order objects were listed in. The same applies
+to any map the code builds for itself, since Go reseeds a map walk on every range statement: a
+report assembled from one disagrees with the evaluation a minute earlier as readily as it
+disagrees with `explain`.
+
+Held by a test rather than by intent. `TestEveryReportedSubjectIsStableUnderPermutation` runs
+each entry point that singles one object out of many over every ordering of its input, several
+times each, and it lives in every package that has such an entry point — the property stopped at
+a package boundary twice before it was written down this way.
 
 Two fields are the exception, and `explain` names them rather than answering as though they were
 not. `Snapshot.LastDrain` is the controller's own memory of when it last finished a drain — a

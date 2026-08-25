@@ -696,13 +696,15 @@ func diagnoseWorkloads(s Snapshot, cfg Config) []Finding {
 		// operator to rewrite selectors over a pod the API server would delete
 		// without reading either budget.
 		if len(matched) > 1 && !pdbsIgnored(pod) {
+			// Not sorted here: matchingPDBs orders by name, so that an
+			// unchanged cluster produces an unchanged report is a property of
+			// the list rather than of each reader of it. Sorting again would
+			// be a second answer to the same question, free to disagree with
+			// the refusal CheckEvictable words from the same budgets.
 			names := make([]string, len(matched))
 			for i, p := range matched {
 				names[i] = p.Name
 			}
-			// Sorted, so the report does not depend on the order budgets were
-			// listed in — an unchanged cluster must produce an unchanged report.
-			sort.Strings(names)
 			g.add(pod, BlockedMultiplePDBs, "selected by "+strings.Join(names, ", "))
 		}
 	}
