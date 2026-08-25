@@ -2195,6 +2195,136 @@ func TestAGatedReplacementEndsTheDrainEvenWhileABudgetIsCatchingUp(t *testing.T)
 	}
 }
 
+func TestAPausedDrainSettlesALandedReplacement(t *testing.T) {
+	// Two branches answer above the awaiting block — the repair and the pause
+	// — and a replacement that landed on the evaluation either of them
+	// answered was never recorded as settled. The marker went on naming the
+	// controller, so the next evaluation went on asking the whole pod list
+	// about it, and any later pod of that ReplicaSet the scheduler could not
+	// place — an HPA scale-up into a cluster binpack has just tightened, a
+	// rollout, a scale-out waiting for a node — ended a healthy half-finished
+	// drain under `replacement-unschedulable`, naming a pod that never ran on
+	// this node and firing the series that exists to detect the scale-up
+	// binpack is meant to prevent.
+	//
+	// Two rounds, because one says nothing. The settle is a write, and what it
+	// buys is what the *next* evaluation does not do.
+	//
+	// The rows that end the drain are the ranking, asserted in the same table
+	// on purpose: a replacement nothing will place outranks the pause, and
+	// resolving the replacement above the branch switch must not quietly
+	// reorder that.
+	landed := func() *corev1.Pod {
+		p := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+		p.Spec.NodeName = "b"
+		return p
+	}
+	gated := func() *corev1.Pod {
+		p := pending("replacement", "web-rs", at.Add(-30*time.Second), false)
+		mother.Gated("kueue.x-k8s.io/admission")(p)
+		return p
+	}
+
+	for _, tc := range []struct {
+		name string
+		// replacement is what became of the pod this drain is owed.
+		replacement *corev1.Pod
+		// catchingUp puts a budget waiting for its own controller in the
+		// snapshot, which is what makes the pause branch answer.
+		catchingUp bool
+		// uncordoned makes the node marked-but-schedulable, which is what
+		// makes the repair branch answer.
+		uncordoned bool
+		// ends: the drain is over on round one, and what the marker says
+		// afterwards is [Abandon]'s business rather than this test's.
+		ends bool
+	}{
+		{
+			name:        "paused while the replacement lands",
+			replacement: landed(),
+			catchingUp:  true,
+		},
+		{
+			name:        "repaired while the replacement lands",
+			replacement: landed(),
+			uncordoned:  true,
+		},
+		{
+			name:        "a refused replacement still outranks the pause",
+			replacement: pending("replacement", "web-rs", at.Add(-30*time.Second), true),
+			catchingUp:  true,
+			ends:        true,
+		},
+		{
+			name:        "a gated replacement still outranks the pause",
+			replacement: gated(),
+			catchingUp:  true,
+			ends:        true,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			nodes := []*corev1.Node{awaitingNode("a", "web-rs", time.Minute), node("b")}
+			if tc.uncordoned {
+				nodes[0].Spec.Unschedulable = false
+			}
+			s := snapshot(nodes, []*corev1.Pod{covered("stayer", "web"), tc.replacement})
+			if tc.catchingUp {
+				s.PDBs = []*policyv1.PodDisruptionBudget{stalePDB()}
+			}
+			c := clientFor(s)
+
+			step, err := executor.Advance(
+				context.Background(), c, s, "a", engineConfig(), drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+
+			if tc.ends {
+				if step.Code != drain.AbandonUnschedulable || !step.Failed {
+					t.Errorf("a replacement nothing will place stopped outranking "+
+						"the pause: %+v", step)
+				}
+				return
+			}
+
+			if step.Failed {
+				t.Fatalf("the drain ended over a replacement that had landed: %+v", step)
+			}
+			if got := nodeFrom(t, c, "a").Annotations[engine.AnnotationDrainAwaiting]; got !=
+				engine.AwaitingSettled {
+				t.Errorf("the marker still names a controller that owes this drain "+
+					"nothing: %q", got)
+			}
+
+			// The ReplicaSet gains a pod the scheduler cannot place. It was
+			// never on this node and this drain did not cause it, so nothing
+			// about it is the drain's business.
+			if err := c.Create(context.Background(),
+				pending("scaled-up", "web-rs", at.Add(30*time.Second), true)); err != nil {
+				t.Fatalf("creating the scale-up pod: %v", err)
+			}
+
+			round := cluster(t, c, at.Add(time.Minute))
+			if tc.catchingUp {
+				round.PDBs = []*policyv1.PodDisruptionBudget{stalePDB()}
+			}
+			step, err = executor.Advance(
+				context.Background(), c, round, "a", engineConfig(), drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance, round two: %v", err)
+			}
+
+			if step.Failed {
+				t.Errorf("a pod that never ran on this node ended a healthy drain: %+v", step)
+			}
+			if !nodeFrom(t, c, "a").Spec.Unschedulable {
+				t.Error("the node was handed back, so every pod it has already " +
+					"lost bought nothing")
+			}
+		})
+	}
+}
+
 // refusingEvictions answers every eviction with err while letting the node
 // patches through, so a test can assert what the drain did about the refusal
 // rather than only that it stopped.
