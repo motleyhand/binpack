@@ -85,9 +85,16 @@ func Begin(ctx context.Context, w Writer, node *corev1.Node, now time.Time) erro
 //
 // "Still being drained" is the answer that needs watching, because it is the
 // one that can be given for ever. It is only safe while every path that
-// returns it has first consulted the drain assessment, which is why the
-// assessment is computed above all of them rather than beside the branch that
+// returns it is bounded by something, which is why the drain assessment is
+// computed above every branch below it rather than beside the branch that
 // happened to need it.
+//
+// One branch sits above the assessment, and it is bounded by a different
+// question: the hand-over waits on the cluster-autoscaler, so what bounds it is
+// whether there is still an autoscaler to finish what it started — see
+// [engine.AutoscalerCanFinish]. Position is therefore not the whole of the
+// property: a branch added above the assessment inherits no bound and has to
+// bring one.
 func Advance(
 	ctx context.Context, w Writer,
 	s engine.Snapshot, name string, cfg engine.Config, policy drain.Policy,
@@ -196,6 +203,50 @@ func Advance(
 	// the count recorded on the node.
 	mine := drain.PodsToMove(state.Pods)
 
+	// What became of the pod an earlier eviction owes this drain.
+	//
+	// Resolved here rather than inside the awaiting block below, because the
+	// switch that follows returns above that block on three of its branches
+	// and two of them leave the drain running: the repair and the pause. A
+	// replacement that lands on an evaluation either of those answers reaches
+	// no resolution at all if the question is asked further down — and "the
+	// drain is owed a replacement" left standing after one has arrived is
+	// exactly the state the settle below exists to prevent.
+	//
+	// "A replacement has landed, nothing is owed" is therefore recorded the
+	// moment it is true, whichever branch the evaluation goes on to take. It
+	// costs nothing that resolving late saved: the read is over the snapshot,
+	// and the settle is a write per eviction rather than per evaluation — a
+	// settled marker names no controller, so every later evaluation resolves
+	// to "nothing owed" and writes nothing.
+	repl, replPod, owed := resolveReplacement(s, name, a.Node)
+
+	if owed && repl == landed {
+		// The marker is replaced rather than left standing, because the next
+		// eviction is not guaranteed to overwrite it: an emptied node has no
+		// next eviction at all, and a wait for a pod still terminating can run
+		// for a whole termination grace period. Through both windows the
+		// marker goes on asking [replacementFor] the same question of the
+		// whole pod list, and any later pod of that controller the scheduler
+		// cannot place answers "refused" — ending a drain that a rollout or an
+		// HPA scale-up merely happened alongside, and naming in the failure a
+		// pod that never ran on the node.
+		//
+		// Settled rather than cleared. This drain has evicted something, and
+		// the marker's presence is the only record of that.
+		//
+		// Ahead of the repair's cordon, which that branch insists comes before
+		// anything else it does. Not a contradiction of it: the cordon comes
+		// first among things that decide what happens to this node, and
+		// settling the marker decides nothing about this node — it records
+		// what became of a pod on another one.
+		if err := Annotate(ctx, w, a.Node, map[string]string{
+			engine.AnnotationDrainAwaiting: engine.AwaitingSettled,
+		}); err != nil {
+			return Step{}, err
+		}
+	}
+
 	switch {
 	case a.SkipCode == engine.SkipUncordoned:
 		// Marked but schedulable, so a previous evaluation stopped between
@@ -255,19 +306,19 @@ func Advance(
 		// that is broken is the disruption controller itself.
 		//
 		// Both ending states, not just the refusal, because this branch and
-		// the awaiting block ask the same helper the same question — and a
-		// state one of them ends on and the other waits through leaves the
-		// answer depending on whether a transient blocker happened to be
-		// present. [settledReplacement] is where the pair is kept in step.
+		// the awaiting block ask the same question of the same resolution —
+		// and a state one of them ends on and the other waits through leaves
+		// the answer depending on whether a transient blocker happened to be
+		// present. [endsTheDrain] is where the pair is kept in step.
 		//
 		// Ahead of the assessment's abandonment for the reason the assessment
 		// is always ranked behind a named cause: "the replacement could not be
 		// scheduled" tells an operator where to look, and "nothing has moved
 		// for eleven minutes" is the same node with the reason filed off. The
 		// awaiting block orders these two the same way.
-		if state, pod, ok := settledReplacement(s, name, a.Node); ok {
+		if owed && endsTheDrain(repl) {
 			return Abandon(ctx, w, a.Node,
-				drain.AbandonUnschedulable, replacementReason(state, pod), s.Now, policy)
+				drain.AbandonUnschedulable, replacementReason(repl, replPod), s.Now, policy)
 		}
 		// Bounded by the same thing every other wait is bounded by, and
 		// checked before the wait rather than after it, because a pause that
@@ -311,9 +362,9 @@ func Advance(
 	// exists, not that the scheduler will choose it. Keeping one replacement
 	// in flight is the whole of what binpack can do about that, and it only
 	// works if "in flight" means bound rather than merely gone from here.
-	if owner, since, ok := awaiting(a.Node); ok {
-		switch state, pod := replacementFor(s, name, owner, since); state {
-		case refused, gated:
+	if owed {
+		switch {
+		case endsTheDrain(repl):
 			// The scheduler said so itself — PodScheduled=False, reason
 			// Unschedulable — so this is detected rather than inferred from a
 			// timeout, and it names the pod. Uncordoning is also the repair:
@@ -328,9 +379,9 @@ func Advance(
 			// weaker reason than a refusal's: this node is where that workload
 			// was already running.
 			return Abandon(ctx, w, a.Node,
-				drain.AbandonUnschedulable, replacementReason(state, pod), s.Now, policy)
+				drain.AbandonUnschedulable, replacementReason(repl, replPod), s.Now, policy)
 
-		case awaited:
+		case repl == awaited:
 			// Bounded, because having a controller does not mean the
 			// controller will produce a bound pod carrying that same UID. A
 			// rollout or a scale-down supersedes the ReplicaSet and every
@@ -360,26 +411,8 @@ func Advance(
 			return Step{Code: StepWaiting,
 				Reason: "waiting for the replacement pod to be scheduled"}, nil
 		}
-		// landed. The marker is replaced rather than left standing, because
-		// the next eviction is not guaranteed to overwrite it: an emptied node
-		// has no next eviction at all, and a wait for a pod still terminating
-		// can run for a whole termination grace period. Through both windows
-		// the marker goes on asking replacementFor the same question of the
-		// whole pod list, and any later pod of that controller the scheduler
-		// cannot place answers "refused" — ending a drain that a rollout or an
-		// HPA scale-up merely happened alongside, and naming in the failure a
-		// pod that never ran on the node.
-		//
-		// Settled rather than cleared. This drain has evicted something, and
-		// the marker's presence is the only record of that.
-		//
-		// One extra write per eviction, not per evaluation: a settled marker
-		// names no controller, so every later evaluation skips this block.
-		if err := Annotate(ctx, w, a.Node, map[string]string{
-			engine.AnnotationDrainAwaiting: engine.AwaitingSettled,
-		}); err != nil {
-			return Step{}, err
-		}
+		// landed, and already settled above: the marker names nothing, and the
+		// drain proceeds to whatever the assessment says next.
 	}
 
 	switch assessment.Action {
@@ -927,32 +960,40 @@ func replacementFor(
 	return awaited, pendingPod
 }
 
-// settledReplacement reports the pod this drain awaits when nothing binpack is
-// waiting for will change the answer, and nothing otherwise.
+// resolveReplacement reports what became of the pod an earlier eviction owes
+// this drain, and false where it is owed none.
 //
-// A narrow reading of the awaiting block below, for the one caller that has to
-// ask the question before that block is reached. Kept to the two ending states
-// on purpose: "awaited" and "landed" both mean the drain should carry on doing
-// whatever it was doing, and only an ending is a fact that outranks another
-// branch's answer.
-//
-// It has to name the same two states that block does, and for the same
-// reasons. A caller recognising only a refusal would pause a drain whose
-// replacement is gated for as long as a transient blocker lasted — holding the
-// cordon down for a workload nothing is going to place, which is exactly the
-// trade the pause exists to avoid making.
-func settledReplacement(
+// The bool is carried beside the state because no state can express it:
+// "awaited" says a replacement is on its way, so a drain that is owed none
+// would read it as a pod to wait out the stall timeout for. Which drains are
+// owed one is [awaiting]'s question, and it answers no for the two markers that
+// name no controller — a drain that has evicted nothing, and one that settled.
+func resolveReplacement(
 	s engine.Snapshot, name string, node *corev1.Node,
 ) (replacement, *corev1.Pod, bool) {
 	owner, since, ok := awaiting(node)
 	if !ok {
 		return awaited, nil, false
 	}
-	switch state, pod := replacementFor(s, name, owner, since); state {
-	case refused, gated:
-		return state, pod, true
-	}
-	return awaited, nil, false
+	state, pod := replacementFor(s, name, owner, since)
+	return state, pod, true
+}
+
+// endsTheDrain reports whether what became of the replacement is a fact no
+// amount of waiting will change.
+//
+// Two branches act on a replacement — the pause and the awaiting block — and
+// both ask through here, so the pair cannot drift. Kept to the two ending
+// states on purpose: "awaited" and "landed" both mean the drain should carry on
+// doing whatever it was doing, and only an ending is a fact that outranks
+// another branch's answer.
+//
+// Naming only a refusal would pause a drain whose replacement is gated for as
+// long as a transient blocker lasted — holding the cordon down for a workload
+// nothing is going to place, which is exactly the trade the pause exists to
+// avoid making.
+func endsTheDrain(state replacement) bool {
+	return state == refused || state == gated
 }
 
 // replacementReason renders a replacement that ends the drain, in one place
