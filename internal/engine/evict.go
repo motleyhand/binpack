@@ -1,7 +1,9 @@
 package engine
 
 import (
+	"cmp"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
@@ -304,6 +306,21 @@ func checkAllowances(demand map[*policyv1.PodDisruptionBudget]*budgetDemand) []E
 		})
 	}
 
+	// Sorted, because the first of these is the one an operator is actually
+	// sent to: [CheckEvictable] appends them after the per-pod blockers, and
+	// what reads Blockers[0] is the last-failure annotation, the sentence in
+	// the DrainAbandoned event, the pause reason and `binpack explain`.
+	//
+	// The walk above is over a map, and the runtime reseeds a map walk on
+	// every range statement — so a node under two short budgets was blamed on
+	// a different one from one evaluation to the next, with nothing about the
+	// cluster having changed, and `explain` could name a third while
+	// previewing the same node. Total, because one budget yields at most one
+	// blocker: the branches above are exclusive and each ends the iteration.
+	slices.SortFunc(blockers, func(a, b EvictionBlocker) int {
+		return cmp.Compare(a.PDB, b.PDB)
+	})
+
 	return blockers
 }
 
@@ -401,7 +418,18 @@ func isPodReady(pod *corev1.Pod) bool {
 	return false
 }
 
-// matchingPDBs returns every budget selecting pod, in declaration order.
+// matchingPDBs returns every budget selecting pod, ordered by name.
+//
+// By name rather than in the order they were listed, because two of the answers
+// built from this list name budgets rather than counting them: the
+// more-than-one refusal names the first two of them, and diagnose lists them
+// all. The list arrives from a watch-backed cache in the controller and from a
+// live client in `binpack explain`, so an order inherited from it is an order
+// the two frontends do not share. Settled here rather than at each of those
+// sites, so there is one answer to which budget gets named.
+//
+// The name alone is total: every budget here is in the pod's own namespace,
+// which is the first thing the loop below checks.
 func matchingPDBs(pod *corev1.Pod, pdbs []*policyv1.PodDisruptionBudget) []*policyv1.PodDisruptionBudget {
 	var matched []*policyv1.PodDisruptionBudget
 
@@ -439,6 +467,10 @@ func matchingPDBs(pod *corev1.Pod, pdbs []*policyv1.PodDisruptionBudget) []*poli
 			matched = append(matched, pdb)
 		}
 	}
+
+	slices.SortFunc(matched, func(a, b *policyv1.PodDisruptionBudget) int {
+		return cmp.Compare(a.Name, b.Name)
+	})
 
 	return matched
 }

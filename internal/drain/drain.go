@@ -498,7 +498,24 @@ func stuck(pods []*corev1.Pod, now time.Time) (*corev1.Pod, time.Duration) {
 		if !terminating {
 			continue
 		}
-		if over := now.Sub(deadline.Add(Slack)); over > 0 && over > by {
+		over := now.Sub(deadline.Add(Slack))
+		if over <= 0 {
+			continue
+		}
+		// Ties broken on the name, and a tie here is the normal case rather
+		// than a corner of one: a drain evicts a batch of one workload's pods,
+		// those pods share terminationGracePeriodSeconds, so the API server
+		// writes them identical deadlines and their overruns are equal to the
+		// second. Ranking on the overrun alone left the winner to be whichever
+		// the input listed first — and that list is filled from a watch-backed
+		// cache in the controller and from a live client in `binpack explain`,
+		// so the two named different pods as the reason for one abandonment.
+		//
+		// The nil test leads so the comparator is total by inspection. Without
+		// it the reader has to reconstruct why over == by cannot be reached
+		// with worst still unset, and that argument stops holding the day
+		// somebody changes what by starts at.
+		if worst == nil || over > by || (over == by && podRef(pod) < podRef(worst)) {
 			worst, by = pod, over
 		}
 	}
@@ -582,3 +599,6 @@ func round(d time.Duration) string {
 		return fmt.Sprintf("%dh", int(d.Hours()))
 	}
 }
+
+// podRef names a pod the way every other report in this tree names one.
+func podRef(pod *corev1.Pod) string { return pod.Namespace + "/" + pod.Name }

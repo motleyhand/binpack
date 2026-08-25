@@ -11,6 +11,7 @@ import (
 	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
+	"github.com/motleyhand/binpack/internal/permute"
 )
 
 var now = time.Date(2026, 8, 16, 12, 0, 0, 0, time.UTC)
@@ -656,4 +657,35 @@ func TestAssessRemovalWaitsThroughScaleUpDelay(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTheStuckPodIsChosenByATotalOrder(t *testing.T) {
+	// A drain evicts a batch of pods belonging to one workload, and those pods
+	// share terminationGracePeriodSeconds — so the API server writes them
+	// identical deletion timestamps and their overruns are equal to the
+	// second. A tie here is the normal case, not a corner of one.
+	//
+	// Ranking on the overrun alone therefore named whichever pod the input
+	// slice happened to list first, and that slice is filled from a
+	// watch-backed cache in the controller and from a live client in
+	// `binpack explain`. The two frontends then named different pods as the
+	// reason for the same abandonment.
+	requested := now.Add(-2 * time.Hour)
+	pods := []*corev1.Pod{
+		mother.Pod("default", "web-1", mother.OnNode("a"),
+			mother.Terminating(requested, time.Minute)),
+		mother.Pod("default", "web-2", mother.OnNode("a"),
+			mother.Terminating(requested, time.Minute)),
+		mother.Pod("default", "web-3", mother.OnNode("a"),
+			mother.Terminating(requested, time.Minute)),
+	}
+	node := mother.SmallNode("a")
+
+	permute.Stable(t, pods, func(pods []*corev1.Pod) string {
+		got := drain.Assess(drain.State{Node: node, Pods: pods, Now: now}, policy())
+		if got.Code != drain.AbandonStuck {
+			t.Fatalf("expected a stuck pod, got %s: %s", got.Code, got.Reason)
+		}
+		return got.Reason
+	})
 }

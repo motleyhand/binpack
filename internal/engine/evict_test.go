@@ -10,6 +10,7 @@ import (
 
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
+	"github.com/motleyhand/binpack/internal/permute"
 )
 
 func codes(blockers []engine.EvictionBlocker) []string {
@@ -756,4 +757,44 @@ func TestAnUnrecognisedEvictionPolicyChargesTheBudget(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestTheFirstBlockerDoesNotDependOnMapOrder(t *testing.T) {
+	// The first blocker is the one an operator is actually sent to: it becomes
+	// the last-failure annotation, the sentence in the DrainAbandoned event,
+	// and the reason `binpack explain` gives for a node it would not touch.
+	//
+	// Allowance blockers are aggregated in a map keyed by budget, and the
+	// runtime reshuffles a map walk on every range statement — so a node under
+	// two short budgets was blamed on a different one from one evaluation to
+	// the next, with nothing about the cluster having changed.
+	//
+	// Both of [permute.Stable]'s axes bite here, which is why it has two: the
+	// order the pods arrive in is the order the budgets are inserted in, and a
+	// map's walk depends on both that and the per-range seed. Re-running one
+	// ordering would have found this too, eventually; asserting on one call
+	// would have found it about six times in seven.
+	alpha := map[string]string{"app": "alpha"}
+	bravo := map[string]string{"app": "bravo"}
+	pods := []*corev1.Pod{
+		mother.Pod("default", "alpha-1", mother.PodLabels(alpha)),
+		mother.Pod("default", "alpha-2", mother.PodLabels(alpha)),
+		mother.Pod("default", "bravo-1", mother.PodLabels(bravo)),
+		mother.Pod("default", "bravo-2", mother.PodLabels(bravo)),
+	}
+	// Two replicas each against an allowance of one: both budgets are short by
+	// exactly one, so neither is the obvious answer and the report has to
+	// choose.
+	pdbs := []*policyv1.PodDisruptionBudget{
+		mother.PDB("default", "alpha-pdb", 1, alpha),
+		mother.PDB("default", "bravo-pdb", 1, bravo),
+	}
+
+	permute.Stable(t, pods, func(pods []*corev1.Pod) string {
+		got := engine.CheckEvictable(pods, pdbs, engine.DefaultEvictConfig(), now)
+		if len(got) != 2 {
+			t.Fatalf("both budgets should be short, got %v", codes(got))
+		}
+		return got[0].PDB
+	})
 }

@@ -62,6 +62,13 @@ linters:
             # is the thing that makes admitting it safe, so it is enforced
             # rather than assumed.
             - "**/internal/mother/**"
+            # The permutation guard, here for the same reason as the fixture
+            # package above: the guarded packages import it from their test
+            # files, so admitting it unguarded would leave a one-hop route to a
+            # client. It holds nothing but a slice shuffler and needs nothing
+            # else, which is what makes enforcing that cheap rather than
+            # notional.
+            - "**/internal/permute/**"
           allow:
             - $gostd
             # The module, package by package rather than wholesale. Wholesale
@@ -76,6 +83,7 @@ linters:
             - github.com/motleyhand/binpack/internal/fit
             - github.com/motleyhand/binpack/internal/drain
             - github.com/motleyhand/binpack/internal/mother
+            - github.com/motleyhand/binpack/internal/permute
             - k8s.io/api
             - k8s.io/apimachinery
             - k8s.io/component-helpers
