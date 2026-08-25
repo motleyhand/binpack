@@ -192,8 +192,11 @@ func PoolNames(s Snapshot, cfg Config) PoolNaming {
 //
 // A type with a method rather than a bare map, so that the fallback every
 // caller needs has one implementation. It had three, plus two callers that
-// skipped it — see [NodeAssessment.PoolLabel], which answers the same question
-// for a caller holding an assessment.
+// skipped it, and then a second rule of its own on the assessment — which
+// disagreed with this one on a pool whose nodes are not uniformly labelled.
+// [NodeAssessment.Pool] is filled from here, so a caller holding an
+// assessment reads this answer through [NodeAssessment.PoolLabel] rather than
+// resolving a fresh one.
 type PoolNaming map[string]string
 
 // Label is the readable name for a group, or the identifier where the cluster

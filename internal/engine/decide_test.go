@@ -451,6 +451,50 @@ func TestPoolAtMinimumIsLeftAlone(t *testing.T) {
 	}
 }
 
+// TestThePoolNameIsTheSameInTheMetricAndInTheDrainEvent closes the join
+// between the two reports an operator has to correlate.
+//
+// `binpack_pool_nodes` and `binpack diagnose` name a pool through
+// [engine.PoolNames], which any one node in the pool can fill; `explain`'s
+// node row and the drain Event name it through the assessment. The two agree
+// only where the readable label is applied uniformly across a pool, and
+// nothing enforces that: a node added by a scale-up before the operator's
+// labelling automation ran carries the identifier and nothing else, and so
+// does a node added by hand. The dashboard series then says `pool-4g` while
+// that node's drain Event says `da8977ba-244f`, with nothing to join on —
+// which is verbatim the harm [engine.NodeAssessment.PoolLabel]'s own doc
+// comment says it was written to end.
+//
+// So what is asserted is not that the name is right but that there is one
+// name: every assessment's Pool is what the resolved naming says about its
+// group, and PoolLabel adds nothing to it.
+func TestThePoolNameIsTheSameInTheMetricAndInTheDrainEvent(t *testing.T) {
+	// Only the identifier label, which is the cluster's join and all a fresh
+	// node is guaranteed to carry.
+	unlabelled := sized("unlabelled", "4Gi", mother.NodeLabels(
+		map[string]string{"doks.digitalocean.com/node-pool-id": poolID}))
+	s := cluster([]*corev1.Node{inPool("labelled"), unlabelled}, nil)
+	cfg := config()
+
+	d := engine.Decide(s, cfg)
+
+	names := engine.PoolNames(s, cfg)
+	if len(d.Assessments) != len(s.Nodes) {
+		t.Fatalf("assessed %d nodes, want all %d", len(d.Assessments), len(s.Nodes))
+	}
+	for _, a := range d.Assessments {
+		if want := names.Label(a.Group); a.Pool != want {
+			t.Errorf("%s reports pool %q while the naming resolves its group to %q, "+
+				"so the metric and the drain Event have nothing to join on",
+				a.Node.Name, a.Pool, want)
+		}
+		if a.PoolLabel() != a.Pool {
+			t.Errorf("%s: PoolLabel() is %q and Pool is %q, so one assessment "+
+				"names its pool two ways", a.Node.Name, a.PoolLabel(), a.Pool)
+		}
+	}
+}
+
 func TestInfeasibleNodeIsReportedNotDrained(t *testing.T) {
 	// Everything is full, so nothing can move.
 	nodes := []*corev1.Node{inPool("a"), inPool("b")}
