@@ -1111,7 +1111,7 @@ func TestExplainSaysWhereItLookedForTheAutoscaler(t *testing.T) {
 	s := explainCluster([]*corev1.Node{explainNode("a")}, nil)
 	s.Autoscaler = engine.Autoscaler{}
 
-	out := renderedExplainIn(t, &options{output: outputText, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName}},
+	out := renderedExplainIn(t, &options{output: outputText, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: v1alpha1.DefaultAutoscalerStatusName}},
 		s, explainConfig())
 
 	if !strings.Contains(out, "autoscaler/cluster-autoscaler-status") {
@@ -1123,7 +1123,7 @@ func TestExplainSaysWhereItLookedForTheAutoscaler(t *testing.T) {
 func TestExplainSaysNothingAboutWhereItLookedWhenTheAutoscalerIsThere(t *testing.T) {
 	// The reverse: the object is worth naming as the evidence behind a
 	// refusal, and is noise on a cluster where the answer was yes.
-	out := renderedExplainIn(t, &options{output: outputText, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName}},
+	out := renderedExplainIn(t, &options{output: outputText, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: v1alpha1.DefaultAutoscalerStatusName}},
 		explainCluster([]*corev1.Node{explainNode("a")}, nil), explainConfig())
 
 	if strings.Contains(out, "cluster-autoscaler-status") {

@@ -37,7 +37,7 @@ func derivedObjects(extra ...client.Object) []client.Object {
 	objs := []client.Object{&corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: v1alpha1.DefaultAutoscalerNamespace,
-			Name:      collect.StatusConfigMapName,
+			Name:      v1alpha1.DefaultAutoscalerStatusName,
 		},
 		Data: map[string]string{"status": `
 autoscalerStatus: Running

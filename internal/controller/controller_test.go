@@ -30,6 +30,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	ctrlmetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
 
+	"github.com/motleyhand/binpack/api/v1alpha1"
 	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
@@ -114,7 +115,7 @@ const statusNamespace = "autoscaler"
 // told.
 var statusRef = collect.StatusRef{
 	Namespace: statusNamespace,
-	Name:      collect.StatusConfigMapName,
+	Name:      v1alpha1.DefaultAutoscalerStatusName,
 }
 
 func statusConfigMap() client.Object { return statusConfigMapProbedAt(time.Now()) }
@@ -126,7 +127,7 @@ func statusConfigMapProbedAt(probed time.Time) client.Object {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: statusNamespace,
-			Name:      collect.StatusConfigMapName,
+			Name:      v1alpha1.DefaultAutoscalerStatusName,
 		},
 		Data: map[string]string{"status": `
 autoscalerStatus: Running
@@ -882,7 +883,7 @@ func TestAOneShotRunReturnsAReadFailureRatherThanHidingIt(t *testing.T) {
 		&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{
 				Namespace: statusNamespace,
-				Name:      collect.StatusConfigMapName,
+				Name:      v1alpha1.DefaultAutoscalerStatusName,
 			},
 			Data: map[string]string{"status": "\tnot: [valid"},
 		})
@@ -984,9 +985,9 @@ func TestTheCacheDoesNotWatchEveryConfigMapInTheCluster(t *testing.T) {
 			len(byConfigMap.Namespaces))
 	}
 	if scoped.FieldSelector == nil ||
-		!strings.Contains(scoped.FieldSelector.String(), collect.StatusConfigMapName) {
+		!strings.Contains(scoped.FieldSelector.String(), v1alpha1.DefaultAutoscalerStatusName) {
 		t.Errorf("the cache is not narrowed to %s: %v",
-			collect.StatusConfigMapName, scoped.FieldSelector)
+			v1alpha1.DefaultAutoscalerStatusName, scoped.FieldSelector)
 	}
 }
 
@@ -2392,7 +2393,7 @@ func derivedStatusConfigMap() client.Object {
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Namespace: statusNamespace,
-			Name:      collect.StatusConfigMapName,
+			Name:      v1alpha1.DefaultAutoscalerStatusName,
 		},
 		Data: map[string]string{"status": `
 autoscalerStatus: Running

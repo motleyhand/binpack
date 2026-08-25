@@ -48,7 +48,15 @@ type Config struct {
 	Pools []PoolOverride `json:"pools,omitempty"`
 }
 
-// Discovery configures how nodes are mapped to autoscaler node groups.
+// Discovery configures how nodes are mapped to autoscaler node groups, and
+// where to find the object that publishes them.
+//
+// That object — the cluster-autoscaler's status ConfigMap — is the reason
+// binpack needs no cloud credentials. It is present and populated even on a
+// managed control plane whose autoscaler pods and logs are invisible, and it
+// reports which pools autoscale, their bounds, and when the cluster last grew:
+// everything binpack would otherwise have to ask a cloud API for. See
+// ADR-0004.
 type Discovery struct {
 	// NodeGroupIDLabel holds, on each node, the identifier the
 	// cluster-autoscaler uses for that node's group. This is what makes
@@ -90,6 +98,14 @@ type Discovery struct {
 	// one place, finding nothing and reporting "no cluster-autoscaler is
 	// running" is a claim about the operator's cluster it has not established
 	// — and on a cluster that renamed the object, a false one.
+	//
+	// DefaultAutoscalerStatusName is the one spelling of that default in the
+	// tree, and binpack's tests build their fixtures from it rather than from
+	// a constant of their own. A second copy is self-consistent with whatever
+	// the tests assert and silent about what binpack ships, so changing this
+	// value would leave an unconfigured binpack reading an object that is not
+	// there while the suite stayed green — reporting exactly the false claim
+	// the paragraph above says the configurability exists to avoid.
 	AutoscalerStatusName string `json:"autoscalerStatusName,omitempty"`
 
 	// NodeGroups states outright which node group a NodeGroupIDLabel value

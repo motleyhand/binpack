@@ -97,6 +97,16 @@ linters:
             # k8s.io/klog is deliberately NOT allowed — it is a logging
             # implementation that writes, and klog.Logger is only an alias for
             # logr.Logger, so nothing is lost by refusing it.
+            #
+            # Read that as "no direct klog import", which is what this list can
+            # say. depguard evaluates these against the import statements in
+            # each file, so the third-party half of the allowlist closes over
+            # direct imports only: admitting k8s.io/apimachinery admits its
+            # transitive closure, and klog is in there — `go list -deps
+            # ./api/v1alpha1 | grep klog` returns seven packages. The module
+            # half above is genuinely closed, every entry being a package this
+            # same rule guards. What the rule buys is that no guarded package
+            # *calls* a writer, not that none is linked in.
             - github.com/go-logr/logr
           deny:
             # $gostd is allowed wholesale for the arithmetic and formatting

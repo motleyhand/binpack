@@ -18,33 +18,15 @@ import (
 	"github.com/motleyhand/binpack/internal/engine"
 )
 
-// StatusConfigMapName is what the cluster-autoscaler calls the object it
-// publishes its status into, unless it was told otherwise.
+// statusKey is the key inside that ConfigMap holding the status document.
 //
-// This object is the reason binpack needs no cloud credentials. It is present
-// and populated even on a managed control plane whose autoscaler pods and logs
-// are invisible, and it reports which pools autoscale, their bounds, and when
-// the cluster last grew — everything binpack would otherwise have to ask a
-// cloud API for. See ADR-0004.
-//
-// Neither half of where it lives is fixed. The autoscaler writes into the
-// namespace it was given with --namespace — which the upstream chart sets to
-// whatever namespace you install it into, so kube-system is a common answer
-// and not the only one — under the name it was given with
-// --status-config-map-name. Both are configuration here for the same reason:
-// binpack reporting "no cluster-autoscaler is running" because it looked
-// somewhere else is a claim about the operator's cluster that it has not
-// established. See discovery.autoscalerNamespace and
-// discovery.autoscalerStatusName.
-//
-// binpack reads the one location it is told to read and no other: a cluster
-// can hold a stale status ConfigMap alongside the live one, and a search
-// across namespaces would have to pick between two documents it cannot tell
-// apart.
-const (
-	StatusConfigMapName = "cluster-autoscaler-status"
-	statusKey           = "status"
-)
+// Where the object itself lives is not named here, and deliberately is not.
+// Both halves are configuration — discovery.autoscalerNamespace and
+// discovery.autoscalerStatusName — and a package
+// that reads the location it is given must not also publish a default,
+// because a second spelling is one that can drift from the one binpack ships
+// while every test built on it stays green.
+const statusKey = "status"
 
 // StatusRef is where to look for that object.
 //
