@@ -1,6 +1,7 @@
 package drain_test
 
 import (
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
@@ -573,6 +574,64 @@ func TestPolicyForResolvesTheNodesOwnPool(t *testing.T) {
 	}
 	if got := drain.PolicyFor(cfg, s, "b"); got.ScaleUpPause != 3*time.Minute {
 		t.Errorf("scale-up pause for b = %s, want the default 3m", got.ScaleUpPause)
+	}
+}
+
+// TestPolicyForCarriesEveryFieldTheDrainBoundsRunUnder is the field-count
+// guard on the one policy seam that had none.
+//
+// The policy field set is enumerated at four places — PoolPolicy.apply,
+// enginePolicy and explicit in internal/cli, and policyFrom here. The first
+// three carry reflect.TypeFor guards; this one did not, and it is the seam
+// where an omission is worst. Nothing here defaults a zero, deliberately, and
+// Assess reads a zero as a real bound rather than as "unset": a StallTimeout
+// left at zero makes every drain in the cluster stalled on the first
+// evaluation after any progress, each node taking exponential backoff, and it
+// presents as a cluster-wide workload problem rather than as a struct field
+// nobody wired.
+//
+// Distinct values throughout, and each of the five asserted separately, so a
+// field wired to its neighbour fails as loudly as one wired to nothing.
+// Exercised through PolicyFor rather than policyFrom, which is unexported —
+// with an empty snapshot, so the fall-through arm resolves the default and
+// the conversion under test is the one both arms share.
+func TestPolicyForCarriesEveryFieldTheDrainBoundsRunUnder(t *testing.T) {
+	// A Fatal rather than an Error: once the counts disagree the assertions
+	// below are answering a question about a different struct, and a sixth
+	// field fed from nothing is exactly what this exists to prevent.
+	const carried = 5
+	if n := reflect.TypeFor[drain.Policy]().NumField(); n != carried {
+		t.Fatalf("drain.Policy has %d fields and this test asserts %d: wire the new one "+
+			"in policyFrom and assert it here, or say here why it is not fed from the "+
+			"engine policy", n, carried)
+	}
+
+	got := drain.PolicyFor(engine.Config{Default: engine.Policy{
+		StallTimeout:         11 * time.Minute,
+		RemovalTimeout:       17 * time.Minute,
+		BackoffInitial:       5 * time.Minute,
+		BackoffMax:           72 * time.Hour,
+		CooldownAfterScaleUp: 13 * time.Minute,
+	}}, engine.Snapshot{}, "any-node")
+
+	for _, tc := range []struct {
+		field string
+		got   time.Duration
+		want  time.Duration
+	}{
+		{"StallTimeout", got.StallTimeout, 11 * time.Minute},
+		{"RemovalTimeout", got.RemovalTimeout, 17 * time.Minute},
+		{"BackoffInitial", got.BackoffInitial, 5 * time.Minute},
+		{"BackoffMax", got.BackoffMax, 72 * time.Hour},
+		// The one field whose name differs on the two sides, which is why it
+		// is the likeliest of the five to be wired to a neighbour: the engine
+		// resolves it as cooldown.afterScaleUp and this package reads it as
+		// the autoscaler's post-growth pause. One number, two questions.
+		{"ScaleUpPause", got.ScaleUpPause, 13 * time.Minute},
+	} {
+		if tc.got != tc.want {
+			t.Errorf("%s = %s, want the configured %s", tc.field, tc.got, tc.want)
+		}
 	}
 }
 

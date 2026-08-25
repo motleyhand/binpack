@@ -272,6 +272,14 @@ func PolicyFor(cfg engine.Config, s engine.Snapshot, name string) Policy {
 // One conversion rather than one per branch above: the fall-through and the
 // matched node have to agree, and two literals listing the same fields is an
 // invariant with nobody enforcing it.
+//
+// A field added to [Policy] and left out here arrives at [Assess] as a zero,
+// and a zero is a bound rather than an absence — which for StallTimeout means
+// every drain in the cluster abandoned as stalled, each node taking backoff,
+// presenting as a workload problem rather than as a struct field nobody
+// wired. TestPolicyForCarriesEveryFieldTheDrainBoundsRunUnder counts the
+// fields and asserts each one, so the omission fails here rather than in a
+// cluster.
 func policyFrom(p engine.Policy) Policy {
 	return Policy{
 		StallTimeout:   p.StallTimeout,
