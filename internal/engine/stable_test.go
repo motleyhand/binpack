@@ -144,15 +144,21 @@ func TestEveryReportedSubjectIsStableUnderPermutation(t *testing.T) {
 func twoShortBudgets() ([]*corev1.Pod, []*policyv1.PodDisruptionBudget) {
 	alpha := map[string]string{"app": "alpha"}
 	bravo := map[string]string{"app": "bravo"}
-	return []*corev1.Pod{
+
+	pods := []*corev1.Pod{
 		mother.Pod("default", "alpha-1", mother.PodLabels(alpha)),
 		mother.Pod("default", "alpha-2", mother.PodLabels(alpha)),
 		mother.Pod("default", "bravo-1", mother.PodLabels(bravo)),
 		mother.Pod("default", "bravo-2", mother.PodLabels(bravo)),
-	}, []*policyv1.PodDisruptionBudget{
+	}
+	// Two replicas each against an allowance of one, so each budget is short
+	// by exactly one.
+	pdbs := []*policyv1.PodDisruptionBudget{
 		mother.PDB("default", "alpha-pdb", 1, alpha),
 		mother.PDB("default", "bravo-pdb", 1, bravo),
 	}
+
+	return pods, pdbs
 }
 
 func firstBlocker(t *testing.T, got []engine.EvictionBlocker) string {
