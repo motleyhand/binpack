@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"errors"
 	"fmt"
 	"maps"
 	"os"
@@ -136,12 +137,15 @@ func TestEveryConfigurationPathInTheTaskPagesIsAField(t *testing.T) {
 			t.Fatalf("reading %s: %v", entry.Name(), err)
 		}
 
-		yamlPaths := fencedConfigurationPaths(string(data))
-		prosePaths := backtickedConfigurationPaths(string(data))
-		fenced += len(yamlPaths)
-		prose += len(prosePaths)
-
 		t.Run(entry.Name(), func(t *testing.T) {
+			yamlPaths, err := fencedConfigurationPaths(string(data))
+			if err != nil {
+				t.Error(err)
+			}
+			prosePaths := backtickedConfigurationPaths(string(data))
+			fenced += len(yamlPaths)
+			prose += len(prosePaths)
+
 			for _, path := range slices.Concat(yamlPaths, prosePaths) {
 				if err := resolveConfigurationPath(path); err != nil {
 					t.Errorf("this page names %s: %v", path, err)
@@ -167,21 +171,47 @@ func TestEveryConfigurationPathInTheTaskPagesIsAField(t *testing.T) {
 // of this type, not only the ones under policy. Everything else on these pages
 // is a Kubernetes manifest or another chart's values, and belongs to nobody
 // here.
-func fencedConfigurationPaths(doc string) []string {
+//
+// Two ways a block can yield nothing, and only one of them is acceptable. A
+// fence that is valid YAML but not a mapping is a fragment nobody here owns,
+// and is skipped. A fence that does not parse at all is a defect on its own
+// terms — it is tagged yaml on a page an operator copies from — and skipping it
+// would take every path in it out of the corpus at exactly the moment the
+// corpus stopped being trustworthy. Every failing block is named rather than
+// the first, which is how the loader reports a bad document too.
+func fencedConfigurationPaths(doc string) ([]string, error) {
 	var paths []string
+	var problems []error
 
 	for _, match := range yamlBlockRE.FindAllStringSubmatch(doc, -1) {
-		var block map[string]any
-		if err := yaml.Unmarshal([]byte(dedent(match[1])), &block); err != nil {
+		var document any
+		if err := yaml.Unmarshal([]byte(dedent(match[1])), &document); err != nil {
+			first, _, _ := strings.Cut(strings.TrimSpace(match[1]), "\n")
+			problems = append(problems, fmt.Errorf("the yaml block starting %q does not parse: %w", first, err))
 			continue
 		}
 
+		block, mapping := document.(map[string]any)
+		if !mapping {
+			continue
+		}
+
+		// Classified the way the loader reads it, which is case-insensitively:
+		// resolving paths that way and then choosing the root by exact key
+		// would drop a whole `Policy:` fence before resolution ever saw it.
 		root := block
-		switch nested, wrapped := block["config"].(map[string]any); {
-		case wrapped:
+		config, wrapped := lookup(block, "config")
+		apiVersion, _ := lookup(block, "apiVersion")
+		_, policy := lookup(block, "policy")
+		_, pools := lookup(block, "pools")
+
+		switch nested, nestedIsMapping := config.(map[string]any); {
+		case wrapped && nestedIsMapping:
 			root = nested
-		case block["apiVersion"] == v1alpha1.GroupVersion:
-		case block["policy"] != nil || block["pools"] != nil:
+		// The group version is a value rather than a field name, so the loader
+		// does not case-fold it and neither does this.
+		case apiVersion == v1alpha1.GroupVersion:
+		case policy || pools:
 		default:
 			continue
 		}
@@ -190,7 +220,7 @@ func fencedConfigurationPaths(doc string) []string {
 	}
 
 	slices.Sort(paths)
-	return slices.Compact(paths)
+	return slices.Compact(paths), errors.Join(problems...)
 }
 
 // keyPaths flattens a decoded document into the dotted paths its keys spell.
@@ -244,7 +274,7 @@ func backtickedConfigurationPaths(doc string) []string {
 			continue
 		}
 		head, _, _ := strings.Cut(path, ".")
-		if _, ok := lookupField(top, pathIndexRE.ReplaceAllString(head, "")); !ok {
+		if _, ok := lookup(top, pathIndexRE.ReplaceAllString(head, "")); !ok {
 			continue
 		}
 
@@ -269,7 +299,7 @@ func resolveConfigurationPath(path string) error {
 		}
 
 		fields := jsonFields(typ)
-		field, ok := lookupField(fields, name)
+		field, ok := lookup(fields, name)
 		if !ok {
 			known := slices.Sorted(maps.Keys(fields))
 			return fmt.Errorf("%q is not a field of %s, which has %s",
@@ -302,21 +332,27 @@ func jsonFields(typ reflect.Type) map[string]reflect.Type {
 	return fields
 }
 
-// lookupField resolves a name the way the loader does, which is
-// case-insensitively: YAML is parsed through encoding/json, so `dryrun` and
-// `dryRun` are the same field. Matching exactly would let a differently-cased
-// head — `Policy.byPool` at the start of a sentence — fall out of the corpus
-// unchecked, taking its invented tail with it.
-func lookupField(fields map[string]reflect.Type, name string) (reflect.Type, bool) {
-	if field, ok := fields[name]; ok {
-		return field, true
+// lookup reads a name the way the loader does, which is case-insensitively:
+// YAML is parsed through encoding/json, so `dryrun` and `dryRun` are the same
+// field. Matching exactly would let a differently-cased name — `Policy.byPool`
+// at the start of a sentence — fall out of the corpus unchecked, taking its
+// invented tail with it. Exact first, so an error message quotes the real
+// spelling rather than whichever case it happened to iterate onto.
+//
+// Used over both a decoded document and a struct's fields, because the rule is
+// the loader's and does not care which of the two it is reading.
+func lookup[V any](m map[string]V, name string) (V, bool) {
+	if value, ok := m[name]; ok {
+		return value, true
 	}
-	for known, field := range fields {
-		if strings.EqualFold(known, name) {
-			return field, true
+	for key, value := range m {
+		if strings.EqualFold(key, name) {
+			return value, true
 		}
 	}
-	return nil, false
+
+	var absent V
+	return absent, false
 }
 
 // underlying strips the pointers and slices a path segment does not spell.
