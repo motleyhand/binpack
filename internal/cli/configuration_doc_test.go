@@ -205,6 +205,11 @@ func keyPaths(prefix string, node map[string]any) []string {
 
 		switch value := value.(type) {
 		case map[string]any:
+			// The mapping's own key first. Descending straight into it loses
+			// `polciy: {}` entirely — an empty mapping contributes no path, so
+			// a misspelling with nothing under it would be invisible to a
+			// guard that only records leaves.
+			paths = append(paths, path)
 			paths = append(paths, keyPaths(path, value)...)
 		case []any:
 			paths = append(paths, path)
@@ -239,7 +244,7 @@ func backtickedConfigurationPaths(doc string) []string {
 			continue
 		}
 		head, _, _ := strings.Cut(path, ".")
-		if _, ok := top[pathIndexRE.ReplaceAllString(head, "")]; !ok {
+		if _, ok := lookupField(top, pathIndexRE.ReplaceAllString(head, "")); !ok {
 			continue
 		}
 
@@ -264,7 +269,7 @@ func resolveConfigurationPath(path string) error {
 		}
 
 		fields := jsonFields(typ)
-		field, ok := fields[name]
+		field, ok := lookupField(fields, name)
 		if !ok {
 			known := slices.Sorted(maps.Keys(fields))
 			return fmt.Errorf("%q is not a field of %s, which has %s",
@@ -295,6 +300,23 @@ func jsonFields(typ reflect.Type) map[string]reflect.Type {
 	}
 
 	return fields
+}
+
+// lookupField resolves a name the way the loader does, which is
+// case-insensitively: YAML is parsed through encoding/json, so `dryrun` and
+// `dryRun` are the same field. Matching exactly would let a differently-cased
+// head — `Policy.byPool` at the start of a sentence — fall out of the corpus
+// unchecked, taking its invented tail with it.
+func lookupField(fields map[string]reflect.Type, name string) (reflect.Type, bool) {
+	if field, ok := fields[name]; ok {
+		return field, true
+	}
+	for known, field := range fields {
+		if strings.EqualFold(known, name) {
+			return field, true
+		}
+	}
+	return nil, false
 }
 
 // underlying strips the pointers and slices a path segment does not spell.

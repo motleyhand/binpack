@@ -53,8 +53,8 @@ report, and the second is answered in your own cluster.
 kubectl annotate node NODE binpack.motleyhand.com/skip=true
 ```
 
-Per pool, a `pools` entry with `enabled: false` is the broader instrument. See
-[configuration](../reference/configuration.md#per-pool-overrides).
+Per pool, `pools[].enabled: false` is the broader instrument — a top-level `pools` entry naming
+that pool. See [configuration](../reference/configuration.md#per-pool-overrides).
 
 ## Turning it on
 
@@ -111,7 +111,7 @@ kubectl taint nodes <node> ToBeDeletedByClusterAutoscaler-
 
 ## After
 
-binpack writes four events per drain, on the node itself:
+binpack writes these events on the node itself:
 
 | Reason | Meaning |
 |---|---|
@@ -128,9 +128,11 @@ In dry run the first of these is `WouldDrain` instead, and says so in its note. 
 differs rather than only the wording, so nothing filtering events can confuse a drain that
 happened with one that was merely decided on.
 
-These four, with `WouldDrain` standing in for the first under dry run, are the events about a
-node. binpack writes three more when it decides *nothing*, which are not about a particular node;
-all eight are listed together in [the CLI reference](../reference/cli.md#events).
+A single drain writes two of them: `Draining`, and then `Drained` or `DrainAbandoned`.
+`WouldAdvanceDrain` appears only where dry run was switched on over a drain already in progress,
+and then on every evaluation until the node is handed back. Those five reasons are the ones about
+a node; binpack writes three more when it decides *nothing*, which are not about a particular
+node. All eight are listed together in [the CLI reference](../reference/cli.md#events).
 
 The metrics worth watching are `binpack_drains_completed_total` against
 `binpack_drains_abandoned_total`, and `binpack_drain_attempts_max`. A cluster where abandonments
