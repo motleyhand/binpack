@@ -182,9 +182,19 @@ func Advance(
 	// Assessing here costs nothing that returning early saved: it reads the
 	// snapshot and writes nothing.
 	state := drain.StateFor(s, a.Node)
-	pods := state.Pods
-
 	assessment := drain.Assess(state, policy)
+
+	// The pods this drain answers for, taken from the assessment's own filter
+	// rather than computed a second time beside it. Everything below that asks
+	// how far the drain has got — what is still in flight, which residents the
+	// simulation should have named, how many came back — has to be asking about
+	// the set the assessment counted, and two filters obliged to agree is the
+	// shape this pair was already wrong in.
+	//
+	// It couples them, and that is the point rather than a cost: a change to
+	// what [drain.PodsToMove] keeps now moves the abandonment below as well as
+	// the count recorded on the node.
+	mine := drain.PodsToMove(state.Pods)
 
 	switch {
 	case a.SkipCode == engine.SkipUncordoned:
@@ -388,7 +398,7 @@ func Advance(
 	// valid assignment exists, not that the scheduler will choose it — so
 	// binpack keeps at most one pod in flight, which makes a wrong prediction
 	// visible after one eviction rather than after all of them.
-	if inFlight := terminating(pods); inFlight != nil {
+	if inFlight := terminating(mine); inFlight != nil {
 		if err := record(ctx, w, a.Node, assessment, s.Now); err != nil {
 			return Step{}, err
 		}
@@ -416,7 +426,7 @@ func Advance(
 	// between may have been placed on a node that was still schedulable; it is
 	// left alone anyway, because the cost of that is one evaluation's delay
 	// and the cost of the other direction is the churn above.
-	staying := residentSince(pods, a.Node)
+	staying := residentSince(mine, a.Node)
 
 	next, placed := nextToEvict(a.Simulation, staying)
 	switch {
@@ -429,6 +439,17 @@ func Advance(
 		// is exactly what the allowlist exists to prevent. Asked of the
 		// residents rather than of everything on the node, because an arrival
 		// is accounted for — binpack simply declines to evict it.
+		//
+		// Not a state a cluster reaches while [engine.Simulate] and
+		// [drain.PodsToMove] agree about which pods need a destination: every
+		// occupying, non-node-bound resident the simulation sees is relocated
+		// or evicted, or leaves it blocked and the verdict infeasible, and one
+		// still terminating is waited for above. So this is the guard for those
+		// two drifting apart rather than a path — and the drift is not
+		// hypothetical. While the residency test above kept node-local pods,
+		// this arm ended the drain of every node running a CNI DaemonSet, one
+		// evaluation short, naming in the failure a pod class binpack models
+		// exactly.
 		return Abandon(ctx, w, a.Node, drain.AbandonUnaccounted, fmt.Sprintf(
 			"%d pods remain that the simulation did not account for", len(staying)), s.Now, policy)
 
@@ -444,7 +465,7 @@ func Advance(
 			return Step{}, err
 		}
 		return Step{Code: StepWaiting, Reason: fmt.Sprintf(
-			"%d pods came back to the node after it was cordoned", len(pods))}, nil
+			"%d pods came back to the node after it was cordoned", len(mine))}, nil
 	}
 
 	// Committed before the eviction rather than after it, and in the same
@@ -684,16 +705,17 @@ func pausable(blockers []engine.EvictionBlocker) bool {
 	return len(blockers) > 0
 }
 
-// terminating finds a pod on the node that is on its way out.
+// terminating finds a pod of the drain's own that is on its way out.
 //
-// Filtered exactly as [drain.Assess] filters, and that is the point rather
-// than a coincidence: a Succeeded or Failed pod held by a finalizer is not
-// occupying the node, so the assessment does not count it — and a helper that
-// called it in flight would wait on it every evaluation while other pods sat
-// there evictable, until the drain was abandoned as stalled.
-func terminating(pods []*corev1.Pod) *corev1.Pod {
-	for _, pod := range pods {
-		if pod.DeletionTimestamp != nil && !engine.NodeBound(pod) && engine.Occupies(pod) {
+// Handed [drain.PodsToMove]'s answer rather than the node's whole population,
+// and that is the point rather than a coincidence: a Succeeded or Failed pod
+// held by a finalizer is not occupying the node, so the assessment does not
+// count it — and a helper that called it in flight would wait on it every
+// evaluation while other pods sat there evictable, until the drain was
+// abandoned as stalled.
+func terminating(mine []*corev1.Pod) *corev1.Pod {
+	for _, pod := range mine {
+		if pod.DeletionTimestamp != nil {
 			return pod
 		}
 	}
@@ -702,6 +724,12 @@ func terminating(pods []*corev1.Pod) *corev1.Pod {
 
 // residentSince drops the pods that arrived on the node after the drain began,
 // leaving the ones it was started to move.
+//
+// Asked of [drain.PodsToMove]'s answer rather than of the node's population,
+// because arrival time is the only question this answers. A DaemonSet, mirror
+// or completed pod predating the drain passes it — they are older than
+// everything — and a residency test that keeps them hands the caller a set the
+// simulation was never going to name.
 //
 // An unreadable drain-started marker keeps every pod, rather than none: the
 // annotation is the drain's own recovery state, and a drain that cannot read it

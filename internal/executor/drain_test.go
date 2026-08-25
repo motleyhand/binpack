@@ -1874,6 +1874,88 @@ func TestAnExpendablePodThatComesBackIsNotEvictedAgainEveryRound(t *testing.T) {
 	}
 }
 
+func TestAnArrivalOnTheCordonedNodeIsWaitedForRatherThanCalledUnaccounted(t *testing.T) {
+	// The pod that arrived after the cordon is the only thing left to move,
+	// and the case above says what happens then: binpack waits, because a
+	// workload that keeps coming back may simply stop and because "no
+	// progress" describes the node better than "pods binpack could not
+	// account for".
+	//
+	// What decides which of those two an operator is told is the filter, and
+	// it has to be the same filter the assessment uses. A CNI DaemonSet pod
+	// is on every node there is, so a residency test that keeps it hands the
+	// abandonment a pod on every cluster there is — and the drain ends one
+	// evaluation short with a sentence sending its operator to look for a
+	// workload binpack models perfectly well.
+	pods := []*corev1.Pod{
+		mother.DaemonSetPod("kube-system", "cni",
+			mother.OnNode("a"), mother.CreatedAt(at.Add(-time.Hour))),
+		returning("late", "web-rs", at.Add(-5*time.Minute)),
+	}
+	s := snapshot([]*corev1.Node{marked("a", 20*time.Minute, time.Minute, "1"), node("b")}, pods)
+	c := clientFor(s)
+
+	step, err := executor.Advance(
+		context.Background(), c, s, "a", engineConfig(), drainPolicy())
+	if err != nil {
+		t.Fatalf("Advance: %v", err)
+	}
+
+	if step.Code != executor.StepWaiting || step.Done || step.Failed {
+		t.Errorf("a DaemonSet pod ended the drain: %+v", step)
+	}
+	// And it is counted the same way, so the sentence names the arrival alone.
+	if !strings.Contains(step.Reason, "1 pods came back") {
+		t.Errorf("reason counted more than the arrival: %q", step.Reason)
+	}
+	if !nodeFrom(t, c, "a").Spec.Unschedulable {
+		t.Error("the drain was handed back over a pod the simulation accounted for")
+	}
+}
+
+func TestAnUnaccountedPodIsOneTheSimulationCouldNotName(t *testing.T) {
+	// The case above is the DaemonSet one; these are the other three ways a
+	// node carries a pod the simulation declines to name, and the point of
+	// running them all is that the residency test they pass is a test about
+	// age. Every one of them predates the drain, so whichever of them a node
+	// happens to run is the one that would end it.
+	//
+	// A mirror pod dies with the node as a DaemonSet pod does. A Succeeded or
+	// Failed pod holds nothing and never leaves on its own. The simulation
+	// accounts for all three by having nothing to do with them, which is what
+	// makes the abandonment's sentence a claim about binpack's allowlist
+	// rather than about the node's population.
+	for _, tc := range []struct {
+		name string
+		pod  *corev1.Pod
+	}{
+		{"mirror", mother.MirrorPod("kube-system", "kube-apiserver", mother.OnNode("a"))},
+		{"succeeded", mother.Pod("default", "job", mother.OnNode("a"), mother.Succeeded())},
+		{"failed", mother.Pod("default", "gone", mother.OnNode("a"), mother.Failed())},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pods := []*corev1.Pod{tc.pod, returning("late", "web-rs", at.Add(-5*time.Minute))}
+			s := snapshot(
+				[]*corev1.Node{marked("a", 20*time.Minute, time.Minute, "1"), node("b")}, pods)
+			c := clientFor(s)
+
+			step, err := executor.Advance(
+				context.Background(), c, s, "a", engineConfig(), drainPolicy())
+			if err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+
+			if step.Code == drain.AbandonUnaccounted {
+				t.Errorf("a %s pod was reported as one the simulation could not name: %+v",
+					tc.name, step)
+			}
+			if step.Code != executor.StepWaiting || step.Done || step.Failed {
+				t.Errorf("the drain did not wait for the arrival: %+v", step)
+			}
+		})
+	}
+}
+
 // stalePDB is a budget covering the drain's remaining work whose controller has
 // not yet observed the current spec. The eviction API refuses every disruption
 // in that state, whatever the recorded allowance says.

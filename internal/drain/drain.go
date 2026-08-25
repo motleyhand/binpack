@@ -336,32 +336,46 @@ type Assessment struct {
 	Progressed bool
 }
 
+// PodsToMove is the pods on a node that this drain is responsible for moving.
+//
+// One of it for the same reason there is one [PodsOn]: every question about how
+// far a drain has got — the count [Assess] records, the executor's wait for a
+// pod still in flight, and which residents the simulation should have named —
+// is a question about the same set, so a second filter alongside this one is a
+// second answer to "is this node nearly empty". The pair drifted exactly that
+// way once, and the executor spent it calling a node's CNI DaemonSet pod a pod
+// the simulation could not account for.
+//
+// A DaemonSet pod wedged during an unrelated rollout is not this drain being
+// stuck, and counting it as remaining would mean the drain never finishes: the
+// DaemonSet controller puts the pod straight back onto the node, which still
+// exists.
+//
+// Deliberately [engine.NodeBound] rather than the engine's NodeLocal class,
+// which also covers terminating pods. That is right for the simulation, where a
+// pod on its way out needs no destination — and wrong here, where it is
+// precisely the pod being waited for. Using the class would report an occupied
+// node as empty and hand it to the autoscaler with work still on it.
+//
+// Completed pods are excluded for the opposite reason: a finished Job pod is a
+// real object that never goes away on its own, and counting it would stall
+// every drain of the node it landed on.
+func PodsToMove(pods []*corev1.Pod) []*corev1.Pod {
+	var mine []*corev1.Pod
+	for _, pod := range pods {
+		if !engine.NodeBound(pod) && engine.Occupies(pod) {
+			mine = append(mine, pod)
+		}
+	}
+	return mine
+}
+
 // Assess says what should happen next to a drain already under way.
 //
 // The checks are ordered by how much they tell an operator: a named stuck pod
 // beats "the drain stalled", which beats a bare count.
 func Assess(s State, policy Policy) Assessment {
-	// Only pods binpack is responsible for moving. A DaemonSet pod wedged
-	// during an unrelated rollout is not this drain being stuck, and counting
-	// it as remaining would mean the drain never finishes: the DaemonSet
-	// controller puts the pod straight back onto the node, which still exists.
-	//
-	// Deliberately [engine.NodeBound] rather than the engine's NodeLocal
-	// class, which also covers terminating pods. That is right for the
-	// simulation, where a pod on its way out needs no destination — and wrong
-	// here, where it is precisely the pod being waited for. Using the class
-	// would report an occupied node as empty and hand it to the autoscaler
-	// with work still on it.
-	//
-	// Completed pods are excluded for the opposite reason: a finished Job pod
-	// is a real object that never goes away on its own, and counting it would
-	// stall every drain of the node it landed on.
-	var mine []*corev1.Pod
-	for _, pod := range s.Pods {
-		if !engine.NodeBound(pod) && engine.Occupies(pod) {
-			mine = append(mine, pod)
-		}
-	}
+	mine := PodsToMove(s.Pods)
 
 	if pod, over := stuck(mine, s.Now); pod != nil {
 		return Assessment{
