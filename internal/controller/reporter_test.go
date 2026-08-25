@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -72,7 +73,7 @@ func (s *recordingSink) Patch(_ context.Context, event *eventsv1.Event, _ []byte
 // The grant was documented as the thing that lets the recorder aggregate
 // repeats of an identical event into one object with a count. It is not:
 // aggregation is a strategic-merge patch. client-go's only write path is
-// `recordEvent` (v0.36.3, tools/events/event_broadcaster.go), which calls
+// `recordEvent` (v0.36.4, tools/events/event_broadcaster.go), which calls
 // `sink.Patch` when the event has a Series and `sink.Create` otherwise or when
 // the series object has gone; `EventSinkImpl.Update` exists to satisfy the
 // interface and has no call site. Reading that once is not enough to remove a
@@ -136,5 +137,30 @@ func TestTheEventRecorderNeverIssuesAnUpdate(t *testing.T) {
 			t.Errorf("the recorder never issued a %s (%v), so this test is not "+
 				"observing the write path it claims to", want, called)
 		}
+	}
+}
+
+// TestTheEventWriteIsTheOnlyOtherThingBinpackWrites holds the enumeration
+// internal/executor's package doc tells a reviewer to trust.
+//
+// That doc says keeping every write in one file makes the set of things
+// binpack can do to a cluster enumerable by reading it, and R4-017's RBAC
+// argument and R4-003's availability argument both rest on the conclusion a
+// reviewer draws from doing so: binpack removes no object, ever. That is true
+// of executor.Writer, which has Patch and SubResource and no Delete. It was
+// not true of the process. This file creates Events, and it held the whole of
+// client.Writer to do it — Create, Update, Patch, Delete and DeleteAllOf — so
+// a Delete was one line away in a file the enumeration does not cover, and
+// would compile, pass, and be invisible to that audit.
+//
+// One method, counted rather than assumed. A verb added here has to be added
+// to the executor package doc's exception too, or this fails.
+func TestTheEventWriteIsTheOnlyOtherThingBinpackWrites(t *testing.T) {
+	const permitted = 1
+	if n := reflect.TypeFor[eventWriter]().NumMethod(); n != permitted {
+		t.Fatalf("eventWriter has %d methods and this test asserts %d: binpack's write "+
+			"surface is enumerated in internal/executor's package doc, which names this "+
+			"Event create as the one write outside that file — widen the doc with the "+
+			"new verb, or say here why it needs none", n, permitted)
 	}
 }

@@ -465,7 +465,7 @@ func reporterFor(opts Options, mgr manager.Manager) reporter {
 
 // reporterForClient is the choice itself, separated from the manager so it can
 // be exercised without starting one.
-func reporterForClient(opts Options, writer client.Writer, recorder events.EventRecorder) reporter {
+func reporterForClient(opts Options, writer eventWriter, recorder events.EventRecorder) reporter {
 	if opts.Once {
 		return directReporter{
 			writer:   writer,

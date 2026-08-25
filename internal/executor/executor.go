@@ -5,7 +5,20 @@
 // Two halves, and the split is the thing to know. executor.go is the writes
 // and nothing else: how each individual change is made, and what each way of
 // failing means. Keeping every write in one file means the set of things
-// binpack can do to a cluster is enumerable by reading it.
+// binpack can do to a *Node or a Pod* is enumerable by reading it — two
+// verbs, Patch and the eviction subresource, and no Delete anywhere.
+//
+// One write lives outside it, and naming it is what makes the enumeration
+// usable. internal/controller creates an events.k8s.io Event to publish each
+// decision, through a one-method interface holding Create and nothing else.
+// That is the whole of the exception: an audit of binpack's write surface
+// reads this file and that one, and nothing between them can remove an
+// object. The doc used to claim the file was the whole surface while the
+// reporter held a full client.Writer, Delete included — so a reviewer
+// checking "binpack removes no object, ever" concluded correctly about the
+// executor and incorrectly about binpack. An enumeration with its exception
+// stated is enumerable; one with the exception omitted is worse than none,
+// because it is the one a reviewer stops looking after.
 //
 // drain.go is the drain protocol, and that is policy. It decides what an
 // evaluation does next to a node already being drained: whether to hand over
