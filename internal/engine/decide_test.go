@@ -451,6 +451,86 @@ func TestPoolAtMinimumIsLeftAlone(t *testing.T) {
 	}
 }
 
+// TestAnUnnamedNodeGroupClaimsNoNodes is the closure of the join's one
+// unguarded direction: an identifier that matches by being absent.
+//
+// [engine.Config.GroupOf] answers "" for a node carrying no join label, which
+// is every static node on every cluster — a self-managed box, a pool the
+// autoscaler was never told about. The managed gate is a lookup of that answer
+// in the published groups, so one group the status names with an empty string
+// makes groups[""] exist and every one of those nodes pass. `name` is
+// omitempty in the autoscaler's own status type, so the value is
+// representable rather than hypothetical.
+//
+// What follows is worse than a mislabelled report. The node stops being
+// reported not-autoscaled, becomes an ordinary drain candidate that no
+// autoscaler will ever reap — so the cordon is stranded — and takes its policy
+// from a pool it is not in, including `enabled: false`. `diagnose` stops
+// listing it as static at the same moment, so the operator loses the signal
+// too.
+func TestAnUnnamedNodeGroupClaimsNoNodes(t *testing.T) {
+	// Carrying neither label: the ordinary static node, and the one an
+	// unnamed group would claim.
+	s := cluster([]*corev1.Node{sized("static", "4Gi")}, nil)
+	s.Autoscaler.Groups = []engine.NodeGroup{{ID: "", MinSize: 1, Ready: 1}}
+
+	d := engine.Decide(s, config())
+
+	a := assessmentFor(d, "static")
+	if a == nil {
+		t.Fatal("every node must be accounted for; static was not")
+	}
+	if a.SkipCode != engine.SkipNotAutoscaled {
+		t.Errorf("static was assessed %q, want %q: a group published with no name "+
+			"has claimed a node that is in no pool at all",
+			a.SkipCode, engine.SkipNotAutoscaled)
+	}
+}
+
+// TestThePoolNameIsTheSameInTheMetricAndInTheDrainEvent closes the join
+// between the two reports an operator has to correlate.
+//
+// `binpack_pool_nodes` and `binpack diagnose` name a pool through
+// [engine.PoolNames], which any one node in the pool can fill; `explain`'s
+// node row and the drain Event name it through the assessment. The two agree
+// only where the readable label is applied uniformly across a pool, and
+// nothing enforces that: a node added by a scale-up before the operator's
+// labelling automation ran carries the identifier and nothing else, and so
+// does a node added by hand. The dashboard series then says `pool-4g` while
+// that node's drain Event says `da8977ba-244f`, with nothing to join on —
+// which is verbatim the harm [engine.NodeAssessment.PoolLabel]'s own doc
+// comment says it was written to end.
+//
+// So what is asserted is not that the name is right but that there is one
+// name: every assessment's Pool is what the resolved naming says about its
+// group, and PoolLabel adds nothing to it.
+func TestThePoolNameIsTheSameInTheMetricAndInTheDrainEvent(t *testing.T) {
+	// Only the identifier label, which is the cluster's join and all a fresh
+	// node is guaranteed to carry.
+	unlabelled := sized("unlabelled", "4Gi", mother.NodeLabels(
+		map[string]string{"doks.digitalocean.com/node-pool-id": poolID}))
+	s := cluster([]*corev1.Node{inPool("labelled"), unlabelled}, nil)
+	cfg := config()
+
+	d := engine.Decide(s, cfg)
+
+	names := engine.PoolNames(s, cfg)
+	if len(d.Assessments) != len(s.Nodes) {
+		t.Fatalf("assessed %d nodes, want all %d", len(d.Assessments), len(s.Nodes))
+	}
+	for _, a := range d.Assessments {
+		if want := names.Label(a.Group); a.Pool != want {
+			t.Errorf("%s reports pool %q while the naming resolves its group to %q, "+
+				"so the metric and the drain Event have nothing to join on",
+				a.Node.Name, a.Pool, want)
+		}
+		if a.PoolLabel() != a.Pool {
+			t.Errorf("%s: PoolLabel() is %q and Pool is %q, so one assessment "+
+				"names its pool two ways", a.Node.Name, a.PoolLabel(), a.Pool)
+		}
+	}
+}
+
 func TestInfeasibleNodeIsReportedNotDrained(t *testing.T) {
 	// Everything is full, so nothing can move.
 	nodes := []*corev1.Node{inPool("a"), inPool("b")}

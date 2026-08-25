@@ -185,6 +185,18 @@ func ParseAutoscalerStatus(document string) (engine.Autoscaler, error) {
 	}
 
 	for _, g := range s.NodeGroups {
+		// A group with no name has no identifier, and the identifier is what
+		// a node's join label is matched against. Since a node in no pool at
+		// all resolves to the empty string too, an unnamed group is one that
+		// claims every static node in the cluster — turning off the check
+		// that says "nothing will ever remove this node" rather than failing
+		// it. `name` is omitempty upstream, so the value is representable.
+		//
+		// Dropped here rather than guarded at each consumer, because here
+		// there is one of them.
+		if g.Name == "" {
+			continue
+		}
 		group := engine.NodeGroup{
 			ID:      g.Name,
 			MinSize: g.Health.MinSize,

@@ -392,23 +392,6 @@ type Config struct {
 	ByPool  map[string]Policy
 }
 
-// policyFor resolves the policy for a pool, matching on any of its names.
-//
-// Unexported, and reached only through [Config.PolicyForNode]: which names a
-// node answers to is the question that went wrong once, so there is one
-// answer to it rather than one per caller.
-func (c Config) policyFor(names ...string) Policy {
-	for _, name := range names {
-		if name == "" {
-			continue
-		}
-		if p, ok := c.ByPool[name]; ok {
-			return p
-		}
-	}
-	return c.Default
-}
-
 // NoDrainToMeasureFrom is why an after-drain cooldown cannot be enforced by a
 // process that did not perform the drain.
 //
@@ -622,7 +605,13 @@ type Decision struct {
 type NodeAssessment struct {
 	Node  *corev1.Node
 	Group string
-	Pool  string
+
+	// Pool is what to call Group, resolved across the whole pool by
+	// [PoolNames] rather than read from this node's own label — so a node
+	// that carries the identifier and not the readable name is still named
+	// the way every other report names its pool. Display only; nothing
+	// matches on it. Read it through [NodeAssessment.PoolLabel].
+	Pool string
 
 	// Skipped is set when the node was ruled out before simulation, with
 	// SkipReason saying why in prose and SkipCode naming it.
@@ -843,8 +832,9 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 	// means nothing will ever remove this node, so continuing to empty it
 	// would strand the cordon.
 	if live, _, why := s.Autoscaler.Live(s.Now); !live {
-		a := NodeAssessment{Node: node, Group: cfg.GroupOf(node),
-			Pool: node.Labels[cfg.PoolNameLabel]}
+		group := cfg.GroupOf(node)
+		a := NodeAssessment{Node: node, Group: group,
+			Pool: PoolNames(s, cfg).Label(group)}
 		// One skip code for every way the answer is no, and the code is what
 		// the executor reads to decide whether a hand-over to the autoscaler
 		// can still complete. That question has one answer here: it cannot.
@@ -859,7 +849,8 @@ func Revalidate(s Snapshot, name string, cfg Config) NodeAssessment {
 		return a
 	}
 
-	a := eligibility(s, cfg, groupsByID(s), protectedNamespaces(s, cfg), node, true)
+	a := eligibility(s, cfg, groupsByID(s), PoolNames(s, cfg),
+		protectedNamespaces(s, cfg), node, true)
 	if a.Skipped {
 		return a
 	}
@@ -1027,10 +1018,14 @@ func trustScaleUp(a Autoscaler) bool {
 // cluster rather than only the interesting part.
 func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []NodeAssessment) {
 	groups := groupsByID(s)
+	// Hoisted with the other two: the naming is a fact about the cluster, not
+	// about the node being assessed, and rebuilding it per candidate would
+	// walk every node in the snapshot once per node in the snapshot.
+	names := PoolNames(s, cfg)
 	protected := protectedNamespaces(s, cfg)
 
 	for _, node := range s.Nodes {
-		a := eligibility(s, cfg, groups, protected, node, false)
+		a := eligibility(s, cfg, groups, names, protected, node, false)
 		if a.Skipped {
 			ruledOut = append(ruledOut, a)
 			continue
@@ -1041,9 +1036,23 @@ func eligible(s Snapshot, cfg Config) (candidates []*NodeAssessment, ruledOut []
 	return candidates, ruledOut
 }
 
+// groupsByID indexes the published groups for the managed check, which is a
+// lookup of [Config.GroupOf]'s answer.
+//
+// The empty identifier is skipped, and that is the check rather than a
+// tidiness: GroupOf answers "" for every node carrying no join label, so a
+// group indexed under "" would be matched by every static node in the cluster
+// — each then reported as pool-managed, drained by a binpack no autoscaler
+// will follow, and governed by a floor and an `enabled` from a pool it is not
+// in. The collector already drops such a group where it parses the status
+// document, and this is the same refusal for a Snapshot built by hand, which
+// is what every test holds.
 func groupsByID(s Snapshot) map[string]NodeGroup {
 	groups := make(map[string]NodeGroup, len(s.Autoscaler.Groups))
 	for _, g := range s.Autoscaler.Groups {
+		if g.ID == "" {
+			continue
+		}
 		groups[g.ID] = g
 	}
 	return groups
@@ -1071,13 +1080,14 @@ func groupsByID(s Snapshot) map[string]NodeGroup {
 // drain should stop, however much of it is already done.
 func eligibility(
 	s Snapshot, cfg Config,
-	groups map[string]NodeGroup, protected map[string]string,
+	groups map[string]NodeGroup, names PoolNaming, protected map[string]string,
 	node *corev1.Node, resuming bool,
 ) NodeAssessment {
+	id := cfg.GroupOf(node)
 	a := NodeAssessment{
 		Node:  node,
-		Group: cfg.GroupOf(node),
-		Pool:  node.Labels[cfg.PoolNameLabel],
+		Group: id,
+		Pool:  names.Label(id),
 	}
 
 	policy := cfg.PolicyForNode(node)
@@ -1254,25 +1264,27 @@ func podsOf(placements []Placement) []*corev1.Pod {
 	return out
 }
 
-// PoolLabel is what to call this node's pool, in one place.
+// PoolLabel is what to call this node's pool.
 //
-// The readable name where the cluster carries one, the node group's
-// identifier otherwise. Trivial, and it was written out three times and
-// omitted twice — so within one evaluation on a cluster with no readable pool
-// label, binpack_pool_nodes named a pool by its identifier, `binpack diagnose`
-// named it the same way, the drain log line logged the empty string, and
-// `explain --output json` omitted the field. An operator correlating a
-// dashboard series against the log entry that recorded the drain had nothing
-// to join on.
+// The accessor, not a rule: the Pool field already holds the answer
+// [PoolNaming.Label] gave for this node's group, and this hands it back. A
+// method rather than a field read because the name has to have one
+// implementation and this is where the callers already point — it was written
+// out three times and omitted twice, so within one evaluation on a cluster
+// with no readable pool label, binpack_pool_nodes named a pool by its
+// identifier, `binpack diagnose` named it the same way, the drain log line
+// logged the empty string, and `explain --output json` omitted the field. An
+// operator correlating a dashboard series against the log entry that recorded
+// the drain had nothing to join on.
 //
-// A method on the assessment because that is where both spellings already
-// are; [PoolNaming.Label] is the same rule for a caller holding a group
-// identifier instead.
+// It carried a fallback of its own until the same failure returned in a
+// subtler form: falling back to *this node's* label made a pool whose nodes
+// are inconsistently labelled — one added by a scale-up before the operator's
+// labelling automation ran — report one name to the metric and another to the
+// drain Event. Resolving across the pool is the only reading that cannot do
+// that, so the fallback lives in [PoolNaming.Label] and nowhere else.
 func (a NodeAssessment) PoolLabel() string {
-	if a.Pool != "" {
-		return a.Pool
-	}
-	return a.Group
+	return a.Pool
 }
 
 // commonestSkip returns the code that ruled out the most nodes, one of those

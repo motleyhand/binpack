@@ -153,15 +153,59 @@ func (c Config) mappingKey() string {
 // operator should not have to know which one binpack matches on: the
 // identifier the autoscaler publishes, the value of whichever label the join
 // reads, the value of the label `discovery.nodeGroupIDLabel` configures, and
-// the human-readable pool name. [ResolvePools] accepts all four when it
-// validates an override, and accepting a name there while ignoring it here is
-// worse than refusing it.
+// the human-readable pool name. [ResolvePools] validates an override against
+// the same set — through [Config.poolNames], not through a second list of its
+// own, because accepting a name there while ignoring it here is worse than
+// refusing it and prose is not what keeps two lists in step.
 //
 // Where the join is plain equality the middle two are the same string and this
 // is the two-name lookup it has always been.
 func (c Config) PolicyForNode(node *corev1.Node) Policy {
-	return c.policyFor(c.GroupOf(node), node.Labels[c.mappingKey()],
-		node.Labels[c.NodeGroupIDLabel], node.Labels[c.PoolNameLabel])
+	return c.policyFor(c.poolNames(node))
+}
+
+// poolNames is every name a `pools[]` entry may use for this node's pool, in
+// the order an override is matched.
+//
+// One implementation, because it was two. This set was written out by hand
+// here and again in [ResolvePools], six hundred lines apart in this file with
+// nothing pointing either at the other, and two enumerations of one set drift
+// in two directions of which only one is loud: a spelling reaching validation
+// alone makes preflight accept an override the engine then ignores — an
+// operator told their configuration is valid while binpack goes on draining a
+// pool they believe they switched off. That is the failure
+// [Config.PolicyForNode] records having already happened once. A spelling
+// reaching resolution alone merely refuses a valid document, which an operator
+// sees immediately.
+//
+// An array rather than a slice: this is called once per node in ResolvePools'
+// loop, and a fixed-size return stays on the stack. Entries may be empty —
+// most nodes carry two of the four — and both callers skip those.
+func (c Config) poolNames(node *corev1.Node) [4]string {
+	return [4]string{
+		c.GroupOf(node),
+		node.Labels[c.mappingKey()],
+		node.Labels[c.NodeGroupIDLabel],
+		node.Labels[c.PoolNameLabel],
+	}
+}
+
+// policyFor resolves the policy for a pool, matching on any of its names.
+//
+// Unexported, and reached only through [Config.PolicyForNode]: which names a
+// node answers to is the question that went wrong once, so there is one
+// answer to it rather than one per caller. It sits beside the join for the
+// same reason — the whole policy-resolution path is one thing to read.
+func (c Config) policyFor(names [4]string) Policy {
+	for _, name := range names {
+		if name == "" {
+			continue
+		}
+		if p, ok := c.ByPool[name]; ok {
+			return p
+		}
+	}
+	return c.Default
 }
 
 // PoolNames maps each autoscaling group's identifier to the human-readable
@@ -192,8 +236,11 @@ func PoolNames(s Snapshot, cfg Config) PoolNaming {
 //
 // A type with a method rather than a bare map, so that the fallback every
 // caller needs has one implementation. It had three, plus two callers that
-// skipped it — see [NodeAssessment.PoolLabel], which answers the same question
-// for a caller holding an assessment.
+// skipped it, and then a second rule of its own on the assessment — which
+// disagreed with this one on a pool whose nodes are not uniformly labelled.
+// [NodeAssessment.Pool] is filled from here, so a caller holding an
+// assessment reads this answer through [NodeAssessment.PoolLabel] rather than
+// resolving a fresh one.
 type PoolNaming map[string]string
 
 // Label is the readable name for a group, or the identifier where the cluster
@@ -767,20 +814,21 @@ func ResolvePools(s Snapshot, cfg Config) (Config, error) {
 		return cfg, nil
 	}
 
+	// The published identifier is the one name in the set that is not a
+	// node's, so it is unioned in separately. Everything else comes from
+	// [Config.poolNames], which is what resolution matches on — accepting a
+	// name here that resolution ignores is worse than refusing it, and the
+	// only way to be sure is for there to be one list.
 	known := map[string]bool{}
 	for _, g := range s.Autoscaler.Groups {
-		known[g.ID] = true
+		if g.ID != "" {
+			known[g.ID] = true
+		}
 	}
 	for _, node := range s.Nodes {
-		if name := node.Labels[cfg.PoolNameLabel]; name != "" {
-			known[name] = true
-		}
-		// Both the label the join reads and the configured one, because they
-		// differ once a join is derived and an operator may reasonably have
-		// written either.
-		for _, key := range []string{cfg.mappingKey(), cfg.NodeGroupIDLabel} {
-			if id := node.Labels[key]; id != "" {
-				known[id] = true
+		for _, name := range cfg.poolNames(node) {
+			if name != "" {
+				known[name] = true
 			}
 		}
 	}
