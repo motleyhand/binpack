@@ -167,12 +167,6 @@ inside binpack is `binpack diagnose`, which reports a cordoned node carrying the
 markers as an abandoned drain — that is the half-cleaned state above, and naming it is the only
 thing standing between it and being forgotten.
 
-## See also
-
-- [Metrics](metrics.md) — `binpack_nodes_in_backoff` and `binpack_drains_abandoned_total`
-- [Configuration](configuration.md) — `stallTimeout` and `removalTimeout`
-- [ADR-0007](../design/adr-0007-drain-progress-not-deadlines.md) — why progress, not deadlines
-
 ## The label
 
 ### `binpack.motleyhand.com/draining`
@@ -198,3 +192,9 @@ The label is a signal, not state: the annotations are what a drain is recovered 
 removing the label by hand changes nothing about a drain in flight. Its one reader is
 `binpack diagnose`, above — a diagnostic rather than a decision, which is why removing it costs
 you the report and not the drain.
+
+## See also
+
+- [Metrics](metrics.md) — `binpack_nodes_in_backoff` and `binpack_drains_abandoned_total`
+- [Configuration](configuration.md) — `stallTimeout` and `removalTimeout`
+- [ADR-0007](../design/adr-0007-drain-progress-not-deadlines.md) — why progress, not deadlines
