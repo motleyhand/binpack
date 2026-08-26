@@ -1,8 +1,13 @@
 package metrics
 
 import (
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
+	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -319,4 +324,110 @@ func TestTheAbandonmentReasonsAreOneSet(t *testing.T) {
 		}
 		seen[reason] = true
 	}
+}
+
+// TestEveryVocabularyConstantIsEnumerated is the direction
+// TestEveryPublishedVocabularyIsASet cannot give.
+//
+// That one visits what an enumerator holds, so it has no opinion about a value
+// removed from it. Dropping AbandonNotRemoved from drain.AbandonCodes() and
+// its row from the reference leaves the drain code emitting it and its
+// fixtures green — they compare against the same constant — while the loop
+// stops visiting it. The series is then published, undocumented, and no longer
+// pre-initialised, so it appears only once something has already gone wrong,
+// which is the case a pre-initialised zero exists to prevent.
+//
+// Read from the packages' own declarations rather than by driving every path
+// that emits one. The constants are what the emitting code names, so a
+// constant that exists and is not enumerated is the whole defect; driving
+// would test the same thing through more machinery and would go quiet for a
+// branch no fixture reaches — which is the state this is meant to catch.
+// internal/controller does the same for its Event reasons, in its own package
+// because the purity rule keeps it out of this one.
+func TestEveryVocabularyConstantIsEnumerated(t *testing.T) {
+	for _, vocabulary := range []struct {
+		name   string
+		dir    string
+		prefix string
+		values []string
+	}{
+		{"engine.SkipCodes", "../engine", "Skip", engine.SkipCodes()},
+		{"engine.Verdicts", "../engine", "Verdict", engine.Verdicts()},
+		{"engine.DecisionCodes", "../engine", "Code", engine.DecisionCodes()},
+		{"drain.AbandonCodes", "../drain", "Abandon", drain.AbandonCodes()},
+	} {
+		enumerated := map[string]bool{}
+		for _, value := range vocabulary.values {
+			enumerated[value] = true
+		}
+
+		declared := constantsWithPrefix(t, vocabulary.dir, vocabulary.prefix)
+		for name, value := range declared {
+			if !enumerated[value] {
+				t.Errorf("%s = %q is declared in %s and %s() does not enumerate it; it is "+
+					"published as a label value, documented by nothing that reads the "+
+					"enumerator, and never pre-initialised — so the series appears for the "+
+					"first time on the day it fires", name, value, vocabulary.dir,
+					vocabulary.name)
+			}
+		}
+		if len(declared) != len(vocabulary.values) {
+			t.Errorf("%s declares %d %s* constants and %s() holds %d; either the parse has "+
+				"stopped seeing them or the enumerator holds a value no constant does",
+				vocabulary.dir, len(declared), vocabulary.prefix, vocabulary.name,
+				len(vocabulary.values))
+		}
+	}
+}
+
+// constantsWithPrefix is every string constant a package declares whose name
+// starts with the given prefix, by name.
+func constantsWithPrefix(t *testing.T, dir, prefix string) map[string]string {
+	t.Helper()
+
+	sources, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	if err != nil {
+		t.Fatalf("globbing %s: %v", dir, err)
+	}
+
+	fset := token.NewFileSet()
+	out := map[string]string{}
+	parsed := 0
+	for _, source := range sources {
+		if strings.HasSuffix(source, "_test.go") {
+			continue
+		}
+		file, err := parser.ParseFile(fset, source, nil, 0)
+		if err != nil {
+			t.Fatalf("parsing %s: %v", source, err)
+		}
+		parsed++
+		ast.Inspect(file, func(n ast.Node) bool {
+			spec, ok := n.(*ast.ValueSpec)
+			if !ok || len(spec.Names) != len(spec.Values) {
+				return true
+			}
+			for i, name := range spec.Names {
+				if !strings.HasPrefix(name.Name, prefix) {
+					continue
+				}
+				lit, ok := spec.Values[i].(*ast.BasicLit)
+				if !ok || lit.Kind != token.STRING {
+					continue
+				}
+				if value, err := strconv.Unquote(lit.Value); err == nil {
+					out[name.Name] = value
+				}
+			}
+			return true
+		})
+	}
+
+	// A glob no file answers returns an empty list and a nil error, so a
+	// package that moves reads as one declaring nothing.
+	if parsed == 0 {
+		t.Fatalf("no non-test file matched %s/*.go — the package moved, and every check "+
+			"reading it is now vacuous", dir)
+	}
+	return out
 }

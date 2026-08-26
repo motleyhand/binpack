@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"testing"
@@ -696,8 +697,28 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 			len(roles), len(bindings))
 	}
 
+	// C4: every object the chart renders has to be a distinct one. Duplicate
+	// manifests keep the counts balanced, collapse into the same map entries
+	// and dedupe through every grant comparison, and Helm then asks the API
+	// server to create the same cluster-scoped object twice and the install
+	// fails outright.
+	identities := map[string]bool{}
+	for _, role := range roles {
+		identity(t, identities, role.Kind, role.Metadata.Namespace, role.Metadata.Name)
+	}
+
 	bound := map[string]bool{}
 	for _, b := range bindings {
+		identity(t, identities, b.Kind, b.Metadata.Namespace, b.Metadata.Name)
+
+		// A ClusterRoleBinding is cluster-scoped and the API server refuses one
+		// carrying a namespace. Skipping the namespace check for anything that
+		// is not a RoleBinding read a namespace on it as "nothing to check".
+		if b.Kind == "ClusterRoleBinding" && b.Metadata.Namespace != "" {
+			t.Errorf("the ClusterRoleBinding %s sets namespace %s; it is cluster-scoped, "+
+				"the API server refuses the object, and the install comes up without any "+
+				"cluster-wide permission", b.Metadata.Name, b.Metadata.Namespace)
+		}
 		bound[b.RoleRef.Kind+"/"+b.RoleRef.Name] = true
 
 		// Kubernetes rejects a binding whose roleRef names another API group,
@@ -812,6 +833,19 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 			}
 		}
 	}
+}
+
+// identity records one object's kind, namespace and name, and fails if the
+// chart has rendered that combination already.
+func identity(t *testing.T, seen map[string]bool, kind, namespace, name string) {
+	t.Helper()
+
+	key := kind + " " + namespace + "/" + name
+	if seen[key] {
+		t.Errorf("the chart renders %s twice; the counts balance, every comparison here "+
+			"dedupes it, and Helm asks the API server to create one object twice", key)
+	}
+	seen[key] = true
 }
 
 // deploymentServiceAccount is the account expression the pod runs as, rendered
@@ -1008,5 +1042,48 @@ func TestTheLeaderElectionGrantsGoWhenLeaderElectionDoes(t *testing.T) {
 	if len(rbacdoc.Grants(on)) <= len(granted) {
 		t.Errorf("turning leader election off removed nothing (%d pairs either way), so "+
 			"this test is not observing the guard it names", len(granted))
+	}
+}
+
+// TestEachFeatureGuardStandsOnItsOwn holds a relationship the readers here
+// deliberately flatten.
+//
+// rbacdoc.Roles unions every branch and rbacdoc.Without models a guard by
+// deleting its block, so neither can say that two values must both be true.
+// Nesting the act rules inside another feature's guard is invisible to both:
+// the union still holds them, the difference between the two renders still
+// reports them as gated on rbac.allowDraining, and an install that opted in to
+// acting and out of the other feature renders neither `nodes: patch` nor
+// `pods/eviction: create` and 403s on its first drain.
+//
+// So the nesting is read from the template rather than inferred from what the
+// branches contain. Both features hang off rbac.create and off nothing else,
+// which is what the reference promises: acting is a decision about acting, and
+// leader election is a decision about replicas.
+func TestEachFeatureGuardStandsOnItsOwn(t *testing.T) {
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+
+	for _, feature := range []struct {
+		guard  string
+		within []string
+	}{
+		{".Values.rbac.create", nil},
+		{".Values.rbac.allowDraining", []string{".Values.rbac.create"}},
+		{".Values.leaderElection.enabled", []string{".Values.rbac.create"}},
+	} {
+		around, err := rbacdoc.GuardsAround(string(chart), feature.guard)
+		if err != nil {
+			t.Errorf("reading what encloses %s: %v", feature.guard, err)
+			continue
+		}
+		if !slices.Equal(around, feature.within) {
+			t.Errorf("the block gated on %s is nested inside %v, and it should be inside "+
+				"%v; an install that set %s and cleared one of the others would render "+
+				"none of its rules while every comparison went on reading them as granted",
+				feature.guard, around, feature.within, feature.guard)
+		}
 	}
 }

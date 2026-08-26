@@ -246,6 +246,58 @@ func Without(template, guard string) (string, error) {
 	return rest, nil
 }
 
+// GuardsAround is the guards enclosing one guard's block, outermost first.
+//
+// [Roles] flattens every conditional into a union and [Without] models a guard
+// by deleting its block, so neither can express that two values must both be
+// true. Nesting the act rules inside another feature's guard is invisible to
+// both: the union still holds them, the gated set still contains them, and an
+// install that opted in to acting and out of the other feature renders neither.
+//
+// So the relationship is read from the template rather than inferred from what
+// the branches contain, and a caller states which guards a feature is allowed
+// to depend on.
+func GuardsAround(template, guard string) ([]string, error) {
+	lines := strings.Split(template, "\n")
+
+	var stack []string
+	var found bool
+	var enclosing []string
+	for i, line := range lines {
+		if opened := openedGuard(line); opened != "" {
+			if opened == guard {
+				if found {
+					return nil, fmt.Errorf("%s guards more than one block (line %d); this "+
+						"reads the first, and every other caller here removes or reads the "+
+						"first too — give the second block its own value", guard, i+1)
+				}
+				found, enclosing = true, slices.Clone(stack)
+			}
+			stack = append(stack, opened)
+			continue
+		}
+		if delta := depthDelta(line); delta < 0 && len(stack) > 0 {
+			stack = stack[:len(stack)+delta]
+		}
+	}
+
+	if !found {
+		return nil, fmt.Errorf("the chart no longer gates any block on %s", guard)
+	}
+	return enclosing, nil
+}
+
+// openedGuard is the condition a line opens a conditional block on, or "".
+func openedGuard(line string) string {
+	for _, action := range helmAction.FindAllString(line, -1) {
+		body := strings.TrimSpace(strings.Trim(strings.Trim(action, "{}"), "-"))
+		if keyword, rest, _ := strings.Cut(body, " "); keyword == "if" {
+			return strings.TrimSpace(rest)
+		}
+	}
+	return ""
+}
+
 // section finds one guarded block, returning its body and the template with
 // the whole block — guard, body and closing action — removed.
 //
