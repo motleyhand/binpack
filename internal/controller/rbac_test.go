@@ -683,7 +683,14 @@ func children(n ast.Node) []ast.Node {
 func requireEveryHelperIsReached(t *testing.T, source *ast.File) {
 	t.Helper()
 
-	// Writer-bearing functions, by name.
+	// Writer-bearing functions, by name, and which of them are methods.
+	//
+	// A method is not an entry point: the audit that requires exported
+	// functions to be driven skips anything with a receiver, so treating an
+	// exported method as an already-driven root here would satisfy both static
+	// walks over a write no fixture ever performs. Kept as a possible callee,
+	// excluded as a root — it has to be reached from something that is driven.
+	methods := map[string]bool{}
 	helpers := map[string]*ast.FuncDecl{}
 	for _, decl := range source.Decls {
 		fn, ok := decl.(*ast.FuncDecl)
@@ -693,6 +700,7 @@ func requireEveryHelperIsReached(t *testing.T, source *ast.File) {
 		for _, param := range fn.Type.Params.List {
 			if ident, ok := param.Type.(*ast.Ident); ok && ident.Name == "Writer" {
 				helpers[fn.Name.Name] = fn
+				methods[fn.Name.Name] = fn.Recv != nil
 			}
 		}
 	}
@@ -724,7 +732,7 @@ func requireEveryHelperIsReached(t *testing.T, source *ast.File) {
 		}
 	}
 	for name := range helpers {
-		if ast.IsExported(name) {
+		if ast.IsExported(name) && !methods[name] {
 			follow(name)
 		}
 	}

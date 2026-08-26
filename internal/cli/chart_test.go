@@ -309,9 +309,14 @@ func requireBoundTo(t *testing.T, options rbacdoc.Options, account string) []str
 
 	namespace := releaseNamespace(options)
 
-	bindings, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, options))
+	manifests := rbacdoc.MustRender(t.Fatal, options)
+	bindings, err := rbacdoc.Bindings(manifests)
 	if err != nil {
 		t.Fatalf("reading the bindings rendered with %v: %v", options.Set, err)
+	}
+	roles, err := rbacdoc.Roles(manifests)
+	if err != nil {
+		t.Fatalf("reading the roles rendered with %v: %v", options.Set, err)
 	}
 	// Three: the ClusterRoleBinding, the autoscaler-status RoleBinding and the
 	// leader-election RoleBinding. A parse that found none would satisfy every
@@ -331,6 +336,29 @@ func requireBoundTo(t *testing.T, options rbacdoc.Options, account string) []str
 				"runs as; a binding with none grants nobody anything",
 				binding.Kind, binding.Metadata.Name, len(binding.Subjects))
 			continue
+		}
+
+		// Where the binding points, as well as who it names. A binding is two
+		// halves and either one wrong makes it inert — and the audit that
+		// checks roleRef in full runs on one render, so a value-dependent path
+		// could change it here and be granted nothing while every subject
+		// check passed.
+		switch {
+		case binding.RoleRef.APIGroup != rbacdoc.RBACAPIGroup:
+			t.Errorf("the %s %s has roleRef.apiGroup %q and Kubernetes requires %q; the "+
+				"API server refuses the binding and the role it names is bound to nobody",
+				binding.Kind, binding.Metadata.Name, binding.RoleRef.APIGroup,
+				rbacdoc.RBACAPIGroup)
+		case rbacdoc.BindingKindFor(binding.RoleRef.Kind) != binding.Kind:
+			t.Errorf("the %s %s names a %s; a %s binds one and this binds the other, so "+
+				"it resolves to nothing", binding.Kind, binding.Metadata.Name,
+				binding.RoleRef.Kind, binding.Kind)
+		case !slices.ContainsFunc(roles, func(role rbacdoc.Role) bool {
+			return role.Kind == binding.RoleRef.Kind && role.Metadata.Name == binding.RoleRef.Name
+		}):
+			t.Errorf("the %s %s names the %s %q and this render creates no such role, so "+
+				"it grants nothing", binding.Kind, binding.Metadata.Name,
+				binding.RoleRef.Kind, binding.RoleRef.Name)
 		}
 
 		subject := binding.Subjects[0]
@@ -1120,8 +1148,13 @@ type deployment struct {
 				Containers         []struct {
 					Args         []string `json:"args"`
 					VolumeMounts []struct {
-						Name        string `json:"name"`
-						MountPath   string `json:"mountPath"`
+						Name      string `json:"name"`
+						MountPath string `json:"mountPath"`
+
+						// Read so that their presence can be refused. See
+						// [mountedConfig]: the chart uses neither, and what
+						// each does to a mounted path is Kubernetes' rule to
+						// state rather than this file's to re-derive.
 						SubPath     string `json:"subPath"`
 						SubPathExpr string `json:"subPathExpr"`
 					} `json:"volumeMounts"`
@@ -1129,7 +1162,9 @@ type deployment struct {
 				Volumes []struct {
 					Name      string `json:"name"`
 					ConfigMap *struct {
-						Name  string `json:"name"`
+						Name string `json:"name"`
+
+						// As above: projected keys are refused, not resolved.
 						Items []struct {
 							Key  string `json:"key"`
 							Path string `json:"path"`
@@ -1204,18 +1239,6 @@ func renderedConfig(t *testing.T, opts ...rbacdoc.Options) *v1alpha1.Config {
 	return cfg
 }
 
-// itemPaths is the names a ConfigMap projection gives the files it mounts.
-func itemPaths(items []struct {
-	Key  string `json:"key"`
-	Path string `json:"path"`
-}) []string {
-	var out []string
-	for _, item := range items {
-		out = append(out, item.Path)
-	}
-	return out
-}
-
 // mountedConfig is the ConfigMap the rendered pod actually reads its
 // configuration from, and the key within it.
 //
@@ -1224,6 +1247,16 @@ func itemPaths(items []struct {
 // volumeMount, the mount has to name a volume, and the volume has to be a
 // ConfigMap. A break anywhere leaves the pod loading its own defaults or not
 // starting at all, and the object this test decodes says nothing about either.
+//
+// Traced, and no further. `subPath` changes a mountPath from a directory into
+// the single file projected there, `subPathExpr` is expanded from the
+// container's environment at start-up, and `items` renames the keys a volume
+// projects — three rules about what Kubernetes does with a pod spec, which
+// this file modelled for a while and got wrong twice before a reviewer said
+// so. The chart uses none of them, so the model was maintained for a shape
+// nothing rendered. They are refused here instead: a chart that starts using
+// one fails with a message saying what is not modelled, which is a smaller
+// thing to be wrong about than a model of somebody else's contract.
 func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 	t.Helper()
 
@@ -1237,37 +1270,19 @@ func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 
 	container := renderedDeployment(t, options).Spec.Template.Spec.Containers[0]
 
-	// What a mountPath means depends on subPath: without one it is the
-	// directory the volume is mounted at, and with one it is the single file
-	// or subdirectory projected there. Read as a directory either way, a mount
-	// that gained `subPath: config.yaml` still resolved --file to a key that
-	// exists — while in the container /etc/binpath/config.yaml is not a path
-	// at all, because /etc/binpack is itself the file.
 	var volume string
 	for _, mount := range container.VolumeMounts {
 		at := strings.TrimSuffix(mount.MountPath, "/")
-
-		switch {
-		case mount.SubPathExpr != "":
-			// Resolved from the container's environment at start-up, which
-			// this cannot read. Refused rather than guessed at: the guess that
-			// looks right is that it names the same file, and that is exactly
-			// the assumption this whole helper exists to stop making.
-			if at == path || strings.HasPrefix(path, at+"/") {
-				t.Fatalf("the volumeMount at %s uses subPathExpr %q, which Kubernetes "+
-					"expands from the container's environment; nothing here can say "+
-					"which file %s then names", at, mount.SubPathExpr, path)
-			}
-		case mount.SubPath != "":
-			// The mount is that one file, so the flag has to name it exactly.
-			if path == at {
-				volume, key = mount.Name, mount.SubPath
-			}
-		default:
-			if rel, under := strings.CutPrefix(path, at+"/"); under {
-				volume, key = mount.Name, rel
-			}
+		if at != path && !strings.HasPrefix(path, at+"/") {
+			continue
 		}
+		if mount.SubPath != "" || mount.SubPathExpr != "" {
+			t.Fatalf("the volumeMount at %s covering %s uses subPath or subPathExpr, "+
+				"which change what that path names and which this test does not model; "+
+				"the chart has never used either, so if it now does, this needs "+
+				"revisiting rather than trusting", at, path)
+		}
+		volume, key = mount.Name, strings.TrimPrefix(path, at+"/")
 	}
 	if volume == "" {
 		t.Fatalf("the rendered pod is started with %s=%s and no volumeMount puts a file "+
@@ -1283,23 +1298,12 @@ func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 				"the chart renders is not what the process reads", volume, path)
 		}
 
-		// With `items`, the file's name in the volume is not its key in the
-		// ConfigMap — the projection renames it, and only the keys listed
-		// appear at all. Assuming the two were the same read `data[path]`,
-		// which exists, while Kubernetes could not populate a volume whose
-		// item names a key that does not: the pod never starts, and every
-		// assertion about the configuration it would have loaded was green.
-		if len(v.ConfigMap.Items) == 0 {
-			return v.ConfigMap.Name, key
+		if len(v.ConfigMap.Items) > 0 {
+			t.Fatalf("the volume %q projects selected keys, which renames what the "+
+				"container sees and which this test does not model; the chart has "+
+				"never done so, and if it now does, this needs revisiting", volume)
 		}
-		for _, item := range v.ConfigMap.Items {
-			if item.Path == key {
-				return v.ConfigMap.Name, item.Key
-			}
-		}
-		t.Fatalf("the volume %q projects only %v and the process is started with a path "+
-			"resolving to %q, which is not among them; that file is not in the container "+
-			"and binpack starts on its own defaults", volume, itemPaths(v.ConfigMap.Items), key)
+		return v.ConfigMap.Name, key
 	}
 
 	t.Fatalf("the container mounts a volume named %q and the pod declares no such volume; "+

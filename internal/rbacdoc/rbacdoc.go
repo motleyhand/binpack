@@ -21,7 +21,6 @@
 package rbacdoc
 
 import (
-	"cmp"
 	"fmt"
 	"regexp"
 	"slices"
@@ -286,75 +285,72 @@ func Roles(manifests string) ([]Role, error) {
 	return decode("the chart's RBAC", manifests)
 }
 
-// fenceOpening matches the start of a fenced YAML block.
+// The one way this repository's documentation opens and closes a YAML block.
 //
-// `yml`, any capitalisation of either, a tilde fence, and whitespace before
-// the info string — a renderer treats them all as YAML and a page is free to
-// use any. Keyed on one exact spelling, a granted snippet written another way
-// was skipped whole while the remaining blocks kept the non-empty guard
-// satisfied.
+// Required rather than accommodated, which is the opposite of how this started.
+// The first reader accepted every spelling CommonMark allows — tilde fences,
+// `yml`, any capitalisation, leading spaces, an info string carrying a title —
+// because a block it failed to recognise was a granted permission that left
+// the comparison in silence. Each spelling was added after a review found it
+// missing, and the reader became a partial Markdown parser with a partial
+// Markdown parser's supply of edge cases.
 //
-// Up to three leading spaces, which is what CommonMark permits before a fence;
-// a fourth makes it an indented code block instead.
-//
-// `yaml` is the info string's *first word*, not the whole of it. A fence may
-// carry anything after the language — `title=`, a line-highlight range, an
-// anchor — and renderers here and everywhere else still treat the block as
-// YAML. Anchored at the end, a fence written that way was not a YAML block to
-// this reader at all, and the grants inside it left the reference silently
-// while the plain blocks kept the non-empty guard satisfied.
-var fenceOpening = regexp.MustCompile("(?i)^ {0,3}(`{3,}|~{3,})[ \t]*ya?ml([ \t].*)?$")
+// Insisting on one spelling removes the reason for all of it. A block written
+// any other way is not skipped, it is an error — so the risk that made the
+// permissiveness necessary is gone, and what is left is a string comparison.
+const (
+	fenceOpen  = "```yaml"
+	fenceClose = "```"
+)
 
-// fencedYAML is the body of every fenced YAML block in a Markdown document.
+// looksLikeYAML matches a fence this page might have meant as YAML, in any of
+// the spellings [fenceOpen] does not permit.
 //
-// Scanned line by line rather than matched with one expression, because the
-// closing fence has to be the *same* delimiter as the opening one and RE2 has
-// no backreference to say so. The expression this replaces accepted either
-// delimiter as the close of either opener, anywhere on a line — so a backtick
-// block whose body mentioned `~~~`, in a YAML comment or a piece of quoted
-// output, ended there. What followed was not reported: the prefix already held
-// a valid rule, so the block decoded, and every grant after that line was
-// dropped in silence. That is the exact disappearance this package exists to
-// prevent, in the reader written to prevent it.
+// The guard that makes the strictness safe. Without it, `~~~yaml` is not a
+// fence this reader knows and its grants are absent from the comparison —
+// which is the silence the old permissiveness was buying off, reintroduced by
+// the fix for it.
+var looksLikeYAML = regexp.MustCompile("(?i)^[ \t]*(?:`{3,}|~{3,})[ \t]*ya?ml\\b")
+
+// fencedYAML is the body of every YAML block in a Markdown document.
 //
-// CommonMark's rules, as far as they matter here: the closing fence is the
-// same character, at least as long as the opening run, alone on its line but
-// for up to three leading spaces and trailing whitespace. An unclosed fence
-// runs to the end of the document, which is a page nobody would ship and is
-// read rather than refused — the decoders downstream say what is wrong with it
-// far more usefully than "no closing fence" would.
-func fencedYAML(doc string) []string {
+// A separator inside one is refused rather than split. These blocks are single
+// objects an operator copies, the pages here write them that way, and a reader
+// that accepted a stream had to decide which of several documents a fence's
+// leading `# ClusterRole` comment described — a question with no good answer
+// and one more thing to get wrong.
+func fencedYAML(doc string) ([]string, error) {
 	var out []string
 
 	lines := strings.Split(doc, "\n")
 	for i := 0; i < len(lines); i++ {
-		opening := fenceOpening.FindStringSubmatch(lines[i])
-		if opening == nil {
+		switch {
+		case lines[i] == fenceOpen:
+		case looksLikeYAML.MatchString(lines[i]):
+			return nil, fmt.Errorf("a YAML block on line %d opens with %q, and the "+
+				"documentation here writes them as %q. A block spelled any other way "+
+				"is one this reader would not compare with the chart, so the "+
+				"permissions in it would go unchecked", i+1, lines[i], fenceOpen)
+		default:
 			continue
 		}
 
-		delimiter := opening[1]
 		body := i + 1
-		i = body
-		for ; i < len(lines) && !closesFence(lines[i], delimiter); i++ {
+		for i = body; i < len(lines) && lines[i] != fenceClose; i++ {
+			if strings.HasPrefix(lines[i], "---") {
+				return nil, fmt.Errorf("the YAML block opening on line %d holds a document "+
+					"separator on line %d. These blocks are single objects an operator "+
+					"copies, and a fence's leading comment says what one object is",
+					body, i+1)
+			}
 		}
-		out = append(out, strings.Join(lines[body:min(i, len(lines))], "\n"))
+		if i >= len(lines) {
+			return nil, fmt.Errorf("the YAML block opening on line %d is never closed with "+
+				"%q, so everything after it reads as YAML", body, fenceClose)
+		}
+		out = append(out, strings.Join(lines[body:i], "\n"))
 	}
-	return out
-}
-
-// closesFence reports whether a line ends a fence opened with this delimiter.
-func closesFence(line, delimiter string) bool {
-	trimmed := strings.TrimRight(strings.TrimLeft(line, " "), " \t")
-	if len(line)-len(strings.TrimLeft(line, " ")) > 3 {
-		return false
-	}
-	// The same character, and at least as many: ```` closes ```, and ``` does
-	// not close ````. Nothing else may share the line.
-	if len(trimmed) < len(delimiter) {
-		return false
-	}
-	return strings.Trim(trimmed, delimiter[:1]) == ""
+	return out, nil
 }
 
 // Documented decodes the role snippets in a Markdown page.
@@ -370,24 +366,19 @@ func closesFence(line, delimiter string) bool {
 // point of the package: silence about a rule is the failure being guarded
 // against, so it may not be a way of succeeding.
 func Documented(doc string) ([]Role, error) {
-	var out []Role
-	for _, fence := range fencedYAML(doc) {
-		// A fence may hold more than one manifest. Decoded whole, the YAML
-		// decoder read the first and every later document was discarded in
-		// silence — so a permission an operator would receive from a block
-		// they copy entire was absent from both directions of the comparison.
-		// The fence's own header describes its first document, and applies to
-		// a later one only if that one says nothing about itself.
-		fenceKind, fenceName := kindOf(fence)
+	blocks, err := fencedYAML(doc)
+	if err != nil {
+		return nil, err
+	}
 
-		for _, body := range Documents(fence) {
-			role, ok, err := documented(body, fenceKind, fenceName)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				out = append(out, role)
-			}
+	var out []Role
+	for _, body := range blocks {
+		role, ok, err := documented(body)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			out = append(out, role)
 		}
 	}
 
@@ -397,8 +388,7 @@ func Documented(doc string) ([]Role, error) {
 	return out, nil
 }
 
-// documented reads one document out of a fenced block, against the header its
-// fence carries.
+// documented reads one fenced block.
 //
 // The bool is whether it is a role at all: a block declaring no rules is a
 // fragment quoted for discussion and is skipped, while a block that mentions a
@@ -406,7 +396,7 @@ func Documented(doc string) ([]Role, error) {
 // error. That distinction is the whole point of the package — silence about a
 // rule is the failure being guarded against, so it may not be a way of
 // succeeding.
-func documented(body, fenceKind, fenceName string) (Role, bool, error) {
+func documented(body string) (Role, bool, error) {
 	role, err := fragment(body)
 
 	// A block naming any rule field is a rule list, whatever became of it.
@@ -489,10 +479,6 @@ func documented(body, fenceKind, fenceName string) (Role, bool, error) {
 	// tells them to apply is namespaced — so binpack would hold none of its
 	// cluster-wide node and pod access, and the page that promised it would
 	// read as correct.
-	//
-	// Compared against this document's own comment rather than the fence's,
-	// because a fence holding two manifests has one header and it describes
-	// the first of them.
 	ownKind, ownName := kindOf(body)
 	if ownKind != "" && role.Kind != "" && ownKind != role.Kind {
 		return Role{}, false, fmt.Errorf("a documented block is headed %s and declares "+
@@ -501,16 +487,13 @@ func documented(body, fenceKind, fenceName string) (Role, bool, error) {
 			"nobody holds:\n%s", ownKind, role.Kind, body)
 	}
 
-	switch {
-	case role.Kind != "":
-		// Its own declaration wins, and its own name with it.
-		if role.Metadata.Name == "" {
-			role.Metadata.Name = cmp.Or(ownName, fenceName)
-		}
-	case ownKind != "":
-		role.Kind, role.Metadata.Name = ownKind, ownName
-	default:
-		role.Kind, role.Metadata.Name = fenceKind, fenceName
+	// A block that declares its own kind keeps it, and the header names it
+	// otherwise.
+	if role.Kind == "" {
+		role.Kind = ownKind
+	}
+	if role.Metadata.Name == "" {
+		role.Metadata.Name = ownName
 	}
 	return role, true, nil
 }
@@ -850,7 +833,7 @@ func Identities() []string {
 // unmarshal reads the first object and ignores the rest: a ClusterRole added
 // after such a line rendered through Helm and was invisible to every audit
 // here.
-var documentSeparator = regexp.MustCompile(`(?m)^---[ \t]*(#.*)?$`)
+var documentSeparator = regexp.MustCompile(`(?m)^---([ \t]+#.*)?[ \t]*$`)
 
 // Documents splits a rendered manifest stream into its documents.
 //
