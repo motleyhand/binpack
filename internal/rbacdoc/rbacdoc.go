@@ -506,18 +506,21 @@ func Documented(doc string) ([]Role, error) {
 		body := match[1]
 
 		role, err := fragment(body)
-		// A block naming apiGroups is a rule list, whatever became of it. Only
-		// there is a failed or empty decode a dropped rule rather than a
-		// snippet quoted for discussion, and there it is reported rather than
-		// skipped.
-		rules := strings.Contains(body, "apiGroups:")
+		// A block naming any rule field is a rule list, whatever became of it.
+		// Keying that on `apiGroups:` alone skipped a non-resource snippet in
+		// silence — it has no apiGroups by definition, so a malformed one was
+		// read as prose quoted for discussion while an operator copying it got
+		// an invalid role. Only in a rule list is a failed or empty decode a
+		// dropped rule rather than an illustration, and only there is it
+		// reported.
+		rules := kindOfBlock(body) != "" || ruleField.MatchString(body)
 		switch {
 		case err != nil && rules:
-			return nil, fmt.Errorf("a documented block declares apiGroups and does not "+
-				"decode as rules, so this reader would drop it: %w\n%s", err, body)
+			return nil, fmt.Errorf("a documented block is written as policy rules and does "+
+				"not decode as them, so this reader would drop it: %w\n%s", err, body)
 		case len(role.Rules) == 0 && rules:
-			return nil, fmt.Errorf("a documented block declares apiGroups and decoded "+
-				"to no rules, so this reader would drop it:\n%s", body)
+			return nil, fmt.Errorf("a documented block is written as policy rules and "+
+				"decoded to none, so this reader would drop it:\n%s", body)
 		case err != nil, len(role.Rules) == 0:
 			continue
 		}
@@ -571,6 +574,15 @@ func fragment(body string) (Role, error) {
 		return Role{}, err
 	}
 	return wrapped, nil
+}
+
+// ruleField matches any field only a policy rule carries.
+var ruleField = regexp.MustCompile(`(?m)^\s*-?\s*(apiGroups|resources|resourceNames|nonResourceURLs|verbs):`)
+
+// kindOfBlock is the object a fragment's leading comment names, or "".
+func kindOfBlock(body string) string {
+	kind, _ := kindOf(body)
+	return kind
 }
 
 // kindOf reads the leading comment a documented fragment names its object in,

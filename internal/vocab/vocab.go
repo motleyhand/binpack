@@ -108,18 +108,30 @@ type declaration struct {
 //
 // Resolved transitively, since a name may be declared in terms of another.
 func stringTypes(files []*ast.File) map[string]bool {
+	// Package-level declarations only, for the reason [declarations] reads
+	// only package-level const blocks: ast.Inspect also visits a type declared
+	// inside a function, and a local `type EventReason int` would overwrite
+	// the package's `type EventReason = string` under the same name — making
+	// every constant typed with it look non-string, and dropping them all from
+	// the count that holds the enumerator honest. The fix for constants was
+	// made a round before this one and not carried across.
 	direct := map[string]string{}
 	for _, file := range files {
-		ast.Inspect(file, func(n ast.Node) bool {
-			spec, ok := n.(*ast.TypeSpec)
-			if !ok {
-				return true
+		for _, decl := range file.Decls {
+			block, ok := decl.(*ast.GenDecl)
+			if !ok || block.Tok != token.TYPE {
+				continue
 			}
-			if ident, ok := spec.Type.(*ast.Ident); ok {
-				direct[spec.Name.Name] = ident.Name
+			for _, spec := range block.Specs {
+				spec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				if ident, ok := spec.Type.(*ast.Ident); ok {
+					direct[spec.Name.Name] = ident.Name
+				}
 			}
-			return true
-		})
+		}
 	}
 
 	out := map[string]bool{"string": true}
@@ -208,6 +220,17 @@ func plainlyNotAString(expr ast.Expr) bool {
 		return expr.Kind != token.STRING
 	case *ast.Ident:
 		return expr.Name == "iota" || expr.Name == "true" || expr.Name == "false"
+	case *ast.ParenExpr:
+		return plainlyNotAString(expr.X)
+	case *ast.UnaryExpr:
+		// No unary operator applies to a string.
+		return true
+	case *ast.BinaryExpr:
+		// Go permits no operator between a string and anything else, so one
+		// plainly non-string operand settles it. `1 << 4` reached the default
+		// branch before this and was reported as unevaluable, which failed the
+		// guard on a correct `const CodeMask`.
+		return plainlyNotAString(expr.X) || plainlyNotAString(expr.Y)
 	default:
 		return false
 	}

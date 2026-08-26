@@ -137,12 +137,16 @@ func codeTables() []struct {
 		// The abandonment table lists the drain's own codes; the skip codes
 		// and the two verdicts reach the counter through revalidation and are
 		// described in the prose beneath it rather than repeated as rows.
-		// Partial by design: the table lists the drain's own codes, and the
-		// skip codes and the two verdicts are described in the prose beneath
-		// it rather than repeated as rows. So a row has to be allowed and an
-		// allowed value need not have a row.
-		{"`reason` is one of:", append(append(append([]string{},
-			drain.AbandonCodes()...), engine.SkipCodes()...), abandonmentVerdicts...), true},
+		// The drain's own codes, exactly. The skip codes and the two verdicts
+		// reach this counter too and are described in the prose beneath the
+		// table rather than repeated as rows — so widening the allowed set to
+		// the union and marking the table partial let a row disappear: with
+		// `stuck` removed and the token still backticked in prose, the
+		// forward guard found it, every surviving row was in the broad
+		// allowance, and the reverse comparison was skipped. The prose half is
+		// held by TestEveryLabelValueBinpackCanProduceIsDocumented, which
+		// searches the page.
+		{"`reason` is one of:", drain.AbandonCodes(), false},
 		{"| `cause` | What binpack could not do |", unmodelledCauses, false},
 	}
 }
