@@ -431,6 +431,19 @@ func Documented(doc string) ([]Role, error) {
 		// while what the page actually tells them to apply is namespaced — so
 		// binpack would hold none of its cluster-wide node and pod access, and
 		// the page that promised it would read as correct.
+		// A fragment carries no apiVersion — it is a rule list, not a
+		// manifest — but a block written to be copied whole does, and then it
+		// has to be one Kubernetes still serves. Its grants and its identity
+		// satisfy every comparison here either way, while an operator applying
+		// it has the object refused and holds none of the permissions the page
+		// spent a section explaining.
+		if role.APIVersion != "" && role.APIVersion != RBACAPIVersion {
+			return nil, fmt.Errorf("a documented block declares apiVersion %q and "+
+				"Kubernetes serves RBAC under %q; an operator applying it is refused "+
+				"at create and holds none of these permissions:\n%s",
+				role.APIVersion, RBACAPIVersion, body)
+		}
+
 		declared := role.Kind
 		role.Kind, role.Metadata.Name = kindOf(body)
 		if declared != "" && declared != role.Kind {

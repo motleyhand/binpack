@@ -647,6 +647,18 @@ func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 				walk(child, true)
 			}
 			return
+		case *ast.FuncLit:
+			// A closure body runs when it is called, not where it is written.
+			// Walked with the declaration site's state, `write := func() {
+			// w.Patch(…) }` invoked only from a branch read as unconditional —
+			// and a literal has no name, so the helper graph beside this
+			// cannot reach it either. Conservatively conditional: a write that
+			// needs a closure is a write that needs its own named function,
+			// which is what this file promises to be.
+			for _, child := range children(n) {
+				walk(child, true)
+			}
+			return
 		case *ast.BinaryExpr:
 			// `&&` and `||` do not evaluate their right operand when the left
 			// decides the answer, so a write there is as conditional as one in

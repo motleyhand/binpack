@@ -40,7 +40,7 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 		return nil, err
 	}
 
-	runeConstants = runes(files)
+	integerConstants = integers(files)
 	stringTypeNames = stringTypes(files)
 
 	declared := declarations(files, stringTypeNames)
@@ -147,25 +147,30 @@ func convertedString(call *ast.CallExpr, resolved map[string]string) (string, bo
 		return "", false
 	}
 
+	// A character literal is the operand's commonest shape and the only one
+	// this handled at first. Every other way of writing the same constant —
+	// a named rune, a conversion, parentheses, arithmetic over them — is as
+	// legal, converts to the same string, and was reported as unevaluable,
+	// which fails the vocabulary guard over code that compiles. So the operand
+	// is evaluated as an integer expression, and only what is not one falls
+	// through to the string evaluator.
+	//
+	// Integers are kept apart from `resolved` because that map holds strings:
+	// a `const letter rune = 'x'` is filtered out by type long before it could
+	// reach one.
 	if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.CHAR {
 		runes, err := strconv.Unquote(lit.Value)
 		return runes, err == nil
 	}
-	// A named rune is as legal an operand as a literal one, and those names
-	// are not in `resolved` — that map holds strings, and a `const letter rune
-	// = 'x'` is filtered out before it reaches one. So the runes are collected
-	// separately and consulted here.
-	if ident, ok := call.Args[0].(*ast.Ident); ok {
-		if value, ok := runeConstants[ident.Name]; ok {
-			return value, true
-		}
+	if value, ok := integer(call.Args[0], integerConstants); ok {
+		return string(rune(value)), true
 	}
 	return evaluate(call.Args[0], resolved)
 }
 
-// runeConstants are the package's rune constants, by name, for the conversions
-// that name one.
-var runeConstants map[string]string
+// integerConstants are the package's integer-valued constants, by name, for
+// the conversions whose operand is one.
+var integerConstants map[string]int64
 
 // stringTypeNames are the package's own names for a string, for the
 // conversions that name one.
@@ -179,26 +184,6 @@ var runeConstants map[string]string
 // honest, so the guard passes while the value is published and documented
 // nowhere.
 var stringTypeNames map[string]bool
-
-// runes is every constant that names a single character, whatever its type
-// and however it is written.
-//
-// Collected apart from the string declarations because those are filtered by
-// type — a `const letter rune = \'x\'` is deliberately not a string — and a
-// `string(letter)` conversion still needs it.
-//
-// Not only character literals. `const letter rune = 65` is the same constant
-// as `\'A\'` and Go converts it to "A" all the same, as it does an alias of one
-// and an arithmetic expression over them. Keyed on the syntax, all three were
-// absent from this map and their conversions were reported as unevaluable —
-// which fails the vocabulary guard over code Go compiles.
-func runes(files []*ast.File) map[string]string {
-	out := map[string]string{}
-	for name, value := range integers(files) {
-		out[name] = string(rune(value))
-	}
-	return out
-}
 
 // integers is every constant with an integer value, by name.
 //
@@ -241,6 +226,19 @@ func integers(files []*ast.File) map[string]int64 {
 	return out
 }
 
+// integerTypes are the predeclared integer types a constant conversion may
+// name.
+//
+// The predeclared ones only. A package's own name for an integer would need
+// resolving the way [stringTypes] resolves its own, and no vocabulary in this
+// repository is written that way — so it is left to be reported as unevaluable
+// rather than guessed at, which is the standing rule here.
+var integerTypes = map[string]bool{
+	"rune": true, "byte": true, "int": true, "int8": true, "int16": true,
+	"int32": true, "int64": true, "uint": true, "uint8": true, "uint16": true,
+	"uint32": true, "uint64": true, "uintptr": true,
+}
+
 // integer evaluates a constant integer expression against what is known.
 //
 // The same shape as [evaluate] and for the same reason: the subset a constant
@@ -271,6 +269,16 @@ func integer(expr ast.Expr, known map[string]int64) (int64, bool) {
 		return value, ok
 	case *ast.ParenExpr:
 		return integer(expr.X, known)
+	case *ast.CallExpr:
+		// A conversion to an integer type, which is the one call a constant
+		// may contain and is how a rune is usually spelled in a conversion:
+		// `string(rune(65))`. Any other name converts to something this
+		// cannot read, and says so.
+		fn, ok := expr.Fun.(*ast.Ident)
+		if !ok || len(expr.Args) != 1 || !integerTypes[fn.Name] {
+			return 0, false
+		}
+		return integer(expr.Args[0], known)
 	case *ast.UnaryExpr:
 		value, ok := integer(expr.X, known)
 		switch {

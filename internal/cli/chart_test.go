@@ -1110,8 +1110,10 @@ type deployment struct {
 				Containers         []struct {
 					Args         []string `json:"args"`
 					VolumeMounts []struct {
-						Name      string `json:"name"`
-						MountPath string `json:"mountPath"`
+						Name        string `json:"name"`
+						MountPath   string `json:"mountPath"`
+						SubPath     string `json:"subPath"`
+						SubPathExpr string `json:"subPathExpr"`
 					} `json:"volumeMounts"`
 				} `json:"containers"`
 				Volumes []struct {
@@ -1225,15 +1227,41 @@ func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 
 	container := renderedDeployment(t, options).Spec.Template.Spec.Containers[0]
 
+	// What a mountPath means depends on subPath: without one it is the
+	// directory the volume is mounted at, and with one it is the single file
+	// or subdirectory projected there. Read as a directory either way, a mount
+	// that gained `subPath: config.yaml` still resolved --file to a key that
+	// exists — while in the container /etc/binpath/config.yaml is not a path
+	// at all, because /etc/binpack is itself the file.
 	var volume string
 	for _, mount := range container.VolumeMounts {
-		if rel, under := strings.CutPrefix(path, strings.TrimSuffix(mount.MountPath, "/")+"/"); under {
-			volume, key = mount.Name, rel
+		at := strings.TrimSuffix(mount.MountPath, "/")
+
+		switch {
+		case mount.SubPathExpr != "":
+			// Resolved from the container's environment at start-up, which
+			// this cannot read. Refused rather than guessed at: the guess that
+			// looks right is that it names the same file, and that is exactly
+			// the assumption this whole helper exists to stop making.
+			if at == path || strings.HasPrefix(path, at+"/") {
+				t.Fatalf("the volumeMount at %s uses subPathExpr %q, which Kubernetes "+
+					"expands from the container's environment; nothing here can say "+
+					"which file %s then names", at, mount.SubPathExpr, path)
+			}
+		case mount.SubPath != "":
+			// The mount is that one file, so the flag has to name it exactly.
+			if path == at {
+				volume, key = mount.Name, mount.SubPath
+			}
+		default:
+			if rel, under := strings.CutPrefix(path, at+"/"); under {
+				volume, key = mount.Name, rel
+			}
 		}
 	}
 	if volume == "" {
-		t.Fatalf("the rendered pod is started with %s=%s and no volumeMount covers that "+
-			"path, so the file is not in the container at all", flag, path)
+		t.Fatalf("the rendered pod is started with %s=%s and no volumeMount puts a file "+
+			"there, so binpack reads no configuration at all", flag, path)
 	}
 
 	for _, v := range renderedDeployment(t, options).Spec.Template.Spec.Volumes {

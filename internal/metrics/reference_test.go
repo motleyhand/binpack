@@ -151,6 +151,113 @@ func codeTables() []struct {
 	}
 }
 
+// TestTheAbandonmentSectionNamesNoReasonTheCounterCannotCarry closes the
+// prose half of binpack_drains_abandoned_total.
+//
+// The table beneath that metric lists the drain's own codes and is compared in
+// both directions. Everything else the counter can carry — every skip code,
+// and the two verdicts that end a drain without one — is described in the
+// prose below it instead of repeated as rows, and prose had only ever been
+// checked forwards: each value binpack produces appears somewhere on the page.
+//
+// That direction cannot see a stale claim. Rename a reason and document the
+// new spelling anywhere, and the paragraph explaining the old one survives,
+// describing a series that will never appear again — in the one document an
+// operator consults when a value shows up on a graph they do not recognise.
+// Drop a verdict from [AbandonmentVerdicts] and the sentence promising it
+// survives the same way, hidden by that word's other appearances elsewhere on
+// the page.
+//
+// So the section is read as a closed claim: every backticked token in it
+// shaped like a label value has to be one the counter can carry. Not every
+// value has to appear here — the section says skip codes can appear and then
+// names only the exceptions, which is the right way to write it — so the
+// forward direction stays page-wide, in the test above.
+func TestTheAbandonmentSectionNamesNoReasonTheCounterCannotCarry(t *testing.T) {
+	section := abandonmentSection(t)
+
+	// Everything the counter can label a series with, from the same three
+	// enumerators its zero series are pre-initialised from.
+	var vocabulary []string
+	vocabulary = append(vocabulary, drain.AbandonCodes()...)
+	vocabulary = append(vocabulary, engine.SkipCodes()...)
+	vocabulary = append(vocabulary, AbandonmentVerdicts()...)
+
+	// The words in this section that are shaped like a code and are not one: a
+	// label's name rather than its value, a Kubernetes field, a noun the prose
+	// happens to set in code font.
+	//
+	// Each is asserted to still be here, so a paragraph that stops using one
+	// fails until it is pruned. An exception list nobody prunes is how a real
+	// code later takes one of these spellings and inherits its exemption.
+	notValues := []string{"reason", "generation"}
+	for _, word := range notValues {
+		if !strings.Contains(section, "`"+word+"`") {
+			t.Errorf("`%s` is listed as a word this section uses that is not a reason "+
+				"value, and the section no longer uses it; remove it from the list, or "+
+				"a reason code spelled that way will be exempt from this check", word)
+		}
+	}
+
+	for _, match := range codeShaped.FindAllStringSubmatch(section, -1) {
+		token := match[1]
+		if slices.Contains(vocabulary, token) || slices.Contains(notValues, token) {
+			continue
+		}
+		t.Errorf("the abandonment section presents `%s` as a reason and no enumerator "+
+			"produces it, so binpack_drains_abandoned_total can carry no such series: "+
+			"either a code was renamed and this paragraph was left behind, or it is a "+
+			"word that needs adding to the list of non-values here", token)
+	}
+}
+
+// codeShaped matches a backticked token written the way a label value is:
+// lower case, words joined by hyphens.
+//
+// Deliberately not every backticked token. This section names metrics,
+// selectors and configuration settings too, and those are spelled with
+// underscores, braces or capitals — so the shape excludes them without a list
+// to maintain.
+var codeShaped = regexp.MustCompile("`([a-z][a-z0-9]*(?:-[a-z0-9]+)*)`")
+
+// nextHeading matches the start of the next Markdown heading, at any level.
+var nextHeading = regexp.MustCompile(`(?m)^#{1,6} `)
+
+// abandonmentSection is the reference's prose about
+// binpack_drains_abandoned_total: its reason table and everything said about
+// the values that are not in it, up to the next heading.
+func abandonmentSection(t *testing.T) string {
+	t.Helper()
+
+	const opening = "`reason` is one of:"
+
+	doc := referenceText(t)
+	start := strings.Index(doc, opening)
+	if start < 0 {
+		t.Fatalf("the metrics reference no longer says %q, so this cannot find the "+
+			"abandonment prose and would check an empty string", opening)
+	}
+
+	section := doc[start:]
+
+	// The next heading at any level, not the next `## `. Cut at the section
+	// level alone, this ran on through `### Pools` and swallowed another
+	// metric's table — so `pool` had to be excused as a word that is not a
+	// reason, when the truth was that it is a different metric's label and
+	// this had no business reading it. An exception list is where an
+	// over-broad reader hides.
+	if end := nextHeading.FindStringIndex(section); end != nil {
+		section = section[:end[0]]
+	}
+	// A floor, because every assertion above iterates what it finds: a section
+	// that shrank to its heading would satisfy them all in silence.
+	if lines := strings.Count(section, "\n"); lines < 20 {
+		t.Fatalf("the abandonment section is %d lines, which is shorter than it has ever "+
+			"been; this test would be checking almost nothing", lines)
+	}
+	return section
+}
+
 // TestTheReferenceDocumentsNoLabelValueBinpackCannotProduce is the direction
 // the metrics reference never had, and it is the one that catches a rename.
 //
