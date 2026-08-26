@@ -2,18 +2,16 @@ package controller
 
 import (
 	"context"
-	"go/ast"
-	"go/parser"
-	"go/token"
+	"maps"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/motleyhand/binpack/internal/mother"
+	"github.com/motleyhand/binpack/internal/vocab"
 )
 
 const referenceDir = "../../docs/reference"
@@ -147,7 +145,7 @@ func TestEveryEventReasonIsDistinct(t *testing.T) {
 // reasonSources is where the Event reason constants are declared. A glob
 // rather than a file, for the reason internal/cli's conventions guard uses
 // one: a split moves the declarations and a named file stops seeing them.
-const reasonSources = "*.go"
+const reasonSources = "."
 
 // TestEveryEventReasonDeclaredIsEnumerated is the direction the guard above
 // cannot give.
@@ -171,76 +169,33 @@ func TestEveryEventReasonDeclaredIsEnumerated(t *testing.T) {
 		enumerated[reason] = true
 	}
 
-	sources, err := filepath.Glob(reasonSources)
-	if err != nil {
-		t.Fatalf("globbing %s: %v", reasonSources, err)
-	}
-
-	fset := token.NewFileSet()
-	var declared int
-	for _, source := range sources {
-		if strings.HasSuffix(source, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, source, nil, 0)
+	// Reasons and actions. An Event carries both and an operator filters on
+	// both, so a check written for one leaves the other unheld — and asked for
+	// every constant instead, this would refuse the package's durations, which
+	// it is right to refuse and wrong to be asked about.
+	declared := map[string]string{}
+	for _, prefix := range []string{"Reason", "Action"} {
+		found, err := vocab.StringConstants(reasonSources, prefix)
 		if err != nil {
-			t.Fatalf("parsing %s: %v", source, err)
+			t.Fatalf("reading this package's %s constants: %v", prefix, err)
 		}
-		var previous []ast.Expr
-		ast.Inspect(file, func(n ast.Node) bool {
-			spec, ok := n.(*ast.ValueSpec)
-			if !ok {
-				return true
-			}
-			// A const spec with no expression repeats the previous one, so a
-			// name declared alone is an alias carrying that value. Skipping
-			// those made an alias invisible: the same value emitted from two
-			// branches, one of them absent from every count this compares.
-			values := spec.Values
-			if len(values) == 0 {
-				values = previous
-			} else {
-				previous = values
-			}
-			if len(spec.Names) != len(values) {
-				return true
-			}
-			for i, name := range spec.Names {
-				// Actions as well as reasons. An Event carries both, an
-				// operator filters on both, and a second action introduced
-				// beside ActionConsolidate would be public, undocumented and
-				// unaudited — the reasons were enumerated and the one action
-				// was written into each check by hand, so nothing discovered
-				// a new one.
-				if !strings.HasPrefix(name.Name, "Reason") && !strings.HasPrefix(name.Name, "Action") {
-					continue
-				}
-				lit, ok := values[i].(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					continue
-				}
-				value, err := strconv.Unquote(lit.Value)
-				if err != nil {
-					continue
-				}
-				declared++
-				if !enumerated[value] {
-					t.Errorf("%s = %q is declared here and the Event vocabulary does not "+
-						"enumerate it; the Events carrying it are written onto nodes, and "+
-						"nothing holds the reference to a vocabulary it is not in",
-						name.Name, value)
-				}
-			}
-			return true
-		})
+		maps.Copy(declared, found)
 	}
 
-	// A glob no file answers returns an empty list and a nil error, so a
-	// package that moves reads as one declaring nothing.
-	if declared != len(eventVocabulary()) {
+	var counted int
+	for name, value := range declared {
+		counted++
+		if !enumerated[value] {
+			t.Errorf("%s = %q is declared here and the Event vocabulary does not enumerate "+
+				"it; the Events carrying it are written onto nodes, and nothing holds the "+
+				"reference to a vocabulary it is not in", name, value)
+		}
+	}
+
+	if counted != len(eventVocabulary()) {
 		t.Errorf("found %d Reason and Action constants and the Event vocabulary holds %d; "+
 			"either the parse has stopped seeing the declarations or the vocabulary holds "+
-			"a value no constant does", declared, len(eventVocabulary()))
+			"a value no constant does", counted, len(eventVocabulary()))
 	}
 }
 

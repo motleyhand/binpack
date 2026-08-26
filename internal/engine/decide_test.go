@@ -1022,6 +1022,19 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 	// pre-initialised as a public label for ever with nothing producing it.
 	//
 	// The fixtures are vocabulary_test.go's, driven rather than described.
+	// The record and [engine.SelectionSkipCodes] have to name the same three.
+	// The package's set is what metrics and the reference read; this one
+	// carries the reasons and the driven check, and a package that quietly
+	// widened its set would otherwise leave both green.
+	for _, code := range engine.SkipCodes() {
+		_, excused := decidedElsewhere[code]
+		if reachable := slices.Contains(engine.SelectionSkipCodes(), code); reachable == excused {
+			t.Errorf("SelectionSkipCodes() %s %q and this record %s it; the two describe "+
+				"one fact and disagree", map[bool]string{true: "includes", false: "omits"}[reachable],
+				code, map[bool]string{true: "excuses", false: "does not excuse"}[excused])
+		}
+	}
+
 	produces := revalidateProduces(t)
 	for code, why := range decidedElsewhere {
 		if !produces[code] {

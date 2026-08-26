@@ -1,13 +1,8 @@
 package metrics
 
 import (
-	"go/ast"
-	"go/parser"
-	"go/token"
 	"os"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"testing"
 
@@ -15,6 +10,7 @@ import (
 
 	"github.com/motleyhand/binpack/internal/drain"
 	"github.com/motleyhand/binpack/internal/engine"
+	"github.com/motleyhand/binpack/internal/vocab"
 )
 
 const reference = "../../docs/reference/metrics.md"
@@ -131,13 +127,12 @@ func codeTables() []struct {
 		partial bool
 	}{
 		{"`code` is one of:", engine.DecisionCodes(), false},
-		// Partial, and for a reason the enumerator cannot express: this series
-		// is fed from a Decision's assessments, so it carries the codes
-		// selection produces. Three of SkipCodes() — gone, uncordoned and
-		// autoscaler-not-live — are Revalidate's, and reach
-		// binpack_drains_abandoned_total instead. A row for one of them would
-		// be wrong; the absence of one is not.
-		{"`code` on `binpack_nodes_skipped` is one of:", engine.SkipCodes(), true},
+		// The codes selection produces, not the whole vocabulary. This series
+		// is fed from a Decision's assessments, so the three codes only
+		// Revalidate reaches can never label it — and marking the table
+		// partial while allowing all sixteen accepted a row for one of them,
+		// which is the same wrong selector the guard beside it refuses.
+		{"`code` on `binpack_nodes_skipped` is one of:", engine.SelectionSkipCodes(), false},
 		// The abandonment table lists the drain's own codes; the skip codes
 		// and the two verdicts reach the counter through revalidation and are
 		// described in the prose beneath it rather than repeated as rows.
@@ -416,63 +411,9 @@ func TestEveryVocabularyConstantIsEnumerated(t *testing.T) {
 func constantsWithPrefix(t *testing.T, dir, prefix string) map[string]string {
 	t.Helper()
 
-	sources, err := filepath.Glob(filepath.Join(dir, "*.go"))
+	out, err := vocab.StringConstants(dir, prefix)
 	if err != nil {
-		t.Fatalf("globbing %s: %v", dir, err)
-	}
-
-	fset := token.NewFileSet()
-	out := map[string]string{}
-	parsed := 0
-	for _, source := range sources {
-		if strings.HasSuffix(source, "_test.go") {
-			continue
-		}
-		file, err := parser.ParseFile(fset, source, nil, 0)
-		if err != nil {
-			t.Fatalf("parsing %s: %v", source, err)
-		}
-		parsed++
-		var previous []ast.Expr
-		ast.Inspect(file, func(n ast.Node) bool {
-			spec, ok := n.(*ast.ValueSpec)
-			if !ok {
-				return true
-			}
-			// A const spec with no expression repeats the previous one, so a
-			// name declared alone is an alias carrying that value. Skipping
-			// those made an alias invisible: the same value emitted from two
-			// branches, one of them absent from every count this compares.
-			values := spec.Values
-			if len(values) == 0 {
-				values = previous
-			} else {
-				previous = values
-			}
-			if len(spec.Names) != len(values) {
-				return true
-			}
-			for i, name := range spec.Names {
-				if !strings.HasPrefix(name.Name, prefix) {
-					continue
-				}
-				lit, ok := values[i].(*ast.BasicLit)
-				if !ok || lit.Kind != token.STRING {
-					continue
-				}
-				if value, err := strconv.Unquote(lit.Value); err == nil {
-					out[name.Name] = value
-				}
-			}
-			return true
-		})
-	}
-
-	// A glob no file answers returns an empty list and a nil error, so a
-	// package that moves reads as one declaring nothing.
-	if parsed == 0 {
-		t.Fatalf("no non-test file matched %s/*.go — the package moved, and every check "+
-			"reading it is now vacuous", dir)
+		t.Fatalf("reading %s's constants: %v", dir, err)
 	}
 	return out
 }

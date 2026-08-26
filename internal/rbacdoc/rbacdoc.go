@@ -187,6 +187,12 @@ func Bindings(template string) ([]Binding, error) {
 		if b.Kind != "RoleBinding" && b.Kind != "ClusterRoleBinding" {
 			continue
 		}
+		if b.Metadata.Name == "" {
+			return nil, fmt.Errorf("the chart declares a %s with no metadata.name; the API "+
+				"server refuses it at create, and nothing downstream reads a binding's own "+
+				"name — it is checked through its roleRef and its subject, both of which "+
+				"stay correct:\n%s", b.Kind, doc)
+		}
 		out = append(out, b)
 	}
 
@@ -694,6 +700,12 @@ func decode(what, manifests string) ([]Role, error) {
 		var role Role
 		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
 			return nil, fmt.Errorf("%s does not parse as YAML: %w\n%s", what, err, doc)
+		}
+		if role.Metadata.Name == "" && (role.Kind == "Role" || role.Kind == "ClusterRole") {
+			return nil, fmt.Errorf("%s declares a %s with no metadata.name; the API server "+
+				"refuses it at create, and every check here keys on the name — an object "+
+				"without one is a distinct identity, an unbound role and a silent "+
+				"install failure all at once:\n%s", what, role.Kind, doc)
 		}
 		if why := malformed(role); why != "" {
 			return nil, fmt.Errorf("%s declares a rule Kubernetes refuses: %s. The API "+
