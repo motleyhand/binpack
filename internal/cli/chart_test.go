@@ -1157,9 +1157,10 @@ func deploymentServiceAccount(t *testing.T, opts ...rbacdoc.Options) string {
 // — which a typed decode answers with a zero value and a map walk answers with
 // a panic or a silently skipped assertion.
 type deployment struct {
-	Kind     string           `json:"kind"`
-	Metadata rbacdoc.Metadata `json:"metadata"`
-	Spec     struct {
+	APIVersion string           `json:"apiVersion"`
+	Kind       string           `json:"kind"`
+	Metadata   rbacdoc.Metadata `json:"metadata"`
+	Spec       struct {
 		Template struct {
 			Spec struct {
 				ServiceAccountName string `json:"serviceAccountName"`
@@ -1288,12 +1289,20 @@ func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 
 	container := renderedDeployment(t, options).Spec.Template.Spec.Containers[0]
 
+	// Which mount holds the file, and only if there is one. Mounts nest, and
+	// the container resolves a path through the most specific of them — one
+	// more rule about what Kubernetes does with a pod spec, and one this file
+	// no longer models. Taking the last match in list order was worse than
+	// either: a nested volume declared before the outer one left this checking
+	// a ConfigMap the process never reads.
 	var volume string
+	var covering int
 	for _, mount := range container.VolumeMounts {
 		at := strings.TrimSuffix(mount.MountPath, "/")
 		if at != path && !strings.HasPrefix(path, at+"/") {
 			continue
 		}
+		covering++
 		if mount.SubPath != "" || mount.SubPathExpr != "" {
 			t.Fatalf("the volumeMount at %s covering %s uses subPath or subPathExpr, "+
 				"which change what that path names and which this test does not model; "+
@@ -1301,6 +1310,12 @@ func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 				"revisiting rather than trusting", at, path)
 		}
 		volume, key = mount.Name, strings.TrimPrefix(path, at+"/")
+	}
+	if covering > 1 {
+		t.Fatalf("%d volumeMounts cover %s and the container resolves it through the "+
+			"most specific of them, which this test does not model; the chart has "+
+			"always had one, so if it now has more, this needs revisiting rather "+
+			"than guessing which", covering, path)
 	}
 	if volume == "" {
 		t.Fatalf("the rendered pod is started with %s=%s and no volumeMount puts a file "+
@@ -1349,6 +1364,15 @@ func renderedDeployment(t *testing.T, opts ...rbacdoc.Options) deployment {
 
 	if len(found) != 1 {
 		t.Fatalf("the chart renders %d Deployments with %v, want one", len(found), options.Set)
+	}
+	// Selected by kind, and then held to a version the API server serves.
+	// `helm template` renders whatever the template says; a Deployment under
+	// apps/v2 renders perfectly and is refused at create, so the install has
+	// every object it needs except the one that runs binpack.
+	if got := found[0].APIVersion; got != "apps/v1" {
+		t.Fatalf("the chart renders its Deployment under apiVersion %q and Kubernetes "+
+			"serves Deployments under apps/v1; the install is refused and no binpack "+
+			"pod is created", got)
 	}
 	return found[0]
 }

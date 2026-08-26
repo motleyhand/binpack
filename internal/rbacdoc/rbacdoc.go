@@ -324,19 +324,27 @@ func fencedYAML(doc string) ([]string, error) {
 
 	lines := strings.Split(doc, "\n")
 	for i := 0; i < len(lines); i++ {
+		labelled := lines[i] == fenceOpen
 		switch {
-		case lines[i] == fenceOpen:
+		case labelled:
 		case looksLikeYAML.MatchString(lines[i]):
 			return nil, fmt.Errorf("a YAML block on line %d opens with %q, and the "+
 				"documentation here writes them as %q. A block spelled any other way "+
 				"is one this reader would not compare with the chart, so the "+
 				"permissions in it would go unchecked", i+1, lines[i], fenceOpen)
+		case strings.HasPrefix(strings.TrimSpace(lines[i]), fenceClose):
+			// An unlabelled fence, which these pages use for log output and
+			// shell. Not read as YAML — and not ignored either, because a
+			// block of rules that lost its language is still copyable
+			// configuration, and skipping it lets the page prescribe a
+			// permission the chart never grants. What it holds is looked at
+			// below rather than assumed from the absence of a label.
 		default:
 			continue
 		}
 
 		body := i + 1
-		for i = body; i < len(lines) && lines[i] != fenceClose; i++ {
+		for i = body; i < len(lines) && !strings.HasPrefix(strings.TrimSpace(lines[i]), fenceClose); i++ {
 			if strings.HasPrefix(lines[i], "---") {
 				return nil, fmt.Errorf("the YAML block opening on line %d holds a document "+
 					"separator on line %d. These blocks are single objects an operator "+
@@ -348,7 +356,17 @@ func fencedYAML(doc string) ([]string, error) {
 			return nil, fmt.Errorf("the YAML block opening on line %d is never closed with "+
 				"%q, so everything after it reads as YAML", body, fenceClose)
 		}
-		out = append(out, strings.Join(lines[body:i], "\n"))
+		block := strings.Join(lines[body:i], "\n")
+		if !labelled {
+			if ruleField.MatchString(block) {
+				return nil, fmt.Errorf("the block opening on line %d carries policy rules "+
+					"and no language, so this reader does not compare it with the chart "+
+					"— while the page still presents it as configuration to copy. Open "+
+					"it with %q", body, fenceOpen)
+			}
+			continue
+		}
+		out = append(out, block)
 	}
 	return out, nil
 }
