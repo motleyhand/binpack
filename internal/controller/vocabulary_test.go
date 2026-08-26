@@ -115,31 +115,54 @@ func TestTheDrainLogLineNamesThePoolWhenOnlyTheIdentifierIsPresent(t *testing.T)
 // reason cannot tell the two apart. Separate because internal/metrics may not
 // import this package.
 func TestEveryEventReasonIsDistinct(t *testing.T) {
-	// The action is checked with them. It is appended to the documentation
-	// loop above and was left out of this one, and an Event whose action is
-	// empty has lost the field that groups every consolidation event together
-	// — the same defect as an empty reason, on the field beside it.
-	reasons := eventVocabulary()
-	if len(reasons) == 0 {
-		t.Fatal("EventReasons() enumerates nothing, so this asserts nothing about it")
+	// Each field on its own. An Event carries a reason and an action, and
+	// Kubernetes stores and filters them separately — so `reason=Consolidate`
+	// and `action=Consolidate` are two selectors rather than one collision,
+	// and merging the vocabularies before deduplicating them would refuse a
+	// legitimate reason for sharing a name with an unrelated action.
+	//
+	// The action is checked at all because it was appended to the
+	// documentation loop above and left out of this one, and an Event whose
+	// action is empty has lost the field that groups every consolidation event
+	// together.
+	for _, vocabulary := range []struct {
+		field  string
+		values []string
+	}{
+		{"reason", EventReasons()},
+		{"action", eventActions()},
+	} {
+		requireDistinct(t, vocabulary.field, vocabulary.values)
+	}
+}
+
+// requireDistinct holds one Event field's vocabulary to being a set of
+// non-empty values.
+func requireDistinct(t *testing.T, field string, values []string) {
+	t.Helper()
+
+	if len(values) == 0 {
+		t.Fatalf("the Event %s vocabulary enumerates nothing, so this asserts nothing "+
+			"about it", field)
 	}
 
 	seen := map[string]bool{}
-	for _, reason := range reasons {
-		// An empty reason is an Event nobody can filter on, and the guard
-		// above would look for `` in the reference — which every Markdown code
-		// fence satisfies. Unlike the metric label values, nothing downstream
-		// refuses this one: an Event carries whatever reason it is given.
-		if reason == "" {
-			t.Error("the Event vocabulary holds the empty string; an Event written with it " +
-				"carries no reason or no action, and `kubectl get events " +
-				"--field-selector reason=` has nothing to match")
+	for _, value := range values {
+		// An empty value is an Event nobody can filter on, and the guard above
+		// would look for `` in the reference — which every Markdown code fence
+		// satisfies. Unlike the metric label values, nothing downstream
+		// refuses this one: an Event carries whatever it is given.
+		if value == "" {
+			t.Errorf("the Event %s vocabulary holds the empty string; an Event written "+
+				"with it carries no %s, and `kubectl get events --field-selector %s=` has "+
+				"nothing to match", field, field, field)
 		}
-		if seen[reason] {
-			t.Errorf("EventReasons() enumerates %q twice, so two constants share it and "+
-				"the events they were meant to distinguish read as one", reason)
+		if seen[value] {
+			t.Errorf("the Event %s vocabulary enumerates %q twice, so two constants share "+
+				"it and the events they were meant to distinguish read as one",
+				field, value)
 		}
-		seen[reason] = true
+		seen[value] = true
 	}
 }
 

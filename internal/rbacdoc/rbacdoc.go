@@ -37,6 +37,10 @@ import (
 // for Kubernetes to resolve, so a pair has to be able to tell the two apart.
 const CoreGroup = "(core)"
 
+// RBACAPIVersion is the group and version Kubernetes serves RBAC objects
+// under, and the only one a chart's roles may declare.
+const RBACAPIVersion = RBACAPIGroup + "/v1"
+
 // RBACAPIGroup is the only API group a roleRef may name. Kubernetes rejects a
 // binding that names another, and the rejection is at install: roleRef is
 // immutable, so there is no upgrade path that repairs it either.
@@ -117,9 +121,15 @@ type Rule struct {
 // stay two different scalars — but it is an expression, not a namespace, so it
 // answers "are these two objects in the same place" and never "where".
 type Role struct {
-	Kind     string   `json:"kind"`
-	Metadata Metadata `json:"metadata"`
-	Rules    []Rule   `json:"rules"`
+	// APIVersion is modelled for roleRef.apiGroup's reason, one level up: a
+	// manifest missing it or misspelling it decodes to the same Kind, the same
+	// name and the same rules, and Kubernetes refuses the object — so the
+	// install has none of its permissions while every comparison here agrees.
+	// Documented fragments carry none by design and are not held to it.
+	APIVersion string   `json:"apiVersion"`
+	Kind       string   `json:"kind"`
+	Metadata   Metadata `json:"metadata"`
+	Rules      []Rule   `json:"rules"`
 
 	// Aggregation is present so that its presence can be refused. A
 	// ClusterRole carrying an aggregationRule does not grant the rules written
@@ -494,11 +504,11 @@ func depthDelta(line string) int {
 
 // fencedYAML matches a fenced YAML block in Markdown, capturing its body.
 //
-// `yml` and any capitalisation of either, because a renderer treats them all
-// as YAML and a page is free to use any: keyed on the exact lowercase `yaml`,
-// a granted snippet written as ```yml was skipped whole while the other blocks
-// kept the non-empty guard satisfied.
-var fencedYAML = regexp.MustCompile("(?is)```ya?ml[ \t]*\n(.*?)```")
+// `yml`, any capitalisation of either, and a tilde fence, because a renderer
+// treats them all as YAML and a page is free to use any. Keyed on one exact
+// spelling, a granted snippet written another way was skipped whole while the
+// remaining blocks kept the non-empty guard satisfied.
+var fencedYAML = regexp.MustCompile("(?is)(?:```|~~~)ya?ml[ \t]*\n(.*?)(?:```|~~~)")
 
 // Documented decodes the role snippets in a Markdown page.
 //
@@ -807,6 +817,14 @@ func decode(what, manifests string) ([]Role, error) {
 		var role Role
 		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
 			return nil, fmt.Errorf("%s does not parse as YAML: %w\n%s", what, err, doc)
+		}
+		if role.Kind == "Role" || role.Kind == "ClusterRole" {
+			if role.APIVersion != RBACAPIVersion {
+				return nil, fmt.Errorf("%s declares a %s with apiVersion %q, and Kubernetes "+
+					"serves RBAC under %q; the API server refuses the object and the "+
+					"install has none of its permissions:\n%s",
+					what, role.Kind, role.APIVersion, RBACAPIVersion, doc)
+			}
 		}
 		if role.Metadata.Name == "" && (role.Kind == "Role" || role.Kind == "ClusterRole") {
 			return nil, fmt.Errorf("%s declares a %s with no metadata.name; the API server "+

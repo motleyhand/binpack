@@ -546,6 +546,26 @@ func ungatedReads() map[string]bool {
 func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 	t.Helper()
 
+	writerNames = map[string]bool{}
+	for _, decl := range source.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok {
+			continue
+		}
+		for _, param := range fn.Type.Params.List {
+			if ident, ok := param.Type.(*ast.Ident); !ok || ident.Name != "Writer" {
+				continue
+			}
+			for _, name := range param.Names {
+				writerNames[name.Name] = true
+			}
+		}
+	}
+	if len(writerNames) == 0 {
+		t.Fatalf("no function in %s takes a Writer, so this cannot recognise a write",
+			executorSource)
+	}
+
 	var found int
 	var walk func(n ast.Node, conditional bool)
 	walk = func(n ast.Node, conditional bool) {
@@ -623,6 +643,10 @@ func children(n ast.Node) []ast.Node {
 	return out
 }
 
+// writerNames are the parameter names the Writer is bound to in executor.go,
+// read from the signatures rather than assumed.
+var writerNames map[string]bool
+
 // writesThroughWriter reports whether a call is one made on a Writer.
 func writesThroughWriter(call *ast.CallExpr) bool {
 	fn, ok := call.Fun.(*ast.SelectorExpr)
@@ -634,9 +658,13 @@ func writesThroughWriter(call *ast.CallExpr) bool {
 	default:
 		return false
 	}
-	// Either `w.Patch(…)` or `w.SubResource("x").Create(…)`.
+	// Either `<writer>.Patch(…)` or `<writer>.SubResource("x").Create(…)`, and
+	// the receiver is found by what it *is* rather than what it is called: the
+	// spelling `w` is this file's convention and not a rule, so a new entry
+	// point taking `writer Writer` slipped past with its conditional write
+	// unexamined.
 	if ident, ok := fn.X.(*ast.Ident); ok {
-		return ident.Name == "w"
+		return writerNames[ident.Name]
 	}
 	inner, ok := fn.X.(*ast.CallExpr)
 	if !ok {

@@ -1389,13 +1389,29 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 		t.Fatal("the chart no longer defines binpack.autoscalerNamespace, and both " +
 			"autoscaler-status objects are checked against it by name")
 	}
-	for _, key := range []string{"discovery", "autoscalerNamespace", ".Values.config"} {
-		if !strings.Contains(body, key) {
-			t.Errorf("binpack.autoscalerNamespace does not read %s: the Role would be "+
-				"created wherever the helper decides and binpack would read the namespace "+
-				"config.discovery.autoscalerNamespace names, which is a 403 on every "+
-				"evaluation", key)
-		}
+	// What it *returns*, as far as reading it can say. Requiring the tokens to
+	// appear anywhere is satisfied by
+	// `{{- $_ := dig "discovery" … -}}kube-system`, which reads the setting,
+	// discards it and returns the default — leaving both objects agreeing with
+	// the helper while the rendered config points binpack elsewhere.
+	//
+	// So: one action, and no literal text beside it, and the dig inside it.
+	// Structural rather than evaluated, because evaluating means rendering the
+	// chart and `make check` may have no helm — the chart CI job renders, and
+	// this holds the shape that makes the render right.
+	if literal := strings.TrimSpace(helmAction.ReplaceAllString(body, "")); literal != "" {
+		t.Errorf("binpack.autoscalerNamespace emits the literal %q beside its expression; "+
+			"whatever it reads, that is what it returns", literal)
+	}
+	if actions := helmAction.FindAllString(body, -1); len(actions) != 1 {
+		t.Errorf("binpack.autoscalerNamespace is %d actions; with more than one, which "+
+			"of them decides the namespace is a question this cannot answer and the two "+
+			"RBAC objects are held to the helper by name alone", len(actions))
+	} else if !strings.Contains(actions[0], `dig "discovery" "autoscalerNamespace"`) {
+		t.Errorf("binpack.autoscalerNamespace does not derive its value from "+
+			"config.discovery.autoscalerNamespace (%s): the Role would be created where "+
+			"the helper decides and binpack would read where the setting says, which is a "+
+			"403 on every evaluation", strings.TrimSpace(actions[0]))
 	}
 
 	// And the ServiceAccount the chart creates is created only when the
@@ -1417,6 +1433,9 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 			"external account receives a chart-managed one too", kinds)
 	}
 }
+
+// helmAction matches one Go template action, as rbacdoc's does.
+var helmAction = regexp.MustCompile(`\{\{-?.*?-?\}\}`)
 
 // helperBody is the body of one named Helm template.
 func helperBody(helpers, name string) (string, bool) {
