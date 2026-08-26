@@ -354,11 +354,19 @@ func requireBoundTo(t *testing.T, options rbacdoc.Options, account string) []str
 				"it resolves to nothing", binding.Kind, binding.Metadata.Name,
 				binding.RoleRef.Kind, binding.Kind)
 		case !slices.ContainsFunc(roles, func(role rbacdoc.Role) bool {
+			// A RoleBinding resolves its Role in its own namespace, so a
+			// same-named Role somewhere else is not the one it names. Matched
+			// on kind and name alone, a binding moved to another namespace
+			// found the Role it had left behind and read as bound.
+			if binding.Kind == "RoleBinding" && role.Metadata.Namespace != binding.Metadata.Namespace {
+				return false
+			}
 			return role.Kind == binding.RoleRef.Kind && role.Metadata.Name == binding.RoleRef.Name
 		}):
-			t.Errorf("the %s %s names the %s %q and this render creates no such role, so "+
-				"it grants nothing", binding.Kind, binding.Metadata.Name,
-				binding.RoleRef.Kind, binding.RoleRef.Name)
+			t.Errorf("the %s %s in namespace %q names the %s %q and this render creates "+
+				"no such role there, so it grants nothing", binding.Kind,
+				binding.Metadata.Name, binding.Metadata.Namespace, binding.RoleRef.Kind,
+				binding.RoleRef.Name)
 		}
 
 		subject := binding.Subjects[0]

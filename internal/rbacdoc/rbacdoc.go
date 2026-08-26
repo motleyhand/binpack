@@ -407,6 +407,10 @@ func documented(body string) (Role, bool, error) {
 	// rule rather than an illustration, and only there is it reported.
 	rules := kindOfBlock(body) != "" || ruleField.MatchString(body)
 
+	// Written to be applied as it stands, rather than assembled into a role by
+	// the reader of the page.
+	manifest := role.APIVersion != "" && role.Kind != ""
+
 	if nothing := err != nil || len(role.Rules) == 0; nothing {
 		// Nothing came out. Whether that is a defect depends on what the block
 		// was: in a rule list it is this reader dropping a rule and is
@@ -426,16 +430,6 @@ func documented(body string) (Role, bool, error) {
 		}
 		return Role{}, false, fmt.Errorf("a documented block is written as policy rules "+
 			"and decoded to none, so this reader would drop it:\n%s", body)
-	}
-
-	// The same shape check the chart's rules get. A malformed rule contributes
-	// no grant, so both directions of the comparison stay green — while an
-	// operator assembling these snippets into a Role has the whole object
-	// refused, which is the failure the page exists to prevent.
-	if why := malformed(role); why != "" {
-		return Role{}, false, fmt.Errorf("a documented block declares a rule Kubernetes "+
-			"refuses: %s. A role written from this page would be rejected whole:\n%s",
-			why, body)
 	}
 
 	// And the refusal [decode] makes of the chart's own manifests, for the
@@ -479,6 +473,11 @@ func documented(body string) (Role, bool, error) {
 	// tells them to apply is namespaced — so binpack would hold none of its
 	// cluster-wide node and pod access, and the page that promised it would
 	// read as correct.
+	// Which object this is, before anything is judged about its rules. What
+	// Kubernetes permits in a rule depends on the kind holding it —
+	// nonResourceURLs are a ClusterRole's alone — and a fragment carries its
+	// kind in a comment rather than a field, so a shape check run before this
+	// was reading role.Kind as empty and skipping the half that depends on it.
 	ownKind, ownName := kindOf(body)
 	if ownKind != "" && role.Kind != "" && ownKind != role.Kind {
 		return Role{}, false, fmt.Errorf("a documented block is headed %s and declares "+
@@ -492,9 +491,34 @@ func documented(body string) (Role, bool, error) {
 	if role.Kind == "" {
 		role.Kind = ownKind
 	}
-	if role.Metadata.Name == "" {
+
+	// A manifest names itself. The header is prose, so substituting it into a
+	// block that declares apiVersion and kind lets a manifest with no
+	// metadata.name satisfy every grant and identity check here while the API
+	// server refuses the object whole — the operator reads a section about
+	// permissions and receives none of them. Only a fragment, which has no
+	// metadata to carry a name, takes one from its header.
+	switch {
+	case role.Metadata.Name != "":
+	case manifest:
+		return Role{}, false, fmt.Errorf("a documented block declares apiVersion and "+
+			"kind and no metadata.name, so it is a manifest the API server refuses at "+
+			"create; an operator applying it holds none of these permissions:\n%s", body)
+	default:
 		role.Metadata.Name = ownName
 	}
+
+	// The same shape check the chart's rules get, now that the kind
+	// deciding half of it is known. A malformed rule contributes
+	// no grant, so both directions of the comparison stay green — while an
+	// operator assembling these snippets into a Role has the whole object
+	// refused, which is the failure the page exists to prevent.
+	if why := malformed(role); why != "" {
+		return Role{}, false, fmt.Errorf("a documented block declares a rule Kubernetes "+
+			"refuses: %s. A role written from this page would be rejected whole:\n%s",
+			why, body)
+	}
+
 	return role, true, nil
 }
 

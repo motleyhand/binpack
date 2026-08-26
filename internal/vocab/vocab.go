@@ -31,6 +31,7 @@ package vocab
 import (
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/constant"
 	"go/importer"
 	"go/parser"
@@ -57,11 +58,13 @@ import (
 func StringConstants(dir, prefix string) (map[string]string, error) {
 	fset := token.NewFileSet()
 
-	// Globbed and parsed one file at a time rather than with parser.ParseDir,
-	// which is deprecated for a reason that would matter here: it ignores
-	// build tags, so a file the compiler excludes would still be read. No file
-	// in this module carries one, and this is the shape that does not have to
-	// be revisited if one ever does.
+	// Which files are in the package is go/build's question, not this one's.
+	// parser.ParseDir is deprecated for ignoring build constraints and a glob
+	// ignores them too: `codes_windows.go`, or a file behind `//go:build
+	// windows`, is not part of the binary binpack ships here, and reading its
+	// constants puts values in a vocabulary that cannot appear. MatchFile
+	// answers for the same context the compiler uses, including the filename
+	// suffixes that are constraints without saying so.
 	sources, err := filepath.Glob(filepath.Join(dir, "*.go"))
 	if err != nil {
 		return nil, fmt.Errorf("globbing %s: %w", dir, err)
@@ -72,6 +75,13 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 		if strings.HasSuffix(source, "_test.go") {
 			continue
 		}
+		switch built, err := build.Default.MatchFile(filepath.Split(source)); {
+		case err != nil:
+			return nil, fmt.Errorf("deciding whether %s is built: %w", source, err)
+		case !built:
+			continue
+		}
+
 		file, err := parser.ParseFile(fset, source, nil, 0)
 		if err != nil {
 			return nil, fmt.Errorf("parsing %s: %w", source, err)
