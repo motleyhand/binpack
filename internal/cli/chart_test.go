@@ -638,3 +638,189 @@ func anchoredIn(t *testing.T, grants map[string]map[string]bool, suffix string, 
 		}
 	}
 }
+
+// TestEveryRoleTheChartRendersIsBoundToItself is the step between granting a
+// permission and holding it.
+//
+// A Role grants nothing until a binding names it, and a binding naming a role
+// that does not exist installs cleanly — the API server does not resolve
+// roleRef at admission, so the failure is a 403 at the first request rather
+// than a rejected manifest. Every other assertion in this file is about what
+// the Roles grant, and all of them stay true when a binding points somewhere
+// else: the grant is still written, and nothing reaches it.
+//
+// Both halves of roleRef. The name is the one that drifts; the kind is the one
+// that is silently wrong, since a RoleBinding may reference either a Role or a
+// ClusterRole and `kind: ClusterRole` with a Role's name resolves to nothing.
+func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+	roles, err := rbacdoc.Roles(string(chart))
+	if err != nil {
+		t.Fatalf("reading the chart's rules: %v", err)
+	}
+	bindings, err := rbacdoc.Bindings(string(chart))
+	if err != nil {
+		t.Fatalf("reading the chart's bindings: %v", err)
+	}
+	if len(bindings) != len(roles) {
+		t.Fatalf("the chart renders %d roles and %d bindings; every role it creates has to "+
+			"be bound or it grants nothing, and every binding has to name one",
+			len(roles), len(bindings))
+	}
+
+	bound := map[string]bool{}
+	for _, b := range bindings {
+		bound[b.RoleRef.Kind+"/"+b.RoleRef.Name] = true
+
+		// A RoleBinding is only effective in its own namespace, so one in a
+		// different namespace from the Role it names binds nothing.
+		if b.Kind == "RoleBinding" {
+			for _, role := range roles {
+				if role.Metadata.Name == b.RoleRef.Name &&
+					role.Metadata.Namespace != b.Metadata.Namespace {
+					t.Errorf("the RoleBinding %s is created in %s and the Role it names is "+
+						"created in %s; a RoleBinding grants nothing outside its own "+
+						"namespace", b.Metadata.Name, b.Metadata.Namespace,
+						role.Metadata.Namespace)
+				}
+			}
+		}
+	}
+
+	for _, role := range roles {
+		if !bound[role.Kind+"/"+role.Metadata.Name] {
+			t.Errorf("the chart renders %s %s and no binding names it as roleRef; every "+
+				"rule in it is granted to nobody, and the install comes up clean",
+				role.Kind, role.Metadata.Name)
+		}
+	}
+}
+
+// TestTheLeaderElectionRoleIsWhereTheLeaseIsTaken is the leader-election half
+// of the promise TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads
+// makes for the autoscaler's status.
+//
+// The two namespaced Roles are anchored to what each grants, and that says
+// nothing about where either is created. binpack takes its Lease in the
+// namespace the deployment names with --leader-election-namespace; move the
+// Role and its binding anywhere else and both stay nonempty, disjoint and
+// correctly anchored while the process cannot acquire leadership and never
+// starts reconciling.
+//
+// The namespaces are Helm expressions, so this compares expressions rather
+// than namespaces: rbacdoc renders each action to a scalar derived from its own
+// text, which answers "are these two the same expression" and never "which
+// namespace is it". That is the question here — the flag and the Role have to
+// move together, whatever they move to.
+func TestTheLeaderElectionRoleIsWhereTheLeaseIsTaken(t *testing.T) {
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+	roles, err := rbacdoc.Roles(string(chart))
+	if err != nil {
+		t.Fatalf("reading the chart's rules: %v", err)
+	}
+
+	elections := rbacdoc.OfIdentity(roles, "Role-leader-election")
+	if len(elections) != 1 {
+		t.Fatalf("found %d leader-election Roles, want one; this asserts nothing without it",
+			len(elections))
+	}
+
+	deployment, err := os.ReadFile("../../charts/binpack/templates/deployment.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's deployment: %v", err)
+	}
+	flag := leaderElectionNamespaceFlag(t, string(deployment))
+
+	if got := elections[0].Metadata.Namespace; got != flag {
+		t.Errorf("the leader-election Role is created in %s and the deployment takes its "+
+			"Lease in %s; binpack would hold no permission where it elects, and a replica "+
+			"could never acquire leadership", got, flag)
+	}
+
+	// And the two namespaced Roles must not be in the same place, or the
+	// anchoring above is describing a distinction the chart no longer draws.
+	status := rbacdoc.OfIdentity(roles, "Role-autoscaler-status")
+	if len(status) == 1 && status[0].Metadata.Namespace == elections[0].Metadata.Namespace {
+		t.Errorf("both namespaced Roles are created in %s; the autoscaler publishes into "+
+			"the namespace it runs in and binpack elects in its own, so a chart that puts "+
+			"them together is wrong about one of them", elections[0].Metadata.Namespace)
+	}
+}
+
+// leaderElectionNamespaceFlag is the namespace expression the deployment passes
+// to --leader-election-namespace, rendered the way rbacdoc renders one.
+func leaderElectionNamespaceFlag(t *testing.T, deployment string) string {
+	t.Helper()
+
+	const flag = "--leader-election-namespace="
+	for line := range strings.SplitSeq(deployment, "\n") {
+		_, value, found := strings.Cut(line, flag)
+		if !found {
+			continue
+		}
+		rendered, err := rbacdoc.HelmToYAML(strings.TrimSpace(value))
+		if err != nil {
+			t.Fatalf("reading the leader-election namespace flag: %v", err)
+		}
+		return rendered
+	}
+
+	t.Fatalf("the deployment no longer passes %s, so this cannot say where the Lease is "+
+		"taken; if the flag has gone, so has the reason for the leader-election Role", flag)
+	return ""
+}
+
+// TestTheLeaderElectionGrantsGoWhenLeaderElectionDoes holds the offer
+// docs/reference/rbac.md makes: that Leases are only for leader election and
+// may be omitted by anyone running a single replica.
+//
+// rbacdoc.Roles is deliberately the union of every branch, so a guard removed
+// from around these rules is invisible to every assertion about what they
+// grant — they are still granted, just to everybody. An operator who set
+// leaderElection.enabled=false to avoid the permission would hold it anyway,
+// and the page would be wrong about a permission rather than about a default.
+func TestTheLeaderElectionGrantsGoWhenLeaderElectionDoes(t *testing.T) {
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+
+	off, err := rbacdoc.Without(string(chart), ".Values.leaderElection.enabled")
+	if err != nil {
+		t.Fatalf("reading the chart without leader election: %v", err)
+	}
+	without, err := rbacdoc.Roles(off)
+	if err != nil {
+		t.Fatalf("reading the rules an install without leader election renders: %v", err)
+	}
+
+	granted := rbacdoc.Grants(without)
+	for pair := range granted {
+		if strings.HasPrefix(pair, "coordination.k8s.io/leases: ") {
+			t.Errorf("an install with leaderElection.enabled=false is still granted %q; "+
+				"the reference tells an operator they may omit Leases entirely, and the "+
+				"chart no longer lets them", pair)
+		}
+	}
+	if len(rbacdoc.OfIdentity(without, "Role-leader-election")) != 0 {
+		t.Error("an install with leaderElection.enabled=false still renders the " +
+			"leader-election Role, so the guard no longer covers the whole object")
+	}
+
+	// And the rules must come back when it is on, or this passes by the guard
+	// having swallowed the wrong block.
+	on, err := rbacdoc.Roles(string(chart))
+	if err != nil {
+		t.Fatalf("reading the chart's rules: %v", err)
+	}
+	if len(rbacdoc.Grants(on)) <= len(granted) {
+		t.Errorf("turning leader election off removed nothing (%d pairs either way), so "+
+			"this test is not observing the guard it names", len(granted))
+	}
+}

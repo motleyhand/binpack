@@ -69,20 +69,75 @@ type Rule struct {
 // Roles into two different namespaces — one where the cluster-autoscaler
 // publishes its status, one where binpack itself runs — so a rule moved from
 // either to the other is granted somewhere binpack is not looking, and
-// [Grants] cannot see the difference. The namespace itself cannot be compared:
-// the chart writes both as Helm expressions and [HelmToYAML] renders them to
-// the same placeholder. The name survives, because what distinguishes the two
-// is a literal suffix on a templated prefix.
+// [Grants] cannot see the difference. The name is what [Identity] matches on,
+// since the distinguishing part of it is a literal suffix on a templated
+// prefix. The namespace is comparable too — [HelmToYAML] derives each
+// placeholder from the expression it replaces, so two different expressions
+// stay two different scalars — but it is an expression, not a namespace, so it
+// answers "are these two objects in the same place" and never "where".
 type Role struct {
 	Kind     string   `json:"kind"`
 	Metadata Metadata `json:"metadata"`
 	Rules    []Rule   `json:"rules"`
+
+	// Aggregation is present so that its presence can be refused. A
+	// ClusterRole carrying an aggregationRule does not grant the rules written
+	// in it: Kubernetes' aggregation controller owns that field and replaces
+	// it with the union of every ClusterRole matching the selectors, so what
+	// is written there is overwritten and what is granted is decided by labels
+	// on objects this package never reads. Every comparison here would go on
+	// inspecting rules the cluster ignores.
+	Aggregation *struct{} `json:"aggregationRule"`
 }
 
 // Metadata is the identifying half of a role, which for these documents means
 // the name alone: the namespace is a Helm expression by the time this reads it.
 type Metadata struct {
-	Name string `json:"name"`
+	Name      string `json:"name"`
+	Namespace string `json:"namespace"`
+}
+
+// Binding is a RoleBinding or ClusterRoleBinding, as much of one as is needed
+// to say which role it makes effective.
+//
+// A Role grants nothing until something binds it, and a binding naming a role
+// that does not exist installs cleanly: the API server does not resolve
+// roleRef at admission. So the autoscaler-status RoleBinding pointed at the
+// leader-election Role's name is an install that comes up, holds its lease,
+// and 403s on every ConfigMap read — with every assertion about what the Roles
+// grant still true, because they do grant it and nothing reaches it.
+type Binding struct {
+	Kind     string   `json:"kind"`
+	Metadata Metadata `json:"metadata"`
+	RoleRef  struct {
+		Kind string `json:"kind"`
+		Name string `json:"name"`
+	} `json:"roleRef"`
+}
+
+// Bindings decodes every binding a chart template declares.
+func Bindings(template string) ([]Binding, error) {
+	yml, err := HelmToYAML(template)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []Binding
+	for _, doc := range documentSeparator.Split(yml, -1) {
+		var b Binding
+		if err := yaml.Unmarshal([]byte(doc), &b); err != nil {
+			return nil, fmt.Errorf("the chart's RBAC does not parse as YAML: %w\n%s", err, doc)
+		}
+		if b.Kind != "RoleBinding" && b.Kind != "ClusterRoleBinding" {
+			continue
+		}
+		out = append(out, b)
+	}
+
+	if len(out) == 0 {
+		return nil, fmt.Errorf("the chart declares no bindings at all")
+	}
+	return out, nil
 }
 
 // Roles decodes every role a chart template declares, as the union of its
@@ -452,6 +507,12 @@ func decode(what, manifests string) ([]Role, error) {
 		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
 			return nil, fmt.Errorf("%s does not parse as YAML: %w\n%s", what, err, doc)
 		}
+		if role.Aggregation != nil {
+			return nil, fmt.Errorf("%s declares an aggregationRule, so Kubernetes decides "+
+				"its rules from labels on other ClusterRoles and the rules written in it "+
+				"are overwritten — every comparison here would be against a document the "+
+				"cluster ignores:\n%s", what, doc)
+		}
 		if role.Kind != "Role" && role.Kind != "ClusterRole" && len(role.Rules) == 0 {
 			continue
 		}
@@ -491,8 +552,6 @@ var helmControlKeywords = []string{"if", "else", "end", "range", "with", "define
 // it — so a template that outgrows this fails the test instead of quietly
 // shrinking the set it is compared against.
 func HelmToYAML(template string) (string, error) {
-	const placeholder = "binpack-placeholder"
-
 	var out []string
 	for i, line := range strings.Split(template, "\n") {
 		actions := helmAction.FindAllString(line, -1)
@@ -511,9 +570,34 @@ func HelmToYAML(template string) (string, error) {
 			continue
 		}
 
-		out = append(out, helmAction.ReplaceAllString(line, placeholder))
+		out = append(out, helmAction.ReplaceAllStringFunc(line, placeholder))
 	}
 	return strings.Join(out, "\n"), nil
+}
+
+// nonAlphanumeric is everything a placeholder drops.
+var nonAlphanumeric = regexp.MustCompile(`[^a-z0-9]+`)
+
+// placeholder is the scalar one Helm action becomes.
+//
+// Derived from the action's own text rather than constant, so that two
+// different expressions become two different values. A constant made every
+// templated field equal to every other, which is why this package twice
+// recorded that a namespace "cannot be compared" — both the chart's namespaces
+// are actions, and both rendered to the same string. They are not the same
+// expression, and an install puts the two Roles in two different namespaces on
+// the strength of that difference.
+//
+// The result has to be a legal YAML scalar and a plausible name, so it is the
+// action's alphanumerics with a fixed prefix. Two actions differing only in
+// punctuation collide, which is a smaller lie than every action colliding.
+func placeholder(action string) string {
+	body := strings.TrimSpace(strings.Trim(strings.Trim(action, "{}"), "-"))
+	slug := nonAlphanumeric.ReplaceAllString(strings.ToLower(body), "")
+	if slug == "" {
+		slug = "empty"
+	}
+	return "binpack-placeholder-" + slug
 }
 
 // controlAction returns the first action that structures the template, or "".
