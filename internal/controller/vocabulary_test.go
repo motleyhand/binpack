@@ -34,7 +34,7 @@ const referenceDir = "../../docs/reference"
 func TestEveryEventReasonIsDocumented(t *testing.T) {
 	reference := referenceCorpus(t)
 
-	for _, name := range append(EventReasons(), ActionConsolidate) {
+	for _, name := range eventVocabulary() {
 		if !strings.Contains(reference, "`"+name+"`") {
 			t.Errorf("the Event %q is written onto nodes and no reference page names it: "+
 				"an operator filtering events has nowhere to look the set up", name)
@@ -120,7 +120,7 @@ func TestEveryEventReasonIsDistinct(t *testing.T) {
 	// loop above and was left out of this one, and an Event whose action is
 	// empty has lost the field that groups every consolidation event together
 	// — the same defect as an empty reason, on the field beside it.
-	reasons := append(EventReasons(), ActionConsolidate)
+	reasons := eventVocabulary()
 	if len(reasons) == 0 {
 		t.Fatal("EventReasons() enumerates nothing, so this asserts nothing about it")
 	}
@@ -167,7 +167,7 @@ const reasonSources = "*.go"
 // to catch.
 func TestEveryEventReasonDeclaredIsEnumerated(t *testing.T) {
 	enumerated := map[string]bool{}
-	for _, reason := range EventReasons() {
+	for _, reason := range eventVocabulary() {
 		enumerated[reason] = true
 	}
 
@@ -186,16 +186,36 @@ func TestEveryEventReasonDeclaredIsEnumerated(t *testing.T) {
 		if err != nil {
 			t.Fatalf("parsing %s: %v", source, err)
 		}
+		var previous []ast.Expr
 		ast.Inspect(file, func(n ast.Node) bool {
 			spec, ok := n.(*ast.ValueSpec)
-			if !ok || len(spec.Names) != len(spec.Values) {
+			if !ok {
+				return true
+			}
+			// A const spec with no expression repeats the previous one, so a
+			// name declared alone is an alias carrying that value. Skipping
+			// those made an alias invisible: the same value emitted from two
+			// branches, one of them absent from every count this compares.
+			values := spec.Values
+			if len(values) == 0 {
+				values = previous
+			} else {
+				previous = values
+			}
+			if len(spec.Names) != len(values) {
 				return true
 			}
 			for i, name := range spec.Names {
-				if !strings.HasPrefix(name.Name, "Reason") {
+				// Actions as well as reasons. An Event carries both, an
+				// operator filters on both, and a second action introduced
+				// beside ActionConsolidate would be public, undocumented and
+				// unaudited — the reasons were enumerated and the one action
+				// was written into each check by hand, so nothing discovered
+				// a new one.
+				if !strings.HasPrefix(name.Name, "Reason") && !strings.HasPrefix(name.Name, "Action") {
 					continue
 				}
-				lit, ok := spec.Values[i].(*ast.BasicLit)
+				lit, ok := values[i].(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING {
 					continue
 				}
@@ -205,9 +225,10 @@ func TestEveryEventReasonDeclaredIsEnumerated(t *testing.T) {
 				}
 				declared++
 				if !enumerated[value] {
-					t.Errorf("%s = %q is declared here and EventReasons() does not enumerate "+
-						"it; the Events carrying it are written onto nodes, and nothing "+
-						"holds the reference to a vocabulary it is not in", name.Name, value)
+					t.Errorf("%s = %q is declared here and the Event vocabulary does not "+
+						"enumerate it; the Events carrying it are written onto nodes, and "+
+						"nothing holds the reference to a vocabulary it is not in",
+						name.Name, value)
 				}
 			}
 			return true
@@ -216,10 +237,10 @@ func TestEveryEventReasonDeclaredIsEnumerated(t *testing.T) {
 
 	// A glob no file answers returns an empty list and a nil error, so a
 	// package that moves reads as one declaring nothing.
-	if declared != len(EventReasons()) {
-		t.Errorf("found %d Reason constants and EventReasons() holds %d; either the parse "+
-			"has stopped seeing the declarations or the enumerator holds a value no "+
-			"constant does", declared, len(EventReasons()))
+	if declared != len(eventVocabulary()) {
+		t.Errorf("found %d Reason and Action constants and the Event vocabulary holds %d; "+
+			"either the parse has stopped seeing the declarations or the vocabulary holds "+
+			"a value no constant does", declared, len(eventVocabulary()))
 	}
 }
 
@@ -292,4 +313,23 @@ func TestTheEventReasonTableIsExactlyTheVocabulary(t *testing.T) {
 				"nothing", reasonTablePage, name, name)
 		}
 	}
+}
+
+// eventVocabulary is every value an Event binpack writes can carry in the two
+// fields an operator filters on.
+//
+// Reasons and actions together, because they are one vocabulary from outside:
+// `kubectl get events --field-selector reason=…,action=…` reads both, and a
+// check written for one of them leaves the other unheld. EventReasons() is the
+// published enumerator of the first half; the second was one constant written
+// into each check by hand, so a second action would have been public,
+// undocumented and unaudited.
+func eventVocabulary() []string {
+	return append(EventReasons(), eventActions()...)
+}
+
+// eventActions is every action binpack writes. One today, enumerated all the
+// same, for the reason [EventReasons] is enumerated.
+func eventActions() []string {
+	return []string{ActionConsolidate}
 }

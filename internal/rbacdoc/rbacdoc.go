@@ -271,16 +271,19 @@ func GuardsAround(template, guard string) ([]string, error) {
 		// is empty, or a `range` over nothing, suppresses everything inside it
 		// exactly as a false condition does. They belong on the stack for both
 		// reasons.
-		if opened, ok := openedBlock(line); ok {
-			if opened == guard {
-				if found {
-					return nil, fmt.Errorf("%s guards more than one block (line %d); this "+
-						"reads the first, and every other caller here removes or reads the "+
-						"first too — give the second block its own value", guard, i+1)
+		if opened := openedBlocks(line); len(opened) > 0 {
+			for _, block := range opened {
+				if block == guard {
+					if found {
+						return nil, fmt.Errorf("%s guards more than one block (line %d); "+
+							"this reads the first, and every other caller here removes or "+
+							"reads the first too — give the second block its own value",
+							guard, i+1)
+					}
+					found, enclosing = true, slices.Clone(stack)
 				}
-				found, enclosing = true, slices.Clone(stack)
+				stack = append(stack, block)
 			}
-			stack = append(stack, opened)
 			continue
 		}
 		if delta := depthDelta(line); delta < 0 {
@@ -298,25 +301,54 @@ func GuardsAround(template, guard string) ([]string, error) {
 	return enclosing, nil
 }
 
-// openedBlock names the block a line opens, and reports whether it opens one.
+// GuardsWithin is every block-opening construct inside one guard's block.
+//
+// [GuardsAround] answers what else has to be true for a feature's rules to
+// render; this answers what else can stop them rendering once it is. They are
+// different questions and the second is the one a nesting *inside* the block
+// belongs to: `{{- if .Values.rbac.allowDraining }}{{- with … }}` on one line
+// leaves the feature enclosed by exactly what it should be while everything it
+// guards sits inside a construct that can suppress it — and a `with` over an
+// empty value suppresses its contents exactly as a false condition does.
+func GuardsWithin(template, guard string) ([]string, error) {
+	body, _, err := section(template, guard)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+	for _, line := range strings.Split(body, "\n") {
+		out = append(out, openedBlocks(line)...)
+	}
+	return out, nil
+}
+
+// openedBlocks names every block a line opens, in order.
+//
+// Every one, because depthDelta counts every one: returning after the first
+// pushed less than it popped, so `{{- if A }}{{- with B }}` on one line left
+// the stack a construct short and the nesting read from it was not the
+// template's. Two actions on one line is unusual and legal, and a reader that
+// is wrong about the unusual case is wrong exactly where nobody is looking.
 //
 // A conditional is named by its condition, so a caller states the guards it
 // expects in the template's own words. Everything else is named by its keyword
 // as well, because those are not guards and should not be mistaken for one:
 // an expectation listing `.Values.rbac.create` does not match `with
 // .Values.rbac`, which is the point.
-func openedBlock(line string) (string, bool) {
+func openedBlocks(line string) []string {
+	var out []string
 	for _, action := range helmAction.FindAllString(line, -1) {
 		body := strings.TrimSpace(strings.Trim(strings.Trim(action, "{}"), "-"))
 		keyword, rest, _ := strings.Cut(body, " ")
 		switch keyword {
 		case "if":
-			return strings.TrimSpace(rest), true
+			out = append(out, strings.TrimSpace(rest))
 		case "range", "with", "define", "block":
-			return strings.TrimSpace(keyword + " " + rest), true
+			out = append(out, strings.TrimSpace(keyword+" "+rest))
 		}
 	}
-	return "", false
+	return out
 }
 
 // section finds one guarded block, returning its body and the template with
@@ -663,6 +695,12 @@ func decode(what, manifests string) ([]Role, error) {
 		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
 			return nil, fmt.Errorf("%s does not parse as YAML: %w\n%s", what, err, doc)
 		}
+		if why := malformed(role); why != "" {
+			return nil, fmt.Errorf("%s declares a rule Kubernetes refuses: %s. The API "+
+				"server rejects the whole role, so the install has none of its "+
+				"permissions — and a rule that grants nothing contributes no pair here, "+
+				"which every comparison reads as agreement:\n%s", what, why, doc)
+		}
 		if role.Aggregation != nil {
 			return nil, fmt.Errorf("%s declares an aggregationRule, so Kubernetes decides "+
 				"its rules from labels on other ClusterRoles and the rules written in it "+
@@ -679,6 +717,36 @@ func decode(what, manifests string) ([]Role, error) {
 		return nil, fmt.Errorf("%s declares no rules at all", what)
 	}
 	return out, nil
+}
+
+// malformed describes the first rule of a role that Kubernetes would refuse,
+// or "".
+//
+// Validated because the failure is silent in both directions at once: such a
+// rule decodes without error and flattens to no grant, so every comparison,
+// count and surplus check reads it as nothing to say — while the API server
+// refuses the entire Role or ClusterRole and the install comes up with none of
+// its permissions.
+//
+// The two shapes upstream allows are a resource rule, which names apiGroups
+// and resources, and a non-resource rule, which names URLs and neither of the
+// other two. Both need verbs; a rule with no verb authorises nothing it names.
+func malformed(role Role) string {
+	for i, rule := range role.Rules {
+		switch {
+		case len(rule.Verbs) == 0:
+			return fmt.Sprintf("rule %d names no verbs", i+1)
+		case len(rule.NonResourceURLs) > 0:
+			if len(rule.Resources) > 0 || len(rule.APIGroups) > 0 {
+				return fmt.Sprintf("rule %d mixes nonResourceURLs with resources", i+1)
+			}
+		case len(rule.Resources) == 0:
+			return fmt.Sprintf("rule %d names no resources and no nonResourceURLs", i+1)
+		case len(rule.APIGroups) == 0:
+			return fmt.Sprintf("rule %d names resources and no apiGroups", i+1)
+		}
+	}
+	return ""
 }
 
 // helmAction matches one Go template action — the {{ ... }} a chart is written

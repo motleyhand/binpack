@@ -18,6 +18,7 @@
 package metrics
 
 import (
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -234,6 +235,18 @@ func init() {
 // spelled twice, the table could document a series the counter can never
 // create, which is the failure the reverse check exists to catch.
 var abandonmentVerdicts = []string{engine.VerdictInfeasible, engine.VerdictBlocked}
+
+// AbandonmentVerdicts is that set, for the one test that can check it against
+// what the executor actually produces.
+//
+// This list is both the source of the pre-initialised zero series and the
+// reference guard's allowed set, which is one source of truth and also one
+// place to be wrong: a verdict added here and to the table satisfies the
+// zero-series check, the reverse-documentation check and the uniqueness check
+// at once, and nothing here can tell that no failed step ever carries it. The
+// package that decides which verdicts end a drain is internal/executor, and
+// its test drives that decision against this.
+func AbandonmentVerdicts() []string { return slices.Clone(abandonmentVerdicts) }
 
 // DrainStarted records a node being marked and cordoned.
 func DrainStarted() { drainsStarted.Inc() }

@@ -1077,12 +1077,18 @@ func TestEachFeatureGuardStandsOnItsOwn(t *testing.T) {
 	}
 
 	for _, feature := range []struct {
-		guard  string
-		within []string
+		guard    string
+		within   []string
+		contains []string
 	}{
-		{".Values.rbac.create", nil},
-		{".Values.rbac.allowDraining", []string{".Values.rbac.create"}},
-		{".Values.leaderElection.enabled", []string{".Values.rbac.create"}},
+		// rbac.create holds the whole file, so the two features are inside it
+		// by design. They hold rules and nothing else: a construct inside one
+		// of them can suppress what it guards, which is the same harm as a
+		// guard around it and is not visible from outside the block.
+		{".Values.rbac.create", nil,
+			[]string{".Values.rbac.allowDraining", ".Values.leaderElection.enabled"}},
+		{".Values.rbac.allowDraining", []string{".Values.rbac.create"}, nil},
+		{".Values.leaderElection.enabled", []string{".Values.rbac.create"}, nil},
 	} {
 		around, err := rbacdoc.GuardsAround(string(chart), feature.guard)
 		if err != nil {
@@ -1094,6 +1100,18 @@ func TestEachFeatureGuardStandsOnItsOwn(t *testing.T) {
 				"%v; an install that set %s and cleared one of the others would render "+
 				"none of its rules while every comparison went on reading them as granted",
 				feature.guard, around, feature.within, feature.guard)
+		}
+
+		inside, err := rbacdoc.GuardsWithin(string(chart), feature.guard)
+		if err != nil {
+			t.Errorf("reading what %s contains: %v", feature.guard, err)
+			continue
+		}
+		if !slices.Equal(inside, feature.contains) {
+			t.Errorf("the block gated on %s contains %v, and it should contain %v; "+
+				"whatever else is in there can suppress the rules this feature is "+
+				"supposed to grant, and every comparison reads them as granted anyway",
+				feature.guard, inside, feature.contains)
 		}
 	}
 }

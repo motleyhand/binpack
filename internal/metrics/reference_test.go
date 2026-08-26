@@ -123,19 +123,31 @@ func TestEveryLabelValueBinpackCanProduceIsDocumented(t *testing.T) {
 func codeTables() []struct {
 	anchor  string
 	allowed []string
+	partial bool
 } {
 	return []struct {
 		anchor  string
 		allowed []string
+		partial bool
 	}{
-		{"`code` is one of:", engine.DecisionCodes()},
-		{"`code` on `binpack_nodes_skipped` is one of:", engine.SkipCodes()},
+		{"`code` is one of:", engine.DecisionCodes(), false},
+		// Partial, and for a reason the enumerator cannot express: this series
+		// is fed from a Decision's assessments, so it carries the codes
+		// selection produces. Three of SkipCodes() — gone, uncordoned and
+		// autoscaler-not-live — are Revalidate's, and reach
+		// binpack_drains_abandoned_total instead. A row for one of them would
+		// be wrong; the absence of one is not.
+		{"`code` on `binpack_nodes_skipped` is one of:", engine.SkipCodes(), true},
 		// The abandonment table lists the drain's own codes; the skip codes
 		// and the two verdicts reach the counter through revalidation and are
 		// described in the prose beneath it rather than repeated as rows.
+		// Partial by design: the table lists the drain's own codes, and the
+		// skip codes and the two verdicts are described in the prose beneath
+		// it rather than repeated as rows. So a row has to be allowed and an
+		// allowed value need not have a row.
 		{"`reason` is one of:", append(append(append([]string{},
-			drain.AbandonCodes()...), engine.SkipCodes()...), abandonmentVerdicts...)},
-		{"| `cause` | What binpack could not do |", unmodelledCauses},
+			drain.AbandonCodes()...), engine.SkipCodes()...), abandonmentVerdicts...), true},
+		{"| `cause` | What binpack could not do |", unmodelledCauses, false},
 	}
 }
 
@@ -163,6 +175,25 @@ func TestTheReferenceDocumentsNoLabelValueBinpackCannotProduce(t *testing.T) {
 			if !slices.Contains(table.allowed, code) {
 				t.Errorf("the reference documents %q under %q, and binpack cannot produce it",
 					code, table.anchor)
+			}
+		}
+
+		// And every allowed code needs a row. Checking only that each row is
+		// allowed leaves the table free to lose one: removing the
+		// `none-feasible` row stayed green because the value is still
+		// backticked in the prose below, which satisfies the
+		// every-value-is-documented guard — and that guard searches the whole
+		// page while this table is the catalogue somebody reads the closed set
+		// out of. A series missing from it is a series an operator has no way
+		// to know exists.
+		if table.partial {
+			continue
+		}
+		for _, code := range table.allowed {
+			if !slices.Contains(rows, code) {
+				t.Errorf("binpack publishes %q and the table under %q does not list it; "+
+					"that table is the closed set an operator reads, and a value absent "+
+					"from it is one they cannot look up", code, table.anchor)
 			}
 		}
 	}
@@ -402,16 +433,30 @@ func constantsWithPrefix(t *testing.T, dir, prefix string) map[string]string {
 			t.Fatalf("parsing %s: %v", source, err)
 		}
 		parsed++
+		var previous []ast.Expr
 		ast.Inspect(file, func(n ast.Node) bool {
 			spec, ok := n.(*ast.ValueSpec)
-			if !ok || len(spec.Names) != len(spec.Values) {
+			if !ok {
+				return true
+			}
+			// A const spec with no expression repeats the previous one, so a
+			// name declared alone is an alias carrying that value. Skipping
+			// those made an alias invisible: the same value emitted from two
+			// branches, one of them absent from every count this compares.
+			values := spec.Values
+			if len(values) == 0 {
+				values = previous
+			} else {
+				previous = values
+			}
+			if len(spec.Names) != len(values) {
 				return true
 			}
 			for i, name := range spec.Names {
 				if !strings.HasPrefix(name.Name, prefix) {
 					continue
 				}
-				lit, ok := spec.Values[i].(*ast.BasicLit)
+				lit, ok := values[i].(*ast.BasicLit)
 				if !ok || lit.Kind != token.STRING {
 					continue
 				}
