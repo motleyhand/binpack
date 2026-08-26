@@ -26,6 +26,14 @@
 // support, since no rule the chart renders grants delete on anything. That
 // property is held by the grant, not by this file's word for it.
 //
+// What this doc claims is now executable rather than only written down.
+// internal/controller's TestTheChartGrantsWhatTheCodeCalls drives all five
+// writes — the four here and the reporter's Event create — against a writer
+// that records what each would need granted, and compares that with the
+// chart. A write added here and to no rule fails it, and so does a grant the
+// chart gates on rbac.allowDraining that nothing exercises, which is what
+// stops the comparison quietly shrinking to the calls somebody remembered.
+//
 // drain.go is the drain protocol, and that is policy. It decides what an
 // evaluation does next to a node already being drained: whether to hand over
 // to the cluster-autoscaler, whether a replacement is still in flight, which

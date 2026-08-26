@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/motleyhand/binpack/internal/rbacdoc"
 )
 
 // The surfaces a stranger meets: the page GitHub renders, the two references
@@ -69,7 +71,7 @@ func TestNoDocClaimsBinpackCannotAct(t *testing.T) {
 // and a drain that 403s on its first node patch: binpack holds its lease,
 // serves its metrics, publishes decisions, and never drains anything.
 func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
-	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
 	if err != nil {
 		t.Fatalf("reading the chart's RBAC: %v", err)
 	}
@@ -77,25 +79,22 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 	// The rules gated on rbac.allowDraining: what internal/executor needs, as
 	// the chart grants it. Taken from the chart rather than listed here, so
 	// the day a third verb is added the reference has to say so too.
-	_, rest, ok := strings.Cut(string(chart), "{{- if .Values.rbac.allowDraining }}")
-	if !ok {
-		t.Fatal("the chart no longer gates the act rules on rbac.allowDraining")
-	}
-	act, _, ok := strings.Cut(rest, "{{- end }}")
-	if !ok {
-		t.Fatal("the chart's act rules are not a closed block")
-	}
-
-	granted := rulePairs(act)
-	if len(granted) == 0 {
-		t.Fatal("no act rules found in the chart; this test would assert nothing")
-	}
-
-	data, err := os.ReadFile("../../docs/reference/rbac.md")
+	act, err := rbacdoc.Section(string(chart), ".Values.rbac.allowDraining")
 	if err != nil {
-		t.Fatalf("reading the RBAC reference: %v", err)
+		t.Fatalf("reading the chart's act rules: %v", err)
 	}
-	documented := rulePairs(grantedSections(string(data)))
+
+	granted := rbacdoc.Grants(act)
+	// A count rather than a non-empty check. The act block has held two pairs
+	// since it existed, and a reader that found one would compare that one and
+	// pass — which is the whole failure this guard is here for.
+	if len(granted) < 2 {
+		t.Fatalf("the chart's act rules parsed to %d group/resource: verb pairs, fewer "+
+			"than the two it has always rendered — the reader has stopped seeing a rule, "+
+			"and the comparison below is against the remainder", len(granted))
+	}
+
+	documented := documentedGrants(t)
 
 	for pair := range granted {
 		if !documented[pair] {
@@ -120,29 +119,50 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 // the same string, and this test would have been blind to the one gap it
 // exists to catch.
 func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
-	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
 	if err != nil {
 		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-	data, err := os.ReadFile("../../docs/reference/rbac.md")
-	if err != nil {
-		t.Fatalf("reading the RBAC reference: %v", err)
 	}
 
 	// Every rule the chart holds, gated or not: the page documents the whole
 	// role, and an operator managing RBAC themselves needs all of it.
-	granted := rulePairs(string(chart))
-	if len(granted) == 0 {
-		t.Fatal("no rules found in the chart; this test would assert nothing")
+	roles, err := rbacdoc.Roles(string(chart))
+	if err != nil {
+		t.Fatalf("reading the chart's rules: %v", err)
+	}
+	granted := rbacdoc.Grants(roles)
+	// A count, in chart_test.go's shape rather than a non-empty check. This
+	// comparison iterates `granted`, so a reader that stopped seeing rules
+	// would check the ones it still saw and report nothing about the rest —
+	// a green run that means less than it did, with nothing to say so.
+	if len(granted) < 30 {
+		t.Fatalf("the chart parsed to %d group/resource: verb pairs, which is fewer than "+
+			"it has ever rendered — the reader has stopped seeing rules, and the "+
+			"comparison below is against the remainder", len(granted))
 	}
 
-	documented := rulePairs(grantedSections(string(data)))
+	documented := documentedGrants(t)
 	for pair := range granted {
 		if !documented[pair] {
 			t.Errorf("the chart grants %q and the RBAC reference does not list it; "+
 				"a role written from this page would be missing it", pair)
 		}
 	}
+}
+
+// documentedGrants is what docs/reference/rbac.md tells an operator to grant.
+func documentedGrants(t *testing.T) map[string]bool {
+	t.Helper()
+
+	data, err := os.ReadFile(rbacdoc.ReferencePath)
+	if err != nil {
+		t.Fatalf("reading the RBAC reference: %v", err)
+	}
+	roles, err := rbacdoc.Documented(grantedSections(string(data)))
+	if err != nil {
+		t.Fatalf("reading the RBAC reference's rules: %v", err)
+	}
+	return rbacdoc.Grants(roles)
 }
 
 // grantedSections drops the sections of a document whose heading says the
@@ -161,61 +181,6 @@ func grantedSections(doc string) string {
 }
 
 var notGranted = regexp.MustCompile(`(?i)not yet|unused|not needed|never granted`)
-
-// rulePairs pulls `group/resource: verb` pairs out of the RBAC rule blocks in
-// a document. Both the chart and the reference write a rule as three adjacent
-// lines, so the template directives around them are simply not matched:
-//
-//   - apiGroups: [""]
-//     resources: [nodes]
-//     verbs: [patch]
-//
-// The core group is rendered as "core" rather than the empty string, so a
-// failure message names something a reader can find in a role.
-func rulePairs(doc string) map[string]bool {
-	pairs := map[string]bool{}
-	var groups, resources []string
-	for line := range strings.SplitSeq(doc, "\n") {
-		line = strings.TrimSpace(line)
-		line = strings.TrimPrefix(line, "- ")
-		switch {
-		case strings.HasPrefix(line, "apiGroups:"):
-			groups = bracketed(line)
-		case strings.HasPrefix(line, "resources:"):
-			resources = bracketed(line)
-		case strings.HasPrefix(line, "verbs:"):
-			for _, group := range groups {
-				group = strings.Trim(group, `"`)
-				if group == "" {
-					group = "core"
-				}
-				for _, resource := range resources {
-					for _, verb := range bracketed(line) {
-						pairs[group+"/"+resource+": "+verb] = true
-					}
-				}
-			}
-			groups, resources = nil, nil
-		}
-	}
-	return pairs
-}
-
-// bracketed reads the inline sequence `key: [a, b]`.
-func bracketed(line string) []string {
-	open := strings.Index(line, "[")
-	shut := strings.LastIndex(line, "]")
-	if open < 0 || shut < open {
-		return nil
-	}
-	var out []string
-	for item := range strings.SplitSeq(line[open+1:shut], ",") {
-		if item = strings.TrimSpace(item); item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
-}
 
 var whitespace = regexp.MustCompile(`\s+`)
 

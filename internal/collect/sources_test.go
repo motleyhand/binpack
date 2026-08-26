@@ -3,15 +3,13 @@ package collect_test
 import (
 	"fmt"
 	"os"
-	"regexp"
 	"slices"
 	"strings"
 	"testing"
 
-	"sigs.k8s.io/yaml"
-
 	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
+	"github.com/motleyhand/binpack/internal/rbacdoc"
 )
 
 // The chart must grant read on exactly the controller kinds binpack reads
@@ -25,12 +23,17 @@ import (
 // nothing they assert would notice. The chart is the one thing that cannot
 // derive from it, which is exactly why it is the one that can fail.
 func TestTheChartGrantsExactlyTheKindsTemplatesReads(t *testing.T) {
-	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
 	if err != nil {
 		t.Fatalf("reading the chart's RBAC: %v", err)
 	}
 
-	got := readGrants(t, clusterRoles(t, helmToYAML(t, string(chart))))
+	roles, err := rbacdoc.Roles(string(chart))
+	if err != nil {
+		t.Fatalf("reading the chart's rules: %v", err)
+	}
+
+	got := readGrants(t, rbacdoc.OfKind(roles, "ClusterRole"))
 	want := wantedReads()
 
 	if !slices.Equal(got, want) {
@@ -48,12 +51,17 @@ func TestTheChartGrantsExactlyTheKindsTemplatesReads(t *testing.T) {
 // followed, and the install it produces fails on the first evaluation with a
 // Forbidden naming a resource the page never mentioned.
 func TestTheRBACReferenceGrantsWhatTheChartDoes(t *testing.T) {
-	doc, err := os.ReadFile("../../docs/reference/rbac.md")
+	doc, err := os.ReadFile(rbacdoc.ReferencePath)
 	if err != nil {
 		t.Fatalf("reading the RBAC reference: %v", err)
 	}
 
-	got := readGrants(t, documentedClusterRoles(t, string(doc)))
+	roles, err := rbacdoc.Documented(string(doc))
+	if err != nil {
+		t.Fatalf("reading the RBAC reference's rules: %v", err)
+	}
+
+	got := readGrants(t, rbacdoc.OfKind(roles, "ClusterRole"))
 	want := wantedReads()
 
 	if !slices.Equal(got, want) {
@@ -256,18 +264,6 @@ func grant(group, resource string) string {
 	return resource + "." + group
 }
 
-// policyRules is as much of a ClusterRole as this file needs. Decoding into
-// rbacv1.ClusterRole would be stricter and is not possible here: the chart's
-// metadata is Helm actions, and the placeholders they become are scalars where
-// typed decoding wants maps.
-type policyRules struct {
-	Rules []struct {
-		APIGroups []string `json:"apiGroups"`
-		Resources []string `json:"resources"`
-		Verbs     []string `json:"verbs"`
-	} `json:"rules"`
-}
-
 // readGrants is every resource the rules grant read on, sorted and deduplicated.
 //
 // Read means get, list and watch together: binpack's cache lists and then
@@ -276,7 +272,7 @@ type policyRules struct {
 // Filtering on it is also what keeps the mutating rules — nodes: patch,
 // pods/eviction: create, the two events rules — out of the comparison without
 // naming them.
-func readGrants(t *testing.T, roles []policyRules) []string {
+func readGrants(t *testing.T, roles []rbacdoc.Role) []string {
 	t.Helper()
 
 	var out []string
@@ -305,133 +301,4 @@ func grantsRead(verbs []string) bool {
 		}
 	}
 	return true
-}
-
-// documentSeparator splits a multi-document YAML stream.
-var documentSeparator = regexp.MustCompile(`(?m)^---$`)
-
-// clusterRoles decodes every ClusterRole in a rendered manifest stream.
-func clusterRoles(t *testing.T, manifests string) []policyRules {
-	t.Helper()
-
-	var out []policyRules
-	for _, doc := range documentSeparator.Split(manifests, -1) {
-		var kind struct {
-			Kind string `json:"kind"`
-		}
-		if err := yaml.Unmarshal([]byte(doc), &kind); err != nil {
-			t.Fatalf("the chart's RBAC does not parse as YAML: %v\n%s", err, doc)
-		}
-		if kind.Kind != "ClusterRole" {
-			continue
-		}
-		var role policyRules
-		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
-			t.Fatalf("decoding a ClusterRole's rules: %v\n%s", err, doc)
-		}
-		out = append(out, role)
-	}
-
-	if len(out) == 0 {
-		t.Fatal("the chart declares no ClusterRole at all")
-	}
-	return out
-}
-
-// fencedYAML matches a ```yaml block in Markdown, capturing its body.
-var fencedYAML = regexp.MustCompile("(?s)```yaml\n(.*?)```")
-
-// documentedClusterRoles decodes the ClusterRole snippets in an RBAC page.
-//
-// The snippets are fragments rather than manifests — they carry rules and no
-// metadata, because the page is about what each rule is for — so which object
-// a block belongs to is written in its first line as a comment, and that is
-// what this reads. A block that is neither a ClusterRole nor a Role is a
-// fragment quoted for discussion and is skipped.
-func documentedClusterRoles(t *testing.T, doc string) []policyRules {
-	t.Helper()
-
-	var out []policyRules
-	for _, match := range fencedYAML.FindAllStringSubmatch(doc, -1) {
-		body := match[1]
-		if !strings.HasPrefix(body, "# ClusterRole") {
-			continue
-		}
-		var role policyRules
-		if err := yaml.Unmarshal([]byte(body), &role); err != nil {
-			t.Fatalf("decoding a documented ClusterRole: %v\n%s", err, body)
-		}
-		out = append(out, role)
-	}
-
-	if len(out) == 0 {
-		t.Fatal("the RBAC reference documents no ClusterRole at all")
-	}
-	return out
-}
-
-// helmAction matches one Go template action — the {{ ... }} a chart is written
-// in.
-var helmAction = regexp.MustCompile(`\{\{-?.*?-?\}\}`)
-
-// helmControlKeywords are the actions that structure a template rather than
-// producing a value.
-var helmControlKeywords = []string{"if", "else", "end", "range", "with", "define", "block", "template"}
-
-// helmToYAML makes a chart template parseable, without running Helm.
-//
-// The templates do not parse as YAML — `{{ include "binpack.fullname" . }}` is
-// not a YAML node — and rendering them properly means shelling out to a helm
-// binary, which would put a second toolchain between `go test` and a green
-// run for the sake of two RBAC rules.
-//
-// So this substitutes rather than renders, and the substitution is stated
-// rather than done quietly. Control actions are deleted along with the line
-// they sit on; every other action becomes a placeholder scalar. Deleting the
-// conditionals means the result is the *union* of every branch, which is the
-// reading a permission audit wants: a rule the chart grants under some values
-// is a rule the chart grants.
-//
-// What it cannot do is see less than the chart holds. An action this does not
-// recognise leaves YAML that does not parse, and a control action sharing its
-// line with content is refused outright rather than taking the content with
-// it — so a template that outgrows this fails the test instead of quietly
-// shrinking the set it is compared against.
-func helmToYAML(t *testing.T, template string) string {
-	t.Helper()
-
-	const placeholder = "binpack-placeholder"
-
-	var out []string
-	for i, line := range strings.Split(template, "\n") {
-		actions := helmAction.FindAllString(line, -1)
-		if len(actions) == 0 {
-			out = append(out, line)
-			continue
-		}
-
-		if control := controlAction(actions); control != "" {
-			if rest := strings.TrimSpace(helmAction.ReplaceAllString(line, "")); rest != "" {
-				t.Fatalf("rbac.yaml:%d puts the control action %q on a line with %q, which "+
-					"this test would drop along with it — render the chart or widen this "+
-					"substitution rather than letting a rule disappear", i+1, control, rest)
-			}
-			continue
-		}
-
-		out = append(out, helmAction.ReplaceAllString(line, placeholder))
-	}
-	return strings.Join(out, "\n")
-}
-
-// controlAction returns the first action that structures the template, or "".
-func controlAction(actions []string) string {
-	for _, action := range actions {
-		body := strings.TrimSpace(strings.Trim(strings.Trim(action, "{}"), "-"))
-		keyword, _, _ := strings.Cut(body, " ")
-		if slices.Contains(helmControlKeywords, keyword) {
-			return action
-		}
-	}
-	return ""
 }
