@@ -113,6 +113,16 @@ type Binding struct {
 		Kind string `json:"kind"`
 		Name string `json:"name"`
 	} `json:"roleRef"`
+
+	// Subjects is who the binding grants to, which is the other half of
+	// whether a permission is held. A binding naming the right role and the
+	// wrong principal is as inert as one naming the wrong role, and reads the
+	// same in every assertion about what the role grants.
+	Subjects []struct {
+		Kind      string `json:"kind"`
+		Name      string `json:"name"`
+		Namespace string `json:"namespace"`
+	} `json:"subjects"`
 }
 
 // Bindings decodes every binding a chart template declares.
@@ -531,7 +541,15 @@ var helmAction = regexp.MustCompile(`\{\{-?.*?-?\}\}`)
 
 // helmControlKeywords are the actions that structure a template rather than
 // producing a value.
-var helmControlKeywords = []string{"if", "else", "end", "range", "with", "define", "block", "template"}
+//
+// `template` is deliberately absent, and it used to be here. It does not
+// structure anything — it invokes a named template and emits whatever that
+// renders — so classifying it as control deleted the line it stood on along
+// with everything the helper would have produced. A helper injecting one extra
+// rule would have been invisible to every check in this package while the
+// installed chart granted it. Standalone invocations are refused instead; see
+// [HelmToYAML].
+var helmControlKeywords = []string{"if", "else", "end", "range", "with", "define", "block"}
 
 // HelmToYAML makes a chart template parseable, without running Helm.
 //
@@ -570,9 +588,32 @@ func HelmToYAML(template string) (string, error) {
 			continue
 		}
 
+		// A line that is nothing but an action emits a document fragment
+		// rather than a value, and what it emits is in another file. A
+		// placeholder scalar in its place is a lie about the shape of the
+		// document and deleting the line is a lie about its contents, so
+		// neither is done.
+		if strings.TrimSpace(helmAction.ReplaceAllString(line, "")) == "" {
+			return "", fmt.Errorf("line %d is a bare template invocation (%s), which "+
+				"renders a fragment this substitution cannot see — render the chart or "+
+				"inline the rules rather than comparing against a document with a hole "+
+				"in it", i+1, strings.TrimSpace(line))
+		}
+
 		out = append(out, helmAction.ReplaceAllStringFunc(line, placeholder))
 	}
 	return strings.Join(out, "\n"), nil
+}
+
+// Placeholder is what [HelmToYAML] renders one action to, for a caller holding
+// a single expression rather than a document line.
+//
+// The document form refuses a line that is nothing but an action, because such
+// a line emits a fragment from another file. A field's *value* is the opposite
+// case — there is nothing to emit but the value — so it is rendered here
+// instead, and the two can then be compared.
+func Placeholder(action string) string {
+	return placeholder(strings.TrimSpace(action))
 }
 
 // nonAlphanumeric is everything a placeholder drops.

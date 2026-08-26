@@ -101,3 +101,28 @@ func TestTheDrainLogLineNamesThePoolWhenOnlyTheIdentifierIsPresent(t *testing.T)
 		t.Errorf("the drain line does not name the pool by its identifier: %v", log.lines)
 	}
 }
+
+// TestEveryEventReasonIsDistinct is internal/metrics'
+// TestEveryPublishedVocabularyIsASet for the one published vocabulary that
+// file cannot reach.
+//
+// Same hazard, same cost: the guard above iterates EventReasons() and compares
+// it with the reference, so two constants sharing a value collapse to one
+// entry that both sides agree about, and an operator filtering events on the
+// reason cannot tell the two apart. Separate because internal/metrics may not
+// import this package.
+func TestEveryEventReasonIsDistinct(t *testing.T) {
+	reasons := EventReasons()
+	if len(reasons) == 0 {
+		t.Fatal("EventReasons() enumerates nothing, so this asserts nothing about it")
+	}
+
+	seen := map[string]bool{}
+	for _, reason := range reasons {
+		if seen[reason] {
+			t.Errorf("EventReasons() enumerates %q twice, so two constants share it and "+
+				"the events they were meant to distinguish read as one", reason)
+		}
+		seen[reason] = true
+	}
+}

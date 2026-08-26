@@ -217,3 +217,58 @@ func TestTheVerdictSentenceListsEveryVerdict(t *testing.T) {
 			sentence)
 	}
 }
+
+// TestEveryPublishedVocabularyIsASet holds the property every guard in this
+// file assumes without checking: that an enumerator's values are distinct.
+//
+// These lists are turned into sets — by the reference comparisons above, by
+// the zero-series pre-initialisation, by the reachability loop in
+// internal/engine — and a set silently absorbs a duplicate. Two constants
+// sharing a value therefore collapse into one enumerated code, every fixture
+// goes on asserting its own constant and passing, and a reference updated to
+// the resulting vocabulary agrees with it. What is lost is the distinction:
+// two operational causes an alert cannot tell apart, published under one label
+// value, with nothing anywhere saying so.
+//
+// Here rather than beside each vocabulary because this is the file that
+// already gathers them, and because they are one namespace to whoever reads
+// the metrics — the reference lists them together and the guards above compare
+// them together.
+//
+// engine.Diagnoses is deliberately absent: it is built from a map keyed by the
+// code, so a duplicate there is not something that can be written. That is the
+// shape to prefer, and the reason these need a guard is that they are
+// hand-written slices. controller.EventReasons is the same hazard and cannot
+// be reached from here — internal/engine is in the depguard purity set and
+// this file imports it — so it carries its own guard in that package.
+//
+// The names cannot be recovered from the values, which is why this reports the
+// value and leaves finding the pair to a grep. Constants are the only place
+// the names exist.
+func TestEveryPublishedVocabularyIsASet(t *testing.T) {
+	for _, vocabulary := range []struct {
+		name   string
+		values []string
+	}{
+		{"engine.SkipCodes", engine.SkipCodes()},
+		{"engine.Verdicts", engine.Verdicts()},
+		{"engine.DecisionCodes", engine.DecisionCodes()},
+		{"drain.AbandonCodes", drain.AbandonCodes()},
+	} {
+		if len(vocabulary.values) == 0 {
+			t.Errorf("%s() enumerates nothing, so this asserts nothing about it",
+				vocabulary.name)
+		}
+
+		seen := map[string]bool{}
+		for _, value := range vocabulary.values {
+			if seen[value] {
+				t.Errorf("%s() enumerates %q twice, so two constants share it: the pair is "+
+					"one label value now, and every check that turns this list into a set "+
+					"reports them as one thing an operator cannot tell apart",
+					vocabulary.name, value)
+			}
+			seen[value] = true
+		}
+	}
+}

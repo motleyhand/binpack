@@ -577,14 +577,14 @@ func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
 	// watches, and `explain` gets, so a rule short of any of the three is a
 	// rule that fails at runtime rather than a narrower version of the same
 	// permission.
-	anchoredIn(t, grants, "-autoscaler-status",
+	grantsExactly(t, grants, "-autoscaler-status",
 		// binpack reads exactly one kind in the namespace
 		// discovery.autoscalerNamespace names: the cluster-autoscaler's status
 		// ConfigMap, which ADR-0004 makes the whole basis of running without
 		// cloud credentials.
 		"core/configmaps: get", "core/configmaps: list", "core/configmaps: watch")
 
-	anchoredIn(t, grants, "-leader-election",
+	grantsExactly(t, grants, "-leader-election",
 		// The Lease is held in binpack's own namespace, and client-go's
 		// LeaseLock gets it, creates it and updates it (k8s.io/client-go
 		// v0.36.4, tools/leaderelection/resourcelock/leaselock.go). Granted
@@ -593,6 +593,15 @@ func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
 		"coordination.k8s.io/leases: get",
 		"coordination.k8s.io/leases: create",
 		"coordination.k8s.io/leases: update",
+		// list, watch and patch are granted and not exercised. That is a
+		// position docs/reference/rbac.md takes and defends — this Role is
+		// namespaced to binpack's own namespace and nothing else there holds a
+		// Lease — so they belong in the expected set rather than being read as
+		// surplus. Narrowing the grant is a decision for that page to change
+		// first.
+		"coordination.k8s.io/leases: list",
+		"coordination.k8s.io/leases: watch",
+		"coordination.k8s.io/leases: patch",
 		// And the events leader election announces itself with, which go to
 		// the *core* group through client-go's legacy recorder — unlike
 		// binpack's own decision events, which are events.k8s.io and
@@ -604,13 +613,18 @@ func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
 		"core/events: patch")
 }
 
-// anchoredIn asserts that each pair is granted by the namespaced Role whose
-// name carries the given suffix, and by no other.
+// grantsExactly asserts that the namespaced Role whose name carries the given
+// suffix grants these pairs, only these, and that no other Role grants them.
 //
-// Both halves. Present in the right Role is what the runtime needs; absent
-// from every other is what stops a rule drifting into a Role created in a
-// namespace binpack never reads.
-func anchoredIn(t *testing.T, grants map[string]map[string]bool, suffix string, pairs ...string) {
+// Three halves, and each fails differently. Present in the right Role is what
+// the runtime needs. Absent from every other is what stops a rule drifting
+// into a Role created in a namespace binpack never reads. And nothing beyond
+// them is the direction the rest of this file had to learn twice: every other
+// check asks whether a permission binpack needs is granted, and none of them
+// has an opinion about one it does not — `delete` added to the ConfigMap rule
+// in the chart and the reference together satisfied the per-identity
+// comparison, disjointness and every minimum anchor at once.
+func grantsExactly(t *testing.T, grants map[string]map[string]bool, suffix string, pairs ...string) {
 	t.Helper()
 
 	var role string
@@ -624,7 +638,10 @@ func anchoredIn(t *testing.T, grants map[string]map[string]bool, suffix string, 
 			"about where %v are granted", suffix, pairs)
 	}
 
+	want := map[string]bool{}
 	for _, pair := range pairs {
+		want[pair] = true
+
 		if !grants[role][pair] {
 			t.Errorf("%s does not grant %q, and it is the Role created in the namespace "+
 				"binpack needs it in", role, pair)
@@ -635,6 +652,14 @@ func anchoredIn(t *testing.T, grants map[string]map[string]bool, suffix string, 
 					"binpack needs it in; the permission would be held somewhere binpack "+
 					"never issues that request", name, pair)
 			}
+		}
+	}
+
+	for pair := range grants[role] {
+		if !want[pair] {
+			t.Errorf("%s grants %q, which binpack never issues in that namespace; a "+
+				"permission nothing uses is one an operator has to justify, and this Role "+
+				"is scoped to a namespace they may not own", role, pair)
 		}
 	}
 }
@@ -696,6 +721,96 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 				"rule in it is granted to nobody, and the install comes up clean",
 				role.Kind, role.Metadata.Name)
 		}
+	}
+
+	// And who it grants to. A binding naming the right role and the wrong
+	// principal is as inert as one naming the wrong role, and reads the same in
+	// every assertion about what the role grants: the subject namespace pointed
+	// at the autoscaler's is a valid binding for a ServiceAccount that does not
+	// exist there, and binpack's own account holds nothing.
+	//
+	// The namespace is compared with the leader-election Role's rather than
+	// against a literal, because that one is already pinned to the namespace
+	// the deployment elects in — which is the release namespace, where the
+	// ServiceAccount and the pod both are. Pinning it twice to the same
+	// expression is what makes it a chain rather than two guesses.
+	elections := rbacdoc.OfIdentity(roles, "Role-leader-election")
+	if len(elections) != 1 {
+		t.Fatalf("found %d leader-election Roles, want one; without it there is nothing to "+
+			"compare the bindings' subject namespace against", len(elections))
+	}
+	release := elections[0].Metadata.Namespace
+
+	var subjects int
+	for _, b := range bindings {
+		for _, subject := range b.Subjects {
+			subjects++
+			if subject.Kind != "ServiceAccount" {
+				t.Errorf("the %s %s binds a %s; binpack runs as a ServiceAccount and a "+
+					"binding to anything else grants it nothing",
+					b.Kind, b.Metadata.Name, subject.Kind)
+			}
+			if subject.Namespace != release {
+				t.Errorf("the %s %s binds a ServiceAccount in %s, and binpack's runs in "+
+					"%s; the binding is valid and names an account that is not the one "+
+					"the chart creates or the pod uses",
+					b.Kind, b.Metadata.Name, subject.Namespace, release)
+			}
+		}
+	}
+	if subjects != len(bindings) {
+		t.Errorf("found %d subjects across %d bindings; every binding grants to exactly "+
+			"one ServiceAccount, and a parse that lost one checked nothing about it",
+			subjects, len(bindings))
+	}
+}
+
+// TestRBACCreateFalseRendersNoRBACAtAll holds what the setting is for.
+//
+// docs/reference/rbac.md and the chart both offer rbac.create: false to an
+// operator who manages RBAC themselves, and what it promises is that the chart
+// adds nothing — they grant what they choose to grant. rbacdoc.Roles unions
+// every branch, so a Role or binding moved outside that guard is invisible to
+// every assertion about what the chart grants: it is still granted, now to
+// everybody, and an operator who chose to manage RBAC elsewhere silently
+// receives chart-managed permissions as well.
+//
+// The chart CI job renders with rbac.create=false and checks only that
+// templating succeeds, which an object rendered outside the guard also does.
+func TestRBACCreateFalseRendersNoRBACAtAll(t *testing.T) {
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+
+	off, err := rbacdoc.Without(string(chart), ".Values.rbac.create")
+	if err != nil {
+		t.Fatalf("reading the chart without rbac.create: %v", err)
+	}
+
+	// Both readers refuse an empty document, which is the answer this wants:
+	// their errors are the assertion, so a Role or a binding surviving the
+	// guard is a successful parse and a failure here.
+	if roles, err := rbacdoc.Roles(off); err == nil {
+		var names []string
+		for _, role := range roles {
+			names = append(names, role.Kind+" "+role.Metadata.Name)
+		}
+		t.Errorf("rbac.create: false still renders %v; the chart promises to add nothing "+
+			"and an operator managing RBAC elsewhere would receive these too", names)
+	}
+	if bindings, err := rbacdoc.Bindings(off); err == nil {
+		var names []string
+		for _, b := range bindings {
+			names = append(names, b.Kind+" "+b.Metadata.Name)
+		}
+		t.Errorf("rbac.create: false still renders %v", names)
+	}
+
+	// And the ordinary install must still render them, or the guard has
+	// swallowed the wrong block and this passes for the wrong reason.
+	if _, err := rbacdoc.Roles(string(chart)); err != nil {
+		t.Fatalf("the chart renders no roles with rbac.create on: %v", err)
 	}
 }
 
@@ -764,11 +879,7 @@ func leaderElectionNamespaceFlag(t *testing.T, deployment string) string {
 		if !found {
 			continue
 		}
-		rendered, err := rbacdoc.HelmToYAML(strings.TrimSpace(value))
-		if err != nil {
-			t.Fatalf("reading the leader-election namespace flag: %v", err)
-		}
-		return rendered
+		return rbacdoc.Placeholder(value)
 	}
 
 	t.Fatalf("the deployment no longer passes %s, so this cannot say where the Lease is "+
