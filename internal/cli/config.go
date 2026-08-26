@@ -81,7 +81,8 @@ func readConfigInput(path string, stdin io.Reader) ([]byte, error) {
 // than vague. The controller resolves pools on every evaluation but holds the
 // error until after it has resumed any drain in progress, because the failure
 // is unretryable and exiting one tick into a drain strands a cordoned node —
-// so `run --once` can advance a drain and exit before it reports either. What
+// so `run --once` can advance a drain and exit before it reports either, and
+// a drain advancing one step per evaluation can span many such runs. What
 // is true without qualification is that the check needs a cluster, that this
 // command has none, and that an unknown name is fatal to the controller
 // whenever it does reach it. Pointing at the read-only command that answers

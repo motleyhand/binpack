@@ -271,8 +271,11 @@ about a document that states neither.
 `binpack explain` and `binpack diagnose` check both against the cluster, and the controller treats
 an unknown name as a fatal configuration error. It resolves pools on every evaluation but holds
 that error until it has resumed any drain already in progress — exiting one tick into a drain
-would strand a cordoned node — so `binpack run --once` can advance a drain and exit before
-reporting it. The next run reports it.
+would leave a node cordoned with nothing left to uncordon it — so `binpack run --once` can advance
+a drain and exit without reporting the error. A drain advances by at most one step per evaluation,
+so it can span many one-shot runs; the error is reported by the first run that finds no drain in
+progress, not by the next one. `binpack explain` reports it immediately either way, and is the
+command to reach for when a `--once` run has said nothing.
 
 `apiVersion` and `kind` are emitted so the report is a document rather than a report *about* a
 document — see below.
