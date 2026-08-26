@@ -127,18 +127,48 @@ func TestTheEventRecorderNeverIssuesAnUpdate(t *testing.T) {
 		}
 	}
 
+	// An equality, in both directions, because recorderMethods is read by
+	// TestTheChartGrantsWhatTheCodeCalls as the verbs the chart has to grant.
+	// A method observed here and missing from that list is a request an install
+	// makes and nobody asked permission for — Update being the case worth
+	// naming, since a recorder that started issuing one would 403 on the
+	// aggregation path against a ClusterRole granting create and patch. And a
+	// method in the list the recorder never issues makes the chart grant
+	// something nothing uses.
+	//
+	// Subset-only, this accepted Patch being dropped from recorderMethods
+	// alongside the chart and the reference: the sink still observed it, this
+	// said nothing, and the RBAC test compared a list that no longer mentioned
+	// it.
 	called := sink.methods()
-	if slices.Contains(called, "Update") {
-		t.Errorf("the recorder issued an Update (%v), so dropping the verb from the "+
-			"ClusterRole would 403 on the aggregation path", called)
+	for _, got := range called {
+		if !slices.Contains(recorderMethods, got) {
+			t.Errorf("the recorder issued a %s (%v) and recorderMethods does not name it, "+
+				"so the chart is never asked to grant it and an install would 403 on "+
+				"that request", got, called)
+		}
 	}
-	for _, want := range []string{"Create", "Patch"} {
+	for _, want := range recorderMethods {
 		if !slices.Contains(called, want) {
 			t.Errorf("the recorder never issued a %s (%v), so this test is not "+
 				"observing the write path it claims to", want, called)
 		}
 	}
 }
+
+// recorderMethods are the event-sink methods client-go's recorder issues on
+// binpack's behalf, on the long-running path.
+//
+// Named here rather than inline because two tests need the same fact and only
+// one of them can prove it. This file's broadcaster test is the proof: it
+// drives the real recorder and observes what reaches the sink.
+// TestTheChartGrantsWhatTheCodeCalls is the consumer, and it needs these
+// because the chart has to grant them — the recorder writes whatever dryRun
+// is set to, and nothing in Go bounds a library's writes the way an interface
+// bounds binpack's own. Dropping events.k8s.io/events: patch from the chart
+// and the reference together left them agreeing and left every decision after
+// the first failing to aggregate.
+var recorderMethods = []string{"Create", "Patch"}
 
 // TestTheEventCreateIsBinpacksOnlyWriteOutsideTheExecutor holds the
 // enumeration internal/executor's package doc tells a reviewer to trust.

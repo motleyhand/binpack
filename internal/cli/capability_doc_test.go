@@ -5,6 +5,8 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+
+	"github.com/motleyhand/binpack/internal/rbacdoc"
 )
 
 // The surfaces a stranger meets: the page GitHub renders, the two references
@@ -69,38 +71,53 @@ func TestNoDocClaimsBinpackCannotAct(t *testing.T) {
 // and a drain that 403s on its first node patch: binpack holds its lease,
 // serves its metrics, publishes decisions, and never drains anything.
 func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
-	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-
 	// The rules gated on rbac.allowDraining: what internal/executor needs, as
 	// the chart grants it. Taken from the chart rather than listed here, so
-	// the day a third verb is added the reference has to say so too.
-	_, rest, ok := strings.Cut(string(chart), "{{- if .Values.rbac.allowDraining }}")
-	if !ok {
-		t.Fatal("the chart no longer gates the act rules on rbac.allowDraining")
-	}
-	act, _, ok := strings.Cut(rest, "{{- end }}")
-	if !ok {
-		t.Fatal("the chart's act rules are not a closed block")
-	}
-
-	granted := rulePairs(act)
-	if len(granted) == 0 {
-		t.Fatal("no act rules found in the chart; this test would assert nothing")
-	}
-
-	data, err := os.ReadFile("../../docs/reference/rbac.md")
+	// the day a third verb is added the reference has to say so too — and as
+	// the difference between an install that opted in and one that did not,
+	// which is the operator's own reading of what opting in buys.
+	on, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"rbac.allowDraining": "true"},
+	}))
 	if err != nil {
-		t.Fatalf("reading the RBAC reference: %v", err)
+		t.Fatalf("reading the chart's rules: %v", err)
 	}
-	documented := rulePairs(grantedSections(string(data)))
+	off, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"rbac.allowDraining": "false"},
+	}))
+	if err != nil {
+		t.Fatalf("reading the chart's ungated rules: %v", err)
+	}
+
+	// Narrowed to the ClusterRole, which is where the act rules live and so
+	// the scope the page has to document them at.
+	granted := rbacdoc.Difference(
+		rbacdoc.OfKind(on, "ClusterRole"), rbacdoc.OfKind(off, "ClusterRole"))
+	// A count rather than a non-empty check. The act block has held two pairs
+	// since it existed, and a reader that found one would compare that one and
+	// pass — which is the whole failure this guard is here for.
+	//
+	// Two ways to get here and the message names both, because they call for
+	// opposite responses: the reader has stopped seeing a rule, or a rule has
+	// left the guard. The second is the more alarming and the less obvious —
+	// internal/controller's TestTheChartGrantsWhatTheCodeCalls is what says
+	// which, since it holds the act grants to the writes binpack makes only
+	// when acting.
+	if len(granted) < 2 {
+		t.Fatalf("the chart's act rules parsed to %d group/resource: verb pairs, fewer "+
+			"than the two it has always rendered. Either the reader has stopped seeing "+
+			"a rule and the comparison below is against the remainder, or a rule has "+
+			"moved out of the rbac.allowDraining guard and a default install now holds "+
+			"it", len(granted))
+	}
+
+	documented := documentedGrants(t)["ClusterRole"]
 
 	for pair := range granted {
 		if !documented[pair] {
-			t.Errorf("the chart grants %q to let binpack act, and the RBAC reference "+
-				"does not list it outside a section marked unused", pair)
+			t.Errorf("the chart grants %q in its ClusterRole to let binpack act, and the "+
+				"RBAC reference does not list it there outside a section marked unused",
+				pair)
 		}
 	}
 }
@@ -120,29 +137,117 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 // the same string, and this test would have been blind to the one gap it
 // exists to catch.
 func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
-	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
+	// Every rule the chart can render, which is an install that opted in to
+	// both features: the page documents the whole role, and an operator
+	// managing RBAC themselves needs all of it. Both values are named because
+	// both default to off for the gated rules, and a default render would hold
+	// the page to a subset while claiming to be complete.
+	roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{
+			"rbac.allowDraining":     "true",
+			"leaderElection.enabled": "true",
+		},
+	}))
 	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
+		t.Fatalf("reading the chart's rules: %v", err)
 	}
-	data, err := os.ReadFile("../../docs/reference/rbac.md")
+	// A count, in chart_test.go's shape rather than a non-empty check. The
+	// comparisons below iterate parsed sets, so a reader that stopped seeing
+	// rules would check the ones it still saw and report nothing about the
+	// rest — a green run that means less than it did, with nothing to say so.
+	//
+	// What it does not catch is a rule *deleted* from the chart, which shrinks
+	// the set for a reason the count cannot distinguish from the reader's. The
+	// equalities below are what catch that.
+	if all := rbacdoc.Grants(roles); len(all) < 30 {
+		t.Fatalf("the chart parsed to %d group/resource: verb pairs, which is fewer than "+
+			"it has ever rendered — the reader has stopped seeing rules, and the "+
+			"comparison below is against the remainder", len(all))
+	}
+
+	// Both directions, and per kind. chart ⊆ page says a role written from the
+	// page is not missing a grant; page ⊆ chart says it does not carry one the
+	// chart never renders. Only the pair of them says the page *is* the role,
+	// which is what its banner claims — and only the second notices a rule
+	// deleted from the chart, which the first reads as one fewer thing to
+	// check. Deleting the autoscaler-status ConfigMap rule cost three pairs
+	// and left every assertion here green.
+	//
+	// Per kind because the union cannot express where a namespaced grant
+	// applies; see documentedGrants.
+	documented := documentedGrants(t)
+	for _, identity := range rbacdoc.Identities() {
+		granted := rbacdoc.Grants(rbacdoc.OfIdentity(roles, identity))
+		if len(granted) == 0 {
+			t.Fatalf("the chart renders no %s rules at all", identity)
+		}
+		for pair := range granted {
+			if !documented[identity][pair] {
+				t.Errorf("the chart's %s grants %q and the RBAC reference does not list it "+
+					"there; a role written from this page would be missing it",
+					identity, pair)
+			}
+		}
+		for pair := range documented[identity] {
+			if !granted[pair] {
+				t.Errorf("the RBAC reference lists %q under %s outside a section marked "+
+					"unused and no such rule the chart renders grants it; either the chart "+
+					"has stopped granting something binpack needs, or the page is asking "+
+					"for a permission nobody has to give", pair, identity)
+			}
+		}
+	}
+
+	// And a property that is not a comparison at all: a rule can be wrong on
+	// its own terms, and two documents agreeing about it says nothing.
+	for _, grant := range rbacdoc.Unauthorizable(roles) {
+		t.Errorf("%s — these verbs carry no object name for a resourceNames restriction "+
+			"to match, and no field selector supplies one, so this grant authorises "+
+			"nothing at all", grant)
+	}
+}
+
+// documentedGrants is what docs/reference/rbac.md tells an operator to grant,
+// in the role kind it tells them to grant it in.
+//
+// Kept apart rather than merged, because merged they answer a question no
+// operator asks. A cluster-wide grant applies everywhere; a namespaced one
+// applies in the namespace its Role is created in, and the page creates Roles
+// in two of them. Moving the events.k8s.io rule out of the ClusterRole snippet
+// and into the leader-election Role's left both directions of the comparison
+// green, and a role written from the page would grant it in binpack's own
+// namespace while decision Events about a Node are filed under `default`.
+func documentedGrants(t *testing.T) map[string]map[string]bool {
+	t.Helper()
+
+	data, err := os.ReadFile(rbacdoc.ReferencePath)
 	if err != nil {
 		t.Fatalf("reading the RBAC reference: %v", err)
 	}
-
-	// Every rule the chart holds, gated or not: the page documents the whole
-	// role, and an operator managing RBAC themselves needs all of it.
-	granted := rulePairs(string(chart))
-	if len(granted) == 0 {
-		t.Fatal("no rules found in the chart; this test would assert nothing")
+	roles, err := rbacdoc.Documented(grantedSections(string(data)))
+	if err != nil {
+		t.Fatalf("reading the RBAC reference's rules: %v", err)
 	}
 
-	documented := rulePairs(grantedSections(string(data)))
-	for pair := range granted {
-		if !documented[pair] {
-			t.Errorf("the chart grants %q and the RBAC reference does not list it; "+
-				"a role written from this page would be missing it", pair)
-		}
+	out, placed := map[string]map[string]bool{}, 0
+	for _, identity := range rbacdoc.Identities() {
+		at := rbacdoc.OfIdentity(roles, identity)
+		placed += len(at)
+		out[identity] = rbacdoc.Grants(at)
 	}
+
+	// A snippet this reader cannot place is one it would otherwise compare at
+	// the wrong scope, which is the failure above. The page states the object
+	// on every block; a new one that does not — or one naming a Role
+	// rbacdoc.NamespacedRoles has never heard of — has to say so before it can
+	// be compared.
+	if placed != len(roles) {
+		t.Fatalf("%d of the reference's %d rule blocks do not name an object this can "+
+			"place, so it cannot say which scope they are granted at; the blocks are "+
+			"headed `# ClusterRole` or `# Role, named <release>%v, …`",
+			len(roles)-placed, len(roles), rbacdoc.NamespacedRoles)
+	}
+	return out
 }
 
 // grantedSections drops the sections of a document whose heading says the
@@ -161,61 +266,6 @@ func grantedSections(doc string) string {
 }
 
 var notGranted = regexp.MustCompile(`(?i)not yet|unused|not needed|never granted`)
-
-// rulePairs pulls `group/resource: verb` pairs out of the RBAC rule blocks in
-// a document. Both the chart and the reference write a rule as three adjacent
-// lines, so the template directives around them are simply not matched:
-//
-//   - apiGroups: [""]
-//     resources: [nodes]
-//     verbs: [patch]
-//
-// The core group is rendered as "core" rather than the empty string, so a
-// failure message names something a reader can find in a role.
-func rulePairs(doc string) map[string]bool {
-	pairs := map[string]bool{}
-	var groups, resources []string
-	for line := range strings.SplitSeq(doc, "\n") {
-		line = strings.TrimSpace(line)
-		line = strings.TrimPrefix(line, "- ")
-		switch {
-		case strings.HasPrefix(line, "apiGroups:"):
-			groups = bracketed(line)
-		case strings.HasPrefix(line, "resources:"):
-			resources = bracketed(line)
-		case strings.HasPrefix(line, "verbs:"):
-			for _, group := range groups {
-				group = strings.Trim(group, `"`)
-				if group == "" {
-					group = "core"
-				}
-				for _, resource := range resources {
-					for _, verb := range bracketed(line) {
-						pairs[group+"/"+resource+": "+verb] = true
-					}
-				}
-			}
-			groups, resources = nil, nil
-		}
-	}
-	return pairs
-}
-
-// bracketed reads the inline sequence `key: [a, b]`.
-func bracketed(line string) []string {
-	open := strings.Index(line, "[")
-	shut := strings.LastIndex(line, "]")
-	if open < 0 || shut < open {
-		return nil
-	}
-	var out []string
-	for item := range strings.SplitSeq(line[open+1:shut], ",") {
-		if item = strings.TrimSpace(item); item != "" {
-			out = append(out, item)
-		}
-	}
-	return out
-}
 
 var whitespace = regexp.MustCompile(`\s+`)
 

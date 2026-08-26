@@ -477,6 +477,37 @@ func SkipCodes() []string {
 	}
 }
 
+// revalidationOnly are the skip codes only [Revalidate] can reach.
+//
+// Selection chooses among the nodes a snapshot carries, so it can never see a
+// node that has gone; it asks eligibility with resuming false, so it cannot
+// reach the marked-but-schedulable branch; and it refuses above the
+// assessments when there is no live autoscaler, returning a decision code
+// rather than a per-node skip. All three are states a drain already under way
+// can be in and a selection cannot.
+//
+// Written here rather than inferred, and held to what runs:
+// internal/engine's own tests drive Revalidate to each of them and fail if one
+// stops being reachable or if selection starts producing it.
+var revalidationOnly = []string{SkipGone, SkipUncordoned, SkipAutoscalerNotLive}
+
+// SelectionSkipCodes is every skip code a [Decision]'s assessments can carry.
+//
+// [SkipCodes] is the whole vocabulary, which is the right set for the
+// abandonment counter — revalidation reaches all of it. It is the wrong set
+// for binpack_nodes_skipped, which is fed from a Decision's assessments: a
+// code only Revalidate produces can never label that series, so documenting
+// one there advertises a selector nothing can match.
+func SelectionSkipCodes() []string {
+	out := make([]string, 0, len(SkipCodes()))
+	for _, code := range SkipCodes() {
+		if !slices.Contains(revalidationOnly, code) {
+			out = append(out, code)
+		}
+	}
+	return out
+}
+
 // AutoscalerCanFinish reports whether a skip code leaves open the possibility
 // that the cluster-autoscaler completes a removal it has already started.
 //
