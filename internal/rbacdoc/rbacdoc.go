@@ -398,11 +398,20 @@ func openedBlocks(line string) []string {
 func section(template, guard string) (body, rest string, err error) {
 	lines := strings.Split(template, "\n")
 
+	// The body begins where the guard's own action ends, which is not always
+	// the next line: another block may open on the same line, and a body
+	// starting below it omits the opener while depthDelta has already counted
+	// it. [GuardsWithin] then reports a block that contains nothing while the
+	// rules inside it sit under a construct that can suppress them.
+	opener := "{{- if " + guard + " }}"
+
 	start, depth := -1, 0
+	var remainder string
 	for i, line := range lines {
 		if start < 0 {
-			if strings.Contains(line, "{{- if "+guard+" }}") {
+			if at := strings.Index(line, opener); at >= 0 {
 				start, depth = i+1, depthDelta(line)
+				remainder = line[at+len(opener):]
 			}
 			continue
 		}
@@ -425,7 +434,8 @@ func section(template, guard string) (body, rest string, err error) {
 
 		if depth += depthDelta(line); depth == 0 {
 			kept := append(append([]string{}, lines[:start-1]...), lines[i+1:]...)
-			return strings.Join(lines[start:i], "\n"), strings.Join(kept, "\n"), nil
+			body := append([]string{remainder}, lines[start:i]...)
+			return strings.Join(body, "\n"), strings.Join(kept, "\n"), nil
 		}
 	}
 
@@ -499,6 +509,16 @@ func Documented(doc string) ([]Role, error) {
 				"to no rules, so this reader would drop it:\n%s", body)
 		case err != nil, len(role.Rules) == 0:
 			continue
+		}
+
+		// The same shape check the chart's rules get. A malformed rule
+		// contributes no grant, so both directions of the comparison stay
+		// green — while an operator assembling these snippets into a Role has
+		// the whole object refused, which is the failure the page exists to
+		// prevent.
+		if why := malformed(role); why != "" {
+			return nil, fmt.Errorf("a documented block declares a rule Kubernetes refuses: "+
+				"%s. A role written from this page would be rejected whole:\n%s", why, body)
 		}
 
 		// Which object a fragment belongs to is written in its first line as a
@@ -709,7 +729,14 @@ func Identities() []string {
 }
 
 // documentSeparator splits a multi-document YAML stream.
-var documentSeparator = regexp.MustCompile(`(?m)^---$`)
+//
+// A separator may carry a comment or trailing space — `--- # the act rules` is
+// a document start and so is `---   `. Matching only the bare form left an
+// appended manifest inside the previous chunk, where a single-document
+// unmarshal reads the first object and ignores the rest: a ClusterRole added
+// after such a line rendered through Helm and was invisible to every audit
+// here.
+var documentSeparator = regexp.MustCompile(`(?m)^---[ \t]*(#.*)?$`)
 
 // decode reads every role in a YAML stream, and every document that declares
 // rules without saying what it is.

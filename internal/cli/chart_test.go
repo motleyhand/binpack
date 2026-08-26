@@ -314,6 +314,7 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 		// object itself was read as the subject's line and never checked at
 		// all. Same section-tracking as roleBindings above.
 		var section string
+		var namespaces int
 		for line := range strings.SplitSeq(doc, "\n") {
 			if !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":") {
 				section = strings.TrimSuffix(line, ":")
@@ -322,6 +323,7 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 			if section != "metadata" || !strings.HasPrefix(line, "namespace:") {
 				continue
 			}
+			namespaces++
 			value := strings.TrimSpace(strings.TrimPrefix(line, "namespace:"))
 			// The whole expression, not a substring of it. Containment says
 			// the helper is mentioned; what has to hold is that its value is
@@ -359,6 +361,19 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 					"namespace named `true` or `123` renders as a bool or an int and the "+
 					"API server refuses the object", value)
 			}
+		}
+
+		// Present, not merely right when present. Every check in this loop is
+		// reached by a namespace line existing, so removing it from both
+		// documents left the objects agreeing with each other, the identity
+		// and binding checks satisfied, and nothing following
+		// discovery.autoscalerNamespace at all — which is a Role in the
+		// release's namespace and a 403 on every read the autoscaler is
+		// anywhere else.
+		if namespaces != 1 {
+			t.Errorf("an autoscaler-status object sets %d metadata namespaces, want the one "+
+				"that follows discovery.autoscalerNamespace; without it the object is "+
+				"created wherever the release is", namespaces)
 		}
 	}
 	if found != 2 {
@@ -846,6 +861,22 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 	release := elections[0].Metadata.Namespace
 	account := deploymentServiceAccount(t)
 
+	// And the account the chart creates, which this chain never reached: it
+	// compared the bindings with the pod and stopped there, so renaming the
+	// ServiceAccount manifest left both of those agreeing with each other
+	// about a name nothing creates. A default install then has a suffixed
+	// account, a Deployment naming the unsuffixed one, and pods that cannot
+	// start.
+	created, createdNamespace := renderedServiceAccount(t)
+	if created != account {
+		t.Errorf("the chart creates the ServiceAccount %s and the Deployment runs as %s; "+
+			"one of them names an account that does not exist", created, account)
+	}
+	if createdNamespace != "" && createdNamespace != release {
+		t.Errorf("the chart creates the ServiceAccount in %s and its bindings name it in "+
+			"%s", createdNamespace, release)
+	}
+
 	for _, b := range bindings {
 		// Per binding, not in aggregate. A total equal to the binding count is
 		// satisfied by one binding with none and another with two, and the
@@ -905,6 +936,40 @@ func identity(t *testing.T, seen map[string]bool, kind, namespace, name string) 
 			"dedupes it, and Helm asks the API server to create one object twice", key)
 	}
 	seen[key] = true
+}
+
+// renderedServiceAccount is the name and namespace expressions of the account
+// the chart creates, rendered the way rbacdoc renders one.
+func renderedServiceAccount(t *testing.T) (name, namespace string) {
+	t.Helper()
+
+	manifest, err := os.ReadFile("../../charts/binpack/templates/serviceaccount.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's ServiceAccount: %v", err)
+	}
+
+	var section string
+	for line := range strings.SplitSeq(string(manifest), "\n") {
+		if !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":") {
+			section = strings.TrimSuffix(line, ":")
+		}
+		if section != "metadata" {
+			continue
+		}
+		trimmed := strings.TrimSpace(line)
+		switch {
+		case strings.HasPrefix(trimmed, "name:"):
+			name = rbacdoc.Placeholder(strings.TrimPrefix(trimmed, "name:"))
+		case strings.HasPrefix(trimmed, "namespace:"):
+			namespace = rbacdoc.Placeholder(strings.TrimPrefix(trimmed, "namespace:"))
+		}
+	}
+
+	if name == "" {
+		t.Fatal("the chart's ServiceAccount manifest names no account, so nothing here can " +
+			"say whether the Deployment and the bindings agree with it")
+	}
+	return name, namespace
 }
 
 // deploymentServiceAccount is the account expression the pod runs as, rendered

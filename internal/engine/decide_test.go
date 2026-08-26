@@ -1116,6 +1116,18 @@ func TestEveryDecisionCarriesACode(t *testing.T) {
 		mother.Pod("default", "big-b", mother.OnNode("b"), mother.Requests("100m", "3Gi")),
 	})
 
+	// A drain already under way pre-empts a new decision, and an autoscaler
+	// that reports itself unwell stops one being made at all.
+	draining := cluster([]*corev1.Node{
+		inPool("a", mother.NodeAnnotations(map[string]string{
+			engine.AnnotationDrainStarted: now.Format(time.RFC3339)})),
+		inPool("b"),
+	}, nil)
+
+	unhealthy := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	unhealthy.Autoscaler.HealthStatus = engine.HealthUnhealthy
+
+	produced := map[string]bool{}
 	for _, tc := range []struct {
 		name string
 		s    engine.Snapshot
@@ -1125,13 +1137,36 @@ func TestEveryDecisionCarriesACode(t *testing.T) {
 		{"nothing eligible", allSkipped, engine.CodeNoCandidates},
 		{"nothing fits", tooBig, engine.CodeNoneFeasible},
 		{"a drain", feasible, engine.CodeDrain},
+		{"a drain already under way", draining, engine.CodeDraining},
+		{"the autoscaler says it is unwell", unhealthy, engine.CodeAutoscalerUnhealthy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := engine.Decide(tc.s, config())
 			if d.Code != tc.want {
 				t.Errorf("code = %q, want %q (reason: %s)", d.Code, tc.want, d.Reason)
 			}
+			produced[d.Code] = true
 		})
+	}
+
+	// Every enumerated code has to be one a decision produces, which the loop
+	// above cannot say: it visits the fixtures rather than the vocabulary. The
+	// skip codes have had that direction since this pull request's first
+	// commit and the decision codes had not, so a constant added here and to
+	// the reference satisfied the declaration count, the uniqueness guard and
+	// both directions of the table comparison while no Decision ever carried
+	// it — and binpack_evaluations_total{code=…} advertised a selector that
+	// can never match.
+	//
+	// No exceptions, unlike the skip codes: every decision code is a whole
+	// evaluation's outcome, and there is no second entry point to reach one
+	// from.
+	for _, code := range engine.DecisionCodes() {
+		if !produced[code] {
+			t.Errorf("no case produces %q; it is published as "+
+				"binpack_evaluations_total{code=%q} and documented as an outcome, and "+
+				"nothing here reaches it", code, code)
+		}
 	}
 }
 
