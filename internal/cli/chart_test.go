@@ -314,10 +314,27 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 			if strings.Contains(value, ".Release.Namespace") {
 				continue
 			}
-			if !strings.Contains(value, "autoscalerNamespace") {
-				t.Errorf("the autoscaler-status objects are bound to %s, which does not "+
-					"move with discovery.autoscalerNamespace: binpack would read a "+
-					"namespace it has no Role in and 403 on every evaluation", value)
+			// The whole expression, not a substring of it. Containment says
+			// the helper is mentioned; what has to hold is that its value is
+			// the namespace, and `printf "%s-wrong" (include …)` mentions it
+			// while creating the Role somewhere else. Both objects would move
+			// together, so comparing them with each other sees nothing either.
+			if pipeline, ok := helmPipeline(value); !ok ||
+				pipeline[0] != `include "binpack.autoscalerNamespace" .` {
+				t.Errorf("the autoscaler-status objects are bound to %s rather than to "+
+					"discovery.autoscalerNamespace itself: binpack reads the namespace that "+
+					"setting names, and a Role anywhere else is a 403 on every evaluation",
+					value)
+			} else {
+				// And nothing but quoting after it. A stage that transforms the
+				// value moves the Role without moving what binpack reads.
+				for _, stage := range pipeline[1:] {
+					if stage != "quote" {
+						t.Errorf("the autoscaler-status namespace passes "+
+							"discovery.autoscalerNamespace through %q; whatever that "+
+							"renders, it is not the namespace binpack reads", stage)
+					}
+				}
 			}
 			// Quoted, because `metadata.namespace` is a string and a bare
 			// namespace name is not necessarily a YAML string. `true`, `false`
@@ -339,6 +356,29 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 		t.Fatalf("found %d autoscaler-status objects, want the Role and its RoleBinding; "+
 			"this test asserts nothing if it cannot find them", found)
 	}
+}
+
+// helmPipeline splits a field whose whole value is one Helm action into the
+// stages of its pipeline, and reports whether it is one.
+//
+// A field written as anything other than a single action — a literal, or an
+// action with text around it — is not a pipeline and the caller has to say so
+// in its own terms.
+func helmPipeline(value string) ([]string, bool) {
+	body, ok := strings.CutPrefix(strings.TrimSpace(value), "{{")
+	if !ok {
+		return nil, false
+	}
+	body, ok = strings.CutSuffix(body, "}}")
+	if !ok {
+		return nil, false
+	}
+
+	var stages []string
+	for _, stage := range strings.Split(strings.Trim(body, "-"), "|") {
+		stages = append(stages, strings.TrimSpace(stage))
+	}
+	return stages, len(stages) > 0
 }
 
 // The chart's default namespace and the binary's must be the same one.
