@@ -261,11 +261,18 @@ declared, so there is nothing an operator must supply.
 |---|---|---|
 | `--file`, `-f` | standard input | Configuration file to read |
 
-A `pools[]` entry is resolved and printed like any other, and **its name is not checked here**:
-this command reads a document, not a cluster. `binpack explain`, `binpack diagnose` and the
-controller each check a name against the pools the cluster has and refuse one that is not there,
-so the summary says underneath the overrides that it has not. Only when there are overrides —
-there is nothing to disclose about a document that has none.
+Two fields name something only a cluster can confirm, and **neither is checked here**: a
+`pools[]` entry has to name a pool the cluster has, and a `discovery.nodeGroups` entry has to name
+a node group the cluster-autoscaler publishes. This command reads a document, not a cluster, so it
+resolves and prints both like any other setting and then says underneath that it did not check
+them. Each line appears only when the document carries that field — there is nothing to disclose
+about a document that states neither.
+
+`binpack explain` and `binpack diagnose` check both against the cluster, and the controller treats
+an unknown name as a fatal configuration error. It resolves pools on every evaluation but holds
+that error until it has resumed any drain already in progress — exiting one tick into a drain
+would strand a cordoned node — so `binpack run --once` can advance a drain and exit before
+reporting it. The next run reports it.
 
 `apiVersion` and `kind` are emitted so the report is a document rather than a report *about* a
 document — see below.

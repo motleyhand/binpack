@@ -64,21 +64,48 @@ func readConfigInput(path string, stdin io.Reader) ([]byte, error) {
 	return data, nil
 }
 
-// poolNamesNotChecked is the one thing this command knowingly leaves
-// unverified, in the sentence the summary prints for it — the disclosure
-// pattern explain already has for controls it cannot evaluate.
+// The two things this command knowingly leaves unverified, in the sentences
+// the summary prints for them — the disclosure pattern explain already has
+// for controls it cannot evaluate.
+//
+// Both name something only a cluster can confirm, and both are confirmed in
+// the same place: [engine.ResolvePools] refuses an override naming a pool the
+// cluster has not got, and a stated join naming a node group the autoscaler
+// does not publish. Two sentences rather than one, because they are separate
+// conditions — a document can state either without the other, and a single
+// disclosure conditioned on the pool overrides said nothing about a document
+// carrying only a join. Each is written to stand alone for that reason, so
+// neither may lean on the other having been printed.
+//
+// Neither promises when the refusal arrives, and that is deliberate rather
+// than vague. The controller resolves pools on every evaluation but holds the
+// error until after it has resumed any drain in progress, because the failure
+// is unretryable and exiting one tick into a drain strands a cordoned node —
+// so `run --once` can advance a drain and exit before it reports either. What
+// is true without qualification is that the check needs a cluster, that this
+// command has none, and that an unknown name is fatal to the controller
+// whenever it does reach it. Pointing at the read-only command that answers
+// the question beats asserting a timing on the operator's behalf.
 //
 // The summary only, deliberately. `--output json` reports a configuration
 // document: apiVersion, kind, and every key a configuration field, so that
 // feeding it back through -f is valid and resolves to the same settings. The
 // loader rejects unknown fields, so a disclosure key there would make the
-// report unloadable for precisely the documents this sentence is about. And
-// there is nothing to disclose to that reader: the JSON never says the
+// report unloadable for precisely the documents these sentences are about.
+// And there is nothing to disclose to that reader: the JSON never says the
 // configuration is valid, it says what the document resolves to, which is
-// true of an override whether or not its pool exists.
-const poolNamesNotChecked = "pools[].name is not checked here: this command reads a document, " +
-	"not a cluster. explain, diagnose and run check each name against the pools this cluster " +
-	"has, and refuse one that is not there."
+// true of an entry whether or not the cluster has what it names.
+const (
+	poolNamesNotChecked = "pools[].name is not checked here: this command reads a document, " +
+		"not a cluster. Run `binpack explain` or `binpack diagnose` against the cluster to " +
+		"check each name against the pools it has; the controller treats an unknown one as a " +
+		"fatal configuration error."
+
+	nodeGroupJoinsNotChecked = "discovery.nodeGroups is not checked here: a stated join must " +
+		"name a node group the cluster-autoscaler publishes, so only a cluster can confirm it. " +
+		"Run `binpack explain` or `binpack diagnose`; the controller treats an unknown group " +
+		"as a fatal configuration error."
+)
 
 // resolvedConfig is what `--output json` reports: the effective settings, not
 // the sparse document that produced them. Echoing the input back would tell an
@@ -251,6 +278,16 @@ func writeConfigSummary(opts *options, cfg *v1alpha1.Config) error {
 	// resolves to must not be the one that reads as a clean bill of health.
 	if len(cfg.Pools) > 0 {
 		p("\n%s\n", poolNamesNotChecked)
+	}
+	// The sibling condition, separately. The joins are printed far above,
+	// beside the label keys rather than down here with the overrides, and a
+	// document can state one without the other — so a disclosure gated on the
+	// overrides left the identical defect standing on the field next to it.
+	if len(cfg.Discovery.NodeGroups) > 0 {
+		if len(cfg.Pools) == 0 {
+			p("\n")
+		}
+		p("%s\n", nodeGroupJoinsNotChecked)
 	}
 
 	return errors.Join(errs...)
