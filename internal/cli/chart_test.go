@@ -764,6 +764,7 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 			"compare the bindings' subject namespace against", len(elections))
 	}
 	release := elections[0].Metadata.Namespace
+	account := deploymentServiceAccount(t)
 
 	for _, b := range bindings {
 		// Per binding, not in aggregate. A total equal to the binding count is
@@ -797,8 +798,44 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 					"the chart creates or the pod uses",
 					b.Kind, b.Metadata.Name, subject.Namespace, release)
 			}
+			// And the account itself. The older raw-template check requires
+			// the name expression to *contain* the helper, which a suffix
+			// satisfies: `…serviceAccountName" . }}-other` on all three
+			// subjects left the suite green while the Deployment went on
+			// running as the unsuffixed account and held none of these
+			// permissions. Compared with the Deployment's own expression, so
+			// the two have to move together.
+			if subject.Name != account {
+				t.Errorf("the %s %s binds the ServiceAccount %s and the Deployment runs as "+
+					"%s; the binding is valid, names an account that is not the pod's, and "+
+					"grants binpack nothing", b.Kind, b.Metadata.Name, subject.Name, account)
+			}
 		}
 	}
+}
+
+// deploymentServiceAccount is the account expression the pod runs as, rendered
+// the way rbacdoc renders one.
+func deploymentServiceAccount(t *testing.T) string {
+	t.Helper()
+
+	deployment, err := os.ReadFile("../../charts/binpack/templates/deployment.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's deployment: %v", err)
+	}
+
+	const field = "serviceAccountName:"
+	for line := range strings.SplitSeq(string(deployment), "\n") {
+		_, value, found := strings.Cut(line, field)
+		if !found {
+			continue
+		}
+		return rbacdoc.Placeholder(value)
+	}
+
+	t.Fatalf("the Deployment no longer sets %s, so it runs as the namespace's default "+
+		"account and every binding here grants binpack nothing", field)
+	return ""
 }
 
 // TestRBACCreateFalseRendersNoRBACAtAll holds what the setting is for.

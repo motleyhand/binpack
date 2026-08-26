@@ -622,7 +622,20 @@ var helmAction = regexp.MustCompile(`\{\{-?.*?-?\}\}`)
 // rule would have been invisible to every check in this package while the
 // installed chart granted it. Standalone invocations are refused instead; see
 // [HelmToYAML].
-var helmControlKeywords = []string{"if", "else", "end", "range", "with", "define", "block"}
+var helmControlKeywords = []string{"if", "else", "end", "range", "with", "block"}
+
+// definedTemplate matches the opening of a `define`, which is refused rather
+// than treated as control flow.
+//
+// `define` declares a named template and renders nothing at the declaration
+// site. Deleting its opening and closing actions the way a conditional's are
+// deleted leaves the body behind as though the chart emitted it — so a role
+// moved into a define whose invocation was forgotten is still read, still
+// compared and still found correct, while Helm renders only its dangling
+// binding and the install comes up with no cluster read at all. It is the
+// mirror of the bare invocation this also refuses: one emits what is not
+// written here, the other writes what is not emitted.
+var definedTemplate = regexp.MustCompile(`\{\{-?\s*define\b`)
 
 // HelmToYAML makes a chart template parseable, without running Helm.
 //
@@ -649,6 +662,13 @@ func HelmToYAML(template string) (string, error) {
 		if len(actions) == 0 {
 			out = append(out, line)
 			continue
+		}
+
+		if definedTemplate.MatchString(line) {
+			return "", fmt.Errorf("line %d declares a named template (%s); its body renders "+
+				"nowhere unless something invokes it, and this substitution would read the "+
+				"body as though the chart emitted it — move the rules out of the define, "+
+				"or render the chart", i+1, strings.TrimSpace(line))
 		}
 
 		if control := controlAction(actions); control != "" {
