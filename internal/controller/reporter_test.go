@@ -127,10 +127,26 @@ func TestTheEventRecorderNeverIssuesAnUpdate(t *testing.T) {
 		}
 	}
 
+	// An equality, in both directions, because recorderMethods is read by
+	// TestTheChartGrantsWhatTheCodeCalls as the verbs the chart has to grant.
+	// A method observed here and missing from that list is a request an install
+	// makes and nobody asked permission for — Update being the case worth
+	// naming, since a recorder that started issuing one would 403 on the
+	// aggregation path against a ClusterRole granting create and patch. And a
+	// method in the list the recorder never issues makes the chart grant
+	// something nothing uses.
+	//
+	// Subset-only, this accepted Patch being dropped from recorderMethods
+	// alongside the chart and the reference: the sink still observed it, this
+	// said nothing, and the RBAC test compared a list that no longer mentioned
+	// it.
 	called := sink.methods()
-	if slices.Contains(called, "Update") {
-		t.Errorf("the recorder issued an Update (%v), so dropping the verb from the "+
-			"ClusterRole would 403 on the aggregation path", called)
+	for _, got := range called {
+		if !slices.Contains(recorderMethods, got) {
+			t.Errorf("the recorder issued a %s (%v) and recorderMethods does not name it, "+
+				"so the chart is never asked to grant it and an install would 403 on "+
+				"that request", got, called)
+		}
 	}
 	for _, want := range recorderMethods {
 		if !slices.Contains(called, want) {

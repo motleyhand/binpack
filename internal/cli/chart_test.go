@@ -592,7 +592,16 @@ func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
 		// never starts reconciling.
 		"coordination.k8s.io/leases: get",
 		"coordination.k8s.io/leases: create",
-		"coordination.k8s.io/leases: update")
+		"coordination.k8s.io/leases: update",
+		// And the events leader election announces itself with, which go to
+		// the *core* group through client-go's legacy recorder — unlike
+		// binpack's own decision events, which are events.k8s.io and
+		// cluster-wide. They are about a Lease in this namespace, so they
+		// belong to this Role: anchoring only the Lease verbs left the core
+		// event rule free to move into the autoscaler-status Role, which is
+		// nonempty, disjoint and in the wrong namespace.
+		"core/events: create",
+		"core/events: patch")
 }
 
 // anchoredIn asserts that each pair is granted by the namespaced Role whose

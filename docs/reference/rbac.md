@@ -67,7 +67,7 @@ The cluster-autoscaler's status ConfigMap is granted separately, as a **Role in 
 to `kube-system` and is not always it:
 
 ```yaml
-# Role, namespace: whatever discovery.autoscalerNamespace is set to
+# Role, named <release>-autoscaler-status, in the namespace discovery.autoscalerNamespace names
 rules:
   - apiGroups: [""]
     resources: [configmaps]
@@ -110,7 +110,7 @@ rules:
 ```
 
 ```yaml
-# Role, in binpack's own namespace
+# Role, named <release>-leader-election, in binpack's own namespace
 rules:
   - apiGroups: ["coordination.k8s.io"]
     resources: [leases]

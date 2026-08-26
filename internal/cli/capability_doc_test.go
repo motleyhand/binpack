@@ -105,7 +105,7 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 
 	// The act rules live in the chart's ClusterRole, so that is the scope the
 	// page has to document them at.
-	documented := documentedGrants(t)[roleKinds[0]]
+	documented := documentedGrants(t)["ClusterRole"]
 
 	for pair := range granted {
 		if !documented[pair] {
@@ -167,24 +167,24 @@ func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
 	// Per kind because the union cannot express where a namespaced grant
 	// applies; see documentedGrants.
 	documented := documentedGrants(t)
-	for _, kind := range roleKinds {
-		granted := rbacdoc.Grants(rbacdoc.OfKind(roles, kind))
+	for _, identity := range rbacdoc.Identities() {
+		granted := rbacdoc.Grants(rbacdoc.OfIdentity(roles, identity))
 		if len(granted) == 0 {
-			t.Fatalf("the chart renders no %s rules at all", kind)
+			t.Fatalf("the chart renders no %s rules at all", identity)
 		}
 		for pair := range granted {
-			if !documented[kind][pair] {
+			if !documented[identity][pair] {
 				t.Errorf("the chart's %s grants %q and the RBAC reference does not list it "+
-					"under a %s; a role written from this page would be missing it",
-					kind, pair, kind)
+					"there; a role written from this page would be missing it",
+					identity, pair)
 			}
 		}
-		for pair := range documented[kind] {
+		for pair := range documented[identity] {
 			if !granted[pair] {
-				t.Errorf("the RBAC reference lists %q under a %s outside a section marked "+
-					"unused and no %s the chart renders grants it; either the chart has "+
-					"stopped granting something binpack needs, or the page is asking for "+
-					"a permission nobody has to give", pair, kind, kind)
+				t.Errorf("the RBAC reference lists %q under %s outside a section marked "+
+					"unused and no such rule the chart renders grants it; either the chart "+
+					"has stopped granting something binpack needs, or the page is asking "+
+					"for a permission nobody has to give", pair, identity)
 			}
 		}
 	}
@@ -220,25 +220,26 @@ func documentedGrants(t *testing.T) map[string]map[string]bool {
 		t.Fatalf("reading the RBAC reference's rules: %v", err)
 	}
 
-	out := map[string]map[string]bool{}
-	for _, kind := range roleKinds {
-		out[kind] = rbacdoc.Grants(rbacdoc.OfKind(roles, kind))
+	out, placed := map[string]map[string]bool{}, 0
+	for _, identity := range rbacdoc.Identities() {
+		at := rbacdoc.OfIdentity(roles, identity)
+		placed += len(at)
+		out[identity] = rbacdoc.Grants(at)
 	}
 
-	// A snippet whose leading comment names neither kind is one this reader
-	// cannot place, and placing it wrongly is the failure above. The page
-	// states the kind on every block; a new one that does not has to say so
-	// before it can be compared.
-	if placed := len(rbacdoc.OfKind(roles, roleKinds[0])) + len(rbacdoc.OfKind(roles, roleKinds[1])); placed != len(roles) {
-		t.Fatalf("%d of the reference's %d rule blocks do not name the kind they belong "+
-			"in, so this cannot say which scope they are granted at", len(roles)-placed, len(roles))
+	// A snippet this reader cannot place is one it would otherwise compare at
+	// the wrong scope, which is the failure above. The page states the object
+	// on every block; a new one that does not — or one naming a Role
+	// rbacdoc.NamespacedRoles has never heard of — has to say so before it can
+	// be compared.
+	if placed != len(roles) {
+		t.Fatalf("%d of the reference's %d rule blocks do not name an object this can "+
+			"place, so it cannot say which scope they are granted at; the blocks are "+
+			"headed `# ClusterRole` or `# Role, named <release>%v, …`",
+			len(roles)-placed, len(roles), rbacdoc.NamespacedRoles)
 	}
 	return out
 }
-
-// roleKinds are the two scopes a rule can be granted at, and the reason every
-// comparison in this file is made per kind rather than over the union.
-var roleKinds = []string{"ClusterRole", "Role"}
 
 // grantedSections drops the sections of a document whose heading says the
 // permissions in them are not granted or not needed, so what remains is what

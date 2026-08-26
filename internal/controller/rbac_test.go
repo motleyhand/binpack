@@ -13,6 +13,7 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
+	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/executor"
 	"github.com/motleyhand/binpack/internal/mother"
 	"github.com/motleyhand/binpack/internal/rbacdoc"
@@ -123,6 +124,25 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 			t.Errorf("binpack performs %q whatever dryRun is set to, and no cluster-scoped "+
 				"rule the chart renders without rbac.allowDraining grants it; a default "+
 				"install would 403 on that call while looking healthy", pair)
+		}
+	}
+
+	// And nothing else. Every check above asks whether a permission binpack
+	// needs is granted; none asks whether a permission granted is one binpack
+	// needs, and those fail in opposite directions. Adding `delete` to the
+	// Node read rule in the chart and the reference together left the two
+	// agreeing, left internal/collect's read equality unchanged — the rule
+	// still carries get, list and watch, so it still "grants read" — and was
+	// never reached by the acting equality, while the service account gained
+	// cluster-wide permission to delete Nodes. "binpack removes no object,
+	// ever" is internal/executor's package doc, R4-003's availability argument
+	// and this page's own "what binpack is never granted" section, and the
+	// grant is where it is actually enforced.
+	for pair := range ungated {
+		if !always[pair] && !ungatedReads()[pair] {
+			t.Errorf("the chart grants %q to every install and binpack neither reads nor "+
+				"writes it; a permission nothing uses is one an operator has to justify, "+
+				"and the reference tells them binpack is never granted it", pair)
 		}
 	}
 
@@ -328,3 +348,37 @@ var (
 	_ executor.Writer = (*recordingWriter)(nil)
 	_ eventWriter     = (*recordingWriter)(nil)
 )
+
+// ungatedReads is every read binpack performs, as the pairs a rule granting it
+// would carry.
+//
+// Derived from the same declaration internal/collect's read equality derives
+// from, so the two cannot drift: the controller kinds come from
+// collect.TemplateSources, and the three the snapshot reads directly are
+// written out for the reason that test writes them out — this has to name them
+// in order to say the ClusterRole holds nothing else, and naming them is what
+// makes the assertion cover the whole role rather than the API groups the
+// controller kinds happen to occupy today.
+//
+// get, list and watch together, and no other verb. binpack's cache lists and
+// then watches and `explain` gets, so those three are what a read costs; a
+// fourth verb on a read rule is not a wider read, it is a different
+// permission.
+func ungatedReads() map[string]bool {
+	resources := []string{"core/nodes", "core/pods", "policy/poddisruptionbudgets"}
+	for _, src := range collect.TemplateSources() {
+		group := src.Group()
+		if group == "" {
+			group = "core"
+		}
+		resources = append(resources, group+"/"+src.Resource)
+	}
+
+	out := map[string]bool{}
+	for _, resource := range resources {
+		for _, verb := range []string{"get", "list", "watch"} {
+			out[resource+": "+verb] = true
+		}
+	}
+	return out
+}

@@ -47,11 +47,17 @@ const (
 // is. It restricts a request by the name in its path, so a rule carrying one
 // authorises only requests that name that object — and a group/resource/verb
 // triple read without it says a permission is granted that is not.
+// NonResourceURLs is here for the opposite reason to ResourceNames: dropping
+// it made a grant invisible rather than larger. A rule granting `get` on
+// `nonResourceURLs: ["*"]` contributes no group/resource triple at all, so it
+// passed every comparison and every count while the service account gained
+// access to endpoints neither the code nor the page asks for.
 type Rule struct {
-	APIGroups     []string `json:"apiGroups"`
-	Resources     []string `json:"resources"`
-	ResourceNames []string `json:"resourceNames"`
-	Verbs         []string `json:"verbs"`
+	APIGroups       []string `json:"apiGroups"`
+	Resources       []string `json:"resources"`
+	ResourceNames   []string `json:"resourceNames"`
+	NonResourceURLs []string `json:"nonResourceURLs"`
+	Verbs           []string `json:"verbs"`
 }
 
 // Role is as much of a ClusterRole or Role as this package needs.
@@ -219,8 +225,11 @@ func Documented(doc string) ([]Role, error) {
 		}
 
 		// Which object a fragment belongs to is written in its first line as a
-		// comment, since it has no metadata to carry it.
-		role.Kind = kindOf(body)
+		// comment, since it has no metadata to carry it. The whole line is
+		// kept as the name: [Identity] matches the chart's metadata.name and
+		// this against the same suffixes, and text is all the two documents
+		// share.
+		role.Kind, role.Metadata.Name = kindOf(body)
 		out = append(out, role)
 	}
 
@@ -256,17 +265,18 @@ func fragment(body string) (Role, error) {
 	return wrapped, nil
 }
 
-// kindOf reads the leading comment a documented fragment names its object in.
-func kindOf(body string) string {
+// kindOf reads the leading comment a documented fragment names its object in,
+// returning the kind and the whole line to identify it by.
+func kindOf(body string) (kind, name string) {
 	first, _, _ := strings.Cut(body, "\n")
 	first = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(first), "#"))
 	switch {
 	case strings.HasPrefix(first, "ClusterRole"):
-		return "ClusterRole"
+		return "ClusterRole", first
 	case strings.HasPrefix(first, "Role"):
-		return "Role"
+		return "Role", first
 	default:
-		return ""
+		return "", ""
 	}
 }
 
@@ -297,9 +307,53 @@ func Grants(roles []Role) map[string]bool {
 					}
 				}
 			}
+			// Spelled as an endpoint rather than as a group and resource,
+			// because that is what it is. What matters is that it appears at
+			// all: a rule granting only these used to add nothing to this map.
+			for _, url := range rule.NonResourceURLs {
+				for _, verb := range rule.Verbs {
+					pairs["nonResourceURL "+url+": "+verb] = true
+				}
+			}
 		}
 	}
 	return pairs
+}
+
+// NamespacedRoles are the chart's namespaced Roles, by the suffix their names
+// carry.
+//
+// A closed list, and checked as one: [Identity] returns "" for a Role matching
+// none of these, and its callers fail on that rather than treating it as
+// unplaceable-so-ignore. A third Role added to the chart therefore fails until
+// it is named here, which is the point — the two documents this package reads
+// have no shared vocabulary for these objects, so the correspondence has to be
+// written down, and a correspondence that is written down and unenforced is
+// how this whole review started.
+var NamespacedRoles = []string{"-autoscaler-status", "-leader-election"}
+
+// Identity is the scope a rule is granted at: the kind, and for a namespaced
+// Role which of the chart's Roles it is.
+//
+// Kind alone is not enough. The chart renders two Roles into two different
+// namespaces — one where the cluster-autoscaler publishes its status, one
+// where binpack runs — so a rule moved between them is granted somewhere
+// binpack never issues that request, and a comparison keyed on "Role" reads
+// the two as interchangeable.
+//
+// The chart states the identity in metadata.name and the reference page in
+// each block's leading comment; text is the only thing they share, so both are
+// matched against the same suffixes.
+func Identity(role Role) string {
+	if role.Kind != "Role" {
+		return role.Kind
+	}
+	for _, suffix := range NamespacedRoles {
+		if strings.Contains(role.Metadata.Name, suffix) {
+			return "Role" + suffix
+		}
+	}
+	return ""
 }
 
 // namelessVerbs are the verbs whose requests carry no object name, so a
@@ -351,6 +405,28 @@ func OfKind(roles []Role, kind string) []Role {
 		if role.Kind == kind {
 			out = append(out, role)
 		}
+	}
+	return out
+}
+
+// OfIdentity is the roles at one scope, which for a namespaced Role is finer
+// than its kind. See [Identity].
+func OfIdentity(roles []Role, identity string) []Role {
+	var out []Role
+	for _, role := range roles {
+		if Identity(role) == identity {
+			out = append(out, role)
+		}
+	}
+	return out
+}
+
+// Identities are the scopes a rule can be granted at in this chart: cluster
+// wide, or in one of the namespaced Roles.
+func Identities() []string {
+	out := []string{"ClusterRole"}
+	for _, suffix := range NamespacedRoles {
+		out = append(out, "Role"+suffix)
 	}
 	return out
 }
