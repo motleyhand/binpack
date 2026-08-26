@@ -371,6 +371,16 @@ func requireBoundTo(t *testing.T, options rbacdoc.Options, account string) []str
 
 		subject := binding.Subjects[0]
 		switch {
+		case subject.APIGroup != rbacdoc.SubjectAPIGroup(subject.Kind):
+			// Kind-specific, and the API server refuses a subject that gets it
+			// wrong: a ServiceAccount's group is the core one, spelled empty.
+			// The audit that checks this in full renders one set of values, so
+			// a value-dependent path could get it wrong and be refused at
+			// create with every other check here passing.
+			t.Errorf("the %s %s names a %s subject with apiGroup %q, and Kubernetes "+
+				"requires %q for that kind; the API server refuses the binding and "+
+				"binpack holds nothing", binding.Kind, binding.Metadata.Name,
+				subject.Kind, subject.APIGroup, rbacdoc.SubjectAPIGroup(subject.Kind))
 		case subject.Kind != "ServiceAccount":
 			t.Errorf("the %s %s binds a %s; binpack runs as a ServiceAccount, and this "+
 				"binding grants whatever that other principal is instead",

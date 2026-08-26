@@ -784,8 +784,12 @@ func walkConditional(n ast.Node, conditional bool, visit func(ast.Node, bool)) {
 		descend(n.Else, true)
 		return
 	case *ast.ForStmt:
+		// The post statement runs after each iteration, so a loop that runs
+		// none never reaches it — as conditional as the body, and skipped
+		// entirely until a reviewer pointed at `for ; ready; w.Patch(…)`.
 		descend(n.Init, conditional)
 		descend(n.Cond, conditional)
+		descend(n.Post, true)
 		descend(n.Body, true)
 		return
 	case *ast.RangeStmt:

@@ -920,7 +920,20 @@ func decode(what, manifests string) ([]Role, error) {
 				"are overwritten — every comparison here would be against a document the "+
 				"cluster ignores:\n%s", what, doc)
 		}
-		if role.Kind != "Role" && role.Kind != "ClusterRole" && len(role.Rules) == 0 {
+		if role.Kind != "Role" && role.Kind != "ClusterRole" {
+			// Nothing that is not a role, and nothing that looks like one and
+			// is not. A rendered document carrying `rules:` under some other
+			// kind was kept and counted: it satisfied the role and binding
+			// counts, `BindingKindFor` reads every kind but ClusterRole as
+			// namespaced so a roleRef could name it, and repeating an existing
+			// grant is deduplicated by every comparison here — while the
+			// install fails, because that API version serves no such kind.
+			if len(role.Rules) > 0 {
+				return nil, fmt.Errorf("%s declares a %s carrying policy rules, and "+
+					"Kubernetes serves no such kind under %s; the install fails and "+
+					"every comparison here would have read it as a role:\n%s",
+					what, role.Kind, RBACAPIVersion, doc)
+			}
 			continue
 		}
 		out = append(out, role)
