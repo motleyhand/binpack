@@ -34,6 +34,34 @@ import (
 // immutable, so there is no upgrade path that repairs it either.
 const RBACAPIGroup = "rbac.authorization.k8s.io"
 
+// SubjectAPIGroup is the API group a subject of the given kind must name.
+//
+// ServiceAccounts are core objects and take the empty group; Users and Groups
+// are not objects at all and take the RBAC one. Kubernetes rejects a binding
+// that gets this wrong, and the wrong value is invisible in every other field.
+func SubjectAPIGroup(kind string) string {
+	if kind == "ServiceAccount" {
+		return ""
+	}
+	return RBACAPIGroup
+}
+
+// BindingKindFor is the binding kind that makes a role of the given kind
+// effective as the chart intends.
+//
+// A ClusterRoleBinding may only reference a ClusterRole. A RoleBinding may
+// reference either — and that is the trap: a RoleBinding naming a ClusterRole
+// is legal, installs cleanly, and grants that ClusterRole's rules inside one
+// namespace only. binpack's ClusterRole is the cluster-wide read of every Node
+// and Pod, so bound that way it grants almost nothing binpack needs while
+// every assertion about the rules themselves stays true.
+func BindingKindFor(roleKind string) string {
+	if roleKind == "ClusterRole" {
+		return "ClusterRoleBinding"
+	}
+	return "RoleBinding"
+}
+
 // The two documents, spelled once. The prefix is relative to a package
 // directory one level under the repository root, which is where every caller
 // lives.
@@ -130,6 +158,13 @@ type Binding struct {
 	// wrong principal is as inert as one naming the wrong role, and reads the
 	// same in every assertion about what the role grants.
 	Subjects []struct {
+		// APIGroup is modelled for roleRef's reason and a stricter one: it is
+		// kind-specific. Kubernetes requires it to be empty for a
+		// ServiceAccount, whose group is the core one, and
+		// rbac.authorization.k8s.io for a User or a Group — so a subject that
+		// acquires the wrong one decodes unchanged in every other field and is
+		// rejected by the API server.
+		APIGroup  string `json:"apiGroup"`
 		Kind      string `json:"kind"`
 		Name      string `json:"name"`
 		Namespace string `json:"namespace"`

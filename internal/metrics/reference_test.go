@@ -262,6 +262,17 @@ func TestEveryPublishedVocabularyIsASet(t *testing.T) {
 
 		seen := map[string]bool{}
 		for _, value := range vocabulary.values {
+			// Already refused downstream — TestNoLabelCarriesProse gathers the
+			// pre-initialised series and rejects `=""`, and every one of these
+			// four is pre-initialised. Refused here too because that test is
+			// about a rendered series and this one is about the vocabulary,
+			// and a reader of the enumerator should not have to know which
+			// other file holds it well-formed.
+			if value == "" {
+				t.Errorf("%s() enumerates the empty string; observeNodes suppresses an "+
+					"empty code, so the value is documented and pre-initialised and no "+
+					"series ever carries it", vocabulary.name)
+			}
 			if seen[value] {
 				t.Errorf("%s() enumerates %q twice, so two constants share it: the pair is "+
 					"one label value now, and every check that turns this list into a set "+

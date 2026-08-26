@@ -112,6 +112,41 @@ func TestEverySkipCodeDecideProducesIsEnumerated(t *testing.T) {
 func TestEverySkipCodeRevalidateProducesIsEnumerated(t *testing.T) {
 	enumerated := engine.SkipCodes()
 
+	for _, tc := range revalidateCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			a := engine.Revalidate(tc.s(), "a", config())
+
+			if a.SkipCode != tc.want {
+				t.Fatalf("skip code = %q, want %q — the fixture no longer reaches the branch",
+					a.SkipCode, tc.want)
+			}
+			if !slices.Contains(enumerated, a.SkipCode) {
+				t.Errorf("Revalidate produced %q, which SkipCodes() does not enumerate: "+
+					"it is published as binpack_drains_abandoned_total{reason=%q} and "+
+					"nothing documents it", a.SkipCode, a.SkipCode)
+			}
+		})
+	}
+}
+
+// revalidateCase is one fixture that drives Revalidate to a code Decide cannot
+// reach.
+type revalidateCase struct {
+	name string
+	want string
+	s    func() engine.Snapshot
+}
+
+// revalidateCases are those fixtures, shared with decide_test.go's
+// decidedElsewhere record.
+//
+// Extracted so that the record of which codes Decide cannot reach is checked
+// against codes something actually emits, rather than against its own prose. A
+// value added to SkipCodes(), to the reference and to that map was accepted by
+// all three on the strength of the sentence in the map — a misspelling or a
+// branch never written could be documented and pre-initialised as a public
+// label for ever with no runtime path producing it.
+func revalidateCases() []revalidateCase {
 	marked := func(opts ...mother.NodeOption) *corev1.Node {
 		return inPool("a", append([]mother.NodeOption{
 			mother.NodeAnnotations(map[string]string{
@@ -120,11 +155,7 @@ func TestEverySkipCodeRevalidateProducesIsEnumerated(t *testing.T) {
 		}, opts...)...)
 	}
 
-	for _, tc := range []struct {
-		name string
-		want string
-		s    func() engine.Snapshot
-	}{
+	return []revalidateCase{
 		{
 			name: "the node has gone",
 			want: engine.SkipGone,
@@ -152,21 +183,22 @@ func TestEverySkipCodeRevalidateProducesIsEnumerated(t *testing.T) {
 				return s
 			},
 		},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			a := engine.Revalidate(tc.s(), "a", config())
-
-			if a.SkipCode != tc.want {
-				t.Fatalf("skip code = %q, want %q — the fixture no longer reaches the branch",
-					a.SkipCode, tc.want)
-			}
-			if !slices.Contains(enumerated, a.SkipCode) {
-				t.Errorf("Revalidate produced %q, which SkipCodes() does not enumerate: "+
-					"it is published as binpack_drains_abandoned_total{reason=%q} and "+
-					"nothing documents it", a.SkipCode, a.SkipCode)
-			}
-		})
 	}
+}
+
+// RevalidateProduces is every skip code the fixtures above actually reach.
+func revalidateProduces(t *testing.T) map[string]bool {
+	t.Helper()
+
+	out := map[string]bool{}
+	for _, tc := range revalidateCases() {
+		a := engine.Revalidate(tc.s(), "a", config())
+		if a.SkipCode == "" {
+			t.Fatalf("the %q fixture reaches no skip code at all", tc.name)
+		}
+		out[a.SkipCode] = true
+	}
+	return out
 }
 
 // TestEveryDocumentedDiagnosisIsReachable asks the question the two

@@ -1014,6 +1014,23 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 		}
 	}
 
+	// And the record is checked against something that emits, not only against
+	// itself. Every entry claims Revalidate reaches the code instead, and until
+	// now that claim was a sentence: a value added to SkipCodes(), to
+	// docs/reference/metrics.md and to this map satisfied all three at once,
+	// so a misspelling or a branch never written could be documented and
+	// pre-initialised as a public label for ever with nothing producing it.
+	//
+	// The fixtures are vocabulary_test.go's, driven rather than described.
+	produces := revalidateProduces(t)
+	for code, why := range decidedElsewhere {
+		if !produces[code] {
+			t.Errorf("the record says Revalidate reaches %q instead, and no fixture there "+
+				"produces it:\n  %s\nA code nothing emits is documentation for a state "+
+				"that cannot happen, which is what this loop exists to refuse", code, why)
+		}
+	}
+
 	// And the other direction, which the loop above cannot give: a code the
 	// engine emits that the enumerator has stopped listing is invisible to
 	// every check keyed on the enumerator, this one included — it simply

@@ -711,6 +711,19 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 				b.Kind, b.Metadata.Name, b.RoleRef.APIGroup, rbacdoc.RBACAPIGroup)
 		}
 
+		// And the binding's own kind against the role's. A RoleBinding naming
+		// a ClusterRole is legal and installs cleanly, and grants that
+		// ClusterRole's rules inside one namespace only — so the
+		// ClusterRoleBinding turned into a RoleBinding leaves the counts
+		// matching, the ClusterRole marked bound, and binpack without the
+		// cluster-wide Node and Pod read this whole file is about.
+		if want := rbacdoc.BindingKindFor(b.RoleRef.Kind); b.Kind != want {
+			t.Errorf("the %s %s references a %s, which is made effective by a %s; as "+
+				"written it grants %s's rules somewhere narrower than they are meant to "+
+				"apply, or not at all", b.Kind, b.Metadata.Name, b.RoleRef.Kind, want,
+				b.RoleRef.Name)
+		}
+
 		// A RoleBinding is only effective in its own namespace, so one in a
 		// different namespace from the Role it names binds nothing.
 		if b.Kind == "RoleBinding" {
@@ -752,14 +765,31 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 	}
 	release := elections[0].Metadata.Namespace
 
-	var subjects int
 	for _, b := range bindings {
+		// Per binding, not in aggregate. A total equal to the binding count is
+		// satisfied by one binding with none and another with two, and the
+		// binding with none grants its whole Role to nobody.
+		if len(b.Subjects) != 1 {
+			t.Errorf("the %s %s has %d subjects, want the one ServiceAccount binpack runs "+
+				"as; with none it grants its Role to nobody, and this check would be "+
+				"satisfied by another binding carrying the difference",
+				b.Kind, b.Metadata.Name, len(b.Subjects))
+		}
+
 		for _, subject := range b.Subjects {
-			subjects++
 			if subject.Kind != "ServiceAccount" {
 				t.Errorf("the %s %s binds a %s; binpack runs as a ServiceAccount and a "+
 					"binding to anything else grants it nothing",
 					b.Kind, b.Metadata.Name, subject.Kind)
+			}
+			// Kind-specific, and empty for a ServiceAccount because it is a
+			// core object. A subject that acquires the RBAC group decodes
+			// unchanged in every other field and the API server refuses the
+			// binding.
+			if want := rbacdoc.SubjectAPIGroup(subject.Kind); subject.APIGroup != want {
+				t.Errorf("the %s %s binds a %s whose apiGroup is %q, and Kubernetes "+
+					"requires %q for that kind; the API server refuses the object",
+					b.Kind, b.Metadata.Name, subject.Kind, subject.APIGroup, want)
 			}
 			if subject.Namespace != release {
 				t.Errorf("the %s %s binds a ServiceAccount in %s, and binpack's runs in "+
@@ -768,11 +798,6 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 					b.Kind, b.Metadata.Name, subject.Namespace, release)
 			}
 		}
-	}
-	if subjects != len(bindings) {
-		t.Errorf("found %d subjects across %d bindings; every binding grants to exactly "+
-			"one ServiceAccount, and a parse that lost one checked nothing about it",
-			subjects, len(bindings))
 	}
 }
 
