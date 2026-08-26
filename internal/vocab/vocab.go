@@ -198,13 +198,28 @@ func integers(files []*ast.File) map[string]int64 {
 			if !ok || block.Tok != token.CONST {
 				continue
 			}
+			// A spec with no expression repeats the previous one, which
+			// [declarations] already carries for the string constants and this
+			// dropped. `const ( letter rune = 65; repeated )` left `repeated`
+			// unknown, so `string(repeated)` was reported as unevaluable —
+			// failing the vocabulary guard over a refactor Go compiles.
+			var previous []ast.Expr
 			for _, spec := range block.Specs {
 				spec, ok := spec.(*ast.ValueSpec)
-				if !ok || len(spec.Names) != len(spec.Values) {
+				if !ok {
+					continue
+				}
+				values := spec.Values
+				if len(values) == 0 {
+					values = previous
+				} else {
+					previous = values
+				}
+				if len(spec.Names) != len(values) {
 					continue
 				}
 				for i, name := range spec.Names {
-					pending[name.Name] = spec.Values[i]
+					pending[name.Name] = values[i]
 				}
 			}
 		}

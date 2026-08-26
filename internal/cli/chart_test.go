@@ -226,6 +226,15 @@ func TestAnInstallIntoAnotherNamespaceIsAnchoredThere(t *testing.T) {
 	if got := deploymentServiceAccount(t, install); got != account {
 		t.Errorf("installing into %q runs the pod as %q and creates %q", namespace, got, account)
 	}
+	// And where the pod itself lands. Pinned, every object above can be
+	// correct in the namespace the operator asked for while the pod is created
+	// in another one — where the account it names does not exist, so it never
+	// starts. A ServiceAccount is namespaced, and so is the pod that claims it.
+	if got := renderedDeployment(t, install).Metadata.Namespace; got != namespace {
+		t.Errorf("installing into %q creates the Deployment in %q; every binding and "+
+			"Role above is where the operator asked for it and the pod is not, so it "+
+			"claims an account that does not exist beside it", namespace, got)
+	}
 
 	// Every binding's subject, which is where a pinned namespace does its
 	// damage: the binding is accepted, and it grants an account that is not
@@ -1102,8 +1111,9 @@ func deploymentServiceAccount(t *testing.T, opts ...rbacdoc.Options) string {
 // — which a typed decode answers with a zero value and a map walk answers with
 // a panic or a silently skipped assertion.
 type deployment struct {
-	Kind string `json:"kind"`
-	Spec struct {
+	Kind     string           `json:"kind"`
+	Metadata rbacdoc.Metadata `json:"metadata"`
+	Spec     struct {
 		Template struct {
 			Spec struct {
 				ServiceAccountName string `json:"serviceAccountName"`
@@ -1158,7 +1168,7 @@ func renderedConfig(t *testing.T, opts ...rbacdoc.Options) *v1alpha1.Config {
 	}
 
 	var found []configMap
-	for doc := range strings.SplitSeq(rbacdoc.MustRender(t.Fatal, options), "\n---\n") {
+	for _, doc := range rbacdoc.Documents(rbacdoc.MustRender(t.Fatal, options)) {
 		var c configMap
 		if err := yaml.Unmarshal([]byte(doc), &c); err != nil {
 			t.Fatalf("a rendered document does not parse as YAML: %v\n%s", err, doc)
@@ -1305,7 +1315,7 @@ func renderedDeployment(t *testing.T, opts ...rbacdoc.Options) deployment {
 
 	var found []deployment
 	manifests := rbacdoc.MustRender(t.Fatal, options)
-	for doc := range strings.SplitSeq(manifests, "\n---\n") {
+	for _, doc := range rbacdoc.Documents(manifests) {
 		var d deployment
 		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
 			t.Fatalf("a rendered document does not parse as YAML: %v\n%s", err, doc)

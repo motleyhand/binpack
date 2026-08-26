@@ -201,7 +201,7 @@ type Binding struct {
 // Bindings decodes every binding in a set of rendered manifests.
 func Bindings(manifests string) ([]Binding, error) {
 	var out []Binding
-	for _, doc := range documentSeparator.Split(manifests, -1) {
+	for _, doc := range Documents(manifests) {
 		var b Binding
 		if err := yaml.Unmarshal([]byte(doc), &b); err != nil {
 			return nil, fmt.Errorf("the chart's RBAC does not parse as YAML: %w\n%s", err, doc)
@@ -264,7 +264,7 @@ type Object struct {
 // text and describes an object the chart does not create.
 func Objects(manifests string) ([]Object, error) {
 	var out []Object
-	for _, doc := range documentSeparator.Split(manifests, -1) {
+	for _, doc := range Documents(manifests) {
 		var object Object
 		if err := yaml.Unmarshal([]byte(doc), &object); err != nil {
 			return nil, fmt.Errorf("a rendered document does not parse as YAML: %w\n%s", err, doc)
@@ -704,7 +704,7 @@ func Unauthorizable(roles []Role) []string {
 // string whichever quoting style produced it.
 func Mistyped(manifests string) ([]string, error) {
 	var out []string
-	for _, doc := range documentSeparator.Split(manifests, -1) {
+	for _, doc := range Documents(manifests) {
 		var object map[string]any
 		if err := yaml.Unmarshal([]byte(doc), &object); err != nil {
 			return nil, fmt.Errorf("a rendered document does not parse as YAML: %w\n%s", err, doc)
@@ -798,6 +798,23 @@ func Identities() []string {
 // here.
 var documentSeparator = regexp.MustCompile(`(?m)^---[ \t]*(#.*)?$`)
 
+// Documents splits a rendered manifest stream into its documents.
+//
+// Exported because it was reimplemented: internal/cli split the same streams on
+// the literal bytes "\n---\n", which is one spelling of a separator among
+// several. YAML ends a document at a `---` alone on its line, and trailing
+// whitespace or a comment after it changes nothing — `helm template`
+// normalises the comment form away when it re-emits each document, and passes
+// a trailing space straight through. Two documents then arrive as one chunk,
+// the decoder reads the first, and the second is invisible to every assertion
+// about what the chart renders.
+//
+// One implementation, because two readers of the same stream disagreeing about
+// where a document ends is the shape this whole package exists to remove.
+func Documents(manifests string) []string {
+	return documentSeparator.Split(manifests, -1)
+}
+
 // decode reads every role in a YAML stream, and every document that declares
 // rules without saying what it is.
 //
@@ -811,7 +828,7 @@ var documentSeparator = regexp.MustCompile(`(?m)^---[ \t]*(#.*)?$`)
 // document has no `kind:` to declare.
 func decode(what, manifests string) ([]Role, error) {
 	var out []Role
-	for _, doc := range documentSeparator.Split(manifests, -1) {
+	for _, doc := range Documents(manifests) {
 		var role Role
 		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
 			return nil, fmt.Errorf("%s does not parse as YAML: %w\n%s", what, err, doc)

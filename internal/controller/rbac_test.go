@@ -612,98 +612,19 @@ func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 	requireEveryHelperIsReached(t, source)
 
 	var found int
-	var walk func(n ast.Node, conditional bool)
-	walk = func(n ast.Node, conditional bool) {
-		if n == nil {
+	walkConditional(source, false, func(n ast.Node, conditional bool) {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || !writesThroughWriter(call) {
 			return
 		}
-
-		switch n := n.(type) {
-		case *ast.IfStmt:
-			// The init runs whatever the condition decides — `if err :=
-			// w.Patch(…); err != nil` always makes the call — so only the
-			// bodies are conditional.
-			walk(n.Init, conditional)
-			walk(n.Cond, conditional)
-			walk(n.Body, true)
-			walk(n.Else, true)
-			return
-		case *ast.ForStmt:
-			walk(n.Init, conditional)
-			walk(n.Cond, conditional)
-			walk(n.Body, true)
-			return
-		case *ast.RangeStmt:
-			walk(n.X, conditional)
-			walk(n.Body, true)
-			return
-		case *ast.SwitchStmt:
-			walk(n.Init, conditional)
-			walk(n.Tag, conditional)
-			walk(n.Body, true)
-			return
-		case *ast.TypeSwitchStmt, *ast.SelectStmt:
-			for _, child := range children(n) {
-				walk(child, true)
-			}
-			return
-		case *ast.FuncLit:
-			// A closure body runs when it is called, not where it is written.
-			// Walked with the declaration site's state, `write := func() {
-			// w.Patch(…) }` invoked only from a branch read as unconditional —
-			// and a literal has no name, so the helper graph beside this
-			// cannot reach it either. Conservatively conditional: a write that
-			// needs a closure is a write that needs its own named function,
-			// which is what this file promises to be.
-			for _, child := range children(n) {
-				walk(child, true)
-			}
-			return
-		case *ast.BinaryExpr:
-			// `&&` and `||` do not evaluate their right operand when the left
-			// decides the answer, so a write there is as conditional as one in
-			// a branch body — `if annotated && w.Patch(…) != nil` reaches the
-			// patch only for annotated nodes. The condition of an if was
-			// walked with its caller's state, which read the whole of it as
-			// always evaluated.
-			if n.Op == token.LAND || n.Op == token.LOR {
-				walk(n.X, conditional)
-				walk(n.Y, true)
-				return
-			}
-		case *ast.CallExpr:
-			if writesThroughWriter(n) {
-				found++
-				if conditional {
-					t.Errorf("%s makes a write inside a conditional; driving the function "+
-						"it is in does not reach it, so the chart is never asked whether "+
-						"it grants what that call needs — give the write its own function, "+
-						"which the audit above then requires to be driven", executorSource)
-				}
-			}
+		found++
+		if conditional {
+			t.Errorf("%s makes a write inside a conditional; driving the function it is "+
+				"in does not reach it, so the chart is never asked whether it grants "+
+				"what that call needs — give the write its own function, which the "+
+				"audit above then requires to be driven", executorSource)
 		}
-
-		// A block's statements are not independent: once a preceding one can
-		// return, everything after it is reached only when that branch was not
-		// taken. `if skip { return nil }` followed by a write made the write
-		// look unconditional while a fixture taking the early return never
-		// reached it.
-		if block, ok := n.(*ast.BlockStmt); ok {
-			mayHaveReturned := conditional
-			for _, statement := range block.List {
-				walk(statement, mayHaveReturned)
-				if !mayHaveReturned && terminates(statement) {
-					mayHaveReturned = true
-				}
-			}
-			return
-		}
-
-		for _, child := range children(n) {
-			walk(child, conditional)
-		}
-	}
-	walk(source, false)
+	})
 
 	if found == 0 {
 		t.Fatalf("no Writer call found in %s; either the writes moved or this parse has "+
@@ -779,43 +700,15 @@ func requireEveryHelperIsReached(t *testing.T, source *ast.File) {
 	// The calls each makes on its own unconditional path.
 	calls := map[string][]string{}
 	for name, fn := range helpers {
-		var walk func(n ast.Node, conditional bool)
-		walk = func(n ast.Node, conditional bool) {
-			if n == nil {
+		walkConditional(fn.Body, false, func(n ast.Node, conditional bool) {
+			call, ok := n.(*ast.CallExpr)
+			if !ok || conditional {
 				return
 			}
-			switch n := n.(type) {
-			case *ast.IfStmt:
-				walk(n.Init, conditional)
-				walk(n.Cond, conditional)
-				walk(n.Body, true)
-				walk(n.Else, true)
-				return
-			case *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt,
-				*ast.TypeSwitchStmt, *ast.SelectStmt, *ast.FuncLit:
-				for _, child := range children(n) {
-					walk(child, true)
-				}
-				return
-			case *ast.BlockStmt:
-				reachable := !conditional
-				for _, statement := range n.List {
-					walk(statement, !reachable)
-					if reachable && terminates(statement) {
-						reachable = false
-					}
-				}
-				return
-			case *ast.CallExpr:
-				if callee, ok := n.Fun.(*ast.Ident); ok && !conditional && helpers[callee.Name] != nil {
-					calls[name] = append(calls[name], callee.Name)
-				}
+			if callee, ok := call.Fun.(*ast.Ident); ok && helpers[callee.Name] != nil {
+				calls[name] = append(calls[name], callee.Name)
 			}
-			for _, child := range children(n) {
-				walk(child, conditional)
-			}
-		}
-		walk(fn.Body, false)
+		})
 	}
 
 	// Everything an exported entry point reaches without a branch.
@@ -845,6 +738,102 @@ func requireEveryHelperIsReached(t *testing.T, source *ast.File) {
 			"a fixture taking the other branch records no grant, the chart is never "+
 			"asked for it, and the branch that does call %s 403s in production",
 			name, executorSource, name)
+	}
+}
+
+// walkConditional walks a syntax tree, telling the visitor of each node
+// whether it is reached only when some branch is taken.
+//
+// One traversal for both audits above, because two of them diverged twice. The
+// write walk learned that a closure body runs where it is called and that `&&`
+// does not evaluate its right operand; the helper walk learned neither, and
+// each gap was a call that looked unconditional and was not. What
+// "conditional" means is one question about Go, and this is the one answer to
+// it.
+//
+// Conservative wherever the answer is not obvious from the syntax alone: a
+// loop body may run no times, a select case may not be chosen, a closure may
+// never be called. Erring the other way makes a write invisible, which is the
+// failure both audits exist to prevent.
+func walkConditional(n ast.Node, conditional bool, visit func(ast.Node, bool)) {
+	if n == nil {
+		return
+	}
+	visit(n, conditional)
+
+	descend := func(child ast.Node, conditional bool) {
+		walkConditional(child, conditional, visit)
+	}
+
+	switch n := n.(type) {
+	case *ast.IfStmt:
+		// The init runs whatever the condition decides — `if err :=
+		// w.Patch(…); err != nil` always makes the call — so only the bodies
+		// are conditional.
+		descend(n.Init, conditional)
+		descend(n.Cond, conditional)
+		descend(n.Body, true)
+		descend(n.Else, true)
+		return
+	case *ast.ForStmt:
+		descend(n.Init, conditional)
+		descend(n.Cond, conditional)
+		descend(n.Body, true)
+		return
+	case *ast.RangeStmt:
+		descend(n.X, conditional)
+		descend(n.Body, true)
+		return
+	case *ast.SwitchStmt:
+		descend(n.Init, conditional)
+		descend(n.Tag, conditional)
+		descend(n.Body, true)
+		return
+	case *ast.TypeSwitchStmt, *ast.SelectStmt:
+		for _, child := range children(n) {
+			descend(child, true)
+		}
+		return
+	case *ast.FuncLit:
+		// A closure body runs when it is called, not where it is written.
+		// Walked with the declaration site's state, `write := func() {
+		// w.Patch(…) }` invoked only from a branch read as unconditional — and
+		// a literal has no name, so the helper graph cannot reach it either. A
+		// write that needs a closure is a write that needs its own named
+		// function, which is what executor.go promises to be.
+		for _, child := range children(n) {
+			descend(child, true)
+		}
+		return
+	case *ast.BinaryExpr:
+		// `&&` and `||` do not evaluate their right operand when the left
+		// decides the answer, so a call there is as conditional as one in a
+		// branch body — `if ready && helper(w) != nil` reaches the helper only
+		// when ready. An if's condition is walked with its caller's state,
+		// which read the whole of it as always evaluated.
+		if n.Op == token.LAND || n.Op == token.LOR {
+			descend(n.X, conditional)
+			descend(n.Y, true)
+			return
+		}
+	case *ast.BlockStmt:
+		// A block's statements are not independent: once a preceding one can
+		// return, everything after it is reached only when that branch was not
+		// taken. `if skip { return nil }` followed by a write made the write
+		// look unconditional while a fixture taking the early return never
+		// reached it.
+		mayHaveReturned := conditional
+		for _, statement := range n.List {
+			descend(statement, mayHaveReturned)
+			if !mayHaveReturned && terminates(statement) {
+				mayHaveReturned = true
+			}
+		}
+		return
+	}
+
+	for _, child := range children(n) {
+		descend(child, conditional)
 	}
 }
 
