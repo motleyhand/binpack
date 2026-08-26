@@ -42,10 +42,16 @@ const (
 // Decoding into rbacv1.ClusterRole would be stricter and is not possible: the
 // chart's metadata is Helm actions, and the placeholders they become are
 // scalars where typed decoding wants maps.
+//
+// ResourceNames is here because dropping it made a grant look larger than it
+// is. It restricts a request by the name in its path, so a rule carrying one
+// authorises only requests that name that object — and a group/resource/verb
+// triple read without it says a permission is granted that is not.
 type Rule struct {
-	APIGroups []string `json:"apiGroups"`
-	Resources []string `json:"resources"`
-	Verbs     []string `json:"verbs"`
+	APIGroups     []string `json:"apiGroups"`
+	Resources     []string `json:"resources"`
+	ResourceNames []string `json:"resourceNames"`
+	Verbs         []string `json:"verbs"`
 }
 
 // Role is as much of a ClusterRole or Role as this package needs.
@@ -274,19 +280,67 @@ func Grants(roles []Role) map[string]bool {
 	pairs := map[string]bool{}
 	for _, role := range roles {
 		for _, rule := range role.Rules {
+			// A restricted grant is a different permission from the same
+			// triple unrestricted, and keying them the same makes narrowing a
+			// rule invisible to every comparison.
+			restriction := ""
+			if len(rule.ResourceNames) > 0 {
+				restriction = " restricted to [" + strings.Join(rule.ResourceNames, ", ") + "]"
+			}
 			for _, group := range rule.APIGroups {
 				if group == "" {
 					group = "core"
 				}
 				for _, resource := range rule.Resources {
 					for _, verb := range rule.Verbs {
-						pairs[group+"/"+resource+": "+verb] = true
+						pairs[group+"/"+resource+": "+verb+restriction] = true
 					}
 				}
 			}
 		}
 	}
 	return pairs
+}
+
+// namelessVerbs are the verbs whose requests carry no object name, so a
+// resourceNames restriction on them authorises nothing at all.
+//
+// The chart's own RBAC comment establishes these two, and they are the reason
+// it scopes the autoscaler-status Role by namespace rather than naming the
+// object: "list and watch requests carry none — so a ClusterRole naming
+// cluster-autoscaler-status would authorise `binpack explain`, which issues a
+// get, and authorise nothing for the controller, whose cache issues a list
+// followed by a watch". Other verbs may share the property; these are the two
+// this repository has established and the two binpack's cache depends on.
+var namelessVerbs = []string{"list", "watch"}
+
+// Unauthorizable names grants that cannot authorise the request they appear
+// to, however they are compared with anything else.
+//
+// This is the one property here that is not a comparison. Adding
+// `resourceNames: [cluster-autoscaler-status]` to the ConfigMap rule leaves
+// chart and page agreeing, every count above its floor and every scope check
+// satisfied — and the controller's cache, which lists and then watches, holds
+// no permission at all. A guard that only ever compares two documents cannot
+// see a rule that is wrong on its own terms.
+func Unauthorizable(roles []Role) []string {
+	var out []string
+	for _, role := range roles {
+		for _, rule := range role.Rules {
+			if len(rule.ResourceNames) == 0 {
+				continue
+			}
+			for _, verb := range rule.Verbs {
+				if !slices.Contains(namelessVerbs, verb) {
+					continue
+				}
+				out = append(out, fmt.Sprintf("%s grants %v: %s on %v, restricted to %v",
+					role.Metadata.Name, rule.APIGroups, verb, rule.Resources, rule.ResourceNames))
+			}
+		}
+	}
+	slices.Sort(out)
+	return out
 }
 
 // OfKind is the roles of one kind, for a caller whose question is about the

@@ -103,12 +103,15 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 			"it", len(granted))
 	}
 
-	documented := documentedGrants(t)
+	// The act rules live in the chart's ClusterRole, so that is the scope the
+	// page has to document them at.
+	documented := documentedGrants(t)[roleKinds[0]]
 
 	for pair := range granted {
 		if !documented[pair] {
-			t.Errorf("the chart grants %q to let binpack act, and the RBAC reference "+
-				"does not list it outside a section marked unused", pair)
+			t.Errorf("the chart grants %q in its ClusterRole to let binpack act, and the "+
+				"RBAC reference does not list it there outside a section marked unused",
+				pair)
 		}
 	}
 }
@@ -139,48 +142,73 @@ func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
-	granted := rbacdoc.Grants(roles)
-	// A count, in chart_test.go's shape rather than a non-empty check. Both
-	// comparisons below iterate a parsed set, so a reader that stopped seeing
+	// A count, in chart_test.go's shape rather than a non-empty check. The
+	// comparisons below iterate parsed sets, so a reader that stopped seeing
 	// rules would check the ones it still saw and report nothing about the
 	// rest — a green run that means less than it did, with nothing to say so.
 	//
 	// What it does not catch is a rule *deleted* from the chart, which shrinks
 	// the set for a reason the count cannot distinguish from the reader's. The
-	// equality below is what catches that.
-	if len(granted) < 30 {
+	// equalities below are what catch that.
+	if all := rbacdoc.Grants(roles); len(all) < 30 {
 		t.Fatalf("the chart parsed to %d group/resource: verb pairs, which is fewer than "+
 			"it has ever rendered — the reader has stopped seeing rules, and the "+
-			"comparison below is against the remainder", len(granted))
+			"comparison below is against the remainder", len(all))
 	}
 
-	// Both directions, because a one-directional check answers only half of
-	// what the page promises. chart ⊆ page says a role written from the page
-	// is not missing a grant; page ⊆ chart says it does not carry one the
+	// Both directions, and per kind. chart ⊆ page says a role written from the
+	// page is not missing a grant; page ⊆ chart says it does not carry one the
 	// chart never renders. Only the pair of them says the page *is* the role,
 	// which is what its banner claims — and only the second notices a rule
 	// deleted from the chart, which the first reads as one fewer thing to
 	// check. Deleting the autoscaler-status ConfigMap rule cost three pairs
 	// and left every assertion here green.
+	//
+	// Per kind because the union cannot express where a namespaced grant
+	// applies; see documentedGrants.
 	documented := documentedGrants(t)
-	for pair := range granted {
-		if !documented[pair] {
-			t.Errorf("the chart grants %q and the RBAC reference does not list it; "+
-				"a role written from this page would be missing it", pair)
+	for _, kind := range roleKinds {
+		granted := rbacdoc.Grants(rbacdoc.OfKind(roles, kind))
+		if len(granted) == 0 {
+			t.Fatalf("the chart renders no %s rules at all", kind)
+		}
+		for pair := range granted {
+			if !documented[kind][pair] {
+				t.Errorf("the chart's %s grants %q and the RBAC reference does not list it "+
+					"under a %s; a role written from this page would be missing it",
+					kind, pair, kind)
+			}
+		}
+		for pair := range documented[kind] {
+			if !granted[pair] {
+				t.Errorf("the RBAC reference lists %q under a %s outside a section marked "+
+					"unused and no %s the chart renders grants it; either the chart has "+
+					"stopped granting something binpack needs, or the page is asking for "+
+					"a permission nobody has to give", pair, kind, kind)
+			}
 		}
 	}
-	for pair := range documented {
-		if !granted[pair] {
-			t.Errorf("the RBAC reference lists %q outside a section marked unused and no "+
-				"rule the chart renders grants it; either the chart has stopped granting "+
-				"something binpack needs, or the page is asking for a permission nobody "+
-				"has to give", pair)
-		}
+
+	// And a property that is not a comparison at all: a rule can be wrong on
+	// its own terms, and two documents agreeing about it says nothing.
+	for _, grant := range rbacdoc.Unauthorizable(roles) {
+		t.Errorf("%s — a resourceNames restriction cannot authorise a request that carries "+
+			"no object name, so this grant authorises nothing and binpack's cache would "+
+			"never establish its watch", grant)
 	}
 }
 
-// documentedGrants is what docs/reference/rbac.md tells an operator to grant.
-func documentedGrants(t *testing.T) map[string]bool {
+// documentedGrants is what docs/reference/rbac.md tells an operator to grant,
+// in the role kind it tells them to grant it in.
+//
+// Kept apart rather than merged, because merged they answer a question no
+// operator asks. A cluster-wide grant applies everywhere; a namespaced one
+// applies in the namespace its Role is created in, and the page creates Roles
+// in two of them. Moving the events.k8s.io rule out of the ClusterRole snippet
+// and into the leader-election Role's left both directions of the comparison
+// green, and a role written from the page would grant it in binpack's own
+// namespace while decision Events about a Node are filed under `default`.
+func documentedGrants(t *testing.T) map[string]map[string]bool {
 	t.Helper()
 
 	data, err := os.ReadFile(rbacdoc.ReferencePath)
@@ -191,8 +219,26 @@ func documentedGrants(t *testing.T) map[string]bool {
 	if err != nil {
 		t.Fatalf("reading the RBAC reference's rules: %v", err)
 	}
-	return rbacdoc.Grants(roles)
+
+	out := map[string]map[string]bool{}
+	for _, kind := range roleKinds {
+		out[kind] = rbacdoc.Grants(rbacdoc.OfKind(roles, kind))
+	}
+
+	// A snippet whose leading comment names neither kind is one this reader
+	// cannot place, and placing it wrongly is the failure above. The page
+	// states the kind on every block; a new one that does not has to say so
+	// before it can be compared.
+	if placed := len(rbacdoc.OfKind(roles, roleKinds[0])) + len(rbacdoc.OfKind(roles, roleKinds[1])); placed != len(roles) {
+		t.Fatalf("%d of the reference's %d rule blocks do not name the kind they belong "+
+			"in, so this cannot say which scope they are granted at", len(roles)-placed, len(roles))
+	}
+	return out
 }
+
+// roleKinds are the two scopes a rule can be granted at, and the reason every
+// comparison in this file is made per kind rather than over the union.
+var roleKinds = []string{"ClusterRole", "Role"}
 
 // grantedSections drops the sections of a document whose heading says the
 // permissions in them are not granted or not needed, so what remains is what

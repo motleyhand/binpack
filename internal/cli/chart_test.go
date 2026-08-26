@@ -557,28 +557,75 @@ func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
 		}
 	}
 
-	// And the anchor, because disjointness alone is satisfied by the two Roles
-	// swapping their rules. binpack reads exactly one kind in the namespace
-	// discovery.autoscalerNamespace names — the cluster-autoscaler's status
-	// ConfigMap, which ADR-0004 makes the whole basis of running without cloud
-	// credentials — so that read belongs to that Role and to no other.
-	var granted bool
+	// Neither may be empty. A Role that grants nothing is still an object the
+	// chart creates and binds, so it satisfies disjointness and every count
+	// while authorising nothing — which is how the rules of one could be moved
+	// wholesale into the other with only the anchors below noticing.
 	for name, mine := range grants {
-		for pair := range mine {
-			if !strings.HasPrefix(pair, "core/configmaps: ") {
-				continue
-			}
-			if !strings.HasSuffix(name, "-autoscaler-status") {
-				t.Errorf("%s grants %q, and it is not the Role created in the namespace "+
-					"discovery.autoscalerNamespace names; binpack would read the "+
-					"cluster-autoscaler's status where it holds no grant and report no "+
-					"autoscaler on every evaluation", name, pair)
-			}
-			granted = true
+		if len(mine) == 0 {
+			t.Errorf("%s grants nothing at all; an install creates it, binds it, and "+
+				"binpack holds no permission in the namespace it is created in", name)
 		}
 	}
-	if !granted {
-		t.Error("no namespaced Role grants a read on configmaps, so nothing lets binpack " +
-			"read the cluster-autoscaler's status")
+
+	// And an anchor per Role, because disjointness alone is satisfied by the
+	// two swapping their rules wholesale — and one anchor alone by everything
+	// moving into the anchored one.
+	//
+	// Read means get, list and watch together, for the reason
+	// internal/collect's grantsRead gives: binpack's cache lists and then
+	// watches, and `explain` gets, so a rule short of any of the three is a
+	// rule that fails at runtime rather than a narrower version of the same
+	// permission.
+	anchoredIn(t, grants, "-autoscaler-status",
+		// binpack reads exactly one kind in the namespace
+		// discovery.autoscalerNamespace names: the cluster-autoscaler's status
+		// ConfigMap, which ADR-0004 makes the whole basis of running without
+		// cloud credentials.
+		"core/configmaps: get", "core/configmaps: list", "core/configmaps: watch")
+
+	anchoredIn(t, grants, "-leader-election",
+		// The Lease is held in binpack's own namespace, and client-go's
+		// LeaseLock gets it, creates it and updates it (k8s.io/client-go
+		// v0.36.4, tools/leaderelection/resourcelock/leaselock.go). Granted
+		// anywhere else, a replica cannot acquire leadership and the process
+		// never starts reconciling.
+		"coordination.k8s.io/leases: get",
+		"coordination.k8s.io/leases: create",
+		"coordination.k8s.io/leases: update")
+}
+
+// anchoredIn asserts that each pair is granted by the namespaced Role whose
+// name carries the given suffix, and by no other.
+//
+// Both halves. Present in the right Role is what the runtime needs; absent
+// from every other is what stops a rule drifting into a Role created in a
+// namespace binpack never reads.
+func anchoredIn(t *testing.T, grants map[string]map[string]bool, suffix string, pairs ...string) {
+	t.Helper()
+
+	var role string
+	for name := range grants {
+		if strings.HasSuffix(name, suffix) {
+			role = name
+		}
+	}
+	if role == "" {
+		t.Fatalf("the chart renders no namespaced Role named %q, so this asserts nothing "+
+			"about where %v are granted", suffix, pairs)
+	}
+
+	for _, pair := range pairs {
+		if !grants[role][pair] {
+			t.Errorf("%s does not grant %q, and it is the Role created in the namespace "+
+				"binpack needs it in", role, pair)
+		}
+		for name, other := range grants {
+			if name != role && other[pair] {
+				t.Errorf("%s grants %q, and it is not the Role created in the namespace "+
+					"binpack needs it in; the permission would be held somewhere binpack "+
+					"never issues that request", name, pair)
+			}
+		}
 	}
 }

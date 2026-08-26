@@ -117,7 +117,7 @@ rules:
     verbs: [get, list, watch, create, update, patch]
 
   # client-go's LeaseLock uses get, create and update (resourcelock/leaselock.go
-  # at v0.36.3); list, watch and patch are the conventional set and are not
+  # at v0.36.4); list, watch and patch are the conventional set and are not
   # exercised. Left as they are:
   # this Role is namespaced to binpack's own namespace, and nothing else here
   # holds a Lease.
@@ -170,6 +170,8 @@ time through the eviction API, and uncordons it again if the drain ends without 
 removed. Two rules cover all of it:
 
 ```yaml
+# ClusterRole
+rules:
   # Cordon, uncordon, the drain label, and the drain marker annotations.
   - apiGroups: [""]
     resources: [nodes]

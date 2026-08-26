@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -32,7 +33,9 @@ import (
 // So this drives binpack's own writes — every one of them, the executor's four
 // and the Event create that is the executor package doc's stated exception —
 // against a writer that records what an RBAC rule would have to grant, and
-// compares that with the chart.
+// compares that with the chart. To them it adds the verbs client-go's event
+// recorder issues on the long-running path, which are binpack's writes for
+// RBAC's purposes even though no interface here bounds them.
 //
 // Both directions, because they fail differently. A recorded pair the chart
 // does not grant is a write nobody has been given permission for. An act-gated
@@ -41,11 +44,13 @@ import (
 // at which point the first direction is checking a shrunken set and passing
 // for it.
 //
-// It does not bound the *process*, and no Go test can. client-go's event
-// recorder writes on the long-running path and the manager writes a Lease and
-// core Events for leader election; internal/executor's package doc says so and
-// docs/reference/rbac.md is the authority. What this holds is binpack's own
-// code, which is what that doc's enumeration is a claim about.
+// It still does not bound the *process*, and no Go test can: the manager
+// writes a Lease and announces itself on the core events API for leader
+// election, and nothing in Go narrows that. internal/executor's package doc
+// says so and docs/reference/rbac.md is the authority. What changed with the
+// recorder is only which side of that line it sits on — bounding a library's
+// writes and asking whether the chart permits the ones it is observed to make
+// are different questions, and the second one has an answer.
 func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 	chart, err := os.ReadFile(rbacdoc.ChartPath)
 	if err != nil {
@@ -174,6 +179,22 @@ func drivenWrites(t *testing.T) (always, acting map[string]bool) {
 				now: func() time.Time { return time.Unix(0, 0) }}
 			return r.emit(ctx, node, "Reason", "Action", "a note")
 		})
+
+	// The other reporter, which is the one an ordinary install runs. It hands
+	// events to client-go's broadcaster, and no interface here bounds what
+	// that writes — but an install still has to be permitted to make those
+	// requests, and this test is where the chart is asked whether it is.
+	//
+	// The verbs come from recorderMethods, which the broadcaster test in
+	// reporter_test.go proves by driving the real recorder and observing its
+	// sink. Named there rather than repeated here: a fact one test can prove
+	// and another needs should be written down once, and only the test that
+	// drives the recorder can prove it. Dropping events.k8s.io/events: patch
+	// from the chart and the reference together left the two agreeing while
+	// every decision after the first failed to aggregate.
+	for _, method := range recorderMethods {
+		always["events.k8s.io/events: "+strings.ToLower(method)] = true
+	}
 
 	acting = writesOf(t, "the executor's writes",
 		func(w *recordingWriter) error { return executor.Cordon(ctx, w, node) },
