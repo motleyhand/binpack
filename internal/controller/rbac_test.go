@@ -3,6 +3,9 @@ package controller
 import (
 	"context"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"strings"
 	"testing"
@@ -216,19 +219,78 @@ func drivenWrites(t *testing.T) (always, acting map[string]bool) {
 		always["events.k8s.io/events: "+strings.ToLower(method)] = true
 	}
 
-	acting = writesOf(t, "the executor's writes",
-		func(w *recordingWriter) error { return executor.Cordon(ctx, w, node) },
-		func(w *recordingWriter) error {
-			return executor.Annotate(ctx, w, node, map[string]string{"a": "b"})
-		},
-		func(w *recordingWriter) error {
+	driven := map[string]func(w *recordingWriter) error{
+		"Cordon":   func(w *recordingWriter) error { return executor.Cordon(ctx, w, node) },
+		"Annotate": func(w *recordingWriter) error { return executor.Annotate(ctx, w, node, map[string]string{"a": "b"}) },
+		"HandBack": func(w *recordingWriter) error {
 			return executor.HandBack(ctx, w, node,
 				map[string]string{"l": ""}, map[string]string{"a": ""})
 		},
-		func(w *recordingWriter) error { return executor.Evict(ctx, w, pod) },
-	)
+		"Evict": func(w *recordingWriter) error { return executor.Evict(ctx, w, pod) },
+	}
+	requireEveryWriteIsDriven(t, driven)
+
+	calls := make([]func(*recordingWriter) error, 0, len(driven))
+	for _, call := range driven {
+		calls = append(calls, call)
+	}
+	acting = writesOf(t, "the executor's writes", calls...)
 
 	return always, acting
+}
+
+// executorSource is where internal/executor's package doc says every write to
+// a Node or a Pod lives.
+const executorSource = "../executor/executor.go"
+
+// requireEveryWriteIsDriven holds the list above to the file it is a list of.
+//
+// It was hand-maintained, which is the shape this whole pull request is about:
+// a new acting path calling Writer.Patch on another resource leaves the
+// interface unchanged, the recorder satisfied and `acting` exactly as it was,
+// so every RBAC comparison passes while that path 403s. The list is checked
+// against the exported functions executor.go declares that take a Writer —
+// which is what its package doc promises the file enumerates, so the promise
+// and the list now fail together or not at all.
+func requireEveryWriteIsDriven(t *testing.T, driven map[string]func(*recordingWriter) error) {
+	t.Helper()
+
+	source, err := parser.ParseFile(token.NewFileSet(), executorSource, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", executorSource, err)
+	}
+
+	declared := map[string]bool{}
+	for _, decl := range source.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Recv != nil || !fn.Name.IsExported() {
+			continue
+		}
+		for _, param := range fn.Type.Params.List {
+			if ident, ok := param.Type.(*ast.Ident); ok && ident.Name == "Writer" {
+				declared[fn.Name.Name] = true
+			}
+		}
+	}
+	if len(declared) == 0 {
+		t.Fatalf("no exported function in %s takes a Writer; either the writes moved or "+
+			"this parse has stopped seeing them, and either way nothing below is checked",
+			executorSource)
+	}
+
+	for name := range declared {
+		if driven[name] == nil {
+			t.Errorf("%s declares %s, which takes a Writer and so performs a write, and "+
+				"nothing here drives it; the chart is never asked whether it grants what "+
+				"that call needs", executorSource, name)
+		}
+	}
+	for name := range driven {
+		if !declared[name] {
+			t.Errorf("this drives %s and %s no longer declares it; the list has outlived "+
+				"the file it is a list of", name, executorSource)
+		}
+	}
 }
 
 // writesOf drives calls against one recorder and returns what they would need

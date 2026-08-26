@@ -529,8 +529,21 @@ func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
 				// brackets are deliberately not trimmed: `<ns>` is a
 				// placeholder and must stay one.
 				ns := strings.Trim(m[1], "`'\",.;)")
-				if len(ns) > 63 || !namespace.MatchString(ns) {
+				// A placeholder is skipped and a typo is reported, and telling
+				// them apart by "is this a legal namespace" got that backwards:
+				// `Binpack_system` is not a legal label, so it read as a
+				// placeholder and a reader copying it gets an error from
+				// kubectl before any resource is addressed. Placeholders are
+				// recognised by their shape instead — angle brackets, a shell
+				// variable, or the page's own sentinel.
+				if placeholder(ns) {
 					skipped++
+					continue
+				}
+				if len(ns) > 63 || !namespace.MatchString(ns) {
+					t.Errorf("%s:%d uses namespace %q, which kubectl refuses: a namespace is "+
+						"a DNS label, at most 63 characters of lowercase alphanumerics and "+
+						"dashes: %s", path, i+1, ns, strings.TrimSpace(line))
 					continue
 				}
 				checked++
@@ -936,6 +949,30 @@ func identity(t *testing.T, seen map[string]bool, kind, namespace, name string) 
 			"dedupes it, and Helm asks the API server to create one object twice", key)
 	}
 	seen[key] = true
+}
+
+// placeholder reports whether a namespace token stands for one rather than
+// being one.
+//
+// Three shapes, and no more: `<namespace>`, a shell variable, and the bare
+// sentinel the pages already use. Anything else that is not a legal namespace
+// is a typo, and reporting it is the whole point — an example nobody can run
+// is worse than no example.
+func placeholder(ns string) bool {
+	switch {
+	// An opening bracket is enough: `<that namespace>` is a placeholder with a
+	// space in it, and the flag pattern above stops at the space, so the token
+	// reaching here is `<that`. Requiring the closing bracket would report a
+	// real placeholder as a typo.
+	case strings.HasPrefix(ns, "<"):
+		return true
+	case strings.HasPrefix(ns, "$"):
+		return true
+	case ns == "NS":
+		return true
+	default:
+		return false
+	}
 }
 
 // joinContinuations folds a backslash-continued shell command onto the line it

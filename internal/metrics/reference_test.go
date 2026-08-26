@@ -2,6 +2,7 @@ package metrics
 
 import (
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"testing"
@@ -247,7 +248,38 @@ func TestTheVerdictSentenceListsEveryVerdict(t *testing.T) {
 		t.Errorf("the reference does not say %q, so its verdict vocabulary is not the engine's",
 			sentence)
 	}
+
+	// Every such claim, not merely one of them. Containment proves the current
+	// sentence exists and says nothing about the others: a verdict renamed
+	// with the new sentence added leaves the old one standing somewhere else
+	// on the page, the forward guard finds the new spelling, and the reverse
+	// label checks never look — they read tables, and this is prose. The page
+	// then advertises a `verdict` selector that matches nothing.
+	claims := verdictClaim.FindAllStringSubmatch(doc, -1)
+	if len(claims) == 0 {
+		t.Fatal("no verdict sentence found at all, so the pattern has stopped matching " +
+			"and the check above passed on a page it did not read")
+	}
+	for _, claim := range claims {
+		listed := backticked.FindAllStringSubmatch(claim[1], -1)
+		var named []string
+		for _, m := range listed {
+			named = append(named, m[1])
+		}
+		if !slices.Equal(named, engine.Verdicts()) {
+			t.Errorf("the reference says the verdicts are %v and the engine's are %v; one "+
+				"of these sentences has outlived the vocabulary, and it tells an operator "+
+				"to filter on a value nothing carries", named, engine.Verdicts())
+		}
+	}
 }
+
+// verdictClaim matches a sentence stating the verdict vocabulary, capturing
+// the list it gives.
+var verdictClaim = regexp.MustCompile("`verdict` is one of ([^.]*)\\.")
+
+// backticked matches one backticked token.
+var backticked = regexp.MustCompile("`([^`]+)`")
 
 // TestEveryPublishedVocabularyIsASet holds the property every guard in this
 // file assumes without checking: that an enumerator's values are distinct.

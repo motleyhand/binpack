@@ -178,11 +178,12 @@ func declarations(files []*ast.File, stringy map[string]bool) []declaration {
 				}
 
 				for i, name := range spec.Names {
-					// An iota run repeats `iota` into every member, and none
-					// of them is a string. Dropped here rather than reported,
-					// since the alternative is to call every enum in the
-					// package an expression this cannot evaluate.
-					if ident, ok := values[i].(*ast.Ident); ok && ident.Name == "iota" {
+					// A constant that is plainly not a string is not a member
+					// of any vocabulary, and reporting it as unevaluable makes
+					// the guard fail on correct code: `const CodeRadix = 10`
+					// matches the prefix `Code` and is an integer. An iota run
+					// is the same case — it repeats `iota` into every member.
+					if plainlyNotAString(values[i]) {
 						continue
 					}
 					out = append(out, declaration{expr: values[i], name: name.Name})
@@ -191,6 +192,25 @@ func declarations(files []*ast.File, stringy map[string]bool) []declaration {
 		}
 	}
 	return out
+}
+
+// plainlyNotAString reports whether an expression obviously holds something
+// else.
+//
+// Only the cases that can be read off the syntax. Anything subtler is left to
+// the resolver, which reports what it cannot evaluate rather than skipping it
+// — the two halves are deliberate: skipping what might be a string is the hole
+// this package exists to close, and reporting what is plainly an integer is a
+// guard nobody keeps.
+func plainlyNotAString(expr ast.Expr) bool {
+	switch expr := expr.(type) {
+	case *ast.BasicLit:
+		return expr.Kind != token.STRING
+	case *ast.Ident:
+		return expr.Name == "iota" || expr.Name == "true" || expr.Name == "false"
+	default:
+		return false
+	}
 }
 
 // mayBeString reports whether a const spec's type leaves it able to hold one.

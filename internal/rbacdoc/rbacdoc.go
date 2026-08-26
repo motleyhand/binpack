@@ -410,6 +410,17 @@ func section(template, guard string) (body, rest string, err error) {
 	for i, line := range lines {
 		if start < 0 {
 			if at := strings.Index(line, opener); at >= 0 {
+				// The remainder is the guard's own body, so an else in it is
+				// this guard's else — and the depth-one check below never sees
+				// it, because that loop begins on the next line. Left
+				// unexamined, `{{- if X }}{{- else }}` attributed the rules
+				// after it to X while Helm renders them when X is false.
+				if hasElse(line[at+len(opener):]) {
+					return "", "", fmt.Errorf("the block gated on %s opens its else branch "+
+						"on the same line (line %d); that branch renders when %s is false, "+
+						"and this substitution models a guard by removing it — render the "+
+						"chart or split the branches into separate blocks", guard, i+1, guard)
+				}
 				start, depth = i+1, depthDelta(line)
 				remainder = line[at+len(opener):]
 			}
