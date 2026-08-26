@@ -1199,16 +1199,42 @@ func leaderElectionNamespaceFlag(t *testing.T, deployment string) string {
 	t.Helper()
 
 	const flag = "--leader-election-namespace="
-	for line := range strings.SplitSeq(deployment, "\n") {
-		_, value, found := strings.Cut(line, flag)
-		if !found {
+	return rbacdoc.Placeholder(theOnly(t, deployment, flag,
+		"the deployment no longer passes "+flag+", so this cannot say where the Lease is "+
+			"taken; if the flag has gone, so has the reason for the leader-election Role"))
+}
+
+// theOnly is the value following a prefix, from the one uncommented line that
+// carries it.
+//
+// Commented lines are skipped and two matches are a failure, for the reason
+// the ServiceAccount field has the same treatment: a comment retaining the old
+// expression above a changed line satisfied a textual search while the
+// rendered object used the other one. The two helpers had that fix applied to
+// one of them.
+func theOnly(t *testing.T, document, prefix, absent string) string {
+	t.Helper()
+
+	var found []string
+	for line := range strings.SplitSeq(document, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		return rbacdoc.Placeholder(value)
+		if _, value, ok := strings.Cut(trimmed, prefix); ok {
+			found = append(found, value)
+		}
 	}
 
-	t.Fatalf("the deployment no longer passes %s, so this cannot say where the Lease is "+
-		"taken; if the flag has gone, so has the reason for the leader-election Role", flag)
+	switch len(found) {
+	case 1:
+		return found[0]
+	case 0:
+		t.Fatal(absent)
+	default:
+		t.Fatalf("%q appears %d times (%v); which one takes effect is then a question "+
+			"about ordering, and this would answer it by position", prefix, len(found), found)
+	}
 	return ""
 }
 
@@ -1320,4 +1346,84 @@ func TestEachFeatureGuardStandsOnItsOwn(t *testing.T) {
 				feature.guard, inside, feature.contains)
 		}
 	}
+}
+
+// TestTheChartAgreesWithItselfAboutItsOptions holds three joins between a
+// template and the value that is supposed to control it.
+//
+// Each is a place where two halves of one decision are written in different
+// files, and where the RBAC guards check one half and take the other on trust:
+// the Role a feature needs is checked against the guard that renders it, and
+// nothing checked that the process is told about the same guard, or that the
+// helper both objects agree on still reads what it claims to.
+func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
+	deployment, err := os.ReadFile("../../charts/binpack/templates/deployment.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's deployment: %v", err)
+	}
+
+	// The flag and the guard are one decision. Hard-coded, an install with
+	// leaderElection.enabled=false renders no Lease permissions — which the
+	// guard test above confirms — and starts a process that tries to take one
+	// anyway, then 403s for as long as it runs.
+	const flag = "--leader-election="
+	value := theOnly(t, string(deployment), flag,
+		"the deployment no longer passes "+flag+", so whether the process elects is "+
+			"decided somewhere this cannot see")
+	if got, want := rbacdoc.Placeholder(value), rbacdoc.Placeholder(".Values.leaderElection.enabled"); got != want {
+		t.Errorf("the deployment passes %s%s and the RBAC is gated on "+
+			".Values.leaderElection.enabled; one of them decides whether binpack elects "+
+			"and the other decides whether it may", flag, strings.TrimSpace(value))
+	}
+
+	// The helper both autoscaler-status objects are held to has to read the
+	// setting they are held to it *for*. Returning the default unconditionally
+	// leaves them agreeing with each other, this pipeline check satisfied, and
+	// the rendered config still telling binpack to read somewhere else.
+	helpers, err := os.ReadFile("../../charts/binpack/templates/_helpers.tpl")
+	if err != nil {
+		t.Fatalf("reading the chart's helpers: %v", err)
+	}
+	body, ok := helperBody(string(helpers), "binpack.autoscalerNamespace")
+	if !ok {
+		t.Fatal("the chart no longer defines binpack.autoscalerNamespace, and both " +
+			"autoscaler-status objects are checked against it by name")
+	}
+	for _, key := range []string{"discovery", "autoscalerNamespace", ".Values.config"} {
+		if !strings.Contains(body, key) {
+			t.Errorf("binpack.autoscalerNamespace does not read %s: the Role would be "+
+				"created wherever the helper decides and binpack would read the namespace "+
+				"config.discovery.autoscalerNamespace names, which is a 403 on every "+
+				"evaluation", key)
+		}
+	}
+
+	// And the ServiceAccount the chart creates is created only when the
+	// operator asked it to. Rendered unguarded, an install naming an external
+	// account gets a chart-managed one as well — which fails if it exists, and
+	// which Helm owns and deletes on uninstall if it does not.
+	account, err := os.ReadFile("../../charts/binpack/templates/serviceaccount.yaml")
+	if err != nil {
+		t.Fatalf("reading the chart's ServiceAccount: %v", err)
+	}
+	off, err := rbacdoc.Without(string(account), ".Values.serviceAccount.create")
+	if err != nil {
+		t.Fatalf("reading the ServiceAccount without its guard: %v", err)
+	}
+	if kinds, err := rbacdoc.Kinds(off); err != nil {
+		t.Errorf("reading what serviceAccount.create: false renders: %v", err)
+	} else if len(kinds) > 0 {
+		t.Errorf("serviceAccount.create: false still renders %v; an operator who named an "+
+			"external account receives a chart-managed one too", kinds)
+	}
+}
+
+// helperBody is the body of one named Helm template.
+func helperBody(helpers, name string) (string, bool) {
+	_, rest, ok := strings.Cut(helpers, `{{- define "`+name+`" -}}`)
+	if !ok {
+		return "", false
+	}
+	body, _, ok := strings.Cut(rest, "{{- end ")
+	return body, ok
 }

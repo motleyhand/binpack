@@ -357,6 +357,8 @@ func requireEverySubresourceIsReached(t *testing.T, recorded map[string]bool) {
 			"parse has stopped seeing it", executorSource)
 	}
 
+	requireEveryWriteIsUnconditional(t, source)
+
 	for call, method := range named {
 		var reached bool
 		for pair := range recorded {
@@ -525,4 +527,121 @@ func ungatedReads() map[string]bool {
 		}
 	}
 	return out
+}
+
+// requireEveryWriteIsUnconditional holds the property that makes driving each
+// entry point once sufficient.
+//
+// The audits above find the writes a subresource literal names, and a direct
+// `w.Patch(…)` on another resource names nothing static text can read: the
+// resource comes from the object's type. So the guard is structural instead —
+// every Writer call in executor.go runs on its function's unconditional path,
+// which is what makes "drove the function" and "reached the write" the same
+// statement.
+//
+// A write that genuinely needs a branch is not forbidden; it has to become its
+// own function, which the exported-function audit then requires to be driven.
+// That is also what internal/executor's package doc already promises the file
+// is: an enumeration of the writes, one per name.
+func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
+	t.Helper()
+
+	var found int
+	var walk func(n ast.Node, conditional bool)
+	walk = func(n ast.Node, conditional bool) {
+		if n == nil {
+			return
+		}
+
+		switch n := n.(type) {
+		case *ast.IfStmt:
+			// The init runs whatever the condition decides — `if err :=
+			// w.Patch(…); err != nil` always makes the call — so only the
+			// bodies are conditional.
+			walk(n.Init, conditional)
+			walk(n.Cond, conditional)
+			walk(n.Body, true)
+			walk(n.Else, true)
+			return
+		case *ast.ForStmt:
+			walk(n.Init, conditional)
+			walk(n.Cond, conditional)
+			walk(n.Body, true)
+			return
+		case *ast.RangeStmt:
+			walk(n.X, conditional)
+			walk(n.Body, true)
+			return
+		case *ast.SwitchStmt:
+			walk(n.Init, conditional)
+			walk(n.Tag, conditional)
+			walk(n.Body, true)
+			return
+		case *ast.TypeSwitchStmt, *ast.SelectStmt:
+			for _, child := range children(n) {
+				walk(child, true)
+			}
+			return
+		case *ast.CallExpr:
+			if writesThroughWriter(n) {
+				found++
+				if conditional {
+					t.Errorf("%s makes a write inside a conditional; driving the function "+
+						"it is in does not reach it, so the chart is never asked whether "+
+						"it grants what that call needs — give the write its own function, "+
+						"which the audit above then requires to be driven", executorSource)
+				}
+			}
+		}
+
+		for _, child := range children(n) {
+			walk(child, conditional)
+		}
+	}
+	walk(source, false)
+
+	if found == 0 {
+		t.Fatalf("no Writer call found in %s; either the writes moved or this parse has "+
+			"stopped seeing them", executorSource)
+	}
+}
+
+// children is one node's immediate children, in source order.
+func children(n ast.Node) []ast.Node {
+	var out []ast.Node
+	first := true
+	ast.Inspect(n, func(child ast.Node) bool {
+		if first {
+			first = false
+			return true
+		}
+		if child != nil {
+			out = append(out, child)
+		}
+		return false
+	})
+	return out
+}
+
+// writesThroughWriter reports whether a call is one made on a Writer.
+func writesThroughWriter(call *ast.CallExpr) bool {
+	fn, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	switch fn.Sel.Name {
+	case "Patch", "Create", "Update":
+	default:
+		return false
+	}
+	// Either `w.Patch(…)` or `w.SubResource("x").Create(…)`.
+	if ident, ok := fn.X.(*ast.Ident); ok {
+		return ident.Name == "w"
+	}
+	inner, ok := fn.X.(*ast.CallExpr)
+	if !ok {
+		return false
+	}
+	sub, ok := inner.Fun.(*ast.SelectorExpr)
+	return ok && sub.Sel.Name == "SubResource"
 }

@@ -122,9 +122,33 @@ func evaluate(expr ast.Expr, resolved map[string]string) (string, bool) {
 		}
 		right, ok := evaluate(expr.Y, resolved)
 		return left + right, ok
+	case *ast.CallExpr:
+		// A constant conversion, which is the one call a constant may
+		// contain: `string('x')` and `string(SomeConst)` are both legal ways
+		// to write a vocabulary value, and both reached the default branch and
+		// were reported as unevaluable.
+		return convertedString(expr, resolved)
 	default:
 		return "", false
 	}
+}
+
+// convertedString reads `string(x)` where x is a constant this can evaluate.
+//
+// A rune literal converts to the character it names; anything already a string
+// converts to itself. Any other conversion is not a string and is left to the
+// caller to report.
+func convertedString(call *ast.CallExpr, resolved map[string]string) (string, bool) {
+	fn, ok := call.Fun.(*ast.Ident)
+	if !ok || fn.Name != "string" || len(call.Args) != 1 {
+		return "", false
+	}
+
+	if lit, ok := call.Args[0].(*ast.BasicLit); ok && lit.Kind == token.CHAR {
+		runes, err := strconv.Unquote(lit.Value)
+		return runes, err == nil
+	}
+	return evaluate(call.Args[0], resolved)
 }
 
 // declaration is one name and the expression it was declared with.
@@ -267,6 +291,11 @@ func plainlyNotAString(expr ast.Expr) bool {
 		// branch before this and was reported as unevaluable, which failed the
 		// guard on a correct `const CodeMask`.
 		return plainlyNotAString(expr.X) || plainlyNotAString(expr.Y)
+	case *ast.CallExpr:
+		// A constant may contain a conversion and nothing else, so a call to
+		// anything but `string` converts to a type that is not one.
+		fn, ok := expr.Fun.(*ast.Ident)
+		return !ok || fn.Name != "string"
 	default:
 		return false
 	}
