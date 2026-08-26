@@ -62,7 +62,7 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 			if _, done := resolved[d.name]; done {
 				continue
 			}
-			if value, ok := evaluate(d.expr, resolved); ok {
+			if value, ok := evaluate(d.expr, resolved, d.iota); ok {
 				resolved[d.name], progressed = value, true
 			}
 		}
@@ -102,7 +102,7 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 // and its imports to read four constants; the subset a vocabulary is written
 // in is small enough to walk, and anything outside it is still reported rather
 // than skipped.
-func evaluate(expr ast.Expr, resolved map[string]string) (string, bool) {
+func evaluate(expr ast.Expr, resolved map[string]string, iota int64) (string, bool) {
 	switch expr := expr.(type) {
 	case *ast.BasicLit:
 		if expr.Kind != token.STRING {
@@ -114,23 +114,23 @@ func evaluate(expr ast.Expr, resolved map[string]string) (string, bool) {
 		value, ok := resolved[expr.Name]
 		return value, ok
 	case *ast.ParenExpr:
-		return evaluate(expr.X, resolved)
+		return evaluate(expr.X, resolved, iota)
 	case *ast.BinaryExpr:
 		if expr.Op != token.ADD {
 			return "", false
 		}
-		left, ok := evaluate(expr.X, resolved)
+		left, ok := evaluate(expr.X, resolved, iota)
 		if !ok {
 			return "", false
 		}
-		right, ok := evaluate(expr.Y, resolved)
+		right, ok := evaluate(expr.Y, resolved, iota)
 		return left + right, ok
 	case *ast.CallExpr:
 		// A constant conversion, which is the one call a constant may
 		// contain: `string('x')` and `string(SomeConst)` are both legal ways
 		// to write a vocabulary value, and both reached the default branch and
 		// were reported as unevaluable.
-		return convertedString(expr, resolved)
+		return convertedString(expr, resolved, iota)
 	default:
 		return "", false
 	}
@@ -141,7 +141,7 @@ func evaluate(expr ast.Expr, resolved map[string]string) (string, bool) {
 // A rune literal converts to the character it names; anything already a string
 // converts to itself. Any other conversion is not a string and is left to the
 // caller to report.
-func convertedString(call *ast.CallExpr, resolved map[string]string) (string, bool) {
+func convertedString(call *ast.CallExpr, resolved map[string]string, iota int64) (string, bool) {
 	fn, ok := call.Fun.(*ast.Ident)
 	if !ok || !convertsToString(fn.Name) || len(call.Args) != 1 {
 		return "", false
@@ -162,10 +162,10 @@ func convertedString(call *ast.CallExpr, resolved map[string]string) (string, bo
 		runes, err := strconv.Unquote(lit.Value)
 		return runes, err == nil
 	}
-	if value, ok := integer(call.Args[0], integerConstants); ok {
+	if value, ok := integer(call.Args[0], integerConstants, iota); ok {
 		return string(rune(value)), true
 	}
-	return evaluate(call.Args[0], resolved)
+	return evaluate(call.Args[0], resolved, iota)
 }
 
 // integerConstants are the package's integer-valued constants, by name, for
@@ -191,7 +191,14 @@ var stringTypeNames map[string]bool
 // declared later in the file or in another of the package\'s files, and because
 // an alias of an alias is as ordinary as an alias.
 func integers(files []*ast.File) map[string]int64 {
-	pending := map[string]ast.Expr{}
+	// The expression and the value `iota` has where it was written, because a
+	// repeated spec evaluates the same syntax at a different position.
+	type at struct {
+		expr ast.Expr
+		iota int64
+	}
+
+	pending := map[string]at{}
 	for _, file := range files {
 		for _, decl := range file.Decls {
 			block, ok := decl.(*ast.GenDecl)
@@ -204,7 +211,7 @@ func integers(files []*ast.File) map[string]int64 {
 			// unknown, so `string(repeated)` was reported as unevaluable —
 			// failing the vocabulary guard over a refactor Go compiles.
 			var previous []ast.Expr
-			for _, spec := range block.Specs {
+			for index, spec := range block.Specs {
 				spec, ok := spec.(*ast.ValueSpec)
 				if !ok {
 					continue
@@ -219,7 +226,7 @@ func integers(files []*ast.File) map[string]int64 {
 					continue
 				}
 				for i, name := range spec.Names {
-					pending[name.Name] = values[i]
+					pending[name.Name] = at{values[i], int64(index)}
 				}
 			}
 		}
@@ -228,8 +235,8 @@ func integers(files []*ast.File) map[string]int64 {
 	out := map[string]int64{}
 	for grew := true; grew; {
 		grew = false
-		for name, expr := range pending {
-			value, ok := integer(expr, out)
+		for name, entry := range pending {
+			value, ok := integer(entry.expr, out, entry.iota)
 			if !ok {
 				continue
 			}
@@ -259,7 +266,7 @@ var integerTypes = map[string]bool{
 // The same shape as [evaluate] and for the same reason: the subset a constant
 // may contain is small enough to walk, and what falls outside it is reported as
 // unknown rather than guessed at.
-func integer(expr ast.Expr, known map[string]int64) (int64, bool) {
+func integer(expr ast.Expr, known map[string]int64, iota int64) (int64, bool) {
 	switch expr := expr.(type) {
 	case *ast.BasicLit:
 		switch expr.Kind {
@@ -280,10 +287,18 @@ func integer(expr ast.Expr, known map[string]int64) (int64, bool) {
 			return 0, false
 		}
 	case *ast.Ident:
+		// `iota` is the one identifier whose value is the expression's
+		// position rather than a declaration elsewhere, and it is how a
+		// sequence of related constants is ordinarily written. Looked up in
+		// `known` like any other name, it was never found, and every member of
+		// such a block was reported as unevaluable.
+		if expr.Name == "iota" {
+			return iota, true
+		}
 		value, ok := known[expr.Name]
 		return value, ok
 	case *ast.ParenExpr:
-		return integer(expr.X, known)
+		return integer(expr.X, known, iota)
 	case *ast.CallExpr:
 		// A conversion to an integer type, which is the one call a constant
 		// may contain and is how a rune is usually spelled in a conversion:
@@ -293,9 +308,9 @@ func integer(expr ast.Expr, known map[string]int64) (int64, bool) {
 		if !ok || len(expr.Args) != 1 || !integerTypes[fn.Name] {
 			return 0, false
 		}
-		return integer(expr.Args[0], known)
+		return integer(expr.Args[0], known, iota)
 	case *ast.UnaryExpr:
-		value, ok := integer(expr.X, known)
+		value, ok := integer(expr.X, known, iota)
 		switch {
 		case !ok:
 			return 0, false
@@ -309,8 +324,8 @@ func integer(expr ast.Expr, known map[string]int64) (int64, bool) {
 			return 0, false
 		}
 	case *ast.BinaryExpr:
-		left, leftOK := integer(expr.X, known)
-		right, rightOK := integer(expr.Y, known)
+		left, leftOK := integer(expr.X, known, iota)
+		right, rightOK := integer(expr.Y, known, iota)
 		if !leftOK || !rightOK {
 			return 0, false
 		}
@@ -359,6 +374,13 @@ func integer(expr ast.Expr, known map[string]int64) (int64, bool) {
 type declaration struct {
 	expr ast.Expr
 	name string
+
+	// iota is the expression's position in its const block, which is the
+	// value `iota` has inside it. Carried rather than looked up: a spec with
+	// no expression repeats the previous one, so the same syntax is evaluated
+	// once per position and `const ( CodeA = string('A' + iota); CodeB )`
+	// yields "A" and "B" from one expression.
+	iota int64
 }
 
 // stringTypes are the package's own names for a string, alias or defined.
@@ -434,7 +456,7 @@ func declarations(files []*ast.File, stringy map[string]bool) []declaration {
 			// previous one within a const block and never across two.
 			var previous []ast.Expr
 			var previousType ast.Expr
-			for _, spec := range block.Specs {
+			for index, spec := range block.Specs {
 				spec, ok := spec.(*ast.ValueSpec)
 				if !ok {
 					continue
@@ -462,7 +484,9 @@ func declarations(files []*ast.File, stringy map[string]bool) []declaration {
 					if plainlyNotAString(values[i]) {
 						continue
 					}
-					out = append(out, declaration{expr: values[i], name: name.Name})
+					out = append(out, declaration{
+						expr: values[i], name: name.Name, iota: int64(index),
+					})
 				}
 			}
 		}

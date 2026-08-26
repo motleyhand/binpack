@@ -21,6 +21,7 @@
 package rbacdoc
 
 import (
+	"cmp"
 	"fmt"
 	"regexp"
 	"slices"
@@ -370,95 +371,148 @@ func closesFence(line, delimiter string) bool {
 // against, so it may not be a way of succeeding.
 func Documented(doc string) ([]Role, error) {
 	var out []Role
-	for _, body := range fencedYAML(doc) {
-		role, err := fragment(body)
-		// A block naming any rule field is a rule list, whatever became of it.
-		// Keying that on `apiGroups:` alone skipped a non-resource snippet in
-		// silence — it has no apiGroups by definition, so a malformed one was
-		// read as prose quoted for discussion while an operator copying it got
-		// an invalid role. Only in a rule list is a failed or empty decode a
-		// dropped rule rather than an illustration, and only there is it
-		// reported.
-		rules := kindOfBlock(body) != "" || ruleField.MatchString(body)
-		switch {
-		case err != nil && rules:
-			return nil, fmt.Errorf("a documented block is written as policy rules and does "+
-				"not decode as them, so this reader would drop it: %w\n%s", err, body)
-		case len(role.Rules) == 0 && rules:
-			return nil, fmt.Errorf("a documented block is written as policy rules and "+
-				"decoded to none, so this reader would drop it:\n%s", body)
-		case err != nil, len(role.Rules) == 0:
-			continue
-		}
+	for _, fence := range fencedYAML(doc) {
+		// A fence may hold more than one manifest. Decoded whole, the YAML
+		// decoder read the first and every later document was discarded in
+		// silence — so a permission an operator would receive from a block
+		// they copy entire was absent from both directions of the comparison.
+		// The fence's own header describes its first document, and applies to
+		// a later one only if that one says nothing about itself.
+		fenceKind, fenceName := kindOf(fence)
 
-		// The same shape check the chart's rules get. A malformed rule
-		// contributes no grant, so both directions of the comparison stay
-		// green — while an operator assembling these snippets into a Role has
-		// the whole object refused, which is the failure the page exists to
-		// prevent.
-		if why := malformed(role); why != "" {
-			return nil, fmt.Errorf("a documented block declares a rule Kubernetes refuses: "+
-				"%s. A role written from this page would be rejected whole:\n%s", why, body)
+		for _, body := range Documents(fence) {
+			role, ok, err := documented(body, fenceKind, fenceName)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				out = append(out, role)
+			}
 		}
-
-		// And the refusal [decode] makes of the chart's own manifests, for the
-		// same reason and with more at stake. A ClusterRole carrying an
-		// aggregationRule does not grant what is written in it: the
-		// aggregation controller replaces those rules with the union of every
-		// ClusterRole its selectors match. The flattened grants can agree with
-		// the chart exactly while an operator who assembled this role from the
-		// page holds whatever labels elsewhere in their cluster decide —
-		// possibly nothing. Checked here as well because this page is written
-		// for the operator who is *not* using the chart, so nothing else in
-		// their install would catch it.
-		if role.Aggregation != nil {
-			return nil, fmt.Errorf("a documented block declares an aggregationRule, so "+
-				"Kubernetes decides its rules from labels on other ClusterRoles and the "+
-				"rules shown here are overwritten — an operator assembling this role may "+
-				"receive none of these permissions:\n%s", body)
-		}
-
-		// Which object a fragment belongs to is written in its first line as a
-		// comment, since it has no metadata to carry it. The whole line is
-		// kept as the name: [Identity] matches the chart's metadata.name and
-		// this against the same suffixes, and text is all the two documents
-		// share.
-		//
-		// A block that also declares a real `kind` is a manifest an operator
-		// can apply, and the two have to agree. Assigned over the decoded
-		// field, a snippet headed `# ClusterRole` and declaring `kind: Role`
-		// was compared as the ClusterRole and could satisfy every grant check,
-		// while what the page actually tells them to apply is namespaced — so
-		// binpack would hold none of its cluster-wide node and pod access, and
-		// the page that promised it would read as correct.
-		// A fragment carries no apiVersion — it is a rule list, not a
-		// manifest — but a block written to be copied whole does, and then it
-		// has to be one Kubernetes still serves. Its grants and its identity
-		// satisfy every comparison here either way, while an operator applying
-		// it has the object refused and holds none of the permissions the page
-		// spent a section explaining.
-		if role.APIVersion != "" && role.APIVersion != RBACAPIVersion {
-			return nil, fmt.Errorf("a documented block declares apiVersion %q and "+
-				"Kubernetes serves RBAC under %q; an operator applying it is refused "+
-				"at create and holds none of these permissions:\n%s",
-				role.APIVersion, RBACAPIVersion, body)
-		}
-
-		declared := role.Kind
-		role.Kind, role.Metadata.Name = kindOf(body)
-		if declared != "" && declared != role.Kind {
-			return nil, fmt.Errorf("a documented block is headed %s and declares kind: %s. "+
-				"An operator applies what it declares and this page is compared against "+
-				"what it is headed, so one of the two is describing permissions nobody "+
-				"holds:\n%s", role.Kind, declared, body)
-		}
-		out = append(out, role)
 	}
 
 	if len(out) == 0 {
 		return nil, fmt.Errorf("the document states no rules at all")
 	}
 	return out, nil
+}
+
+// documented reads one document out of a fenced block, against the header its
+// fence carries.
+//
+// The bool is whether it is a role at all: a block declaring no rules is a
+// fragment quoted for discussion and is skipped, while a block that mentions a
+// rule field and still yields none is this reader dropping a rule, and is an
+// error. That distinction is the whole point of the package — silence about a
+// rule is the failure being guarded against, so it may not be a way of
+// succeeding.
+func documented(body, fenceKind, fenceName string) (Role, bool, error) {
+	role, err := fragment(body)
+
+	// A block naming any rule field is a rule list, whatever became of it.
+	// Keying that on `apiGroups:` alone skipped a non-resource snippet in
+	// silence — it has no apiGroups by definition, so a malformed one was read
+	// as prose quoted for discussion while an operator copying it got an
+	// invalid role. Only in a rule list is a failed or empty decode a dropped
+	// rule rather than an illustration, and only there is it reported.
+	rules := kindOfBlock(body) != "" || ruleField.MatchString(body)
+
+	if nothing := err != nil || len(role.Rules) == 0; nothing {
+		// Nothing came out. Whether that is a defect depends on what the block
+		// was: in a rule list it is this reader dropping a rule and is
+		// reported, and anywhere else the block is prose quoted for discussion
+		// and whatever the decoder made of it says nothing about the page.
+		//
+		// Written as a decision about the block rather than about `err`,
+		// because the two are separate questions and pairing them reads as a
+		// swallowed error.
+		if !rules {
+			return Role{}, false, nil
+		}
+		if err != nil {
+			return Role{}, false, fmt.Errorf("a documented block is written as policy "+
+				"rules and does not decode as them, so this reader would drop it: "+
+				"%w\n%s", err, body)
+		}
+		return Role{}, false, fmt.Errorf("a documented block is written as policy rules "+
+			"and decoded to none, so this reader would drop it:\n%s", body)
+	}
+
+	// The same shape check the chart's rules get. A malformed rule contributes
+	// no grant, so both directions of the comparison stay green — while an
+	// operator assembling these snippets into a Role has the whole object
+	// refused, which is the failure the page exists to prevent.
+	if why := malformed(role); why != "" {
+		return Role{}, false, fmt.Errorf("a documented block declares a rule Kubernetes "+
+			"refuses: %s. A role written from this page would be rejected whole:\n%s",
+			why, body)
+	}
+
+	// And the refusal [decode] makes of the chart's own manifests, for the
+	// same reason and with more at stake. A ClusterRole carrying an
+	// aggregationRule does not grant what is written in it: the aggregation
+	// controller replaces those rules with the union of every ClusterRole its
+	// selectors match. The flattened grants can agree with the chart exactly
+	// while an operator who assembled this role from the page holds whatever
+	// labels elsewhere in their cluster decide — possibly nothing. Checked
+	// here as well because this page is written for the operator who is *not*
+	// using the chart, so nothing else in their install would catch it.
+	if role.Aggregation != nil {
+		return Role{}, false, fmt.Errorf("a documented block declares an aggregationRule, "+
+			"so Kubernetes decides its rules from labels on other ClusterRoles and the "+
+			"rules shown here are overwritten — an operator assembling this role may "+
+			"receive none of these permissions:\n%s", body)
+	}
+
+	// A fragment carries no apiVersion — it is a rule list, not a manifest —
+	// but a block written to be copied whole does, and then it has to be one
+	// Kubernetes still serves. Its grants and its identity satisfy every
+	// comparison here either way, while an operator applying it has the object
+	// refused and holds none of the permissions the page spent a section
+	// explaining.
+	if role.APIVersion != "" && role.APIVersion != RBACAPIVersion {
+		return Role{}, false, fmt.Errorf("a documented block declares apiVersion %q and "+
+			"Kubernetes serves RBAC under %q; an operator applying it is refused at "+
+			"create and holds none of these permissions:\n%s",
+			role.APIVersion, RBACAPIVersion, body)
+	}
+
+	// Which object a fragment belongs to is written in its first line as a
+	// comment, since it has no metadata to carry it. The whole line is kept as
+	// the name: [Identity] matches the chart's metadata.name and this against
+	// the same suffixes, and text is all the two documents share.
+	//
+	// A block that also declares a real `kind` is a manifest an operator can
+	// apply, and the two have to agree. Assigned over the decoded field, a
+	// snippet headed `# ClusterRole` and declaring `kind: Role` was compared as
+	// the ClusterRole and could satisfy every grant check, while what the page
+	// tells them to apply is namespaced — so binpack would hold none of its
+	// cluster-wide node and pod access, and the page that promised it would
+	// read as correct.
+	//
+	// Compared against this document's own comment rather than the fence's,
+	// because a fence holding two manifests has one header and it describes
+	// the first of them.
+	ownKind, ownName := kindOf(body)
+	if ownKind != "" && role.Kind != "" && ownKind != role.Kind {
+		return Role{}, false, fmt.Errorf("a documented block is headed %s and declares "+
+			"kind: %s. An operator applies what it declares and this page is compared "+
+			"against what it is headed, so one of the two is describing permissions "+
+			"nobody holds:\n%s", ownKind, role.Kind, body)
+	}
+
+	switch {
+	case role.Kind != "":
+		// Its own declaration wins, and its own name with it.
+		if role.Metadata.Name == "" {
+			role.Metadata.Name = cmp.Or(ownName, fenceName)
+		}
+	case ownKind != "":
+		role.Kind, role.Metadata.Name = ownKind, ownName
+	default:
+		role.Kind, role.Metadata.Name = fenceKind, fenceName
+	}
+	return role, true, nil
 }
 
 // fragment decodes a documented snippet, which may be a document carrying
