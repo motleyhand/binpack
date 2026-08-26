@@ -134,7 +134,7 @@ func codeTables() []struct {
 		// and the two verdicts reach the counter through revalidation and are
 		// described in the prose beneath it rather than repeated as rows.
 		{"`reason` is one of:", append(append(append([]string{},
-			drain.AbandonCodes()...), engine.SkipCodes()...), engine.Verdicts()...)},
+			drain.AbandonCodes()...), engine.SkipCodes()...), abandonmentVerdicts...)},
 		{"| `cause` | What binpack could not do |", unmodelledCauses},
 	}
 }
@@ -308,7 +308,7 @@ func TestTheAbandonmentReasonsAreOneSet(t *testing.T) {
 	var reasons []string
 	reasons = append(reasons, drain.AbandonCodes()...)
 	reasons = append(reasons, engine.SkipCodes()...)
-	reasons = append(reasons, engine.Verdicts()...)
+	reasons = append(reasons, abandonmentVerdicts...)
 
 	if len(reasons) == 0 {
 		t.Fatal("the abandonment reasons enumerate nothing, so this asserts nothing")

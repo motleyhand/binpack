@@ -215,7 +215,7 @@ func init() {
 	for _, code := range engine.SkipCodes() {
 		drainsAbandoned.WithLabelValues(code)
 	}
-	for _, code := range []string{engine.VerdictInfeasible, engine.VerdictBlocked} {
+	for _, code := range abandonmentVerdicts {
 		drainsAbandoned.WithLabelValues(code)
 	}
 
@@ -223,6 +223,17 @@ func init() {
 		evaluations, evaluationErrors, evaluationDuration,
 		drainsStarted, drainsCompleted, drainsAbandoned, state)
 }
+
+// abandonmentVerdicts are the verdicts that can end a drain, which is two of
+// the four.
+//
+// A revalidation that returns no skip code ends the drain on its verdict, and
+// only infeasible and blocked mean it should stop — skipped carries a code by
+// construction and drainable is the drain continuing. Named rather than
+// written inline because the reference guard has to allow exactly this set:
+// spelled twice, the table could document a series the counter can never
+// create, which is the failure the reverse check exists to catch.
+var abandonmentVerdicts = []string{engine.VerdictInfeasible, engine.VerdictBlocked}
 
 // DrainStarted records a node being marked and cordoned.
 func DrainStarted() { drainsStarted.Inc() }

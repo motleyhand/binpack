@@ -116,7 +116,11 @@ func TestTheDrainLogLineNamesThePoolWhenOnlyTheIdentifierIsPresent(t *testing.T)
 // reason cannot tell the two apart. Separate because internal/metrics may not
 // import this package.
 func TestEveryEventReasonIsDistinct(t *testing.T) {
-	reasons := EventReasons()
+	// The action is checked with them. It is appended to the documentation
+	// loop above and was left out of this one, and an Event whose action is
+	// empty has lost the field that groups every consolidation event together
+	// — the same defect as an empty reason, on the field beside it.
+	reasons := append(EventReasons(), ActionConsolidate)
 	if len(reasons) == 0 {
 		t.Fatal("EventReasons() enumerates nothing, so this asserts nothing about it")
 	}
@@ -128,9 +132,9 @@ func TestEveryEventReasonIsDistinct(t *testing.T) {
 		// fence satisfies. Unlike the metric label values, nothing downstream
 		// refuses this one: an Event carries whatever reason it is given.
 		if reason == "" {
-			t.Error("EventReasons() enumerates the empty string; the Events written with " +
-				"it carry no reason, and `kubectl get events --field-selector reason=` " +
-				"has nothing to match")
+			t.Error("the Event vocabulary holds the empty string; an Event written with it " +
+				"carries no reason or no action, and `kubectl get events " +
+				"--field-selector reason=` has nothing to match")
 		}
 		if seen[reason] {
 			t.Errorf("EventReasons() enumerates %q twice, so two constants share it and "+
@@ -216,5 +220,76 @@ func TestEveryEventReasonDeclaredIsEnumerated(t *testing.T) {
 		t.Errorf("found %d Reason constants and EventReasons() holds %d; either the parse "+
 			"has stopped seeing the declarations or the enumerator holds a value no "+
 			"constant does", declared, len(EventReasons()))
+	}
+}
+
+// reasonTable is the catalogue an operator reads the Event vocabulary from,
+// and the line that introduces it.
+//
+// Keyed on the introducing line rather than on position, the way
+// internal/metrics keys its code tables: inserting a section moves nothing
+// here, and a table that loses its preamble fails loudly instead of being
+// skipped.
+const (
+	reasonTablePage   = "../../docs/reference/cli.md"
+	reasonTableAnchor = "| Reason | When |"
+)
+
+// TestTheEventReasonTableIsExactlyTheVocabulary is the direction the
+// containment check above cannot give.
+//
+// That one proves each current reason appears *somewhere* in the reference
+// corpus, which a mention in any page satisfies and which says nothing about
+// what else the catalogue lists. Renaming a reason, putting the new spelling
+// on some other page and leaving the old row here keeps every vocabulary test
+// green while this table goes on advertising a `--field-selector` no Event can
+// match — and this table is the one an operator copies the selector out of.
+//
+// Compared exactly, in both directions, because the table is the catalogue
+// rather than a mention: a row with no constant is a promise nothing keeps,
+// and a constant with no row is the gap the containment check was added for.
+func TestTheEventReasonTableIsExactlyTheVocabulary(t *testing.T) {
+	page, err := os.ReadFile(reasonTablePage)
+	if err != nil {
+		t.Fatalf("reading %s: %v", reasonTablePage, err)
+	}
+
+	_, rest, ok := strings.Cut(string(page), reasonTableAnchor)
+	if !ok {
+		t.Fatalf("%s no longer carries the %q table, so the Event vocabulary has no "+
+			"catalogue and this asserts nothing", reasonTablePage, reasonTableAnchor)
+	}
+
+	listed := map[string]bool{}
+	for _, line := range strings.Split(rest, "\n") {
+		// The table ends at the first line that is not one of its rows.
+		if !strings.HasPrefix(line, "| `") {
+			if len(listed) > 0 {
+				break
+			}
+			continue
+		}
+		name, _, _ := strings.Cut(strings.TrimPrefix(line, "| `"), "`")
+		listed[name] = true
+	}
+	if len(listed) == 0 {
+		t.Fatalf("the %q table in %s parsed to no rows", reasonTableAnchor, reasonTablePage)
+	}
+
+	enumerated := map[string]bool{}
+	for _, reason := range EventReasons() {
+		enumerated[reason] = true
+		if !listed[reason] {
+			t.Errorf("EventReasons() holds %q and the catalogue in %s does not list it; an "+
+				"operator reading that table for a field selector has no way to know the "+
+				"Event exists", reason, reasonTablePage)
+		}
+	}
+	for name := range listed {
+		if !enumerated[name] {
+			t.Errorf("the catalogue in %s lists %q and no Event carries it; the page "+
+				"advertises `kubectl get events --field-selector reason=%s`, which matches "+
+				"nothing", reasonTablePage, name, name)
+		}
 	}
 }

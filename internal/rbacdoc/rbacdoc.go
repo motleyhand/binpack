@@ -264,7 +264,14 @@ func GuardsAround(template, guard string) ([]string, error) {
 	var found bool
 	var enclosing []string
 	for i, line := range lines {
-		if opened := openedGuard(line); opened != "" {
+		// Every construct that opens a block, not only `if`. depthDelta counts
+		// `with`, `range` and `block` as openers and their `end` as a close, so
+		// recording only conditions pushed less than it popped and unwound the
+		// stack through guards that were still open — and a `with` whose value
+		// is empty, or a `range` over nothing, suppresses everything inside it
+		// exactly as a false condition does. They belong on the stack for both
+		// reasons.
+		if opened, ok := openedBlock(line); ok {
 			if opened == guard {
 				if found {
 					return nil, fmt.Errorf("%s guards more than one block (line %d); this "+
@@ -276,7 +283,11 @@ func GuardsAround(template, guard string) ([]string, error) {
 			stack = append(stack, opened)
 			continue
 		}
-		if delta := depthDelta(line); delta < 0 && len(stack) > 0 {
+		if delta := depthDelta(line); delta < 0 {
+			if len(stack)+delta < 0 {
+				return nil, fmt.Errorf("line %d closes a block this never saw opened, so the "+
+					"nesting read here is not the template's", i+1)
+			}
 			stack = stack[:len(stack)+delta]
 		}
 	}
@@ -287,15 +298,25 @@ func GuardsAround(template, guard string) ([]string, error) {
 	return enclosing, nil
 }
 
-// openedGuard is the condition a line opens a conditional block on, or "".
-func openedGuard(line string) string {
+// openedBlock names the block a line opens, and reports whether it opens one.
+//
+// A conditional is named by its condition, so a caller states the guards it
+// expects in the template's own words. Everything else is named by its keyword
+// as well, because those are not guards and should not be mistaken for one:
+// an expectation listing `.Values.rbac.create` does not match `with
+// .Values.rbac`, which is the point.
+func openedBlock(line string) (string, bool) {
 	for _, action := range helmAction.FindAllString(line, -1) {
 		body := strings.TrimSpace(strings.Trim(strings.Trim(action, "{}"), "-"))
-		if keyword, rest, _ := strings.Cut(body, " "); keyword == "if" {
-			return strings.TrimSpace(rest)
+		keyword, rest, _ := strings.Cut(body, " ")
+		switch keyword {
+		case "if":
+			return strings.TrimSpace(rest), true
+		case "range", "with", "define", "block":
+			return strings.TrimSpace(keyword + " " + rest), true
 		}
 	}
-	return ""
+	return "", false
 }
 
 // section finds one guarded block, returning its body and the template with

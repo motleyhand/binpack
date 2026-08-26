@@ -705,6 +705,16 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 	identities := map[string]bool{}
 	for _, role := range roles {
 		identity(t, identities, role.Kind, role.Metadata.Namespace, role.Metadata.Name)
+
+		// A ClusterRole is cluster-scoped and the API server refuses one
+		// carrying a namespace. Nothing else here would notice: every rule it
+		// holds is still written, still compared and still correct, and the
+		// object is never created.
+		if role.Kind == "ClusterRole" && role.Metadata.Namespace != "" {
+			t.Errorf("the ClusterRole %s sets namespace %s; it is cluster-scoped, the API "+
+				"server refuses the object, and the install comes up with none of the "+
+				"cluster-wide reads binpack needs", role.Metadata.Name, role.Metadata.Namespace)
+		}
 	}
 
 	bound := map[string]bool{}
