@@ -12,6 +12,7 @@ import (
 
 	"github.com/motleyhand/binpack/api/v1alpha1"
 	"github.com/motleyhand/binpack/internal/controller"
+	"github.com/motleyhand/binpack/internal/rbacdoc"
 )
 
 // The chart's default configuration must be one binpack accepts.
@@ -489,5 +490,95 @@ func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
 		t.Fatalf("found no real namespace in a `kubectl` example under docs/ or the "+
 			"README (%d placeholders skipped); this test asserts nothing if its "+
 			"pattern has stopped matching", skipped)
+	}
+}
+
+// TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor completes the promise
+// the binding test above makes.
+//
+// That test holds the autoscaler-status Role and RoleBinding to the namespace
+// binpack reads the status from. It says nothing about what that Role grants —
+// and the two are one promise, because a Role bound in the right namespace
+// granting nothing binpack needs there fails exactly as a Role bound in the
+// wrong one does: a 403 on every evaluation, from an install that came up
+// clean.
+//
+// The gap is invisible to the RBAC comparisons in capability_doc_test.go,
+// which key on group, resource and verb. Those keys are right for a
+// ClusterRole, whose grants apply everywhere. They cannot express a namespaced
+// one, and this chart renders two into two different namespaces: the
+// autoscaler's, which the operator names through discovery.autoscalerNamespace,
+// and binpack's own. Moving the ConfigMap read from the first Role to the
+// second left every test in this repository green, while any install whose
+// release namespace differs from the autoscaler's — the ordinary case, since
+// the autoscaler publishes into the namespace it runs in — reads a namespace
+// it holds no grant for.
+//
+// The namespaces themselves cannot be compared here: the chart writes both as
+// Helm expressions, and rendering them means running Helm. The names can, and
+// they are what the objects are actually distinguished by.
+func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
+	chart, err := os.ReadFile(rbacdoc.ChartPath)
+	if err != nil {
+		t.Fatalf("reading the chart's RBAC: %v", err)
+	}
+	roles, err := rbacdoc.Roles(string(chart))
+	if err != nil {
+		t.Fatalf("reading the chart's rules: %v", err)
+	}
+
+	namespaced := rbacdoc.OfKind(roles, "Role")
+	if len(namespaced) != 2 {
+		t.Fatalf("found %d namespaced Roles, want the autoscaler-status one and the "+
+			"leader-election one; this test asserts nothing if it cannot find them",
+			len(namespaced))
+	}
+
+	grants := map[string]map[string]bool{}
+	for _, role := range namespaced {
+		grants[role.Metadata.Name] = rbacdoc.Grants([]rbacdoc.Role{role})
+	}
+
+	// Disjoint, which is the general form and needs no list. Two Roles in two
+	// namespaces granting the same pair means one of them grants it somewhere
+	// nobody asked for it.
+	for name, mine := range grants {
+		for other, theirs := range grants {
+			if name == other {
+				continue
+			}
+			for pair := range mine {
+				if theirs[pair] {
+					t.Errorf("%s and %s both grant %q, and they are created in different "+
+						"namespaces; one of them is granting it where binpack does not "+
+						"read", name, other, pair)
+				}
+			}
+		}
+	}
+
+	// And the anchor, because disjointness alone is satisfied by the two Roles
+	// swapping their rules. binpack reads exactly one kind in the namespace
+	// discovery.autoscalerNamespace names — the cluster-autoscaler's status
+	// ConfigMap, which ADR-0004 makes the whole basis of running without cloud
+	// credentials — so that read belongs to that Role and to no other.
+	var granted bool
+	for name, mine := range grants {
+		for pair := range mine {
+			if !strings.HasPrefix(pair, "core/configmaps: ") {
+				continue
+			}
+			if !strings.HasSuffix(name, "-autoscaler-status") {
+				t.Errorf("%s grants %q, and it is not the Role created in the namespace "+
+					"discovery.autoscalerNamespace names; binpack would read the "+
+					"cluster-autoscaler's status where it holds no grant and report no "+
+					"autoscaler on every evaluation", name, pair)
+			}
+			granted = true
+		}
+	}
+	if !granted {
+		t.Error("no namespaced Role grants a read on configmaps, so nothing lets binpack " +
+			"read the cluster-autoscaler's status")
 	}
 }

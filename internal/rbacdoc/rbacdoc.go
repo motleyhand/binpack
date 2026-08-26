@@ -52,9 +52,25 @@ type Rule struct {
 //
 // It carries its Kind because the callers ask different questions of the two:
 // what the cluster-wide role grants is not what a namespaced Role does.
+//
+// And its name, because "namespaced" is not one place. This chart renders two
+// Roles into two different namespaces — one where the cluster-autoscaler
+// publishes its status, one where binpack itself runs — so a rule moved from
+// either to the other is granted somewhere binpack is not looking, and
+// [Grants] cannot see the difference. The namespace itself cannot be compared:
+// the chart writes both as Helm expressions and [HelmToYAML] renders them to
+// the same placeholder. The name survives, because what distinguishes the two
+// is a literal suffix on a templated prefix.
 type Role struct {
-	Kind  string `json:"kind"`
-	Rules []Rule `json:"rules"`
+	Kind     string   `json:"kind"`
+	Metadata Metadata `json:"metadata"`
+	Rules    []Rule   `json:"rules"`
+}
+
+// Metadata is the identifying half of a role, which for these documents means
+// the name alone: the namespace is a Helm expression by the time this reads it.
+type Metadata struct {
+	Name string `json:"name"`
 }
 
 // Roles decodes every role a chart template declares, as the union of its
@@ -288,7 +304,17 @@ func OfKind(roles []Role, kind string) []Role {
 // documentSeparator splits a multi-document YAML stream.
 var documentSeparator = regexp.MustCompile(`(?m)^---$`)
 
-// decode reads every document of a YAML stream that declares rules.
+// decode reads every role in a YAML stream, and every document that declares
+// rules without saying what it is.
+//
+// A role is kept even when it grants nothing. Skipping it would be the reader
+// disappearing again, one level up: a Role stripped of its last rule is not an
+// absent Role, it is the object an install still creates and binds and which
+// authorises nothing — and a caller counting the roles it found would report
+// that as "I could not find them" rather than as "this one is empty".
+//
+// The rules-without-a-kind case is [Section]'s: a block lifted out of its
+// document has no `kind:` to declare.
 func decode(what, manifests string) ([]Role, error) {
 	var out []Role
 	for _, doc := range documentSeparator.Split(manifests, -1) {
@@ -296,7 +322,7 @@ func decode(what, manifests string) ([]Role, error) {
 		if err := yaml.Unmarshal([]byte(doc), &role); err != nil {
 			return nil, fmt.Errorf("%s does not parse as YAML: %w\n%s", what, err, doc)
 		}
-		if len(role.Rules) == 0 {
+		if role.Kind != "Role" && role.Kind != "ClusterRole" && len(role.Rules) == 0 {
 			continue
 		}
 		out = append(out, role)
