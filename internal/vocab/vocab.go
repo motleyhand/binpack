@@ -40,7 +40,7 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 		return nil, err
 	}
 
-	declared := declarations(files)
+	declared := declarations(files, stringTypes(files))
 
 	// Every declaration's literal value, whatever its name, so an alias can be
 	// followed to a constant the prefix does not cover. Then identifiers are
@@ -97,8 +97,48 @@ type declaration struct {
 	name string
 }
 
+// stringTypes are the package's own names for a string, alias or defined.
+//
+// `type EventReason = string` and `type EventReason string` both give
+// constants a type whose values are strings, and a spec typed with either was
+// being skipped as though it could not hold one. Skipping is the hole: the
+// declaration vanishes from the count that compares declarations with an
+// enumerator, and both sides shrink together when the value is dropped from
+// the enumerator too.
+//
+// Resolved transitively, since a name may be declared in terms of another.
+func stringTypes(files []*ast.File) map[string]bool {
+	direct := map[string]string{}
+	for _, file := range files {
+		ast.Inspect(file, func(n ast.Node) bool {
+			spec, ok := n.(*ast.TypeSpec)
+			if !ok {
+				return true
+			}
+			if ident, ok := spec.Type.(*ast.Ident); ok {
+				direct[spec.Name.Name] = ident.Name
+			}
+			return true
+		})
+	}
+
+	out := map[string]bool{"string": true}
+	for range len(direct) + 1 {
+		progressed := false
+		for name, underlying := range direct {
+			if !out[name] && out[underlying] {
+				out[name], progressed = true, true
+			}
+		}
+		if !progressed {
+			break
+		}
+	}
+	return out
+}
+
 // declarations is every name a set of files declares that could hold a string.
-func declarations(files []*ast.File) []declaration {
+func declarations(files []*ast.File, stringy map[string]bool) []declaration {
 	var out []declaration
 	for _, file := range files {
 		var previous []ast.Expr
@@ -118,7 +158,7 @@ func declarations(files []*ast.File) []declaration {
 			} else {
 				previous, previousType = values, spec.Type
 			}
-			if len(spec.Names) != len(values) || !mayBeString(typ) {
+			if len(spec.Names) != len(values) || !mayBeString(typ, stringy) {
 				return true
 			}
 
@@ -140,14 +180,14 @@ func declarations(files []*ast.File) []declaration {
 
 // mayBeString reports whether a const spec's type leaves it able to hold one.
 //
-// An untyped spec can, and `string` can; a named type of any other kind
-// cannot.
-func mayBeString(typ ast.Expr) bool {
+// An untyped spec can, `string` can, and so can any of the package's own names
+// for a string. A named type of any other kind cannot.
+func mayBeString(typ ast.Expr, stringy map[string]bool) bool {
 	if typ == nil {
 		return true
 	}
 	ident, ok := typ.(*ast.Ident)
-	return ok && ident.Name == "string"
+	return ok && stringy[ident.Name]
 }
 
 // parsePackage parses every non-test file in a directory.

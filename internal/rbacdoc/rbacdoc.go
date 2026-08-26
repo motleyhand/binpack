@@ -22,6 +22,7 @@ package rbacdoc
 
 import (
 	"fmt"
+	"hash/fnv"
 	"regexp"
 	"slices"
 	"strings"
@@ -198,6 +199,33 @@ func Bindings(template string) ([]Binding, error) {
 
 	if len(out) == 0 {
 		return nil, fmt.Errorf("the chart declares no bindings at all")
+	}
+	return out, nil
+}
+
+// Kinds is the `kind` of every document a chart template declares.
+//
+// For the caller asking whether anything at all survives a guard. Matching
+// `kind: Role` as text answers that for one serialisation of it: `kind:
+// "Role"` is the same object to Kubernetes and to every reader here, and to a
+// substring it is not there at all.
+func Kinds(template string) ([]string, error) {
+	yml, err := HelmToYAML(template)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []string
+	for _, doc := range documentSeparator.Split(yml, -1) {
+		var object struct {
+			Kind string `json:"kind"`
+		}
+		if err := yaml.Unmarshal([]byte(doc), &object); err != nil {
+			return nil, fmt.Errorf("a rendered document does not parse as YAML: %w\n%s", err, doc)
+		}
+		if object.Kind != "" {
+			out = append(out, object.Kind)
+		}
 	}
 	return out, nil
 }
@@ -884,7 +912,21 @@ func placeholder(action string) string {
 	if slug == "" {
 		slug = "empty"
 	}
-	return "binpack-placeholder-" + slug
+
+	// The slug alone is not injective — it deletes punctuation, so
+	// `{{ .Release.Namespace }}` and `{{ "release-namespace" }}` become one
+	// string, and a field set to the literal would compare equal to a field
+	// set to the release's namespace. An earlier version of this comment
+	// called that "a smaller lie than every action colliding", which it is,
+	// and a lie all the same: the whole point of deriving the placeholder is
+	// that two expressions are two values.
+	//
+	// So the expression's own bytes decide the suffix. The slug stays because
+	// a failure message naming `binpack-placeholder-releasenamespace-...` is
+	// readable and one naming a bare digest is not.
+	digest := fnv.New32a()
+	_, _ = digest.Write([]byte(body))
+	return fmt.Sprintf("binpack-placeholder-%s-%08x", slug, digest.Sum32())
 }
 
 // controlAction returns the first action that structures the template, or "".

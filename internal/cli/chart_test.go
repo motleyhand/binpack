@@ -954,18 +954,24 @@ func TestRBACCreateFalseRendersNoRBACAtAll(t *testing.T) {
 		t.Fatalf("reading the chart without rbac.create: %v", err)
 	}
 
-	// Read from the rendered text rather than from the readers refusing it.
-	// Both do refuse an empty document, so `err != nil` would pass today — and
-	// it would go on passing if they ever stopped, since the assertion would
-	// then be about a contract nothing here states. What this needs to know is
-	// whether an object survived the guard, which the document says directly.
-	for _, kind := range []string{
-		"ClusterRole", "Role", "ClusterRoleBinding", "RoleBinding",
-	} {
-		if strings.Contains(off, "\nkind: "+kind+"\n") {
+	// Read from the rendered documents rather than from the readers refusing
+	// them. Both do refuse an empty document, so `err != nil` would pass today
+	// — and would go on passing if they ever stopped, since the assertion
+	// would then be about a contract nothing here states.
+	//
+	// Decoded rather than matched as text: `kind: "Role"` is the same object
+	// to Kubernetes and to every other reader here, and to a substring it is
+	// not there at all.
+	kinds, err := rbacdoc.Kinds(off)
+	if err != nil {
+		t.Fatalf("reading what rbac.create: false renders: %v", err)
+	}
+	for _, kind := range kinds {
+		if strings.HasSuffix(kind, "Role") || strings.HasSuffix(kind, "RoleBinding") {
 			t.Errorf("rbac.create: false still renders a %s; the chart promises to add "+
 				"nothing, and an operator who chose to manage RBAC elsewhere would "+
-				"receive it anyway", kind)
+				"receive it anyway — and their install fails if the object already "+
+				"exists", kind)
 		}
 	}
 

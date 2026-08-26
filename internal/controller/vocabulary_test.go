@@ -5,6 +5,7 @@ import (
 	"maps"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -287,4 +288,48 @@ func eventVocabulary() []string {
 // same, for the reason [EventReasons] is enumerated.
 func eventActions() []string {
 	return []string{ActionConsolidate}
+}
+
+// actionClaim matches the reference's statement of an Event's action.
+var actionClaim = regexp.MustCompile("`action: ([A-Za-z]+)`")
+
+// TestTheDocumentedActionIsExactlyTheVocabulary is the actions' half of
+// TestTheEventReasonTableIsExactlyTheVocabulary.
+//
+// The reasons have a catalogue and are compared with it in both directions.
+// The action has a sentence — "Every Event carries `action: Consolidate`, so
+// they filter as a group" — and was only ever checked forward, by the
+// containment guard that asks whether each current value appears *somewhere*
+// in the reference corpus. Renaming the action and mentioning the new spelling
+// anywhere satisfies that, while the sentence goes on telling an operator to
+// filter on `action=Consolidate`, which no Event carries.
+//
+// One claim today and compared as a set anyway, because the failure this
+// catches is a value that stops being emitted rather than one that is added,
+// and a check written for exactly one value cannot see that.
+func TestTheDocumentedActionIsExactlyTheVocabulary(t *testing.T) {
+	claimed := map[string]bool{}
+	for _, match := range actionClaim.FindAllStringSubmatch(referenceCorpus(t), -1) {
+		claimed[match[1]] = true
+	}
+	if len(claimed) == 0 {
+		t.Fatal("no reference page states the action an Event carries, so an operator " +
+			"filtering on it has nowhere to look and this asserts nothing")
+	}
+
+	enumerated := map[string]bool{}
+	for _, action := range eventActions() {
+		enumerated[action] = true
+		if !claimed[action] {
+			t.Errorf("binpack writes Events with action %q and no reference page says so; "+
+				"the pages document the reasons and leave the field they are grouped by "+
+				"unstated", action)
+		}
+	}
+	for action := range claimed {
+		if !enumerated[action] {
+			t.Errorf("a reference page says Events carry action %q and none does; it tells "+
+				"an operator to filter on `action=%s`, which matches nothing", action, action)
+		}
+	}
 }
