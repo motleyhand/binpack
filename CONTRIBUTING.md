@@ -5,9 +5,18 @@ easy to trust.
 
 ## Getting started
 
-Requires Go 1.26.0 or newer and [golangci-lint](https://golangci-lint.run) v2.12.2, which is the
-version both workflows install — `make lint` says so if the one you have installed is a different
-build.
+Requires Go 1.26.0 or newer, [golangci-lint](https://golangci-lint.run) v2.12.2 — the version both
+workflows install, and `make lint` says so if the one you have is a different build — and
+[helm](https://helm.sh/docs/intro/install/).
+
+Helm because the chart is part of what is tested. The tests holding the chart to
+`docs/reference/rbac.md` and to the code render it with `helm template` and read the manifests an
+install would apply, under several combinations of values. That used to be a substitution pass
+written in Go, so that `make check` needed no Helm; it was several times the size of the chart it
+read, it answered for what the template said rather than for what Helm does with it, and every
+disagreement between the two was a guard that passed while the install was wrong. These tests fail
+rather than skip when helm is absent — a skipped comparison between the chart and the page is a
+comparison nobody is making, and it reads in a test log exactly like one with nothing to report.
 
 Both numbers live in the tree rather than on this page. `go.mod` sets the Go floor at 1.26.0,
 raised there by `k8s.io/*` v0.36, and separately pins `toolchain go1.26.7` — the compiler that

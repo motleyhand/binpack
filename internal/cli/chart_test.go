@@ -2,6 +2,7 @@ package cli
 
 import (
 	"io/fs"
+	"maps"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -10,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"sigs.k8s.io/yaml"
 
 	"github.com/motleyhand/binpack/api/v1alpha1"
 	"github.com/motleyhand/binpack/internal/controller"
@@ -124,155 +127,106 @@ func TestTheChartGivesTheShutdownTimeToHappen(t *testing.T) {
 // refuse, the way _validate.tpl refuses the other combination that installs
 // cleanly and then does the wrong thing.
 //
-// Read from the templates rather than rendered, because `make check` may not
-// have Helm: CONTRIBUTING asks for Go and golangci-lint, and
-// hack/check-workflows.py holds the release job to whatever the build job
-// installs, so shelling out to `helm template` would either skip in CI or make
-// Helm a release-time dependency. The render itself is asserted in the chart
-// CI job, which has Helm.
+// Rendered rather than read from the templates. Three bindings, a Deployment
+// and a helper with two arms were each matched as text — which arm is which,
+// what a `required` says, whether a `default` supplies a literal — and every
+// one of those was a guess about what Helm would do. Asking Helm answers all
+// of them at once, and answers the question the operator actually has: what
+// account do my bindings name.
 func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
-	bindings := roleBindings(t)
-	// Three: the ClusterRoleBinding, the autoscaler-status RoleBinding in
-	// kube-system, and the leader-election RoleBinding. A parse that found
-	// none would satisfy every assertion below without checking anything.
+	// The install the chart ships. Every binding must name the account it
+	// creates, and the pod must run as it.
+	account, _ := renderedServiceAccount(t)
+
+	bindings, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{}))
+	if err != nil {
+		t.Fatalf("reading the chart's bindings: %v", err)
+	}
+	// Three: the ClusterRoleBinding, the autoscaler-status RoleBinding and the
+	// leader-election RoleBinding. A parse that found none would satisfy every
+	// assertion below without checking anything.
 	if len(bindings) < 3 {
-		t.Fatalf("found %d subjects in the chart's bindings, want the three it renders: "+
-			"the parse has lost the structure it is checking", len(bindings))
+		t.Fatalf("found %d bindings, want the three the chart renders: the parse has "+
+			"lost the structure it is checking", len(bindings))
 	}
 
-	const helper = `include "binpack.serviceAccountName"`
-	for _, b := range bindings {
-		if !strings.Contains(b.subject, helper) {
-			t.Errorf("the %s at rbac.yaml:%d binds %s, which does not come from %s; "+
-				"a guard on one helper covers only the bindings that use it",
-				b.kind, b.line, b.subject, helper)
-		}
-	}
-
-	managed, external := serviceAccountNameArms(t)
-
-	// The arm taken when the operator manages the ServiceAccount themselves.
-	if refusal := refusalIn(external); refusal == "" {
-		for _, b := range bindings {
-			t.Errorf("the %s at rbac.yaml:%d binds the %q ServiceAccount when "+
-				"serviceAccount.create is false and serviceAccount.name is unset",
-				b.kind, b.line, literalIn(external))
-		}
-	} else {
-		// Named values, not prose: the operator has to be told which one to
-		// set and when, and a reworded refusal that stopped saying so would
-		// otherwise still pass.
-		for _, value := range []string{"serviceAccount.name", "serviceAccount.create"} {
-			if !strings.Contains(refusal, value) {
-				t.Errorf("the refusal does not name %s, so it does not say what to set: %q",
-					value, refusal)
+	for _, binding := range bindings {
+		for _, subject := range binding.Subjects {
+			if subject.Kind != "ServiceAccount" {
+				continue
+			}
+			if subject.Name == "default" {
+				t.Errorf("the %s %s binds the default ServiceAccount; every pod in that "+
+					"namespace would inherit what binpack was granted, which under "+
+					"rbac.allowDraining is cluster-wide nodes: patch and "+
+					"pods/eviction: create", binding.Kind, binding.Metadata.Name)
+			}
+			if subject.Name != account {
+				t.Errorf("the %s %s binds %q and the chart creates %q; the binding grants "+
+					"an account that does not exist and binpack holds nothing",
+					binding.Kind, binding.Metadata.Name, subject.Name, account)
 			}
 		}
 	}
-
-	// And the ordinary install must still render. A refusal that fired on the
-	// chart's own defaults would break every install there is.
-	if refusal := refusalIn(managed); refusal != "" {
-		t.Errorf("the chart refuses to render when it creates the ServiceAccount itself: %q", refusal)
-	}
-	if !strings.Contains(managed, `include "binpack.fullname"`) {
-		t.Errorf("a created ServiceAccount is no longer named after the release: %s", oneLine(managed))
-	}
-}
-
-// roleBinding is one subject of one binding, as the template writes it.
-type roleBinding struct {
-	kind    string // ClusterRoleBinding or RoleBinding
-	line    int    // in rbac.yaml, so a failure can be read against the source
-	subject string // the expression the subject's name comes from
-}
-
-// roleBindings reads every binding subject out of the chart's RBAC template.
-func roleBindings(t *testing.T) []roleBinding {
-	t.Helper()
-
-	rbac, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
+	if got := deploymentServiceAccount(t); got != account {
+		t.Errorf("the pod runs as %q and the chart creates and binds %q", got, account)
 	}
 
-	var bindings []roleBinding
-	var kind, section string
-	for i, line := range strings.Split(string(rbac), "\n") {
-		switch {
-		case strings.HasPrefix(line, "---"):
-			kind, section = "", ""
-		case strings.HasPrefix(line, "kind: "):
-			kind, section = strings.TrimPrefix(line, "kind: "), ""
-		case !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":"):
-			section = strings.TrimSuffix(line, ":")
-		case section == "subjects" && strings.HasPrefix(line, "    name: ") &&
-			strings.HasSuffix(kind, "Binding"):
-			bindings = append(bindings, roleBinding{
-				kind:    kind,
-				line:    i + 1,
-				subject: strings.TrimPrefix(line, "    name: "),
-			})
+	// And the combination that would otherwise install cleanly and do the
+	// wrong thing: managing the account elsewhere without saying which one.
+	// The helper has to refuse, the way _validate.tpl refuses the other.
+	_, err = rbacdoc.Render(rbacdoc.Options{
+		Set: map[string]string{"serviceAccount.create": "false"},
+	})
+	if err == nil {
+		t.Fatal("the chart renders with serviceAccount.create=false and no " +
+			"serviceAccount.name, so it binds whatever the helper falls back to — and " +
+			"if that is `default`, every pod in the namespace holds binpack's grants")
+	}
+
+	// Named values, not prose: the operator has to be told which one to set
+	// and when, and a reworded refusal that stopped saying so would otherwise
+	// still pass.
+	for _, value := range []string{"serviceAccount.name", "serviceAccount.create"} {
+		if !strings.Contains(err.Error(), value) {
+			t.Errorf("the refusal does not name %s, so it does not say what to set: %v",
+				value, err)
 		}
 	}
-	return bindings
-}
 
-// serviceAccountNameArms returns the two arms of binpack.serviceAccountName:
-// what it names when the chart creates the ServiceAccount, and what it names
-// when the operator manages it elsewhere.
-func serviceAccountNameArms(t *testing.T) (managed, external string) {
-	t.Helper()
+	// And naming one has to be enough, or the refusal above is a chart that
+	// cannot be installed with an external account at all.
+	//
+	// Both halves, and the pod's half is the one that hides. The chart's own
+	// default name is the release name, so a Deployment that names the release
+	// directly renders identically to one that goes through the helper — until
+	// an operator sets serviceAccount.name, at which point the bindings follow
+	// the setting, the pod does not, and it runs as an account nothing
+	// created. A default install cannot show the difference, so this is where
+	// it has to be asked.
+	managed := map[string]string{
+		"serviceAccount.create": "false",
+		"serviceAccount.name":   "managed-elsewhere",
+	}
 
-	helpers, err := os.ReadFile("../../charts/binpack/templates/_helpers.tpl")
+	external, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: managed}))
 	if err != nil {
-		t.Fatalf("reading the chart's helpers: %v", err)
+		t.Fatalf("reading the bindings of an install with an external account: %v", err)
 	}
-
-	const opening = `{{- define "binpack.serviceAccountName" -}}`
-	start := strings.Index(string(helpers), opening)
-	if start < 0 {
-		t.Fatal("the chart has no binpack.serviceAccountName helper, though its bindings name one")
+	for _, binding := range external {
+		for _, subject := range binding.Subjects {
+			if subject.Kind == "ServiceAccount" && subject.Name != "managed-elsewhere" {
+				t.Errorf("the %s %s binds %q when serviceAccount.name says "+
+					"managed-elsewhere", binding.Kind, binding.Metadata.Name, subject.Name)
+			}
+		}
 	}
-	body := string(helpers)[start+len(opening):]
-	if next := strings.Index(body, `{{- define "`); next >= 0 {
-		body = body[:next]
+	if got := deploymentServiceAccount(t, managed); got != "managed-elsewhere" {
+		t.Errorf("serviceAccount.name says managed-elsewhere and the pod runs as %q; the "+
+			"bindings grant the account the operator named and the pod is not it, so "+
+			"binpack holds nothing — and if that account does not exist, the pod does "+
+			"not start", got)
 	}
-
-	if !strings.Contains(body, ".Values.serviceAccount.create") {
-		t.Fatalf("binpack.serviceAccountName no longer branches on serviceAccount.create: %s", oneLine(body))
-	}
-	arms := strings.SplitN(body, "{{- else -}}", 2)
-	if len(arms) != 2 {
-		t.Fatalf("binpack.serviceAccountName is no longer one if/else, so this test cannot "+
-			"tell its arms apart: %s", oneLine(body))
-	}
-	return arms[0], arms[1]
-}
-
-// refusalIn returns the message a template arm refuses with, or "" if it
-// renders a name instead.
-func refusalIn(arm string) string {
-	return firstGroup(regexp.MustCompile(`(?:required|fail)\s+"([^"]*)"`), arm)
-}
-
-// literalIn returns the name an arm falls back to when the value it prefers is
-// empty.
-func literalIn(arm string) string {
-	return firstGroup(regexp.MustCompile(`default\s+"([^"]*)"`), arm)
-}
-
-// oneLine folds a template fragment onto one line, so a failure reads as one
-// failure rather than as a stray block of chart.
-func oneLine(s string) string {
-	return strings.Join(strings.Fields(s), " ")
-}
-
-func firstGroup(re *regexp.Regexp, s string) string {
-	if m := re.FindStringSubmatch(s); m != nil {
-		return m[1]
-	}
-	return ""
 }
 
 // The Role granting the autoscaler's status must be bound where binpack will
@@ -285,124 +239,86 @@ func firstGroup(re *regexp.Regexp, s string) string {
 // commands report as a failure to read the cluster. Neither says "your Role is
 // in kube-system and your autoscaler is not".
 //
-// So the two must come from one value. Asserted against the chart's text
-// because `helm lint` cannot see it either: to Helm, the config is an opaque
-// string and the Role's namespace is a different key entirely.
+// So the two must come from one value, and the value is chosen here rather
+// than inspected. The version this replaces checked that the namespace field
+// was exactly `include "binpack.autoscalerNamespace" .` with nothing but
+// `quote` after it — a statement about the expression, which had to be
+// extended every time somebody thought of another way to write one that
+// mentions the helper and renders elsewhere. Setting the value and reading
+// where the object landed is the same assertion without the enumeration.
+//
+// The names are the ones that made quoting load-bearing: `true` and `123` are
+// legal DNS-1123 labels and therefore legal namespace names, and rendered
+// unquoted they come back out of the YAML as a bool and an int. `kubectl
+// apply` then refuses these two objects while installing the other seven —
+// install-cleanly-then-403 reached through Helm rather than through RBAC.
 func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
-	chart, err := os.ReadFile("../../charts/binpack/templates/rbac.yaml")
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
+	for _, namespace := range []string{"not-the-default-namespace", "true", "123"} {
+		t.Run(namespace, func(t *testing.T) {
+			manifests := rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+				Set: map[string]string{"config.discovery.autoscalerNamespace": namespace},
+			})
 
-	// Every object named for the autoscaler's status: the Role and the
-	// RoleBinding, both namespaced, and both wrong in the same way if either
-	// is pinned.
-	var found int
-	for doc := range strings.SplitSeq(string(chart), "\n---\n") {
-		if !strings.Contains(doc, "-autoscaler-status") {
-			continue
-		}
-		found++
+			// Every object named for the autoscaler's status: the Role and the
+			// RoleBinding, both namespaced, and both wrong in the same way if
+			// either is pinned.
+			objects, err := rbacdoc.Objects(manifests)
+			if err != nil {
+				t.Fatalf("reading the rendered objects: %v", err)
+			}
 
-		// Which namespace this is, read from the document's structure rather
-		// than from what its value mentions. A binding carries two: the
-		// object's own, under `metadata`, and the ServiceAccount subject's,
-		// under `subjects` — and the second is the release's namespace and has
-		// nothing to do with where the autoscaler runs. Classifying them by
-		// looking for `.Release.Namespace` in the value skipped anything that
-		// mentioned it, so `{{ printf "%s-wrong" .Release.Namespace }}` on the
-		// object itself was read as the subject's line and never checked at
-		// all. Same section-tracking as roleBindings above.
-		var section string
-		var namespaces int
-		for line := range strings.SplitSeq(doc, "\n") {
-			if !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":") {
-				section = strings.TrimSuffix(line, ":")
+			var found int
+			for _, object := range objects {
+				if !strings.Contains(object.Metadata.Name, "-autoscaler-status") {
+					continue
+				}
+				found++
+				if object.Metadata.Namespace != namespace {
+					t.Errorf("discovery.autoscalerNamespace is %q and the %s is created "+
+						"in %q; binpack reads the namespace that setting names, and an "+
+						"object anywhere else is a 403 on every evaluation",
+						namespace, object.Kind, object.Metadata.Namespace)
+				}
 			}
-			line = strings.TrimSpace(line)
-			if section != "metadata" || !strings.HasPrefix(line, "namespace:") {
-				continue
+			if found != 2 {
+				t.Fatalf("found %d autoscaler-status objects, want the Role and its "+
+					"RoleBinding; this test asserts nothing if it cannot find them", found)
 			}
-			namespaces++
-			value := strings.TrimSpace(strings.TrimPrefix(line, "namespace:"))
-			// The whole expression, not a substring of it. Containment says
-			// the helper is mentioned; what has to hold is that its value is
-			// the namespace, and `printf "%s-wrong" (include …)` mentions it
-			// while creating the Role somewhere else. Both objects would move
-			// together, so comparing them with each other sees nothing either.
-			if pipeline, ok := helmPipeline(value); !ok ||
-				pipeline[0] != `include "binpack.autoscalerNamespace" .` {
-				t.Errorf("the autoscaler-status objects are bound to %s rather than to "+
-					"discovery.autoscalerNamespace itself: binpack reads the namespace that "+
-					"setting names, and a Role anywhere else is a 403 on every evaluation",
-					value)
-			} else {
-				// And nothing but quoting after it. A stage that transforms the
-				// value moves the Role without moving what binpack reads.
-				for _, stage := range pipeline[1:] {
-					if stage != "quote" {
-						t.Errorf("the autoscaler-status namespace passes "+
-							"discovery.autoscalerNamespace through %q; whatever that "+
-							"renders, it is not the namespace binpack reads", stage)
+
+			// And every name and namespace has to reach the API server as a
+			// string. The comparison above cannot say so: it reads a decode
+			// that coerces, so an unquoted `true` arrives here as "true" and
+			// matches. See [rbacdoc.Mistyped].
+			mistyped, err := rbacdoc.Mistyped(manifests)
+			if err != nil {
+				t.Fatalf("reading the rendered documents: %v", err)
+			}
+			for _, object := range mistyped {
+				t.Errorf("%s; the API server decodes manifests strictly and refuses that "+
+					"object while installing the rest of the chart", object)
+			}
+
+			// And the subject's namespace is the release's, which is a
+			// different question the same field answers on a binding.
+			bindings, err := rbacdoc.Bindings(manifests)
+			if err != nil {
+				t.Fatalf("reading the rendered bindings: %v", err)
+			}
+			for _, binding := range bindings {
+				if !strings.Contains(binding.Metadata.Name, "-autoscaler-status") {
+					continue
+				}
+				for _, subject := range binding.Subjects {
+					if subject.Namespace != rbacdoc.DefaultNamespace {
+						t.Errorf("the autoscaler-status RoleBinding names a subject in "+
+							"%q; binpack's ServiceAccount lives in the release's "+
+							"namespace, %q, wherever the autoscaler publishes",
+							subject.Namespace, rbacdoc.DefaultNamespace)
 					}
 				}
 			}
-			// Quoted, because `metadata.namespace` is a string and a bare
-			// namespace name is not necessarily a YAML string. `true`, `false`
-			// and `123` are all legal DNS-1123 labels and therefore legal
-			// namespace names, and rendered unquoted they come back out of the
-			// YAML as a bool or an int: `kubectl apply` says "cannot unmarshal
-			// bool into Go struct field ObjectMeta.metadata.namespace of type
-			// string" and rejects these two objects while installing the other
-			// seven. That is the install-cleanly-then-403 shape again, reached
-			// through Helm rather than through RBAC.
-			if !strings.Contains(value, "quote") && !strings.HasPrefix(value, `"`) {
-				t.Errorf("the autoscaler-status namespace is rendered unquoted (%s), so a "+
-					"namespace named `true` or `123` renders as a bool or an int and the "+
-					"API server refuses the object", value)
-			}
-		}
-
-		// Present, not merely right when present. Every check in this loop is
-		// reached by a namespace line existing, so removing it from both
-		// documents left the objects agreeing with each other, the identity
-		// and binding checks satisfied, and nothing following
-		// discovery.autoscalerNamespace at all — which is a Role in the
-		// release's namespace and a 403 on every read the autoscaler is
-		// anywhere else.
-		if namespaces != 1 {
-			t.Errorf("an autoscaler-status object sets %d metadata namespaces, want the one "+
-				"that follows discovery.autoscalerNamespace; without it the object is "+
-				"created wherever the release is", namespaces)
-		}
+		})
 	}
-	if found != 2 {
-		t.Fatalf("found %d autoscaler-status objects, want the Role and its RoleBinding; "+
-			"this test asserts nothing if it cannot find them", found)
-	}
-}
-
-// helmPipeline splits a field whose whole value is one Helm action into the
-// stages of its pipeline, and reports whether it is one.
-//
-// A field written as anything other than a single action — a literal, or an
-// action with text around it — is not a pipeline and the caller has to say so
-// in its own terms.
-func helmPipeline(value string) ([]string, bool) {
-	body, ok := strings.CutPrefix(strings.TrimSpace(value), "{{")
-	if !ok {
-		return nil, false
-	}
-	body, ok = strings.CutSuffix(body, "}}")
-	if !ok {
-		return nil, false
-	}
-
-	var stages []string
-	for _, stage := range strings.Split(strings.Trim(body, "-"), "|") {
-		stages = append(stages, strings.TrimSpace(stage))
-	}
-	return stages, len(stages) > 0
 }
 
 // The chart's default namespace and the binary's must be the same one.
@@ -596,11 +512,9 @@ func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
 // Helm expressions, and rendering them means running Helm. The names can, and
 // they are what the objects are actually distinguished by.
 func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-	roles, err := rbacdoc.Roles(string(chart))
+	roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"leaderElection.enabled": "true"},
+	}))
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
@@ -756,15 +670,21 @@ func grantsExactly(t *testing.T, grants map[string]map[string]bool, suffix strin
 // that is silently wrong, since a RoleBinding may reference either a Role or a
 // ClusterRole and `kind: ClusterRole` with a Role's name resolves to nothing.
 func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-	roles, err := rbacdoc.Roles(string(chart))
+	// Both features on: every Role the chart can render has to be bound, and a
+	// Role that appears only under a value nobody set is one this would never
+	// see missing its binding.
+	manifests := rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{
+			"rbac.allowDraining":     "true",
+			"leaderElection.enabled": "true",
+		},
+	})
+
+	roles, err := rbacdoc.Roles(manifests)
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
-	bindings, err := rbacdoc.Bindings(string(chart))
+	bindings, err := rbacdoc.Bindings(manifests)
 	if err != nil {
 		t.Fatalf("reading the chart's bindings: %v", err)
 	}
@@ -1004,14 +924,14 @@ func joinContinuations(lines []string) []string {
 	return out
 }
 
-// renderedServiceAccount is the name and namespace expressions of the account
-// the chart creates, rendered the way rbacdoc renders one.
+// renderedServiceAccount is the account the chart creates: the name and the
+// namespace Helm renders, not an expression standing in for them.
 func renderedServiceAccount(t *testing.T) (name, namespace string) {
 	t.Helper()
 
-	manifest, err := os.ReadFile("../../charts/binpack/templates/serviceaccount.yaml")
+	objects, err := rbacdoc.Objects(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{}))
 	if err != nil {
-		t.Fatalf("reading the chart's ServiceAccount: %v", err)
+		t.Fatalf("reading the chart's objects: %v", err)
 	}
 
 	// What it is, before what it is called — decoded, because a search for the
@@ -1019,106 +939,158 @@ func renderedServiceAccount(t *testing.T) (name, namespace string) {
 	// field. Changed to another valid kind the metadata still reads the same,
 	// so the Deployment and the bindings go on agreeing about a name nothing
 	// creates and a default install has a pod Kubernetes will not start.
-	objects, err := rbacdoc.Objects(string(manifest))
-	if err != nil {
-		t.Fatalf("reading the chart's ServiceAccount: %v", err)
+	var accounts []rbacdoc.Object
+	for _, object := range objects {
+		if object.Kind == "ServiceAccount" {
+			accounts = append(accounts, object)
+		}
 	}
-	if len(objects) != 1 {
-		t.Fatalf("serviceaccount.yaml declares %d objects, want the one account the "+
-			"Deployment and every binding name", len(objects))
+	if len(accounts) != 1 {
+		t.Fatalf("a default install renders %d ServiceAccounts, want the one the "+
+			"Deployment and every binding name", len(accounts))
 	}
-	if objects[0].APIVersion != "v1" || objects[0].Kind != "ServiceAccount" {
-		t.Errorf("serviceaccount.yaml declares %s %s, not a v1 ServiceAccount; whatever it "+
-			"creates, the Deployment and every binding name an account that does not exist",
-			objects[0].APIVersion, objects[0].Kind)
+	if accounts[0].APIVersion != "v1" {
+		t.Errorf("the chart's ServiceAccount declares apiVersion %q, not v1; the API "+
+			"server refuses it, and the Deployment and every binding name an account "+
+			"that does not exist", accounts[0].APIVersion)
 	}
-
-	// From the decode, not a second pass over the text. Scanning for
-	// `name:` under `metadata` is indentation-blind, so a nested key — a
-	// `labels.name` carrying the old expression, say — overwrites the object's
-	// own name and the Deployment and bindings go on agreeing with something
-	// Kubernetes does not create.
-	if objects[0].Metadata.Name == "" {
-		t.Fatal("the chart's ServiceAccount manifest names no account, so nothing here can " +
-			"say whether the Deployment and the bindings agree with it")
+	if accounts[0].Metadata.Name == "" {
+		t.Fatal("the chart's ServiceAccount names no account, so nothing here can say " +
+			"whether the Deployment and the bindings agree with it")
 	}
-	// Already rendered: Objects runs the same substitution, so these are the
-	// placeholders the other halves of the comparison carry.
-	return objects[0].Metadata.Name, objects[0].Metadata.Namespace
+	return accounts[0].Metadata.Name, accounts[0].Metadata.Namespace
 }
 
-// deploymentServiceAccount is the account expression the pod runs as, rendered
-// the way rbacdoc renders one.
-func deploymentServiceAccount(t *testing.T) string {
+// deploymentServiceAccount is the account the rendered pod runs as.
+func deploymentServiceAccount(t *testing.T, values ...map[string]string) string {
 	t.Helper()
 
-	deployment, err := os.ReadFile("../../charts/binpack/templates/deployment.yaml")
-	if err != nil {
-		t.Fatalf("reading the chart's deployment: %v", err)
+	account := renderedDeployment(t, values...).Spec.Template.Spec.ServiceAccountName
+	if account == "" {
+		t.Fatal("the rendered Deployment sets no serviceAccountName, so the pod runs as " +
+			"the namespace's default account and every binding here grants binpack nothing")
+	}
+	return account
+}
+
+// deployment is the part of the rendered Deployment these tests ask about.
+//
+// A named struct rather than a walk over decoded maps: the fields wanted are
+// nested four deep, and every question here is about one of them being absent
+// — which a typed decode answers with a zero value and a map walk answers with
+// a panic or a silently skipped assertion.
+type deployment struct {
+	Kind string `json:"kind"`
+	Spec struct {
+		Template struct {
+			Spec struct {
+				ServiceAccountName string `json:"serviceAccountName"`
+				Containers         []struct {
+					Args []string `json:"args"`
+				} `json:"containers"`
+			} `json:"spec"`
+		} `json:"template"`
+	} `json:"spec"`
+}
+
+// renderedDeployment is the one Deployment a default install renders.
+func renderedDeployment(t *testing.T, values ...map[string]string) deployment {
+	t.Helper()
+
+	set := map[string]string{}
+	for _, v := range values {
+		maps.Copy(set, v)
 	}
 
-	// The field, not the first line mentioning it. A comment carrying the old
-	// expression above a changed field satisfied a textual search while the
-	// rendered pod named an account the chart never creates — so a commented
-	// line is skipped, and finding more than one real field is a failure
-	// rather than a choice between them.
-	const field = "serviceAccountName:"
+	var found []deployment
+	manifests := rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: set})
+	for doc := range strings.SplitSeq(manifests, "\n---\n") {
+		var d deployment
+		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
+			t.Fatalf("a rendered document does not parse as YAML: %v\n%s", err, doc)
+		}
+		if d.Kind == "Deployment" {
+			found = append(found, d)
+		}
+	}
+
+	if len(found) != 1 {
+		t.Fatalf("the chart renders %d Deployments with %v, want one", len(found), set)
+	}
+	return found[0]
+}
+
+// containerArgs is the flags the rendered pod's single container is started
+// with.
+//
+// One container is asserted rather than assumed. A sidecar appended to the
+// list would make "the args" a question about ordering, and answering it by
+// position is how a test goes on passing while reading somebody else's flags.
+func containerArgs(t *testing.T, values ...map[string]string) []string {
+	t.Helper()
+
+	containers := renderedDeployment(t, values...).Spec.Template.Spec.Containers
+	if len(containers) != 1 {
+		t.Fatalf("the rendered pod has %d containers, want the one binpack runs in",
+			len(containers))
+	}
+	return containers[0].Args
+}
+
+// flagValue is the value of one `--name=value` flag, and whether it is set.
+//
+// Both spellings, because a chart may write either and the pod sees no
+// difference: `--flag=value` as one argument, or `--flag` followed by its
+// value as the next. Finding it twice is a failure rather than a choice
+// between them.
+func flagValue(t *testing.T, args []string, name string) (string, bool) {
+	t.Helper()
 
 	var found []string
-	for line := range strings.SplitSeq(string(deployment), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			continue
+	for i, arg := range args {
+		switch {
+		case strings.HasPrefix(arg, name+"="):
+			found = append(found, strings.TrimPrefix(arg, name+"="))
+		case arg == name && i+1 < len(args):
+			found = append(found, args[i+1])
+		case arg == name:
+			found = append(found, "")
 		}
-		value, ok := strings.CutPrefix(trimmed, field)
-		if !ok {
-			continue
-		}
-		found = append(found, rbacdoc.Placeholder(value))
 	}
 
 	switch len(found) {
-	case 1:
-		return found[0]
 	case 0:
-		t.Fatalf("the Deployment no longer sets %s, so it runs as the namespace's default "+
-			"account and every binding here grants binpack nothing", field)
+		return "", false
+	case 1:
+		return found[0], true
 	default:
-		t.Fatalf("the Deployment sets %s %d times (%v); which account the pod runs as is "+
-			"then a question about ordering, and this would answer it by position",
-			field, len(found), found)
+		t.Fatalf("the rendered pod is started with %s %d times (%v); which one takes "+
+			"effect is a question about ordering, and this would answer it by position",
+			name, len(found), found)
+		return "", false
 	}
-	return ""
 }
 
 // TestRBACCreateFalseRendersNoRBACAtAll holds what the setting is for.
 //
 // docs/reference/rbac.md and the chart both offer rbac.create: false to an
 // operator who manages RBAC themselves, and what it promises is that the chart
-// adds nothing — they grant what they choose to grant. rbacdoc.Roles unions
-// every branch, so a Role or binding moved outside that guard is invisible to
-// every assertion about what the chart grants: it is still granted, now to
-// everybody, and an operator who chose to manage RBAC elsewhere silently
-// receives chart-managed permissions as well.
+// adds nothing — they grant what they choose to grant. A Role or binding that
+// escapes that guard is still granted, now to everybody, and an operator who
+// chose to manage RBAC elsewhere silently receives chart-managed permissions
+// as well.
 //
 // The chart CI job renders with rbac.create=false and checks only that
 // templating succeeds, which an object rendered outside the guard also does.
+//
+// Asked of every template rather than of rbac.yaml, which is where the guard
+// happens to be written today. The promise is about the install, so a Role
+// added to another file would break it just as completely.
 func TestRBACCreateFalseRendersNoRBACAtAll(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
+	off := rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"rbac.create": "false"},
+	})
 
-	off, err := rbacdoc.Without(string(chart), ".Values.rbac.create")
-	if err != nil {
-		t.Fatalf("reading the chart without rbac.create: %v", err)
-	}
-
-	// Read from the rendered documents rather than from the readers refusing
-	// them. Both do refuse an empty document, so `err != nil` would pass today
-	// — and would go on passing if they ever stopped, since the assertion
-	// would then be about a contract nothing here states.
-	//
 	// Decoded rather than matched as text: `kind: "Role"` is the same object
 	// to Kubernetes and to every other reader here, and to a substring it is
 	// not there at all.
@@ -1137,7 +1109,7 @@ func TestRBACCreateFalseRendersNoRBACAtAll(t *testing.T) {
 
 	// And the ordinary install must still render them, or the guard has
 	// swallowed the wrong block and this passes for the wrong reason.
-	roles, err := rbacdoc.Roles(string(chart))
+	roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{}))
 	if err != nil {
 		t.Fatalf("the chart renders no roles with rbac.create on: %v", err)
 	}
@@ -1159,17 +1131,12 @@ func TestRBACCreateFalseRendersNoRBACAtAll(t *testing.T) {
 // correctly anchored while the process cannot acquire leadership and never
 // starts reconciling.
 //
-// The namespaces are Helm expressions, so this compares expressions rather
-// than namespaces: rbacdoc renders each action to a scalar derived from its own
-// text, which answers "are these two the same expression" and never "which
-// namespace is it". That is the question here — the flag and the Role have to
-// move together, whatever they move to.
+// Both sides are real namespaces, because both are rendered. This used to
+// compare two expressions derived from template text, which could say the flag
+// and the Role moved together and never which namespace either named — so a
+// chart that anchored both to the wrong place read as correct.
 func TestTheLeaderElectionRoleIsWhereTheLeaseIsTaken(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-	roles, err := rbacdoc.Roles(string(chart))
+	roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{}))
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
@@ -1180,11 +1147,7 @@ func TestTheLeaderElectionRoleIsWhereTheLeaseIsTaken(t *testing.T) {
 			len(elections))
 	}
 
-	deployment, err := os.ReadFile("../../charts/binpack/templates/deployment.yaml")
-	if err != nil {
-		t.Fatalf("reading the chart's deployment: %v", err)
-	}
-	flag := leaderElectionNamespaceFlag(t, string(deployment))
+	flag := leaderElectionNamespaceFlag(t)
 
 	if got := elections[0].Metadata.Namespace; got != flag {
 		t.Errorf("the leader-election Role is created in %s and the deployment takes its "+
@@ -1202,71 +1165,34 @@ func TestTheLeaderElectionRoleIsWhereTheLeaseIsTaken(t *testing.T) {
 	}
 }
 
-// leaderElectionNamespaceFlag is the namespace expression the deployment passes
-// to --leader-election-namespace, rendered the way rbacdoc renders one.
-func leaderElectionNamespaceFlag(t *testing.T, deployment string) string {
+// leaderElectionNamespaceFlag is the namespace the rendered pod is told to
+// take its Lease in.
+func leaderElectionNamespaceFlag(t *testing.T) string {
 	t.Helper()
 
-	const flag = "--leader-election-namespace="
-	return rbacdoc.Placeholder(theOnly(t, deployment, flag,
-		"the deployment no longer passes "+flag+", so this cannot say where the Lease is "+
-			"taken; if the flag has gone, so has the reason for the leader-election Role"))
-}
+	const flag = "--leader-election-namespace"
 
-// theOnly is the value following a prefix, from the one uncommented line that
-// carries it.
-//
-// Commented lines are skipped and two matches are a failure, for the reason
-// the ServiceAccount field has the same treatment: a comment retaining the old
-// expression above a changed line satisfied a textual search while the
-// rendered object used the other one. The two helpers had that fix applied to
-// one of them.
-func theOnly(t *testing.T, document, prefix, absent string) string {
-	t.Helper()
-
-	var found []string
-	for line := range strings.SplitSeq(document, "\n") {
-		trimmed := strings.TrimSpace(line)
-		if strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if _, value, ok := strings.Cut(trimmed, prefix); ok {
-			found = append(found, value)
-		}
+	value, ok := flagValue(t, containerArgs(t), flag)
+	if !ok {
+		t.Fatal("the rendered pod is no longer started with " + flag + ", so this cannot " +
+			"say where the Lease is taken; if the flag has gone, so has the reason for " +
+			"the leader-election Role")
 	}
-
-	switch len(found) {
-	case 1:
-		return found[0]
-	case 0:
-		t.Fatal(absent)
-	default:
-		t.Fatalf("%q appears %d times (%v); which one takes effect is then a question "+
-			"about ordering, and this would answer it by position", prefix, len(found), found)
-	}
-	return ""
+	return value
 }
 
 // TestTheLeaderElectionGrantsGoWhenLeaderElectionDoes holds the offer
 // docs/reference/rbac.md makes: that Leases are only for leader election and
 // may be omitted by anyone running a single replica.
 //
-// rbacdoc.Roles is deliberately the union of every branch, so a guard removed
-// from around these rules is invisible to every assertion about what they
-// grant — they are still granted, just to everybody. An operator who set
-// leaderElection.enabled=false to avoid the permission would hold it anyway,
-// and the page would be wrong about a permission rather than about a default.
+// A guard removed from around these rules leaves them granted to everybody. An
+// operator who set leaderElection.enabled=false to avoid the permission would
+// hold it anyway, and the page would be wrong about a permission rather than
+// about a default — so this asks the install itself rather than the template.
 func TestTheLeaderElectionGrantsGoWhenLeaderElectionDoes(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-
-	off, err := rbacdoc.Without(string(chart), ".Values.leaderElection.enabled")
-	if err != nil {
-		t.Fatalf("reading the chart without leader election: %v", err)
-	}
-	without, err := rbacdoc.Roles(off)
+	without, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"leaderElection.enabled": "false"},
+	}))
 	if err != nil {
 		t.Fatalf("reading the rules an install without leader election renders: %v", err)
 	}
@@ -1286,7 +1212,9 @@ func TestTheLeaderElectionGrantsGoWhenLeaderElectionDoes(t *testing.T) {
 
 	// And the rules must come back when it is on, or this passes by the guard
 	// having swallowed the wrong block.
-	on, err := rbacdoc.Roles(string(chart))
+	on, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"leaderElection.enabled": "true"},
+	}))
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
@@ -1296,64 +1224,51 @@ func TestTheLeaderElectionGrantsGoWhenLeaderElectionDoes(t *testing.T) {
 	}
 }
 
-// TestEachFeatureGuardStandsOnItsOwn holds a relationship the readers here
-// deliberately flatten.
+// TestEachFeatureGuardStandsOnItsOwn holds that the chart's two features are
+// two decisions.
 //
-// rbacdoc.Roles unions every branch and rbacdoc.Without models a guard by
-// deleting its block, so neither can say that two values must both be true.
-// Nesting the act rules inside another feature's guard is invisible to both:
-// the union still holds them, the difference between the two renders still
-// reports them as gated on rbac.allowDraining, and an install that opted in to
-// acting and out of the other feature renders neither `nodes: patch` nor
-// `pods/eviction: create` and 403s on its first drain.
+// Nesting one feature's rules inside another's guard is invisible to every
+// comparison that reads one render: the rules are present when both values are
+// on, absent when both are off, and the difference between those two renders
+// reports them as gated on the value they are named after. An install that
+// opted in to acting and out of leader election would render neither `nodes:
+// patch` nor `pods/eviction: create` and 403 on its first drain.
 //
-// So the nesting is read from the template rather than inferred from what the
-// branches contain. Both features hang off rbac.create and off nothing else,
-// which is what the reference promises: acting is a decision about acting, and
-// leader election is a decision about replicas.
+// So each feature is rendered on with every other feature off. That is the
+// operator's own question — "do I get what I asked for" — and it is right
+// however the guards are written, which the structural reading it replaces was
+// not: that one scanned the template for `{{- if }}` blocks and could only
+// answer for the nesting it anticipated.
 func TestEachFeatureGuardStandsOnItsOwn(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-
 	for _, feature := range []struct {
-		guard    string
-		within   []string
-		contains []string
+		value  string
+		others map[string]string
+		grants []string
 	}{
-		// rbac.create holds the whole file, so the two features are inside it
-		// by design. They hold rules and nothing else: a construct inside one
-		// of them can suppress what it guards, which is the same harm as a
-		// guard around it and is not visible from outside the block.
-		{".Values.rbac.create", nil,
-			[]string{".Values.rbac.allowDraining", ".Values.leaderElection.enabled"}},
-		{".Values.rbac.allowDraining", []string{".Values.rbac.create"}, nil},
-		{".Values.leaderElection.enabled", []string{".Values.rbac.create"}, nil},
+		{"rbac.allowDraining", map[string]string{"leaderElection.enabled": "false"},
+			[]string{rbacdoc.CoreGroup + "/nodes: patch", rbacdoc.CoreGroup + "/pods/eviction: create"}},
+		{"leaderElection.enabled", map[string]string{"rbac.allowDraining": "false"},
+			[]string{"coordination.k8s.io/leases: create"}},
 	} {
-		around, err := rbacdoc.GuardsAround(string(chart), feature.guard)
-		if err != nil {
-			t.Errorf("reading what encloses %s: %v", feature.guard, err)
-			continue
-		}
-		if !slices.Equal(around, feature.within) {
-			t.Errorf("the block gated on %s is nested inside %v, and it should be inside "+
-				"%v; an install that set %s and cleared one of the others would render "+
-				"none of its rules while every comparison went on reading them as granted",
-				feature.guard, around, feature.within, feature.guard)
-		}
+		t.Run(feature.value, func(t *testing.T) {
+			set := map[string]string{feature.value: "true"}
+			maps.Copy(set, feature.others)
 
-		inside, err := rbacdoc.GuardsWithin(string(chart), feature.guard)
-		if err != nil {
-			t.Errorf("reading what %s contains: %v", feature.guard, err)
-			continue
-		}
-		if !slices.Equal(inside, feature.contains) {
-			t.Errorf("the block gated on %s contains %v, and it should contain %v; "+
-				"whatever else is in there can suppress the rules this feature is "+
-				"supposed to grant, and every comparison reads them as granted anyway",
-				feature.guard, inside, feature.contains)
-		}
+			roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: set}))
+			if err != nil {
+				t.Fatalf("reading the rules %v renders: %v", set, err)
+			}
+
+			granted := rbacdoc.Grants(roles)
+			for _, pair := range feature.grants {
+				if !granted[pair] {
+					t.Errorf("an install with %v is not granted %q; turning %s on is "+
+						"supposed to be a decision about %s alone, and this install "+
+						"asked for it and did not get it", set, pair, feature.value,
+						feature.value)
+				}
+			}
+		})
 	}
 }
 
@@ -1365,117 +1280,85 @@ func TestEachFeatureGuardStandsOnItsOwn(t *testing.T) {
 // the Role a feature needs is checked against the guard that renders it, and
 // nothing checked that the process is told about the same guard, or that the
 // helper both objects agree on still reads what it claims to.
+//
+// All three are asked of a render. The helper check in particular used to be
+// structural — one action, no literal beside it, a `dig` inside it, and not an
+// assignment — because evaluating meant rendering and `make check` might have
+// no helm. Every one of those clauses was a guess at what Helm would do with
+// the text, three of them were added after a shape got past the previous
+// version, and the whole set is replaced by rendering with a namespace of this
+// test's choosing and looking at where the Role landed. A helper that reads
+// the setting and returns the default cannot survive that, however it is
+// spelled.
 func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
-	deployment, err := os.ReadFile("../../charts/binpack/templates/deployment.yaml")
-	if err != nil {
-		t.Fatalf("reading the chart's deployment: %v", err)
-	}
-
 	// The flag and the guard are one decision. Hard-coded, an install with
 	// leaderElection.enabled=false renders no Lease permissions — which the
 	// guard test above confirms — and starts a process that tries to take one
 	// anyway, then 403s for as long as it runs.
-	const flag = "--leader-election="
-	value := theOnly(t, string(deployment), flag,
-		"the deployment no longer passes "+flag+", so whether the process elects is "+
-			"decided somewhere this cannot see")
-	if got, want := rbacdoc.Placeholder(value), rbacdoc.Placeholder(".Values.leaderElection.enabled"); got != want {
-		t.Errorf("the deployment passes %s%s and the RBAC is gated on "+
-			".Values.leaderElection.enabled; one of them decides whether binpack elects "+
-			"and the other decides whether it may", flag, strings.TrimSpace(value))
+	for _, enabled := range []string{"true", "false"} {
+		args := containerArgs(t, map[string]string{"leaderElection.enabled": enabled})
+
+		value, ok := flagValue(t, args, "--leader-election")
+		if !ok {
+			t.Errorf("with leaderElection.enabled=%s the rendered pod is not started "+
+				"with --leader-election, so whether the process elects is decided "+
+				"somewhere this cannot see", enabled)
+			continue
+		}
+		if value != enabled {
+			t.Errorf("with leaderElection.enabled=%s the rendered pod is started with "+
+				"--leader-election=%s; one of them decides whether binpack elects and "+
+				"the other decides whether it may", enabled, value)
+		}
 	}
 
 	// The helper both autoscaler-status objects are held to has to read the
 	// setting they are held to it *for*. Returning the default unconditionally
-	// leaves them agreeing with each other, this pipeline check satisfied, and
-	// the rendered config still telling binpack to read somewhere else.
-	helpers, err := os.ReadFile("../../charts/binpack/templates/_helpers.tpl")
+	// leaves them agreeing with each other and the rendered config still
+	// telling binpack to read somewhere else — so the namespace asked for here
+	// is one no default could be.
+	const elsewhere = "not-the-default-namespace"
+	manifests := rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"config.discovery.autoscalerNamespace": elsewhere},
+	})
+
+	roles, err := rbacdoc.Roles(manifests)
 	if err != nil {
-		t.Fatalf("reading the chart's helpers: %v", err)
+		t.Fatalf("reading the chart's rules: %v", err)
 	}
-	body, ok := helperBody(string(helpers), "binpack.autoscalerNamespace")
-	if !ok {
-		t.Fatal("the chart no longer defines binpack.autoscalerNamespace, and both " +
-			"autoscaler-status objects are checked against it by name")
+	status := rbacdoc.OfIdentity(roles, "Role-autoscaler-status")
+	if len(status) != 1 {
+		t.Fatalf("found %d autoscaler-status Roles, want one; this asserts nothing "+
+			"without it", len(status))
 	}
-	// What it *returns*, as far as reading it can say. Requiring the tokens to
-	// appear anywhere is satisfied by
-	// `{{- $_ := dig "discovery" … -}}kube-system`, which reads the setting,
-	// discards it and returns the default — leaving both objects agreeing with
-	// the helper while the rendered config points binpack elsewhere.
-	//
-	// So: one action, and no literal text beside it, and the dig inside it.
-	// Structural rather than evaluated, because evaluating means rendering the
-	// chart and `make check` may have no helm — the chart CI job renders, and
-	// this holds the shape that makes the render right.
-	if literal := strings.TrimSpace(helmAction.ReplaceAllString(body, "")); literal != "" {
-		t.Errorf("binpack.autoscalerNamespace emits the literal %q beside its expression; "+
-			"whatever it reads, that is what it returns", literal)
+	if got := status[0].Metadata.Namespace; got != elsewhere {
+		t.Errorf("config.discovery.autoscalerNamespace is %q and the Role is created in "+
+			"%q; binpack would read where the setting says and hold permission where "+
+			"the chart decided, which is a 403 on every evaluation", elsewhere, got)
 	}
-	if actions := helmAction.FindAllString(body, -1); len(actions) != 1 {
-		t.Errorf("binpack.autoscalerNamespace is %d actions; with more than one, which "+
-			"of them decides the namespace is a question this cannot answer and the two "+
-			"RBAC objects are held to the helper by name alone", len(actions))
-	} else if assigns(actions[0]) {
-		// An assignment emits nothing. `{{- $_ := dig … -}}` has one action,
-		// no literal beside it and the dig inside it, and returns the empty
-		// string — which is the shape the previous version of this check was
-		// written against and still admitted.
-		t.Errorf("binpack.autoscalerNamespace assigns rather than emits (%s), so it "+
-			"returns the empty string whatever it reads", strings.TrimSpace(actions[0]))
-	} else if !strings.Contains(actions[0], `dig "discovery" "autoscalerNamespace"`) {
-		t.Errorf("binpack.autoscalerNamespace does not derive its value from "+
-			"config.discovery.autoscalerNamespace (%s): the Role would be created where "+
-			"the helper decides and binpack would read where the setting says, which is a "+
-			"403 on every evaluation", strings.TrimSpace(actions[0]))
+	// And the process has to be told the same thing, or the Role is in the
+	// right place for a namespace binpack never reads.
+	if !strings.Contains(manifests, "autoscalerNamespace: "+elsewhere) {
+		t.Errorf("config.discovery.autoscalerNamespace is %q and no rendered document "+
+			"tells binpack so; the Role above is then anchored to a setting the "+
+			"process does not receive", elsewhere)
 	}
 
 	// And the ServiceAccount the chart creates is created only when the
 	// operator asked it to. Rendered unguarded, an install naming an external
 	// account gets a chart-managed one as well — which fails if it exists, and
 	// which Helm owns and deletes on uninstall if it does not.
-	account, err := os.ReadFile("../../charts/binpack/templates/serviceaccount.yaml")
+	off, err := rbacdoc.Kinds(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{
+			"serviceAccount.create": "false",
+			"serviceAccount.name":   "managed-elsewhere",
+		},
+	}))
 	if err != nil {
-		t.Fatalf("reading the chart's ServiceAccount: %v", err)
+		t.Fatalf("reading what serviceAccount.create: false renders: %v", err)
 	}
-	off, err := rbacdoc.Without(string(account), ".Values.serviceAccount.create")
-	if err != nil {
-		t.Fatalf("reading the ServiceAccount without its guard: %v", err)
+	if slices.Contains(off, "ServiceAccount") {
+		t.Error("serviceAccount.create: false still renders a ServiceAccount; an " +
+			"operator who named an external account receives a chart-managed one too")
 	}
-	if kinds, err := rbacdoc.Kinds(off); err != nil {
-		t.Errorf("reading what serviceAccount.create: false renders: %v", err)
-	} else if len(kinds) > 0 {
-		t.Errorf("serviceAccount.create: false still renders %v; an operator who named an "+
-			"external account receives a chart-managed one too", kinds)
-	}
-}
-
-// assigns reports whether a template action assigns rather than emits.
-//
-// Both spellings: `:=` declares and `=` re-assigns, and neither renders
-// anything. Checking only the first left `{{- $ = dig … -}}` satisfying every
-// other part of the shape and returning the empty string. Comparisons in a
-// template are `eq` and `ne`, so an `=` outside those operators is an
-// assignment.
-func assigns(action string) bool {
-	if strings.Contains(action, ":=") {
-		return true
-	}
-	for _, comparison := range []string{"==", "!=", ">=", "<="} {
-		action = strings.ReplaceAll(action, comparison, "")
-	}
-	return strings.Contains(action, "=")
-}
-
-// helmAction matches one Go template action, as rbacdoc's does.
-var helmAction = regexp.MustCompile(`\{\{-?.*?-?\}\}`)
-
-// helperBody is the body of one named Helm template.
-func helperBody(helpers, name string) (string, bool) {
-	_, rest, ok := strings.Cut(helpers, `{{- define "`+name+`" -}}`)
-	if !ok {
-		return "", false
-	}
-	body, _, ok := strings.Cut(rest, "{{- end ")
-	return body, ok
 }

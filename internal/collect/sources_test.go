@@ -23,12 +23,7 @@ import (
 // nothing they assert would notice. The chart is the one thing that cannot
 // derive from it, which is exactly why it is the one that can fail.
 func TestTheChartGrantsExactlyTheKindsTemplatesReads(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-
-	roles, err := rbacdoc.Roles(string(chart))
+	roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{}))
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}

@@ -71,20 +71,28 @@ func TestNoDocClaimsBinpackCannotAct(t *testing.T) {
 // and a drain that 403s on its first node patch: binpack holds its lease,
 // serves its metrics, publishes decisions, and never drains anything.
 func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-
 	// The rules gated on rbac.allowDraining: what internal/executor needs, as
 	// the chart grants it. Taken from the chart rather than listed here, so
-	// the day a third verb is added the reference has to say so too.
-	act, err := rbacdoc.Section(string(chart), ".Values.rbac.allowDraining")
+	// the day a third verb is added the reference has to say so too — and as
+	// the difference between an install that opted in and one that did not,
+	// which is the operator's own reading of what opting in buys.
+	on, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"rbac.allowDraining": "true"},
+	}))
 	if err != nil {
-		t.Fatalf("reading the chart's act rules: %v", err)
+		t.Fatalf("reading the chart's rules: %v", err)
+	}
+	off, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"rbac.allowDraining": "false"},
+	}))
+	if err != nil {
+		t.Fatalf("reading the chart's ungated rules: %v", err)
 	}
 
-	granted := rbacdoc.Grants(act)
+	// Narrowed to the ClusterRole, which is where the act rules live and so
+	// the scope the page has to document them at.
+	granted := rbacdoc.Difference(
+		rbacdoc.OfKind(on, "ClusterRole"), rbacdoc.OfKind(off, "ClusterRole"))
 	// A count rather than a non-empty check. The act block has held two pairs
 	// since it existed, and a reader that found one would compare that one and
 	// pass — which is the whole failure this guard is here for.
@@ -103,8 +111,6 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 			"it", len(granted))
 	}
 
-	// The act rules live in the chart's ClusterRole, so that is the scope the
-	// page has to document them at.
 	documented := documentedGrants(t)["ClusterRole"]
 
 	for pair := range granted {
@@ -131,14 +137,17 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 // the same string, and this test would have been blind to the one gap it
 // exists to catch.
 func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-
-	// Every rule the chart holds, gated or not: the page documents the whole
-	// role, and an operator managing RBAC themselves needs all of it.
-	roles, err := rbacdoc.Roles(string(chart))
+	// Every rule the chart can render, which is an install that opted in to
+	// both features: the page documents the whole role, and an operator
+	// managing RBAC themselves needs all of it. Both values are named because
+	// both default to off for the gated rules, and a default render would hold
+	// the page to a subset while claiming to be complete.
+	roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{
+			"rbac.allowDraining":     "true",
+			"leaderElection.enabled": "true",
+		},
+	}))
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}

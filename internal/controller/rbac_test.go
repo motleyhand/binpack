@@ -6,7 +6,6 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
-	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -57,12 +56,13 @@ import (
 // writes and asking whether the chart permits the ones it is observed to make
 // are different questions, and the second one has an answer.
 func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
-	chart, err := os.ReadFile(rbacdoc.ChartPath)
-	if err != nil {
-		t.Fatalf("reading the chart's RBAC: %v", err)
-	}
-
-	roles, err := rbacdoc.Roles(string(chart))
+	// Everything the chart can grant, which is an install that opted in:
+	// rbac.allowDraining defaults to false, so the act rules are absent from a
+	// default render and naming the value here is what makes this the upper
+	// bound rather than a second copy of the ungated render below.
+	roles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"rbac.allowDraining": "true"},
+	}))
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
@@ -76,7 +76,8 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 			"assertion below would pass on the remainder", len(all))
 	}
 
-	// Cluster-scoped, because every write binpack's own code makes is. Nodes
+	// Cluster-scoped throughout, because every write binpack's own code makes
+	// is. Nodes
 	// are cluster-scoped objects; eviction is namespaced but binpack evicts
 	// from whichever namespaces the chosen node hosts; and the decision event
 	// is filed under `default`, where `kubectl describe node` looks for it,
@@ -87,7 +88,6 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 	// events rule out of the ClusterRole and into the namespaced Role beside
 	// the ConfigMap grant left every comparison here green, and reporting
 	// would 403 on a namespace that Role does not cover.
-	clusterWide := rbacdoc.Grants(rbacdoc.OfKind(roles, "ClusterRole"))
 
 	// What an install that has not opted in renders. The union above is the
 	// right reading of "what could this chart ever grant" and the wrong one of
@@ -96,26 +96,18 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 	// rules. Checked against the union, moving its grant inside the opt-in
 	// guard is invisible: the pair is still in `granted`, and the reverse
 	// check below still finds it exercised.
-	off, err := rbacdoc.Without(string(chart), ".Values.rbac.allowDraining")
-	if err != nil {
-		t.Fatalf("reading the chart without its act rules: %v", err)
-	}
-	ungatedRoles, err := rbacdoc.Roles(off)
+	ungatedRoles, err := rbacdoc.Roles(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{
+		Set: map[string]string{"rbac.allowDraining": "false"},
+	}))
 	if err != nil {
 		t.Fatalf("reading the chart's ungated rules: %v", err)
 	}
 	ungated := rbacdoc.Grants(rbacdoc.OfKind(ungatedRoles, "ClusterRole"))
 
-	// The act grants are the difference between the two renders rather than
-	// the guarded block read on its own. A block lifted out of its document
-	// has no kind to carry, so reading it directly is the one way to obtain
-	// these pairs that cannot tell a ClusterRole rule from a namespaced one.
-	gated := map[string]bool{}
-	for pair := range clusterWide {
-		if !ungated[pair] {
-			gated[pair] = true
-		}
-	}
+	// The act grants are the difference between the two renders. See
+	// [rbacdoc.Difference] for why not the guarded block read on its own.
+	gated := rbacdoc.Difference(
+		rbacdoc.OfKind(roles, "ClusterRole"), rbacdoc.OfKind(ungatedRoles, "ClusterRole"))
 	if len(gated) == 0 {
 		t.Fatal("opting in to rbac.allowDraining adds no cluster-scoped rule, so this " +
 			"asserts nothing about what acting takes")

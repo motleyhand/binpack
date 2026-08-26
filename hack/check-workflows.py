@@ -191,10 +191,25 @@ def release_can_verify() -> list[str]:
         return ["ci.yaml has no build job; this check needs rethinking"]
     after_build = ci.split("\n  build:\n", 1)[1]
     build = re.split(r"\n  [a-z-]+:\n", after_build, maxsplit=1)[0]
-    missing = setup_actions(build) - setup_actions(release)
+
+    # The job that runs `make check`, not the whole file. release.yaml also has
+    # a chart job, which sets up helm and runs on its own runner — so taking
+    # the union let one job's tools stand in for another's, and the moment the
+    # tests started needing helm this check went green against a release that
+    # would have failed at its verify step.
+    if "\n  release:\n" not in release:
+        return ["release.yaml has no release job; this check needs rethinking"]
+    after_release = release.split("\n  release:\n", 1)[1]
+    verifying = re.split(r"\n  [a-z-]+:\n", after_release, maxsplit=1)[0]
+    if not re.search(r"^\s*run: make check\s*$", verifying, re.MULTILINE):
+        return ["release.yaml runs `make check` outside its release job; this check "
+                "compares the wrong block and needs rethinking"]
+
+    missing = setup_actions(build) - setup_actions(verifying)
     if missing:
         return [
-            "release.yaml runs `make check` but does not set up: " + ", ".join(sorted(missing)),
+            "release.yaml's release job runs `make check` but does not set up: "
+            + ", ".join(sorted(missing)),
             "a tag would fail at the verify step, before publishing anything",
         ]
     return []
