@@ -79,13 +79,9 @@ func Roles(template string) ([]Role, error) {
 // here is a rule that stops being seen, and a decoder handed something it
 // cannot read says so instead of returning less.
 func Section(template, guard string) ([]Role, error) {
-	_, rest, ok := strings.Cut(template, "{{- if "+guard+" }}")
-	if !ok {
-		return nil, fmt.Errorf("the chart no longer gates any rules on %s", guard)
-	}
-	block, _, ok := strings.Cut(rest, "{{- end }}")
-	if !ok {
-		return nil, fmt.Errorf("the rules the chart gates on %s are not a closed block", guard)
+	block, _, err := section(template, guard)
+	if err != nil {
+		return nil, err
 	}
 
 	yml, err := HelmToYAML(block)
@@ -93,6 +89,74 @@ func Section(template, guard string) ([]Role, error) {
 		return nil, err
 	}
 	return decode(guard+"'s rules", "rules:\n"+yml)
+}
+
+// Without is the template with one guarded block removed: what an install
+// renders when that value is off.
+//
+// [Roles] is deliberately the union of every branch, which is the right
+// reading of "what could this chart ever grant". It is the wrong reading of
+// "what does an install that has not opted in grant", and a write binpack
+// makes unconditionally has to be checked against the second — otherwise
+// moving its rule inside an opt-in guard is invisible.
+func Without(template, guard string) (string, error) {
+	_, rest, err := section(template, guard)
+	if err != nil {
+		return "", err
+	}
+	return rest, nil
+}
+
+// section finds one guarded block, returning its body and the template with
+// the whole block — guard, body and closing action — removed.
+//
+// The closing action is matched by depth rather than by taking the first
+// `{{- end }}`, which is wrong the moment a guard contains another. It is
+// already wrong: this chart nests the leader-election block inside
+// `.Values.rbac.create`, so cutting at the first end returned twenty-five of
+// the thirty-six pairs that file holds. Nothing asked it for that guard, which
+// is the only reason it had not been noticed — and a reader that returns part
+// of a permission set is the exact failure this package exists to refuse.
+func section(template, guard string) (body, rest string, err error) {
+	lines := strings.Split(template, "\n")
+
+	start, depth := -1, 0
+	for i, line := range lines {
+		if start < 0 {
+			if strings.Contains(line, "{{- if "+guard+" }}") {
+				start, depth = i+1, depthDelta(line)
+			}
+			continue
+		}
+
+		if depth += depthDelta(line); depth == 0 {
+			kept := append(append([]string{}, lines[:start-1]...), lines[i+1:]...)
+			return strings.Join(lines[start:i], "\n"), strings.Join(kept, "\n"), nil
+		}
+	}
+
+	if start < 0 {
+		return "", "", fmt.Errorf("the chart no longer gates any rules on %s", guard)
+	}
+	return "", "", fmt.Errorf("the rules the chart gates on %s are not a closed block", guard)
+}
+
+// depthDelta is how far one line opens or closes template blocks.
+//
+// `template` is not here and `define`/`block` are: invoking a template opens
+// nothing, while the other two are closed by an `{{- end }}` like `if` is.
+func depthDelta(line string) int {
+	delta := 0
+	for _, action := range helmAction.FindAllString(line, -1) {
+		body := strings.TrimSpace(strings.Trim(strings.Trim(action, "{}"), "-"))
+		switch keyword, _, _ := strings.Cut(body, " "); keyword {
+		case "if", "range", "with", "define", "block":
+			delta++
+		case "end":
+			delta--
+		}
+	}
+	return delta
 }
 
 // fencedYAML matches a ```yaml block in Markdown, capturing its body.
@@ -115,17 +179,20 @@ func Documented(doc string) ([]Role, error) {
 	for _, match := range fencedYAML.FindAllStringSubmatch(doc, -1) {
 		body := match[1]
 
-		var role Role
-		if err := yaml.Unmarshal([]byte(body), &role); err != nil || len(role.Rules) == 0 {
-			role = Role{}
-			_ = yaml.Unmarshal([]byte("rules:\n"+body), &role)
-		}
-
-		if len(role.Rules) == 0 {
-			if strings.Contains(body, "apiGroups:") {
-				return nil, fmt.Errorf("a documented block declares apiGroups and decoded "+
-					"to no rules, so this reader would drop it:\n%s", body)
-			}
+		role, err := fragment(body)
+		// A block naming apiGroups is a rule list, whatever became of it. Only
+		// there is a failed or empty decode a dropped rule rather than a
+		// snippet quoted for discussion, and there it is reported rather than
+		// skipped.
+		rules := strings.Contains(body, "apiGroups:")
+		switch {
+		case err != nil && rules:
+			return nil, fmt.Errorf("a documented block declares apiGroups and does not "+
+				"decode as rules, so this reader would drop it: %w\n%s", err, body)
+		case len(role.Rules) == 0 && rules:
+			return nil, fmt.Errorf("a documented block declares apiGroups and decoded "+
+				"to no rules, so this reader would drop it:\n%s", body)
+		case err != nil, len(role.Rules) == 0:
 			continue
 		}
 
@@ -139,6 +206,32 @@ func Documented(doc string) ([]Role, error) {
 		return nil, fmt.Errorf("the document states no rules at all")
 	}
 	return out, nil
+}
+
+// fragment decodes a documented snippet, which may be a document carrying
+// `rules:` or the bare sequence under it.
+//
+// A partial decode is never returned. encoding/json fills in what it can and
+// reports the first field it could not, so a page whose second rule has a
+// malformed `resources:` decodes to two rules of which one grants nothing —
+// and [Grants] emits nothing for it while this reports success. That is the
+// same disappearance as the line reader's, arrived at from the other side, so
+// an error here discards the value rather than qualifying it.
+func fragment(body string) (Role, error) {
+	var direct Role
+	directErr := yaml.Unmarshal([]byte(body), &direct)
+	if directErr == nil && len(direct.Rules) > 0 {
+		return direct, nil
+	}
+
+	var wrapped Role
+	if err := yaml.Unmarshal([]byte("rules:\n"+body), &wrapped); err != nil {
+		if directErr != nil {
+			return Role{}, fmt.Errorf("as a document: %w; as a rule sequence: %w", directErr, err)
+		}
+		return Role{}, err
+	}
+	return wrapped, nil
 }
 
 // kindOf reads the leading comment a documented fragment names its object in.

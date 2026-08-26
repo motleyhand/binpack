@@ -76,16 +76,40 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 		t.Fatal("the chart gates no rules on rbac.allowDraining, so this asserts nothing")
 	}
 
-	called := drivenWrites(t)
+	// What an install that has not opted in renders. The union above is the
+	// right reading of "what could this chart ever grant" and the wrong one of
+	// "what does a default install grant" — and dryRun defaults to true, so
+	// the decision event is written by installs that render none of the act
+	// rules. Checked against the union, moving its grant inside the opt-in
+	// guard is invisible: the pair is still in `granted`, and the reverse check
+	// below still finds it exercised.
+	off, err := rbacdoc.Without(string(chart), ".Values.rbac.allowDraining")
+	if err != nil {
+		t.Fatalf("reading the chart without its act rules: %v", err)
+	}
+	ungatedRoles, err := rbacdoc.Roles(off)
+	if err != nil {
+		t.Fatalf("reading the chart's ungated rules: %v", err)
+	}
+	ungated := rbacdoc.Grants(ungatedRoles)
 
-	for pair := range called {
+	always, acting := drivenWrites(t)
+
+	for pair := range always {
+		if !ungated[pair] {
+			t.Errorf("binpack performs %q whatever dryRun is set to, and no rule the chart "+
+				"renders without rbac.allowDraining grants it; a default install would "+
+				"403 on that call while looking healthy", pair)
+		}
+	}
+	for pair := range acting {
 		if !granted[pair] {
 			t.Errorf("binpack's code performs %q and no rule the chart renders grants it; "+
 				"an install would 403 on that call", pair)
 		}
 	}
 	for pair := range gated {
-		if !called[pair] {
+		if !acting[pair] {
 			t.Errorf("the chart grants %q to let binpack act and nothing here exercises it. "+
 				"Either the grant has outlived its caller, or this test has stopped "+
 				"driving one — in which case the check above is comparing a shrunken set",
@@ -94,44 +118,61 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 	}
 }
 
-// drivenWrites runs every write binpack's own code makes and returns what each
-// one would need granted.
+// drivenWrites runs every write binpack's own code makes, returning what each
+// would need granted — split by whether an install has to opt in to reach it.
 //
 // Every call site, named once. The executor's four writes plus the reporter's
 // Event create are the whole of it — that is internal/executor's package doc's
 // claim, and internal/controller's eventWriter method count is what stops a
 // sixth appearing here unnoticed.
-func drivenWrites(t *testing.T) map[string]bool {
+//
+// The split is a fact about the controller rather than about the calls: an
+// evaluation reports its decision on the node whatever dryRun says — that is
+// what dry run is *for*, and evaluate does it on the frozen-drain path too —
+// while advance, which is where every executor write is reached, is only ever
+// entered when binpack is acting. It is the same line the chart draws with
+// rbac.allowDraining, which is why the two can be compared at all.
+func drivenWrites(t *testing.T) (always, acting map[string]bool) {
 	t.Helper()
 
 	ctx := context.Background()
 	node := mother.SmallNode("node-a")
 	pod := mother.Pod("default", "web", mother.OnNode(node.Name))
-	w := &recordingWriter{pairs: map[string]bool{}}
 
-	for _, call := range []struct {
-		what string
-		do   func() error
-	}{
-		{"Cordon", func() error { return executor.Cordon(ctx, w, node) }},
-		{"Annotate", func() error {
+	always = writesOf(t, "the decision event",
+		func(w *recordingWriter) error {
+			r := directReporter{writer: w, instance: "test",
+				now: func() time.Time { return time.Unix(0, 0) }}
+			return r.emit(ctx, node, "Reason", "Action", "a note")
+		})
+
+	acting = writesOf(t, "the executor's writes",
+		func(w *recordingWriter) error { return executor.Cordon(ctx, w, node) },
+		func(w *recordingWriter) error {
 			return executor.Annotate(ctx, w, node, map[string]string{"a": "b"})
-		}},
-		{"HandBack", func() error {
+		},
+		func(w *recordingWriter) error {
 			return executor.HandBack(ctx, w, node,
 				map[string]string{"l": ""}, map[string]string{"a": ""})
-		}},
-		{"Evict", func() error { return executor.Evict(ctx, w, pod) }},
-		{"the decision event", func() error {
-			r := directReporter{writer: w, instance: "test", now: func() time.Time { return time.Unix(0, 0) }}
-			return r.emit(ctx, node, "Reason", "Action", "a note")
-		}},
-	} {
-		if err := call.do(); err != nil {
-			t.Fatalf("%s: %v", call.what, err)
+		},
+		func(w *recordingWriter) error { return executor.Evict(ctx, w, pod) },
+	)
+
+	return always, acting
+}
+
+// writesOf drives calls against one recorder and returns what they would need
+// granted. A call only errors here when the recorder cannot name the object it
+// was handed, and its message says which type that was.
+func writesOf(t *testing.T, what string, calls ...func(*recordingWriter) error) map[string]bool {
+	t.Helper()
+
+	w := &recordingWriter{pairs: map[string]bool{}}
+	for i, call := range calls {
+		if err := call(w); err != nil {
+			t.Fatalf("%s, call %d: %v", what, i+1, err)
 		}
 	}
-
 	return w.pairs
 }
 

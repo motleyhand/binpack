@@ -131,21 +131,41 @@ func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
 	granted := rbacdoc.Grants(roles)
-	// A count, in chart_test.go's shape rather than a non-empty check. This
-	// comparison iterates `granted`, so a reader that stopped seeing rules
-	// would check the ones it still saw and report nothing about the rest —
-	// a green run that means less than it did, with nothing to say so.
+	// A count, in chart_test.go's shape rather than a non-empty check. Both
+	// comparisons below iterate a parsed set, so a reader that stopped seeing
+	// rules would check the ones it still saw and report nothing about the
+	// rest — a green run that means less than it did, with nothing to say so.
+	//
+	// What it does not catch is a rule *deleted* from the chart, which shrinks
+	// the set for a reason the count cannot distinguish from the reader's. The
+	// equality below is what catches that.
 	if len(granted) < 30 {
 		t.Fatalf("the chart parsed to %d group/resource: verb pairs, which is fewer than "+
 			"it has ever rendered — the reader has stopped seeing rules, and the "+
 			"comparison below is against the remainder", len(granted))
 	}
 
+	// Both directions, because a one-directional check answers only half of
+	// what the page promises. chart ⊆ page says a role written from the page
+	// is not missing a grant; page ⊆ chart says it does not carry one the
+	// chart never renders. Only the pair of them says the page *is* the role,
+	// which is what its banner claims — and only the second notices a rule
+	// deleted from the chart, which the first reads as one fewer thing to
+	// check. Deleting the autoscaler-status ConfigMap rule cost three pairs
+	// and left every assertion here green.
 	documented := documentedGrants(t)
 	for pair := range granted {
 		if !documented[pair] {
 			t.Errorf("the chart grants %q and the RBAC reference does not list it; "+
 				"a role written from this page would be missing it", pair)
+		}
+	}
+	for pair := range documented {
+		if !granted[pair] {
+			t.Errorf("the RBAC reference lists %q outside a section marked unused and no "+
+				"rule the chart renders grants it; either the chart has stopped granting "+
+				"something binpack needs, or the page is asking for a permission nobody "+
+				"has to give", pair)
 		}
 	}
 }
