@@ -295,7 +295,14 @@ func Roles(manifests string) ([]Role, error) {
 //
 // Up to three leading spaces, which is what CommonMark permits before a fence;
 // a fourth makes it an indented code block instead.
-var fenceOpening = regexp.MustCompile("(?i)^ {0,3}(`{3,}|~{3,})[ \t]*ya?ml[ \t]*$")
+//
+// `yaml` is the info string's *first word*, not the whole of it. A fence may
+// carry anything after the language — `title=`, a line-highlight range, an
+// anchor — and renderers here and everywhere else still treat the block as
+// YAML. Anchored at the end, a fence written that way was not a YAML block to
+// this reader at all, and the grants inside it left the reference silently
+// while the plain blocks kept the non-empty guard satisfied.
+var fenceOpening = regexp.MustCompile("(?i)^ {0,3}(`{3,}|~{3,})[ \t]*ya?ml([ \t].*)?$")
 
 // fencedYAML is the body of every fenced YAML block in a Markdown document.
 //
@@ -416,7 +423,22 @@ func Documented(doc string) ([]Role, error) {
 		// kept as the name: [Identity] matches the chart's metadata.name and
 		// this against the same suffixes, and text is all the two documents
 		// share.
+		//
+		// A block that also declares a real `kind` is a manifest an operator
+		// can apply, and the two have to agree. Assigned over the decoded
+		// field, a snippet headed `# ClusterRole` and declaring `kind: Role`
+		// was compared as the ClusterRole and could satisfy every grant check,
+		// while what the page actually tells them to apply is namespaced — so
+		// binpack would hold none of its cluster-wide node and pod access, and
+		// the page that promised it would read as correct.
+		declared := role.Kind
 		role.Kind, role.Metadata.Name = kindOf(body)
+		if declared != "" && declared != role.Kind {
+			return nil, fmt.Errorf("a documented block is headed %s and declares kind: %s. "+
+				"An operator applies what it declares and this page is compared against "+
+				"what it is headed, so one of the two is describing permissions nobody "+
+				"holds:\n%s", role.Kind, declared, body)
+		}
 		out = append(out, role)
 	}
 
@@ -507,8 +529,8 @@ func Grants(roles []Role) map[string]bool {
 			// triple unrestricted, and keying them the same makes narrowing a
 			// rule invisible to every comparison.
 			restriction := ""
-			if len(rule.ResourceNames) > 0 {
-				restriction = " restricted to [" + strings.Join(rule.ResourceNames, ", ") + "]"
+			if names := canonicalNames(rule.ResourceNames); len(names) > 0 {
+				restriction = " restricted to [" + strings.Join(names, ", ") + "]"
 			}
 			for _, group := range rule.APIGroups {
 				if group == "" {
@@ -531,6 +553,25 @@ func Grants(roles []Role) map[string]bool {
 		}
 	}
 	return pairs
+}
+
+// canonicalNames is a resourceNames list as Kubernetes reads it: a set.
+//
+// Sorted and deduplicated, because the authorizer asks whether the requested
+// name is among them and neither order nor a repeat changes the answer. Keyed
+// on the list as written, the same restriction spelled in two orders produced
+// two different pairs — so the bidirectional comparison reported one missing
+// permission and one surplus, and an operator reordering a line on the
+// reference page to match their own house style was told the page and the
+// chart disagreed about a permission they had not changed.
+//
+// A copy, because these rules come from objects the caller still holds and
+// sorting in place would reorder theirs.
+func canonicalNames(names []string) []string {
+	if len(names) == 0 {
+		return nil
+	}
+	return slices.Compact(slices.Sorted(slices.Values(names)))
 }
 
 // NamespacedRoles are the chart's namespaced Roles, by the suffix their names

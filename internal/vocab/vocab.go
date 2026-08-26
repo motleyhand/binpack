@@ -180,13 +180,33 @@ var runeConstants map[string]string
 // nowhere.
 var stringTypeNames map[string]bool
 
-// runes is every constant declared as a character literal, whatever its type.
+// runes is every constant that names a single character, whatever its type
+// and however it is written.
 //
 // Collected apart from the string declarations because those are filtered by
-// type — a `const letter rune = 'x'` is deliberately not a string — and a
+// type — a `const letter rune = \'x\'` is deliberately not a string — and a
 // `string(letter)` conversion still needs it.
+//
+// Not only character literals. `const letter rune = 65` is the same constant
+// as `\'A\'` and Go converts it to "A" all the same, as it does an alias of one
+// and an arithmetic expression over them. Keyed on the syntax, all three were
+// absent from this map and their conversions were reported as unevaluable —
+// which fails the vocabulary guard over code Go compiles.
 func runes(files []*ast.File) map[string]string {
 	out := map[string]string{}
+	for name, value := range integers(files) {
+		out[name] = string(rune(value))
+	}
+	return out
+}
+
+// integers is every constant with an integer value, by name.
+//
+// Resolved to a fixpoint, because a constant may be defined in terms of one
+// declared later in the file or in another of the package\'s files, and because
+// an alias of an alias is as ordinary as an alias.
+func integers(files []*ast.File) map[string]int64 {
+	pending := map[string]ast.Expr{}
 	for _, file := range files {
 		for _, decl := range file.Decls {
 			block, ok := decl.(*ast.GenDecl)
@@ -199,18 +219,117 @@ func runes(files []*ast.File) map[string]string {
 					continue
 				}
 				for i, name := range spec.Names {
-					lit, ok := spec.Values[i].(*ast.BasicLit)
-					if !ok || lit.Kind != token.CHAR {
-						continue
-					}
-					if value, err := strconv.Unquote(lit.Value); err == nil {
-						out[name.Name] = value
-					}
+					pending[name.Name] = spec.Values[i]
 				}
 			}
 		}
 	}
+
+	out := map[string]int64{}
+	for grew := true; grew; {
+		grew = false
+		for name, expr := range pending {
+			value, ok := integer(expr, out)
+			if !ok {
+				continue
+			}
+			out[name] = value
+			delete(pending, name)
+			grew = true
+		}
+	}
 	return out
+}
+
+// integer evaluates a constant integer expression against what is known.
+//
+// The same shape as [evaluate] and for the same reason: the subset a constant
+// may contain is small enough to walk, and what falls outside it is reported as
+// unknown rather than guessed at.
+func integer(expr ast.Expr, known map[string]int64) (int64, bool) {
+	switch expr := expr.(type) {
+	case *ast.BasicLit:
+		switch expr.Kind {
+		case token.INT:
+			value, err := strconv.ParseInt(expr.Value, 0, 64)
+			return value, err == nil
+		case token.CHAR:
+			text, err := strconv.Unquote(expr.Value)
+			if err != nil {
+				return 0, false
+			}
+			runes := []rune(text)
+			if len(runes) != 1 {
+				return 0, false
+			}
+			return int64(runes[0]), true
+		default:
+			return 0, false
+		}
+	case *ast.Ident:
+		value, ok := known[expr.Name]
+		return value, ok
+	case *ast.ParenExpr:
+		return integer(expr.X, known)
+	case *ast.UnaryExpr:
+		value, ok := integer(expr.X, known)
+		switch {
+		case !ok:
+			return 0, false
+		case expr.Op == token.SUB:
+			return -value, true
+		case expr.Op == token.ADD:
+			return value, true
+		case expr.Op == token.XOR:
+			return ^value, true
+		default:
+			return 0, false
+		}
+	case *ast.BinaryExpr:
+		left, leftOK := integer(expr.X, known)
+		right, rightOK := integer(expr.Y, known)
+		if !leftOK || !rightOK {
+			return 0, false
+		}
+		switch expr.Op {
+		case token.ADD:
+			return left + right, true
+		case token.SUB:
+			return left - right, true
+		case token.MUL:
+			return left * right, true
+		case token.QUO:
+			if right == 0 {
+				return 0, false
+			}
+			return left / right, true
+		case token.REM:
+			if right == 0 {
+				return 0, false
+			}
+			return left % right, true
+		case token.SHL:
+			if right < 0 || right > 62 {
+				return 0, false
+			}
+			return left << right, true
+		case token.SHR:
+			if right < 0 || right > 62 {
+				return 0, false
+			}
+			return left >> right, true
+		case token.AND:
+			return left & right, true
+		case token.OR:
+			return left | right, true
+		case token.XOR:
+			return left ^ right, true
+		default:
+			return 0, false
+		}
+	default:
+		return 0, false
+	}
 }
 
 // declaration is one name and the expression it was declared with.

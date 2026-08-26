@@ -535,6 +535,15 @@ func ungatedReads() map[string]bool {
 // own function, which the exported-function audit then requires to be driven.
 // That is also what internal/executor's package doc already promises the file
 // is: an enumeration of the writes, one per name.
+//
+// The per-function reading does not compose on its own, which is the second
+// half of this. An unexported helper whose body writes unconditionally
+// satisfies the walk, and if the only call to it is behind a branch then
+// driving the entry point still need not reach the write: a fixture taking the
+// other branch records no grant, the chart is never asked for it, and the
+// production branch 403s. So the call edges are checked too — every
+// Writer-bearing function must be exported, and therefore driven in its own
+// right, or reachable by unconditional calls from one that is.
 func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 	t.Helper()
 
@@ -599,6 +608,8 @@ func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 			return true
 		})
 	}
+
+	requireEveryHelperIsReached(t, source)
 
 	var found int
 	var walk func(n ast.Node, conditional bool)
@@ -723,6 +734,106 @@ func children(n ast.Node) []ast.Node {
 		return false
 	})
 	return out
+}
+
+// requireEveryHelperIsReached holds that driving the exported entry points
+// reaches every Writer-bearing function in the file.
+//
+// The edges, where [requireEveryWriteIsUnconditional] holds the bodies. A
+// helper called only from a branch is one a fixture may never enter, and its
+// write is then a permission nothing asks the chart for.
+//
+// Unconditional calls only. `if err != nil { return … }` before a call makes
+// that call conditional too, which over-approximates — but every helper in the
+// file today has at least one caller that reaches it outright, so the strict
+// reading costs nothing and the loose one would let the shape above back in.
+func requireEveryHelperIsReached(t *testing.T, source *ast.File) {
+	t.Helper()
+
+	// Writer-bearing functions, by name.
+	helpers := map[string]*ast.FuncDecl{}
+	for _, decl := range source.Decls {
+		fn, ok := decl.(*ast.FuncDecl)
+		if !ok || fn.Body == nil {
+			continue
+		}
+		for _, param := range fn.Type.Params.List {
+			if ident, ok := param.Type.(*ast.Ident); ok && ident.Name == "Writer" {
+				helpers[fn.Name.Name] = fn
+			}
+		}
+	}
+
+	// The calls each makes on its own unconditional path.
+	calls := map[string][]string{}
+	for name, fn := range helpers {
+		var walk func(n ast.Node, conditional bool)
+		walk = func(n ast.Node, conditional bool) {
+			if n == nil {
+				return
+			}
+			switch n := n.(type) {
+			case *ast.IfStmt:
+				walk(n.Init, conditional)
+				walk(n.Cond, conditional)
+				walk(n.Body, true)
+				walk(n.Else, true)
+				return
+			case *ast.ForStmt, *ast.RangeStmt, *ast.SwitchStmt,
+				*ast.TypeSwitchStmt, *ast.SelectStmt, *ast.FuncLit:
+				for _, child := range children(n) {
+					walk(child, true)
+				}
+				return
+			case *ast.BlockStmt:
+				reachable := !conditional
+				for _, statement := range n.List {
+					walk(statement, !reachable)
+					if reachable && terminates(statement) {
+						reachable = false
+					}
+				}
+				return
+			case *ast.CallExpr:
+				if callee, ok := n.Fun.(*ast.Ident); ok && !conditional && helpers[callee.Name] != nil {
+					calls[name] = append(calls[name], callee.Name)
+				}
+			}
+			for _, child := range children(n) {
+				walk(child, conditional)
+			}
+		}
+		walk(fn.Body, false)
+	}
+
+	// Everything an exported entry point reaches without a branch.
+	reached := map[string]bool{}
+	var follow func(name string)
+	follow = func(name string) {
+		if reached[name] {
+			return
+		}
+		reached[name] = true
+		for _, callee := range calls[name] {
+			follow(callee)
+		}
+	}
+	for name := range helpers {
+		if ast.IsExported(name) {
+			follow(name)
+		}
+	}
+
+	for name := range helpers {
+		if reached[name] {
+			continue
+		}
+		t.Errorf("%s takes a Writer and no exported function in %s reaches it without "+
+			"passing a branch, so driving the entry points need not perform its write: "+
+			"a fixture taking the other branch records no grant, the chart is never "+
+			"asked for it, and the branch that does call %s 403s in production",
+			name, executorSource, name)
+	}
 }
 
 // writerNames are the parameter names the Writer is bound to in executor.go,

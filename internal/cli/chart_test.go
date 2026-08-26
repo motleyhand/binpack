@@ -1117,7 +1117,11 @@ type deployment struct {
 				Volumes []struct {
 					Name      string `json:"name"`
 					ConfigMap *struct {
-						Name string `json:"name"`
+						Name  string `json:"name"`
+						Items []struct {
+							Key  string `json:"key"`
+							Path string `json:"path"`
+						} `json:"items"`
 					} `json:"configMap"`
 				} `json:"volumes"`
 			} `json:"spec"`
@@ -1188,6 +1192,18 @@ func renderedConfig(t *testing.T, opts ...rbacdoc.Options) *v1alpha1.Config {
 	return cfg
 }
 
+// itemPaths is the names a ConfigMap projection gives the files it mounts.
+func itemPaths(items []struct {
+	Key  string `json:"key"`
+	Path string `json:"path"`
+}) []string {
+	var out []string
+	for _, item := range items {
+		out = append(out, item.Path)
+	}
+	return out
+}
+
 // mountedConfig is the ConfigMap the rendered pod actually reads its
 // configuration from, and the key within it.
 //
@@ -1228,7 +1244,24 @@ func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 			t.Fatalf("the volume %q holding %s is not a ConfigMap, so the configuration "+
 				"the chart renders is not what the process reads", volume, path)
 		}
-		return v.ConfigMap.Name, key
+
+		// With `items`, the file's name in the volume is not its key in the
+		// ConfigMap — the projection renames it, and only the keys listed
+		// appear at all. Assuming the two were the same read `data[path]`,
+		// which exists, while Kubernetes could not populate a volume whose
+		// item names a key that does not: the pod never starts, and every
+		// assertion about the configuration it would have loaded was green.
+		if len(v.ConfigMap.Items) == 0 {
+			return v.ConfigMap.Name, key
+		}
+		for _, item := range v.ConfigMap.Items {
+			if item.Path == key {
+				return v.ConfigMap.Name, item.Key
+			}
+		}
+		t.Fatalf("the volume %q projects only %v and the process is started with a path "+
+			"resolving to %q, which is not among them; that file is not in the container "+
+			"and binpack starts on its own defaults", volume, itemPaths(v.ConfigMap.Items), key)
 	}
 
 	t.Fatalf("the container mounts a volume named %q and the pod declares no such volume; "+
