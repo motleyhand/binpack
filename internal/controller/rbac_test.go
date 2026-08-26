@@ -7,6 +7,7 @@ import (
 	"go/parser"
 	"go/token"
 	"os"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -235,6 +236,7 @@ func drivenWrites(t *testing.T) (always, acting map[string]bool) {
 		calls = append(calls, call)
 	}
 	acting = writesOf(t, "the executor's writes", calls...)
+	requireEverySubresourceIsReached(t, acting)
 
 	return always, acting
 }
@@ -289,6 +291,70 @@ func requireEveryWriteIsDriven(t *testing.T, driven map[string]func(*recordingWr
 		if !declared[name] {
 			t.Errorf("this drives %s and %s no longer declares it; the list has outlived "+
 				"the file it is a list of", name, executorSource)
+		}
+	}
+}
+
+// requireEverySubresourceIsReached holds the writes *inside* those functions,
+// which the audit above cannot.
+//
+// Driving each entry point once proves the entry points are all driven and
+// nothing about what each one does: a conditional
+// `w.SubResource("status").Patch(…)` added inside Cordon leaves the exported
+// signatures unchanged, is never reached by a fixture that does not take that
+// branch, and leaves `acting` exactly as it was while the production path
+// 403s.
+//
+// Subresources specifically, because they are the part of an RBAC pair that
+// static text can answer: the resource comes from the object's type and the
+// verb from the method, but a subresource is a string literal at the call
+// site. Every one executor.go names has to appear in what the recorder saw.
+func requireEverySubresourceIsReached(t *testing.T, recorded map[string]bool) {
+	t.Helper()
+
+	source, err := parser.ParseFile(token.NewFileSet(), executorSource, nil, 0)
+	if err != nil {
+		t.Fatalf("parsing %s: %v", executorSource, err)
+	}
+
+	named := map[string]bool{}
+	ast.Inspect(source, func(n ast.Node) bool {
+		call, ok := n.(*ast.CallExpr)
+		if !ok || len(call.Args) != 1 {
+			return true
+		}
+		fn, ok := call.Fun.(*ast.SelectorExpr)
+		if !ok || fn.Sel.Name != "SubResource" {
+			return true
+		}
+		lit, ok := call.Args[0].(*ast.BasicLit)
+		if !ok || lit.Kind != token.STRING {
+			t.Errorf("%s calls SubResource with something other than a literal, so this "+
+				"cannot say which subresource it writes", executorSource)
+			return true
+		}
+		if value, err := strconv.Unquote(lit.Value); err == nil {
+			named[value] = true
+		}
+		return true
+	})
+
+	if len(named) == 0 {
+		t.Fatalf("no SubResource call found in %s; either the eviction write moved or this "+
+			"parse has stopped seeing it", executorSource)
+	}
+
+	for subresource := range named {
+		var reached bool
+		for pair := range recorded {
+			if strings.Contains(pair, "/"+subresource+":") {
+				reached = true
+			}
+		}
+		if !reached {
+			t.Errorf("%s writes the %q subresource and nothing here reaches that call; the "+
+				"chart is never asked whether it grants it, and the branch holding it 403s "+
+				"in production", executorSource, subresource)
 		}
 	}
 }

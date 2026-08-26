@@ -576,8 +576,16 @@ func fragment(body string) (Role, error) {
 	return wrapped, nil
 }
 
-// ruleField matches any field only a policy rule carries.
-var ruleField = regexp.MustCompile(`(?m)^\s*-?\s*(apiGroups|resources|resourceNames|nonResourceURLs|verbs):`)
+// ruleField matches any field a policy rule or the object holding one carries.
+//
+// Quoting a mapping key is legal YAML and changes nothing about what the
+// document means, so `"verbs": get` has to read as a rule field — keyed on the
+// bare spelling alone, a malformed block written that way was skipped in
+// silence. `kind` and `rules` are here for the same reason from the other
+// side: a fence declaring itself a ClusterRole is a rule list whatever its
+// rules turned out to be.
+var ruleField = regexp.MustCompile(
+	`(?m)^\s*-?\s*["']?(apiGroups|resources|resourceNames|nonResourceURLs|verbs|kind|rules)["']?\s*:`)
 
 // kindOfBlock is the object a fragment's leading comment names, or "".
 func kindOfBlock(body string) string {
@@ -852,6 +860,9 @@ func malformed(role Role) string {
 // in.
 var helmAction = regexp.MustCompile(`\{\{-?.*?-?\}\}`)
 
+// helmComment matches a Go template comment, which renders nothing.
+var helmComment = regexp.MustCompile(`\{\{-?\s*/\*.*?\*/\s*-?\}\}`)
+
 // helmControlKeywords are the actions that structure a template rather than
 // producing a value.
 //
@@ -919,6 +930,22 @@ func HelmToYAML(template string) (string, error) {
 					i+1, control, rest)
 			}
 			continue
+		}
+
+		// A comment renders nothing, so it is dropped before anything else
+		// looks at the line — and a line that was only a comment goes with it.
+		// Left in, `{{/* … */}}` is an action that is neither control flow nor
+		// a value, so the bare-invocation check below refused a template Helm
+		// renders identically with or without it.
+		if helmComment.MatchString(line) {
+			line = helmComment.ReplaceAllString(line, "")
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			if actions = helmAction.FindAllString(line, -1); len(actions) == 0 {
+				out = append(out, line)
+				continue
+			}
 		}
 
 		// A line that is nothing but an action emits a document fragment

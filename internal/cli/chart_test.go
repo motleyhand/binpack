@@ -1048,17 +1048,37 @@ func deploymentServiceAccount(t *testing.T) string {
 		t.Fatalf("reading the chart's deployment: %v", err)
 	}
 
+	// The field, not the first line mentioning it. A comment carrying the old
+	// expression above a changed field satisfied a textual search while the
+	// rendered pod named an account the chart never creates — so a commented
+	// line is skipped, and finding more than one real field is a failure
+	// rather than a choice between them.
 	const field = "serviceAccountName:"
+
+	var found []string
 	for line := range strings.SplitSeq(string(deployment), "\n") {
-		_, value, found := strings.Cut(line, field)
-		if !found {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-		return rbacdoc.Placeholder(value)
+		value, ok := strings.CutPrefix(trimmed, field)
+		if !ok {
+			continue
+		}
+		found = append(found, rbacdoc.Placeholder(value))
 	}
 
-	t.Fatalf("the Deployment no longer sets %s, so it runs as the namespace's default "+
-		"account and every binding here grants binpack nothing", field)
+	switch len(found) {
+	case 1:
+		return found[0]
+	case 0:
+		t.Fatalf("the Deployment no longer sets %s, so it runs as the namespace's default "+
+			"account and every binding here grants binpack nothing", field)
+	default:
+		t.Fatalf("the Deployment sets %s %d times (%v); which account the pod runs as is "+
+			"then a question about ordering, and this would answer it by position",
+			field, len(found), found)
+	}
 	return ""
 }
 

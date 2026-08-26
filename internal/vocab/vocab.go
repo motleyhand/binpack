@@ -59,11 +59,7 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 			if _, done := resolved[d.name]; done {
 				continue
 			}
-			ident, ok := d.expr.(*ast.Ident)
-			if !ok {
-				continue
-			}
-			if value, ok := resolved[ident.Name]; ok {
+			if value, ok := evaluate(d.expr, resolved); ok {
 				resolved[d.name], progressed = value, true
 			}
 		}
@@ -89,6 +85,46 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 		out[d.name] = value
 	}
 	return out, nil
+}
+
+// evaluate reads a constant string expression, given what is resolved so far.
+//
+// Literals, names, parentheses and concatenation — the whole of what a string
+// constant can be built from without a function call, which a constant cannot
+// contain. Concatenation is here because leaving it out failed the guard on
+// `const SkipFoo = "foo" + "-bar"`, which is a legal way to write a value and
+// not one this package has any business refusing.
+//
+// go/types would answer this exactly and would mean type-checking the package
+// and its imports to read four constants; the subset a vocabulary is written
+// in is small enough to walk, and anything outside it is still reported rather
+// than skipped.
+func evaluate(expr ast.Expr, resolved map[string]string) (string, bool) {
+	switch expr := expr.(type) {
+	case *ast.BasicLit:
+		if expr.Kind != token.STRING {
+			return "", false
+		}
+		value, err := strconv.Unquote(expr.Value)
+		return value, err == nil
+	case *ast.Ident:
+		value, ok := resolved[expr.Name]
+		return value, ok
+	case *ast.ParenExpr:
+		return evaluate(expr.X, resolved)
+	case *ast.BinaryExpr:
+		if expr.Op != token.ADD {
+			return "", false
+		}
+		left, ok := evaluate(expr.X, resolved)
+		if !ok {
+			return "", false
+		}
+		right, ok := evaluate(expr.Y, resolved)
+		return left + right, ok
+	default:
+		return "", false
+	}
 }
 
 // declaration is one name and the expression it was declared with.
