@@ -788,29 +788,31 @@ func TestRBACCreateFalseRendersNoRBACAtAll(t *testing.T) {
 		t.Fatalf("reading the chart without rbac.create: %v", err)
 	}
 
-	// Both readers refuse an empty document, which is the answer this wants:
-	// their errors are the assertion, so a Role or a binding surviving the
-	// guard is a successful parse and a failure here.
-	if roles, err := rbacdoc.Roles(off); err == nil {
-		var names []string
-		for _, role := range roles {
-			names = append(names, role.Kind+" "+role.Metadata.Name)
+	// Read from the rendered text rather than from the readers refusing it.
+	// Both do refuse an empty document, so `err != nil` would pass today — and
+	// it would go on passing if they ever stopped, since the assertion would
+	// then be about a contract nothing here states. What this needs to know is
+	// whether an object survived the guard, which the document says directly.
+	for _, kind := range []string{
+		"ClusterRole", "Role", "ClusterRoleBinding", "RoleBinding",
+	} {
+		if strings.Contains(off, "\nkind: "+kind+"\n") {
+			t.Errorf("rbac.create: false still renders a %s; the chart promises to add "+
+				"nothing, and an operator who chose to manage RBAC elsewhere would "+
+				"receive it anyway", kind)
 		}
-		t.Errorf("rbac.create: false still renders %v; the chart promises to add nothing "+
-			"and an operator managing RBAC elsewhere would receive these too", names)
-	}
-	if bindings, err := rbacdoc.Bindings(off); err == nil {
-		var names []string
-		for _, b := range bindings {
-			names = append(names, b.Kind+" "+b.Metadata.Name)
-		}
-		t.Errorf("rbac.create: false still renders %v", names)
 	}
 
 	// And the ordinary install must still render them, or the guard has
 	// swallowed the wrong block and this passes for the wrong reason.
-	if _, err := rbacdoc.Roles(string(chart)); err != nil {
+	roles, err := rbacdoc.Roles(string(chart))
+	if err != nil {
 		t.Fatalf("the chart renders no roles with rbac.create on: %v", err)
+	}
+	if len(roles) < 3 {
+		t.Errorf("the chart renders %d roles with rbac.create on, and it has always "+
+			"rendered the ClusterRole and two namespaced Roles; this test would pass "+
+			"against a chart that had lost them", len(roles))
 	}
 }
 
