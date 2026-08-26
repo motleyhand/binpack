@@ -317,24 +317,37 @@ func requireEverySubresourceIsReached(t *testing.T, recorded map[string]bool) {
 		t.Fatalf("parsing %s: %v", executorSource, err)
 	}
 
-	named := map[string]bool{}
+	// The method as well as the subresource. Keyed on the name alone, a
+	// `SubResource("eviction").Patch(…)` added behind an unexercised branch was
+	// reported as reached by the existing `pods/eviction: create` — a different
+	// verb on the same subresource is a different RBAC pair, and the chart was
+	// never asked for it.
+	named := map[string]string{}
 	ast.Inspect(source, func(n ast.Node) bool {
-		call, ok := n.(*ast.CallExpr)
-		if !ok || len(call.Args) != 1 {
+		outer, ok := n.(*ast.CallExpr)
+		if !ok {
 			return true
 		}
-		fn, ok := call.Fun.(*ast.SelectorExpr)
-		if !ok || fn.Sel.Name != "SubResource" {
+		method, ok := outer.Fun.(*ast.SelectorExpr)
+		if !ok {
 			return true
 		}
-		lit, ok := call.Args[0].(*ast.BasicLit)
+		inner, ok := method.X.(*ast.CallExpr)
+		if !ok || len(inner.Args) != 1 {
+			return true
+		}
+		if fn, ok := inner.Fun.(*ast.SelectorExpr); !ok || fn.Sel.Name != "SubResource" {
+			return true
+		}
+
+		lit, ok := inner.Args[0].(*ast.BasicLit)
 		if !ok || lit.Kind != token.STRING {
 			t.Errorf("%s calls SubResource with something other than a literal, so this "+
 				"cannot say which subresource it writes", executorSource)
 			return true
 		}
 		if value, err := strconv.Unquote(lit.Value); err == nil {
-			named[value] = true
+			named[value+": "+strings.ToLower(method.Sel.Name)] = method.Sel.Name
 		}
 		return true
 	})
@@ -344,17 +357,17 @@ func requireEverySubresourceIsReached(t *testing.T, recorded map[string]bool) {
 			"parse has stopped seeing it", executorSource)
 	}
 
-	for subresource := range named {
+	for call, method := range named {
 		var reached bool
 		for pair := range recorded {
-			if strings.Contains(pair, "/"+subresource+":") {
+			if strings.HasSuffix(pair, "/"+call) {
 				reached = true
 			}
 		}
 		if !reached {
-			t.Errorf("%s writes the %q subresource and nothing here reaches that call; the "+
-				"chart is never asked whether it grants it, and the branch holding it 403s "+
-				"in production", executorSource, subresource)
+			t.Errorf("%s calls %s on a subresource and nothing here reaches it (%q); the "+
+				"chart is never asked whether it grants that verb, and the branch holding "+
+				"the call 403s in production", executorSource, method, call)
 		}
 	}
 }
@@ -425,7 +438,7 @@ func (w *recordingWriter) record(obj client.Object, subresource, verb string) er
 	}
 	group := kinds[0].Group
 	if group == "" {
-		group = "core"
+		group = rbacdoc.CoreGroup
 	}
 
 	w.pairs[group+"/"+resource+": "+verb] = true
@@ -493,11 +506,14 @@ var (
 // fourth verb on a read rule is not a wider read, it is a different
 // permission.
 func ungatedReads() map[string]bool {
-	resources := []string{"core/nodes", "core/pods", "policy/poddisruptionbudgets"}
+	resources := []string{
+		rbacdoc.CoreGroup + "/nodes", rbacdoc.CoreGroup + "/pods",
+		"policy/poddisruptionbudgets",
+	}
 	for _, src := range collect.TemplateSources() {
 		group := src.Group()
 		if group == "" {
-			group = "core"
+			group = rbacdoc.CoreGroup
 		}
 		resources = append(resources, group+"/"+src.Resource)
 	}

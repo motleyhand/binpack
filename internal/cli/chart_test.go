@@ -660,7 +660,7 @@ func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
 		// discovery.autoscalerNamespace names: the cluster-autoscaler's status
 		// ConfigMap, which ADR-0004 makes the whole basis of running without
 		// cloud credentials.
-		"core/configmaps: get", "core/configmaps: list", "core/configmaps: watch")
+		rbacdoc.CoreGroup+"/configmaps: get", rbacdoc.CoreGroup+"/configmaps: list", rbacdoc.CoreGroup+"/configmaps: watch")
 
 	grantsExactly(t, grants, "-leader-election",
 		// The Lease is held in binpack's own namespace, and client-go's
@@ -687,8 +687,8 @@ func TestEachNamespacedRoleGrantsWhatItsOwnNamespaceIsFor(t *testing.T) {
 		// belong to this Role: anchoring only the Lease verbs left the core
 		// event rule free to move into the autoscaler-status Role, which is
 		// nonempty, disjoint and in the wrong namespace.
-		"core/events: create",
-		"core/events: patch")
+		rbacdoc.CoreGroup+"/events: create",
+		rbacdoc.CoreGroup+"/events: patch")
 }
 
 // grantsExactly asserts that the namespaced Role whose name carries the given

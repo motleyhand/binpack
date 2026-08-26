@@ -30,6 +30,13 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// CoreGroup is how a pair names Kubernetes' core API group, whose real name is
+// the empty string.
+//
+// Not "core": that is a legal thing to write in a chart and an illegal thing
+// for Kubernetes to resolve, so a pair has to be able to tell the two apart.
+const CoreGroup = "(core)"
+
 // RBACAPIGroup is the only API group a roleRef may name. Kubernetes rejects a
 // binding that names another, and the rejection is at install: roleRef is
 // immutable, so there is no upgrade path that repairs it either.
@@ -485,8 +492,13 @@ func depthDelta(line string) int {
 	return delta
 }
 
-// fencedYAML matches a ```yaml block in Markdown, capturing its body.
-var fencedYAML = regexp.MustCompile("(?s)```yaml\n(.*?)```")
+// fencedYAML matches a fenced YAML block in Markdown, capturing its body.
+//
+// `yml` and any capitalisation of either, because a renderer treats them all
+// as YAML and a page is free to use any: keyed on the exact lowercase `yaml`,
+// a granted snippet written as ```yml was skipped whole while the other blocks
+// kept the non-empty guard satisfied.
+var fencedYAML = regexp.MustCompile("(?is)```ya?ml[ \t]*\n(.*?)```")
 
 // Documented decodes the role snippets in a Markdown page.
 //
@@ -598,22 +610,31 @@ func kindOfBlock(body string) string {
 func kindOf(body string) (kind, name string) {
 	first, _, _ := strings.Cut(body, "\n")
 	first = strings.TrimSpace(strings.TrimPrefix(strings.TrimSpace(first), "#"))
-	switch {
-	case strings.HasPrefix(first, "ClusterRole"):
-		return "ClusterRole", first
-	case strings.HasPrefix(first, "Role"):
-		return "Role", first
-	default:
-		return "", ""
+	// A whole token, not a prefix. `RoleBinding` starts with `Role` and
+	// `ClusterRoleBinding` with `ClusterRole`, so prefix matching read a
+	// binding's header as the role it binds — leaving every grant comparison
+	// unchanged while the page told an operator to put `rules:` on a binding,
+	// which Kubernetes refuses.
+	for _, kind := range []string{"ClusterRole", "Role"} {
+		rest, ok := strings.CutPrefix(first, kind)
+		if ok && (rest == "" || strings.HasPrefix(rest, ",") || strings.HasPrefix(rest, " ")) {
+			return kind, first
+		}
 	}
+	return "", ""
 }
 
 // Grants is every `group/resource: verb` triple the roles hold.
 //
-// The core group is rendered as "core" rather than the empty string, so a
-// failure message names something a reader can find in a role — and so that
-// `events` from the core group and `events` from events.k8s.io stay different
-// strings, which is the distinction a documented gap once hid in.
+// The core group is rendered as a sentinel rather than the empty string, so a
+// failure message names something a reader can place — and so that `events`
+// from the core group and `events` from events.k8s.io stay different strings,
+// which is the distinction a documented gap once hid in.
+//
+// Parenthesised because an API group is a DNS subdomain and cannot contain
+// them. Spelled bare, `apiGroups: ["core"]` — a plausible mistake, and one
+// Kubernetes reads as a group that does not exist — produced the same key as
+// the empty group and agreed with everything.
 func Grants(roles []Role) map[string]bool {
 	pairs := map[string]bool{}
 	for _, role := range roles {
@@ -627,7 +648,7 @@ func Grants(roles []Role) map[string]bool {
 			}
 			for _, group := range rule.APIGroups {
 				if group == "" {
-					group = "core"
+					group = CoreGroup
 				}
 				for _, resource := range rule.Resources {
 					for _, verb := range rule.Verbs {
@@ -923,6 +944,19 @@ func HelmToYAML(template string) (string, error) {
 		}
 
 		if control := controlAction(actions); control != "" {
+			// A content action beside a control one is still a content
+			// action. Removing every action before looking at what is left
+			// read `{{- if X }}{{ include "y" . }}` as a bare control line and
+			// discarded the include with it, so a helper adding a grant was
+			// invisible to every comparison here.
+			for _, action := range actions {
+				if action != control && controlAction([]string{action}) == "" {
+					return "", fmt.Errorf("line %d puts %s beside the control action %s; it "+
+						"renders a fragment this substitution cannot see, and deleting the "+
+						"line to be rid of the control action would take it too", i+1,
+						strings.TrimSpace(action), control)
+				}
+			}
 			if rest := strings.TrimSpace(helmAction.ReplaceAllString(line, "")); rest != "" {
 				return "", fmt.Errorf("line %d puts the control action %q on a line with %q, "+
 					"which this substitution would drop along with it — render the chart or "+
