@@ -137,37 +137,8 @@ func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
 	// The install the chart ships. Every binding must name the account it
 	// creates, and the pod must run as it.
 	account, _ := renderedServiceAccount(t)
+	shipped := requireBoundTo(t, nil, account)
 
-	bindings, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{}))
-	if err != nil {
-		t.Fatalf("reading the chart's bindings: %v", err)
-	}
-	// Three: the ClusterRoleBinding, the autoscaler-status RoleBinding and the
-	// leader-election RoleBinding. A parse that found none would satisfy every
-	// assertion below without checking anything.
-	if len(bindings) < 3 {
-		t.Fatalf("found %d bindings, want the three the chart renders: the parse has "+
-			"lost the structure it is checking", len(bindings))
-	}
-
-	for _, binding := range bindings {
-		for _, subject := range binding.Subjects {
-			if subject.Kind != "ServiceAccount" {
-				continue
-			}
-			if subject.Name == "default" {
-				t.Errorf("the %s %s binds the default ServiceAccount; every pod in that "+
-					"namespace would inherit what binpack was granted, which under "+
-					"rbac.allowDraining is cluster-wide nodes: patch and "+
-					"pods/eviction: create", binding.Kind, binding.Metadata.Name)
-			}
-			if subject.Name != account {
-				t.Errorf("the %s %s binds %q and the chart creates %q; the binding grants "+
-					"an account that does not exist and binpack holds nothing",
-					binding.Kind, binding.Metadata.Name, subject.Name, account)
-			}
-		}
-	}
 	if got := deploymentServiceAccount(t); got != account {
 		t.Errorf("the pod runs as %q and the chart creates and binds %q", got, account)
 	}
@@ -175,7 +146,7 @@ func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
 	// And the combination that would otherwise install cleanly and do the
 	// wrong thing: managing the account elsewhere without saying which one.
 	// The helper has to refuse, the way _validate.tpl refuses the other.
-	_, err = rbacdoc.Render(rbacdoc.Options{
+	_, err := rbacdoc.Render(rbacdoc.Options{
 		Set: map[string]string{"serviceAccount.create": "false"},
 	})
 	if err == nil {
@@ -197,36 +168,100 @@ func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
 	// And naming one has to be enough, or the refusal above is a chart that
 	// cannot be installed with an external account at all.
 	//
-	// Both halves, and the pod's half is the one that hides. The chart's own
-	// default name is the release name, so a Deployment that names the release
-	// directly renders identically to one that goes through the helper — until
-	// an operator sets serviceAccount.name, at which point the bindings follow
-	// the setting, the pod does not, and it runs as an account nothing
-	// created. A default install cannot show the difference, so this is where
-	// it has to be asked.
+	// Held to the same standard as the default install, and to the same set of
+	// bindings. This is a value-dependent path that no other test renders, so
+	// a conditional that dropped a binding here — or left one with no subject
+	// at all — would be granting an operator less than the chart promises,
+	// invisibly: binpack starts, holds its lease, and 403s on whatever the
+	// missing binding covered.
 	managed := map[string]string{
 		"serviceAccount.create": "false",
 		"serviceAccount.name":   "managed-elsewhere",
 	}
 
-	external, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: managed}))
-	if err != nil {
-		t.Fatalf("reading the bindings of an install with an external account: %v", err)
+	external := requireBoundTo(t, managed, "managed-elsewhere")
+	if !slices.Equal(shipped, external) {
+		t.Errorf("a default install renders the bindings %v and one with an external "+
+			"account renders %v; whichever is missing is a permission the operator was "+
+			"promised and does not hold", shipped, external)
 	}
-	for _, binding := range external {
-		for _, subject := range binding.Subjects {
-			if subject.Kind == "ServiceAccount" && subject.Name != "managed-elsewhere" {
-				t.Errorf("the %s %s binds %q when serviceAccount.name says "+
-					"managed-elsewhere", binding.Kind, binding.Metadata.Name, subject.Name)
-			}
-		}
-	}
+
+	// The pod's half hides behind the chart's own default. The default account
+	// name *is* the release name, so a Deployment naming the release directly
+	// renders identically to one going through the helper — until
+	// serviceAccount.name is set, at which point the bindings follow the
+	// setting and the pod does not.
 	if got := deploymentServiceAccount(t, managed); got != "managed-elsewhere" {
 		t.Errorf("serviceAccount.name says managed-elsewhere and the pod runs as %q; the "+
 			"bindings grant the account the operator named and the pod is not it, so "+
 			"binpack holds nothing — and if that account does not exist, the pod does "+
 			"not start", got)
 	}
+}
+
+// requireBoundTo checks that every binding one set of values renders names the
+// given account, and returns the bindings it found, sorted.
+//
+// Exactly one subject per binding, of kind ServiceAccount, in the release's
+// namespace. Each clause is a way to hold no permission while every other
+// assertion here passes: a binding with no subjects grants nobody, a subject
+// of another kind grants somebody else, and a ServiceAccount subject resolves
+// per namespace — so the right name in the wrong one is as inert as the wrong
+// name. The version this replaces iterated subjects and skipped anything that
+// was not already a correctly-kinded ServiceAccount, which made all three
+// invisible.
+func requireBoundTo(t *testing.T, values map[string]string, account string) []string {
+	t.Helper()
+
+	bindings, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: values}))
+	if err != nil {
+		t.Fatalf("reading the bindings rendered with %v: %v", values, err)
+	}
+	// Three: the ClusterRoleBinding, the autoscaler-status RoleBinding and the
+	// leader-election RoleBinding. A parse that found none would satisfy every
+	// assertion below without checking anything.
+	if len(bindings) < 3 {
+		t.Fatalf("%v renders %d bindings, want the three the chart has always "+
+			"rendered: the parse has lost the structure it is checking",
+			values, len(bindings))
+	}
+
+	var found []string
+	for _, binding := range bindings {
+		found = append(found, binding.Kind+" "+binding.Metadata.Name)
+
+		if len(binding.Subjects) != 1 {
+			t.Errorf("the %s %s names %d subjects, want the one ServiceAccount binpack "+
+				"runs as; a binding with none grants nobody anything",
+				binding.Kind, binding.Metadata.Name, len(binding.Subjects))
+			continue
+		}
+
+		subject := binding.Subjects[0]
+		switch {
+		case subject.Kind != "ServiceAccount":
+			t.Errorf("the %s %s binds a %s; binpack runs as a ServiceAccount, and this "+
+				"binding grants whatever that other principal is instead",
+				binding.Kind, binding.Metadata.Name, subject.Kind)
+		case subject.Name == "default":
+			t.Errorf("the %s %s binds the default ServiceAccount; every pod in that "+
+				"namespace would inherit what binpack was granted, which under "+
+				"rbac.allowDraining is cluster-wide nodes: patch and "+
+				"pods/eviction: create", binding.Kind, binding.Metadata.Name)
+		case subject.Name != account:
+			t.Errorf("the %s %s binds %q and the account is %q; the binding grants an "+
+				"account binpack does not run as, and binpack holds nothing",
+				binding.Kind, binding.Metadata.Name, subject.Name, account)
+		case subject.Namespace != rbacdoc.DefaultNamespace:
+			t.Errorf("the %s %s binds %q in namespace %q; a ServiceAccount subject "+
+				"resolves per namespace, so the right name in the wrong one grants "+
+				"binpack nothing", binding.Kind, binding.Metadata.Name,
+				subject.Name, subject.Namespace)
+		}
+	}
+
+	slices.Sort(found)
+	return found
 }
 
 // The Role granting the autoscaler's status must be bound where binpack will
@@ -993,6 +1028,57 @@ type deployment struct {
 	} `json:"spec"`
 }
 
+// renderedConfig is the configuration the rendered ConfigMap hands the
+// process, loaded the way binpack loads it.
+//
+// Through v1alpha1.Load rather than read as text, so what this returns is what
+// the binary would run on. Matching `autoscalerNamespace: <value>` in the
+// manifests was satisfied by a templated comment left above a dropped field —
+// the Role would follow the setting, the process would fall back to the
+// default, and every status read is a 403 the check said could not happen.
+func renderedConfig(t *testing.T, values ...map[string]string) *v1alpha1.Config {
+	t.Helper()
+
+	set := map[string]string{}
+	for _, v := range values {
+		maps.Copy(set, v)
+	}
+
+	type configMap struct {
+		Kind string            `json:"kind"`
+		Data map[string]string `json:"data"`
+	}
+
+	var found []configMap
+	for doc := range strings.SplitSeq(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: set}), "\n---\n") {
+		var c configMap
+		if err := yaml.Unmarshal([]byte(doc), &c); err != nil {
+			t.Fatalf("a rendered document does not parse as YAML: %v\n%s", err, doc)
+		}
+		if c.Kind == "ConfigMap" {
+			found = append(found, c)
+		}
+	}
+	if len(found) != 1 {
+		t.Fatalf("the chart renders %d ConfigMaps with %v, want the one binpack reads "+
+			"its configuration from", len(found), set)
+	}
+
+	const key = "config.yaml"
+	body, ok := found[0].Data[key]
+	if !ok {
+		t.Fatalf("the rendered ConfigMap has no %s, so the process starts on its own "+
+			"defaults whatever the chart was told", key)
+	}
+
+	cfg, err := v1alpha1.Load([]byte(body))
+	if err != nil {
+		t.Fatalf("the configuration the chart renders with %v is one binpack rejects: "+
+			"%v\n%s", set, err, body)
+	}
+	return cfg
+}
+
 // renderedDeployment is the one Deployment a default install renders.
 func renderedDeployment(t *testing.T, values ...map[string]string) deployment {
 	t.Helper()
@@ -1337,11 +1423,15 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 			"the chart decided, which is a 403 on every evaluation", elsewhere, got)
 	}
 	// And the process has to be told the same thing, or the Role is in the
-	// right place for a namespace binpack never reads.
-	if !strings.Contains(manifests, "autoscalerNamespace: "+elsewhere) {
-		t.Errorf("config.discovery.autoscalerNamespace is %q and no rendered document "+
-			"tells binpack so; the Role above is then anchored to a setting the "+
-			"process does not receive", elsewhere)
+	// right place for a namespace binpack never reads. Loaded rather than
+	// matched, so this is the value binpack would run on — see [renderedConfig].
+	cfg := renderedConfig(t, map[string]string{
+		"config.discovery.autoscalerNamespace": elsewhere,
+	})
+	if got := cfg.Discovery.AutoscalerNamespace; got != elsewhere {
+		t.Errorf("config.discovery.autoscalerNamespace is %q and the configuration the "+
+			"chart renders loads as %q; the Role above is then anchored to a setting "+
+			"the process does not receive", elsewhere, got)
 	}
 
 	// And the ServiceAccount the chart creates is created only when the

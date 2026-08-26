@@ -200,12 +200,20 @@ def release_can_verify() -> list[str]:
     if "\n  release:\n" not in release:
         return ["release.yaml has no release job; this check needs rethinking"]
     after_release = release.split("\n  release:\n", 1)[1]
-    verifying = re.split(r"\n  [a-z-]+:\n", after_release, maxsplit=1)[0]
-    if not re.search(r"^\s*run: make check\s*$", verifying, re.MULTILINE):
+    job = re.split(r"\n  [a-z-]+:\n", after_release, maxsplit=1)[0]
+
+    # Only the steps that run *before* the verification, because a setup step
+    # is available to a command only if it has already run. Compared against
+    # the whole job, moving `azure/setup-helm` below `run: make check` left
+    # this green and the tag failing at its verify step — the same masking as
+    # the job-vs-file one above, one level down.
+    verify = re.search(r"^\s*run: make check\s*$", job, re.MULTILINE)
+    if not verify:
         return ["release.yaml runs `make check` outside its release job; this check "
                 "compares the wrong block and needs rethinking"]
+    before = job[: verify.start()]
 
-    missing = setup_actions(build) - setup_actions(verifying)
+    missing = setup_actions(build) - setup_actions(before)
     if missing:
         return [
             "release.yaml's release job runs `make check` but does not set up: "

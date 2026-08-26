@@ -334,10 +334,21 @@ func plainlyNotAString(expr ast.Expr) bool {
 		// No unary operator applies to a string.
 		return true
 	case *ast.BinaryExpr:
-		// Go permits no operator between a string and anything else, so one
-		// plainly non-string operand settles it. `1 << 4` reached the default
-		// branch before this and was reported as unevaluable, which failed the
-		// guard on a correct `const CodeMask`.
+		// Classified by the operator first, because the operator decides the
+		// *result*. Only `+` yields a string; every comparison yields a bool
+		// and every arithmetic or bitwise operator yields a number, whatever
+		// the operands are — so `"a" == "a"` is plainly not a string even
+		// though both sides are, and reading the operands alone reported it as
+		// one this could not evaluate. That failed the vocabulary guard on
+		// valid package code whose name happened to share a prefix.
+		if expr.Op != token.ADD {
+			return true
+		}
+		// And for `+`, Go permits no operator between a string and anything
+		// else, so one plainly non-string operand settles it. `1 + 2` is
+		// caught here; `1 << 4` is caught above, having reached the default
+		// branch before either check existed and failed a correct
+		// `const CodeMask`.
 		return plainlyNotAString(expr.X) || plainlyNotAString(expr.Y)
 	case *ast.CallExpr:
 		// A constant may contain a conversion and nothing else, so a call to
