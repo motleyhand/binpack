@@ -41,8 +41,9 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 	}
 
 	runeConstants = runes(files)
+	stringTypeNames = stringTypes(files)
 
-	declared := declarations(files, stringTypes(files))
+	declared := declarations(files, stringTypeNames)
 
 	// Every declaration's literal value, whatever its name, so an alias can be
 	// followed to a constant the prefix does not cover. Then identifiers are
@@ -142,7 +143,7 @@ func evaluate(expr ast.Expr, resolved map[string]string) (string, bool) {
 // caller to report.
 func convertedString(call *ast.CallExpr, resolved map[string]string) (string, bool) {
 	fn, ok := call.Fun.(*ast.Ident)
-	if !ok || fn.Name != "string" || len(call.Args) != 1 {
+	if !ok || !convertsToString(fn.Name) || len(call.Args) != 1 {
 		return "", false
 	}
 
@@ -165,6 +166,19 @@ func convertedString(call *ast.CallExpr, resolved map[string]string) (string, bo
 // runeConstants are the package's rune constants, by name, for the conversions
 // that name one.
 var runeConstants map[string]string
+
+// stringTypeNames are the package's own names for a string, for the
+// conversions that name one.
+//
+// A vocabulary is often declared through its own type, and
+// `DecisionCode("Drain")` is as ordinary a way to write a member as
+// `DecisionCode = "Drain"`. Recognising only the predeclared `string` read
+// those as conversions to something else and dropped them — silently, which is
+// the failure this package exists to prevent: a constant omitted from the
+// declarations shrinks both sides of the count that holds the enumerator
+// honest, so the guard passes while the value is published and documented
+// nowhere.
+var stringTypeNames map[string]bool
 
 // runes is every constant declared as a character literal, whatever its type.
 //
@@ -314,6 +328,12 @@ func declarations(files []*ast.File, stringy map[string]bool) []declaration {
 	return out
 }
 
+// convertsToString reports whether a conversion to this type name yields a
+// string: the predeclared one, or any of the package's own names for it.
+func convertsToString(name string) bool {
+	return name == "string" || stringTypeNames[name]
+}
+
 // plainlyNotAString reports whether an expression obviously holds something
 // else.
 //
@@ -352,9 +372,11 @@ func plainlyNotAString(expr ast.Expr) bool {
 		return plainlyNotAString(expr.X) || plainlyNotAString(expr.Y)
 	case *ast.CallExpr:
 		// A constant may contain a conversion and nothing else, so a call to
-		// anything but `string` converts to a type that is not one.
+		// anything but a string type converts to a type that is not one — and
+		// the package's own names for a string count, which is how a
+		// vocabulary is usually spelled. See [stringTypeNames].
 		fn, ok := expr.Fun.(*ast.Ident)
-		return !ok || fn.Name != "string"
+		return !ok || !convertsToString(fn.Name)
 	default:
 		return false
 	}

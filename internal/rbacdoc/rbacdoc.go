@@ -285,14 +285,69 @@ func Roles(manifests string) ([]Role, error) {
 	return decode("the chart's RBAC", manifests)
 }
 
-// fencedYAML matches a fenced YAML block in Markdown, capturing its body.
+// fenceOpening matches the start of a fenced YAML block.
 //
 // `yml`, any capitalisation of either, a tilde fence, and whitespace before
 // the info string — a renderer treats them all as YAML and a page is free to
 // use any. Keyed on one exact spelling, a granted snippet written another way
 // was skipped whole while the remaining blocks kept the non-empty guard
 // satisfied.
-var fencedYAML = regexp.MustCompile("(?is)(?:```|~~~)[ \t]*ya?ml[ \t]*\n(.*?)(?:```|~~~)")
+//
+// Up to three leading spaces, which is what CommonMark permits before a fence;
+// a fourth makes it an indented code block instead.
+var fenceOpening = regexp.MustCompile("(?i)^ {0,3}(`{3,}|~{3,})[ \t]*ya?ml[ \t]*$")
+
+// fencedYAML is the body of every fenced YAML block in a Markdown document.
+//
+// Scanned line by line rather than matched with one expression, because the
+// closing fence has to be the *same* delimiter as the opening one and RE2 has
+// no backreference to say so. The expression this replaces accepted either
+// delimiter as the close of either opener, anywhere on a line — so a backtick
+// block whose body mentioned `~~~`, in a YAML comment or a piece of quoted
+// output, ended there. What followed was not reported: the prefix already held
+// a valid rule, so the block decoded, and every grant after that line was
+// dropped in silence. That is the exact disappearance this package exists to
+// prevent, in the reader written to prevent it.
+//
+// CommonMark's rules, as far as they matter here: the closing fence is the
+// same character, at least as long as the opening run, alone on its line but
+// for up to three leading spaces and trailing whitespace. An unclosed fence
+// runs to the end of the document, which is a page nobody would ship and is
+// read rather than refused — the decoders downstream say what is wrong with it
+// far more usefully than "no closing fence" would.
+func fencedYAML(doc string) []string {
+	var out []string
+
+	lines := strings.Split(doc, "\n")
+	for i := 0; i < len(lines); i++ {
+		opening := fenceOpening.FindStringSubmatch(lines[i])
+		if opening == nil {
+			continue
+		}
+
+		delimiter := opening[1]
+		body := i + 1
+		i = body
+		for ; i < len(lines) && !closesFence(lines[i], delimiter); i++ {
+		}
+		out = append(out, strings.Join(lines[body:min(i, len(lines))], "\n"))
+	}
+	return out
+}
+
+// closesFence reports whether a line ends a fence opened with this delimiter.
+func closesFence(line, delimiter string) bool {
+	trimmed := strings.TrimRight(strings.TrimLeft(line, " "), " \t")
+	if len(line)-len(strings.TrimLeft(line, " ")) > 3 {
+		return false
+	}
+	// The same character, and at least as many: ```` closes ```, and ``` does
+	// not close ````. Nothing else may share the line.
+	if len(trimmed) < len(delimiter) {
+		return false
+	}
+	return strings.Trim(trimmed, delimiter[:1]) == ""
+}
 
 // Documented decodes the role snippets in a Markdown page.
 //
@@ -308,9 +363,7 @@ var fencedYAML = regexp.MustCompile("(?is)(?:```|~~~)[ \t]*ya?ml[ \t]*\n(.*?)(?:
 // against, so it may not be a way of succeeding.
 func Documented(doc string) ([]Role, error) {
 	var out []Role
-	for _, match := range fencedYAML.FindAllStringSubmatch(doc, -1) {
-		body := match[1]
-
+	for _, body := range fencedYAML(doc) {
 		role, err := fragment(body)
 		// A block naming any rule field is a rule list, whatever became of it.
 		// Keying that on `apiGroups:` alone skipped a non-resource snippet in
@@ -339,6 +392,23 @@ func Documented(doc string) ([]Role, error) {
 		if why := malformed(role); why != "" {
 			return nil, fmt.Errorf("a documented block declares a rule Kubernetes refuses: "+
 				"%s. A role written from this page would be rejected whole:\n%s", why, body)
+		}
+
+		// And the refusal [decode] makes of the chart's own manifests, for the
+		// same reason and with more at stake. A ClusterRole carrying an
+		// aggregationRule does not grant what is written in it: the
+		// aggregation controller replaces those rules with the union of every
+		// ClusterRole its selectors match. The flattened grants can agree with
+		// the chart exactly while an operator who assembled this role from the
+		// page holds whatever labels elsewhere in their cluster decide —
+		// possibly nothing. Checked here as well because this page is written
+		// for the operator who is *not* using the chart, so nothing else in
+		// their install would catch it.
+		if role.Aggregation != nil {
+			return nil, fmt.Errorf("a documented block declares an aggregationRule, so "+
+				"Kubernetes decides its rules from labels on other ClusterRoles and the "+
+				"rules shown here are overwritten — an operator assembling this role may "+
+				"receive none of these permissions:\n%s", body)
 		}
 
 		// Which object a fragment belongs to is written in its first line as a

@@ -137,7 +137,7 @@ func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
 	// The install the chart ships. Every binding must name the account it
 	// creates, and the pod must run as it.
 	account, _ := renderedServiceAccount(t)
-	shipped := requireBoundTo(t, nil, account)
+	shipped := requireBoundTo(t, rbacdoc.Options{}, account)
 
 	if got := deploymentServiceAccount(t); got != account {
 		t.Errorf("the pod runs as %q and the chart creates and binds %q", got, account)
@@ -174,10 +174,10 @@ func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
 	// at all — would be granting an operator less than the chart promises,
 	// invisibly: binpack starts, holds its lease, and 403s on whatever the
 	// missing binding covered.
-	managed := map[string]string{
+	managed := rbacdoc.Options{Set: map[string]string{
 		"serviceAccount.create": "false",
 		"serviceAccount.name":   "managed-elsewhere",
-	}
+	}}
 
 	external := requireBoundTo(t, managed, "managed-elsewhere")
 	if !slices.Equal(shipped, external) {
@@ -199,6 +199,91 @@ func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
 	}
 }
 
+// TestAnInstallIntoAnotherNamespaceIsAnchoredThere renders somewhere other
+// than the chart's default and holds everything namespaced to it.
+//
+// Every other render in this file installs into binpack-system, so every
+// assertion about a namespace accepted that literal string. A subject changed
+// from `.Release.Namespace` to `binpack-system` passed all of them — and an
+// install anywhere else binds an account in a namespace its pod does not run
+// in, which grants binpack nothing while every object looks correct.
+//
+// A ServiceAccount subject resolves per namespace, so this is the difference
+// between a chart that can be installed anywhere and one that works in exactly
+// one place. Nothing in `helm lint` or a default render can see it.
+func TestAnInstallIntoAnotherNamespaceIsAnchoredThere(t *testing.T) {
+	// Not a prefix or suffix of the default, so a partial substitution cannot
+	// pass by resembling it.
+	const namespace = "operators"
+	install := rbacdoc.Options{Namespace: namespace}
+
+	account, created := renderedServiceAccount(t, install)
+	if created != namespace {
+		t.Errorf("installing into %q creates the ServiceAccount in %q; the pod runs in "+
+			"the release's namespace and the account it names is somewhere else",
+			namespace, created)
+	}
+	if got := deploymentServiceAccount(t, install); got != account {
+		t.Errorf("installing into %q runs the pod as %q and creates %q", namespace, got, account)
+	}
+
+	// Every binding's subject, which is where a pinned namespace does its
+	// damage: the binding is accepted, and it grants an account that is not
+	// the one binpack runs as.
+	requireBoundTo(t, install, account)
+
+	// The namespaced Roles and their bindings. The leader-election pair follows
+	// the release; the autoscaler-status pair follows its own setting, which is
+	// a different namespace on purpose and is checked elsewhere.
+	objects, err := rbacdoc.Objects(rbacdoc.MustRender(t.Fatal, install))
+	if err != nil {
+		t.Fatalf("reading the rendered objects: %v", err)
+	}
+
+	var found int
+	for _, object := range objects {
+		if !strings.Contains(object.Metadata.Name, "-leader-election") {
+			continue
+		}
+		found++
+		if object.Metadata.Namespace != namespace {
+			t.Errorf("installing into %q creates the %s %s in %q; binpack takes its Lease "+
+				"where it runs, and holds permission somewhere else", namespace,
+				object.Kind, object.Metadata.Name, object.Metadata.Namespace)
+		}
+	}
+	if found != 2 {
+		t.Fatalf("found %d leader-election objects, want the Role and its RoleBinding",
+			found)
+	}
+
+	// And the process has to be told where it is running, or it elects in a
+	// namespace it holds nothing in.
+	if got := leaderElectionNamespaceFlag(t, install); got != namespace {
+		t.Errorf("installing into %q starts the pod with --leader-election-namespace=%q; "+
+			"the Role is where the release is and the Lease is taken elsewhere",
+			namespace, got)
+	}
+
+	// The ConfigMap the pod mounts is namespaced too, and a volume cannot
+	// reach one in another namespace.
+	renderedConfig(t, install)
+}
+
+// releaseNamespace is the namespace a render installs into.
+//
+// Named rather than compared against rbacdoc.DefaultNamespace directly,
+// because every render in this file used the default and so every assertion
+// accepted the literal string: a subject pinned to `binpack-system` passed
+// them all, and an install anywhere else bound an account in a namespace its
+// pod does not run in.
+func releaseNamespace(options rbacdoc.Options) string {
+	if options.Namespace != "" {
+		return options.Namespace
+	}
+	return rbacdoc.DefaultNamespace
+}
+
 // requireBoundTo checks that every binding one set of values renders names the
 // given account, and returns the bindings it found, sorted.
 //
@@ -210,12 +295,14 @@ func TestTheChartNeverBindsTheDefaultServiceAccount(t *testing.T) {
 // name. The version this replaces iterated subjects and skipped anything that
 // was not already a correctly-kinded ServiceAccount, which made all three
 // invisible.
-func requireBoundTo(t *testing.T, values map[string]string, account string) []string {
+func requireBoundTo(t *testing.T, options rbacdoc.Options, account string) []string {
 	t.Helper()
 
-	bindings, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: values}))
+	namespace := releaseNamespace(options)
+
+	bindings, err := rbacdoc.Bindings(rbacdoc.MustRender(t.Fatal, options))
 	if err != nil {
-		t.Fatalf("reading the bindings rendered with %v: %v", values, err)
+		t.Fatalf("reading the bindings rendered with %v: %v", options.Set, err)
 	}
 	// Three: the ClusterRoleBinding, the autoscaler-status RoleBinding and the
 	// leader-election RoleBinding. A parse that found none would satisfy every
@@ -223,7 +310,7 @@ func requireBoundTo(t *testing.T, values map[string]string, account string) []st
 	if len(bindings) < 3 {
 		t.Fatalf("%v renders %d bindings, want the three the chart has always "+
 			"rendered: the parse has lost the structure it is checking",
-			values, len(bindings))
+			options.Set, len(bindings))
 	}
 
 	var found []string
@@ -252,7 +339,7 @@ func requireBoundTo(t *testing.T, values map[string]string, account string) []st
 			t.Errorf("the %s %s binds %q and the account is %q; the binding grants an "+
 				"account binpack does not run as, and binpack holds nothing",
 				binding.Kind, binding.Metadata.Name, subject.Name, account)
-		case subject.Namespace != rbacdoc.DefaultNamespace:
+		case subject.Namespace != namespace:
 			t.Errorf("the %s %s binds %q in namespace %q; a ServiceAccount subject "+
 				"resolves per namespace, so the right name in the wrong one grants "+
 				"binpack nothing", binding.Kind, binding.Metadata.Name,
@@ -961,10 +1048,10 @@ func joinContinuations(lines []string) []string {
 
 // renderedServiceAccount is the account the chart creates: the name and the
 // namespace Helm renders, not an expression standing in for them.
-func renderedServiceAccount(t *testing.T) (name, namespace string) {
+func renderedServiceAccount(t *testing.T, opts ...rbacdoc.Options) (name, namespace string) {
 	t.Helper()
 
-	objects, err := rbacdoc.Objects(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{}))
+	objects, err := rbacdoc.Objects(rbacdoc.MustRender(t.Fatal, only(t, opts)))
 	if err != nil {
 		t.Fatalf("reading the chart's objects: %v", err)
 	}
@@ -997,10 +1084,10 @@ func renderedServiceAccount(t *testing.T) (name, namespace string) {
 }
 
 // deploymentServiceAccount is the account the rendered pod runs as.
-func deploymentServiceAccount(t *testing.T, values ...map[string]string) string {
+func deploymentServiceAccount(t *testing.T, opts ...rbacdoc.Options) string {
 	t.Helper()
 
-	account := renderedDeployment(t, values...).Spec.Template.Spec.ServiceAccountName
+	account := renderedDeployment(t, opts...).Spec.Template.Spec.ServiceAccountName
 	if account == "" {
 		t.Fatal("the rendered Deployment sets no serviceAccountName, so the pod runs as " +
 			"the namespace's default account and every binding here grants binpack nothing")
@@ -1021,8 +1108,18 @@ type deployment struct {
 			Spec struct {
 				ServiceAccountName string `json:"serviceAccountName"`
 				Containers         []struct {
-					Args []string `json:"args"`
+					Args         []string `json:"args"`
+					VolumeMounts []struct {
+						Name      string `json:"name"`
+						MountPath string `json:"mountPath"`
+					} `json:"volumeMounts"`
 				} `json:"containers"`
+				Volumes []struct {
+					Name      string `json:"name"`
+					ConfigMap *struct {
+						Name string `json:"name"`
+					} `json:"configMap"`
+				} `json:"volumes"`
 			} `json:"spec"`
 		} `json:"template"`
 	} `json:"spec"`
@@ -1036,60 +1133,117 @@ type deployment struct {
 // manifests was satisfied by a templated comment left above a dropped field —
 // the Role would follow the setting, the process would fall back to the
 // default, and every status read is a 403 the check said could not happen.
-func renderedConfig(t *testing.T, values ...map[string]string) *v1alpha1.Config {
+func renderedConfig(t *testing.T, opts ...rbacdoc.Options) *v1alpha1.Config {
 	t.Helper()
 
-	set := map[string]string{}
-	for _, v := range values {
-		maps.Copy(set, v)
-	}
+	options := only(t, opts)
+
+	// Which ConfigMap, traced from the flag the process is started with rather
+	// than taken as the only one of its kind. Decoding whatever ConfigMap the
+	// chart happened to render says what that object holds and nothing about
+	// what binpack loads: pointing the volume at a name nothing creates left
+	// this green while the pod cannot start.
+	name, key := mountedConfig(t, options)
 
 	type configMap struct {
-		Kind string            `json:"kind"`
-		Data map[string]string `json:"data"`
+		Kind     string            `json:"kind"`
+		Metadata rbacdoc.Metadata  `json:"metadata"`
+		Data     map[string]string `json:"data"`
 	}
 
 	var found []configMap
-	for doc := range strings.SplitSeq(rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: set}), "\n---\n") {
+	for doc := range strings.SplitSeq(rbacdoc.MustRender(t.Fatal, options), "\n---\n") {
 		var c configMap
 		if err := yaml.Unmarshal([]byte(doc), &c); err != nil {
 			t.Fatalf("a rendered document does not parse as YAML: %v\n%s", err, doc)
 		}
-		if c.Kind == "ConfigMap" {
+		if c.Kind == "ConfigMap" && c.Metadata.Name == name {
 			found = append(found, c)
 		}
 	}
 	if len(found) != 1 {
-		t.Fatalf("the chart renders %d ConfigMaps with %v, want the one binpack reads "+
-			"its configuration from", len(found), set)
+		t.Fatalf("the pod mounts the ConfigMap %q and the chart renders %d of that name; "+
+			"the process starts on a volume Kubernetes cannot populate", name, len(found))
+	}
+	// A ConfigMap volume is namespaced to the pod, so one rendered elsewhere is
+	// as absent as one not rendered at all.
+	if got := found[0].Metadata.Namespace; got != releaseNamespace(options) {
+		t.Errorf("the pod runs in %q and the ConfigMap it mounts is created in %q; the "+
+			"volume names a ConfigMap that does not exist where the pod is scheduled",
+			releaseNamespace(options), got)
 	}
 
-	const key = "config.yaml"
 	body, ok := found[0].Data[key]
 	if !ok {
-		t.Fatalf("the rendered ConfigMap has no %s, so the process starts on its own "+
-			"defaults whatever the chart was told", key)
+		t.Fatalf("the process is started with --file naming %q and the ConfigMap it mounts "+
+			"has keys %v; the file is not there, so binpack starts on its own defaults "+
+			"whatever the chart was told", key, slices.Sorted(maps.Keys(found[0].Data)))
 	}
 
 	cfg, err := v1alpha1.Load([]byte(body))
 	if err != nil {
 		t.Fatalf("the configuration the chart renders with %v is one binpack rejects: "+
-			"%v\n%s", set, err, body)
+			"%v\n%s", options.Set, err, body)
 	}
 	return cfg
 }
 
-// renderedDeployment is the one Deployment a default install renders.
-func renderedDeployment(t *testing.T, values ...map[string]string) deployment {
+// mountedConfig is the ConfigMap the rendered pod actually reads its
+// configuration from, and the key within it.
+//
+// Traced end to end, because every link is a way to render a correct ConfigMap
+// the process never sees: --file names a path, the path has to fall inside a
+// volumeMount, the mount has to name a volume, and the volume has to be a
+// ConfigMap. A break anywhere leaves the pod loading its own defaults or not
+// starting at all, and the object this test decodes says nothing about either.
+func mountedConfig(t *testing.T, options rbacdoc.Options) (name, key string) {
 	t.Helper()
 
-	set := map[string]string{}
-	for _, v := range values {
-		maps.Copy(set, v)
+	const flag = "--file"
+
+	path, ok := flagValue(t, containerArgs(t, options), flag)
+	if !ok {
+		t.Fatalf("the rendered pod is not started with %s, so it reads no configuration "+
+			"file and the ConfigMap the chart renders is not what it runs on", flag)
 	}
 
+	container := renderedDeployment(t, options).Spec.Template.Spec.Containers[0]
+
+	var volume string
+	for _, mount := range container.VolumeMounts {
+		if rel, under := strings.CutPrefix(path, strings.TrimSuffix(mount.MountPath, "/")+"/"); under {
+			volume, key = mount.Name, rel
+		}
+	}
+	if volume == "" {
+		t.Fatalf("the rendered pod is started with %s=%s and no volumeMount covers that "+
+			"path, so the file is not in the container at all", flag, path)
+	}
+
+	for _, v := range renderedDeployment(t, options).Spec.Template.Spec.Volumes {
+		if v.Name != volume {
+			continue
+		}
+		if v.ConfigMap == nil {
+			t.Fatalf("the volume %q holding %s is not a ConfigMap, so the configuration "+
+				"the chart renders is not what the process reads", volume, path)
+		}
+		return v.ConfigMap.Name, key
+	}
+
+	t.Fatalf("the container mounts a volume named %q and the pod declares no such volume; "+
+		"the Deployment would be refused and nothing runs", volume)
+	return "", ""
+}
+
+// renderedDeployment is the one Deployment a default install renders.
+func renderedDeployment(t *testing.T, opts ...rbacdoc.Options) deployment {
+	t.Helper()
+
+	options := only(t, opts)
+
 	var found []deployment
-	manifests := rbacdoc.MustRender(t.Fatal, rbacdoc.Options{Set: set})
+	manifests := rbacdoc.MustRender(t.Fatal, options)
 	for doc := range strings.SplitSeq(manifests, "\n---\n") {
 		var d deployment
 		if err := yaml.Unmarshal([]byte(doc), &d); err != nil {
@@ -1101,9 +1255,28 @@ func renderedDeployment(t *testing.T, values ...map[string]string) deployment {
 	}
 
 	if len(found) != 1 {
-		t.Fatalf("the chart renders %d Deployments with %v, want one", len(found), set)
+		t.Fatalf("the chart renders %d Deployments with %v, want one", len(found), options.Set)
 	}
 	return found[0]
+}
+
+// only is the single Options a helper was given, or the zero value.
+//
+// Variadic so that the common case — the install the chart ships — needs no
+// argument, and bounded at one because two would have to be merged and the
+// merge is a rule nobody reading the call could see.
+func only(t *testing.T, opts []rbacdoc.Options) rbacdoc.Options {
+	t.Helper()
+
+	switch len(opts) {
+	case 0:
+		return rbacdoc.Options{}
+	case 1:
+		return opts[0]
+	default:
+		t.Fatalf("given %d renders to read one answer from", len(opts))
+		return rbacdoc.Options{}
+	}
 }
 
 // containerArgs is the flags the rendered pod's single container is started
@@ -1112,10 +1285,10 @@ func renderedDeployment(t *testing.T, values ...map[string]string) deployment {
 // One container is asserted rather than assumed. A sidecar appended to the
 // list would make "the args" a question about ordering, and answering it by
 // position is how a test goes on passing while reading somebody else's flags.
-func containerArgs(t *testing.T, values ...map[string]string) []string {
+func containerArgs(t *testing.T, opts ...rbacdoc.Options) []string {
 	t.Helper()
 
-	containers := renderedDeployment(t, values...).Spec.Template.Spec.Containers
+	containers := renderedDeployment(t, opts...).Spec.Template.Spec.Containers
 	if len(containers) != 1 {
 		t.Fatalf("the rendered pod has %d containers, want the one binpack runs in",
 			len(containers))
@@ -1253,12 +1426,12 @@ func TestTheLeaderElectionRoleIsWhereTheLeaseIsTaken(t *testing.T) {
 
 // leaderElectionNamespaceFlag is the namespace the rendered pod is told to
 // take its Lease in.
-func leaderElectionNamespaceFlag(t *testing.T) string {
+func leaderElectionNamespaceFlag(t *testing.T, opts ...rbacdoc.Options) string {
 	t.Helper()
 
 	const flag = "--leader-election-namespace"
 
-	value, ok := flagValue(t, containerArgs(t), flag)
+	value, ok := flagValue(t, containerArgs(t, opts...), flag)
 	if !ok {
 		t.Fatal("the rendered pod is no longer started with " + flag + ", so this cannot " +
 			"say where the Lease is taken; if the flag has gone, so has the reason for " +
@@ -1382,7 +1555,9 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 	// guard test above confirms — and starts a process that tries to take one
 	// anyway, then 403s for as long as it runs.
 	for _, enabled := range []string{"true", "false"} {
-		args := containerArgs(t, map[string]string{"leaderElection.enabled": enabled})
+		args := containerArgs(t, rbacdoc.Options{
+			Set: map[string]string{"leaderElection.enabled": enabled},
+		})
 
 		value, ok := flagValue(t, args, "--leader-election")
 		if !ok {
@@ -1425,8 +1600,8 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 	// And the process has to be told the same thing, or the Role is in the
 	// right place for a namespace binpack never reads. Loaded rather than
 	// matched, so this is the value binpack would run on — see [renderedConfig].
-	cfg := renderedConfig(t, map[string]string{
-		"config.discovery.autoscalerNamespace": elsewhere,
+	cfg := renderedConfig(t, rbacdoc.Options{
+		Set: map[string]string{"config.discovery.autoscalerNamespace": elsewhere},
 	})
 	if got := cfg.Discovery.AutoscalerNamespace; got != elsewhere {
 		t.Errorf("config.discovery.autoscalerNamespace is %q and the configuration the "+

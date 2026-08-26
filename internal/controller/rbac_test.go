@@ -558,6 +558,48 @@ func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 			executorSource)
 	}
 
+	// And the names a Writer is passed on to inside the file. `writer := w`
+	// followed by a conditional `writer.Patch(…)` was a write this could not
+	// see: the entry point stayed in `driven`, and a fixture that missed the
+	// branch left the recorder contributing no grant at all, so every RBAC
+	// comparison passed over a call the production path makes.
+	//
+	// To a fixpoint, because an alias may be aliased. Deliberately not scoped
+	// per function: a name that shadows one of these elsewhere is treated as a
+	// writer too, which over-approximates — the cost is a write examined that
+	// need not have been, and the alternative errs the other way.
+	for grew := true; grew; {
+		grew = false
+		ast.Inspect(source, func(n ast.Node) bool {
+			var lhs, rhs []ast.Expr
+			switch n := n.(type) {
+			case *ast.AssignStmt:
+				lhs, rhs = n.Lhs, n.Rhs
+			case *ast.ValueSpec:
+				for _, name := range n.Names {
+					lhs = append(lhs, name)
+				}
+				rhs = n.Values
+			default:
+				return true
+			}
+
+			if len(lhs) != len(rhs) {
+				return true
+			}
+			for i, target := range lhs {
+				name, ok := target.(*ast.Ident)
+				source, isIdent := rhs[i].(*ast.Ident)
+				if !ok || !isIdent || !writerNames[source.Name] || writerNames[name.Name] {
+					continue
+				}
+				writerNames[name.Name] = true
+				grew = true
+			}
+			return true
+		})
+	}
+
 	var found int
 	var walk func(n ast.Node, conditional bool)
 	walk = func(n ast.Node, conditional bool) {
