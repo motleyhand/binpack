@@ -238,21 +238,45 @@ func Bindings(template string) ([]Binding, error) {
 // "Role"` is the same object to Kubernetes and to every reader here, and to a
 // substring it is not there at all.
 func Kinds(template string) ([]string, error) {
-	yml, err := HelmToYAML(template)
+	objects, err := Objects(template)
 	if err != nil {
 		return nil, err
 	}
 
 	var out []string
+	for _, object := range objects {
+		out = append(out, object.Kind)
+	}
+	return out, nil
+}
+
+// Object is what a document says it is.
+type Object struct {
+	APIVersion string   `json:"apiVersion"`
+	Kind       string   `json:"kind"`
+	Metadata   Metadata `json:"metadata"`
+}
+
+// Objects is every document a chart template declares, by what it declares
+// itself to be.
+//
+// Decoded rather than matched, for the reason every other reader here decodes:
+// `# kind: ServiceAccount` above a changed field satisfies a search for the
+// text and describes an object the chart does not create.
+func Objects(template string) ([]Object, error) {
+	yml, err := HelmToYAML(template)
+	if err != nil {
+		return nil, err
+	}
+
+	var out []Object
 	for _, doc := range documentSeparator.Split(yml, -1) {
-		var object struct {
-			Kind string `json:"kind"`
-		}
+		var object Object
 		if err := yaml.Unmarshal([]byte(doc), &object); err != nil {
 			return nil, fmt.Errorf("a rendered document does not parse as YAML: %w\n%s", err, doc)
 		}
 		if object.Kind != "" {
-			out = append(out, object.Kind)
+			out = append(out, object)
 		}
 	}
 	return out, nil
@@ -515,11 +539,12 @@ func depthDelta(line string) int {
 
 // fencedYAML matches a fenced YAML block in Markdown, capturing its body.
 //
-// `yml`, any capitalisation of either, and a tilde fence, because a renderer
-// treats them all as YAML and a page is free to use any. Keyed on one exact
-// spelling, a granted snippet written another way was skipped whole while the
-// remaining blocks kept the non-empty guard satisfied.
-var fencedYAML = regexp.MustCompile("(?is)(?:```|~~~)ya?ml[ \t]*\n(.*?)(?:```|~~~)")
+// `yml`, any capitalisation of either, a tilde fence, and whitespace before
+// the info string — a renderer treats them all as YAML and a page is free to
+// use any. Keyed on one exact spelling, a granted snippet written another way
+// was skipped whole while the remaining blocks kept the non-empty guard
+// satisfied.
+var fencedYAML = regexp.MustCompile("(?is)(?:```|~~~)[ \t]*ya?ml[ \t]*\n(.*?)(?:```|~~~)")
 
 // Documented decodes the role snippets in a Markdown page.
 //

@@ -602,6 +602,18 @@ func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 				walk(child, true)
 			}
 			return
+		case *ast.BinaryExpr:
+			// `&&` and `||` do not evaluate their right operand when the left
+			// decides the answer, so a write there is as conditional as one in
+			// a branch body — `if annotated && w.Patch(…) != nil` reaches the
+			// patch only for annotated nodes. The condition of an if was
+			// walked with its caller's state, which read the whole of it as
+			// always evaluated.
+			if n.Op == token.LAND || n.Op == token.LOR {
+				walk(n.X, conditional)
+				walk(n.Y, true)
+				return
+			}
 		case *ast.CallExpr:
 			if writesThroughWriter(n) {
 				found++

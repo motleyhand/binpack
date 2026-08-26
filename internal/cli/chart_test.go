@@ -1014,16 +1014,23 @@ func renderedServiceAccount(t *testing.T) (name, namespace string) {
 		t.Fatalf("reading the chart's ServiceAccount: %v", err)
 	}
 
-	// What it is, before what it is called. Changed to another valid kind the
-	// metadata still reads the same, so the Deployment and the bindings went
-	// on agreeing with a name nothing creates — and a default install has no
-	// ServiceAccount and a pod Kubernetes will not start.
-	for _, want := range []string{"apiVersion: v1", "kind: ServiceAccount"} {
-		if !strings.Contains(string(manifest), want+"\n") {
-			t.Errorf("the chart's serviceaccount.yaml does not declare %q; whatever it "+
-				"creates, the Deployment and every binding name an account that does not "+
-				"exist", want)
-		}
+	// What it is, before what it is called — decoded, because a search for the
+	// text is satisfied by `# kind: ServiceAccount` left above a changed
+	// field. Changed to another valid kind the metadata still reads the same,
+	// so the Deployment and the bindings go on agreeing about a name nothing
+	// creates and a default install has a pod Kubernetes will not start.
+	objects, err := rbacdoc.Objects(string(manifest))
+	if err != nil {
+		t.Fatalf("reading the chart's ServiceAccount: %v", err)
+	}
+	if len(objects) != 1 {
+		t.Fatalf("serviceaccount.yaml declares %d objects, want the one account the "+
+			"Deployment and every binding name", len(objects))
+	}
+	if objects[0].APIVersion != "v1" || objects[0].Kind != "ServiceAccount" {
+		t.Errorf("serviceaccount.yaml declares %s %s, not a v1 ServiceAccount; whatever it "+
+			"creates, the Deployment and every binding name an account that does not exist",
+			objects[0].APIVersion, objects[0].Kind)
 	}
 
 	var section string
@@ -1419,7 +1426,7 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 		t.Errorf("binpack.autoscalerNamespace is %d actions; with more than one, which "+
 			"of them decides the namespace is a question this cannot answer and the two "+
 			"RBAC objects are held to the helper by name alone", len(actions))
-	} else if strings.Contains(actions[0], ":=") {
+	} else if assigns(actions[0]) {
 		// An assignment emits nothing. `{{- $_ := dig … -}}` has one action,
 		// no literal beside it and the dig inside it, and returns the empty
 		// string — which is the shape the previous version of this check was
@@ -1451,6 +1458,23 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 		t.Errorf("serviceAccount.create: false still renders %v; an operator who named an "+
 			"external account receives a chart-managed one too", kinds)
 	}
+}
+
+// assigns reports whether a template action assigns rather than emits.
+//
+// Both spellings: `:=` declares and `=` re-assigns, and neither renders
+// anything. Checking only the first left `{{- $ = dig … -}}` satisfying every
+// other part of the shape and returning the empty string. Comparisons in a
+// template are `eq` and `ne`, so an `=` outside those operators is an
+// assignment.
+func assigns(action string) bool {
+	if strings.Contains(action, ":=") {
+		return true
+	}
+	for _, comparison := range []string{"==", "!=", ">=", "<="} {
+		action = strings.ReplaceAll(action, comparison, "")
+	}
+	return strings.Contains(action, "=")
 }
 
 // helmAction matches one Go template action, as rbacdoc's does.
