@@ -303,17 +303,26 @@ func TestTheChartBindsTheAutoscalerStatusRoleWhereBinpackReads(t *testing.T) {
 			continue
 		}
 		found++
+
+		// Which namespace this is, read from the document's structure rather
+		// than from what its value mentions. A binding carries two: the
+		// object's own, under `metadata`, and the ServiceAccount subject's,
+		// under `subjects` — and the second is the release's namespace and has
+		// nothing to do with where the autoscaler runs. Classifying them by
+		// looking for `.Release.Namespace` in the value skipped anything that
+		// mentioned it, so `{{ printf "%s-wrong" .Release.Namespace }}` on the
+		// object itself was read as the subject's line and never checked at
+		// all. Same section-tracking as roleBindings above.
+		var section string
 		for line := range strings.SplitSeq(doc, "\n") {
+			if !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":") {
+				section = strings.TrimSuffix(line, ":")
+			}
 			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "namespace:") {
+			if section != "metadata" || !strings.HasPrefix(line, "namespace:") {
 				continue
 			}
 			value := strings.TrimSpace(strings.TrimPrefix(line, "namespace:"))
-			// The ServiceAccount subject is in the release's namespace and
-			// has nothing to do with where the autoscaler runs.
-			if strings.Contains(value, ".Release.Namespace") {
-				continue
-			}
 			// The whole expression, not a substring of it. Containment says
 			// the helper is mentioned; what has to hold is that its value is
 			// the namespace, and `printf "%s-wrong" (include …)` mentions it
