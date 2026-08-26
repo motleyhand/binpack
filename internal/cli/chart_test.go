@@ -700,6 +700,17 @@ func TestEveryRoleTheChartRendersIsBoundToItself(t *testing.T) {
 	for _, b := range bindings {
 		bound[b.RoleRef.Kind+"/"+b.RoleRef.Name] = true
 
+		// Kubernetes rejects a binding whose roleRef names another API group,
+		// and nothing else here would notice: the kind and name would still be
+		// the pair this test expects. Helm validates neither, and roleRef is
+		// immutable, so the failure lands at install with no upgrade that
+		// repairs it.
+		if b.RoleRef.APIGroup != rbacdoc.RBACAPIGroup {
+			t.Errorf("the %s %s has roleRef.apiGroup %q, and Kubernetes accepts only %q; "+
+				"the API server refuses the object and the install is missing a binding",
+				b.Kind, b.Metadata.Name, b.RoleRef.APIGroup, rbacdoc.RBACAPIGroup)
+		}
+
 		// A RoleBinding is only effective in its own namespace, so one in a
 		// different namespace from the Role it names binds nothing.
 		if b.Kind == "RoleBinding" {

@@ -29,6 +29,11 @@ import (
 	"sigs.k8s.io/yaml"
 )
 
+// RBACAPIGroup is the only API group a roleRef may name. Kubernetes rejects a
+// binding that names another, and the rejection is at install: roleRef is
+// immutable, so there is no upgrade path that repairs it either.
+const RBACAPIGroup = "rbac.authorization.k8s.io"
+
 // The two documents, spelled once. The prefix is relative to a package
 // directory one level under the repository root, which is where every caller
 // lives.
@@ -110,8 +115,14 @@ type Binding struct {
 	Kind     string   `json:"kind"`
 	Metadata Metadata `json:"metadata"`
 	RoleRef  struct {
-		Kind string `json:"kind"`
-		Name string `json:"name"`
+		// APIGroup is modelled because Kubernetes rejects a binding whose
+		// roleRef names the wrong one, and nothing else here would notice: the
+		// kind and name would still be the pair this package expects. Helm
+		// validates neither, and roleRef is immutable, so the failure is at
+		// install rather than at upgrade.
+		APIGroup string `json:"apiGroup"`
+		Kind     string `json:"kind"`
+		Name     string `json:"name"`
 	} `json:"roleRef"`
 
 	// Subjects is who the binding grants to, which is the other half of
@@ -222,6 +233,22 @@ func section(template, guard string) (body, rest string, err error) {
 			continue
 		}
 
+		// An `else` belonging to this guard renders when the guard is false,
+		// which is precisely the case [Without] exists to model — and Without
+		// deletes the whole block, both branches with it. A grant in the else
+		// branch would then be classified as gated while every install without
+		// the opt-in received it. Modelling the false render means rendering
+		// the chart; refusing is the honest alternative.
+		//
+		// Depth one only: a nested block's else is inside content this either
+		// keeps whole or removes whole, so it changes nothing.
+		if depth == 1 && hasElse(line) {
+			return "", "", fmt.Errorf("the block gated on %s has an else branch at line %d, "+
+				"which renders when %s is false — this substitution models a guard by "+
+				"removing it and would report that branch's rules as gated; render the "+
+				"chart or split the branches into separate blocks", guard, i+1, guard)
+		}
+
 		if depth += depthDelta(line); depth == 0 {
 			kept := append(append([]string{}, lines[:start-1]...), lines[i+1:]...)
 			return strings.Join(lines[start:i], "\n"), strings.Join(kept, "\n"), nil
@@ -232,6 +259,17 @@ func section(template, guard string) (body, rest string, err error) {
 		return "", "", fmt.Errorf("the chart no longer gates any rules on %s", guard)
 	}
 	return "", "", fmt.Errorf("the rules the chart gates on %s are not a closed block", guard)
+}
+
+// hasElse reports whether a line carries an else or else-if action.
+func hasElse(line string) bool {
+	for _, action := range helmAction.FindAllString(line, -1) {
+		body := strings.TrimSpace(strings.Trim(strings.Trim(action, "{}"), "-"))
+		if keyword, _, _ := strings.Cut(body, " "); keyword == "else" {
+			return true
+		}
+	}
+	return false
 }
 
 // depthDelta is how far one line opens or closes template blocks.

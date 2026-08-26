@@ -272,3 +272,40 @@ func TestEveryPublishedVocabularyIsASet(t *testing.T) {
 		}
 	}
 }
+
+// TestTheAbandonmentReasonsAreOneSet is the cross-enumerator half of
+// TestEveryPublishedVocabularyIsASet, and it is needed because one label
+// namespace is fed by three lists.
+//
+// binpack_drains_abandoned_total{reason} carries a drain's own codes, the skip
+// codes a revalidation can end a drain with, and the verdicts that can. Each
+// list is distinct within itself and nothing checked them against each other:
+// AbandonStuck taking SkipBackoff's value leaves every per-list guard green,
+// and the reference updated to the resulting vocabulary agrees with it. The
+// series then means both "this drain is wedged on a finalizer" and "this node
+// is in backoff", and an alert on it cannot say which — which is exactly the
+// distinction PUBLIC-01 split these codes apart to make.
+//
+// The same three lists the reference's abandonment table is checked against,
+// so a value added to that namespace is covered here without being named.
+func TestTheAbandonmentReasonsAreOneSet(t *testing.T) {
+	var reasons []string
+	reasons = append(reasons, drain.AbandonCodes()...)
+	reasons = append(reasons, engine.SkipCodes()...)
+	reasons = append(reasons, engine.Verdicts()...)
+
+	if len(reasons) == 0 {
+		t.Fatal("the abandonment reasons enumerate nothing, so this asserts nothing")
+	}
+
+	seen := map[string]bool{}
+	for _, reason := range reasons {
+		if seen[reason] {
+			t.Errorf("%q reaches binpack_drains_abandoned_total{reason} from two of "+
+				"drain.AbandonCodes, engine.SkipCodes and engine.Verdicts; the two causes "+
+				"are one series, and nothing reading the metric can tell them apart",
+				reason)
+		}
+		seen[reason] = true
+	}
+}
