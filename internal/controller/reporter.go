@@ -65,21 +65,26 @@ func (r broadcastReporter) emit(
 	return nil
 }
 
-// eventWriter is the one write binpack makes outside internal/executor.
+// eventWriter is the one write binpack's own code makes outside
+// internal/executor.
 //
 // One method, and the narrowing is the point. internal/executor's package doc
-// tells a reviewer that reading executor.go enumerates what binpack can do to
-// a cluster, and executor.Writer holds Patch and the eviction subresource and
-// no Delete — which is what "binpack removes no object, ever" is read off. A
-// field of type client.Writer here held Create, Update, Patch, Delete and
-// DeleteAllOf, so that conclusion was correct about the executor and wrong
-// about the process: a Delete was one line away, in a file the enumeration
-// does not cover, and would have compiled and passed.
+// tells a reviewer that reading executor.go enumerates what binpack's code
+// does to a Node or a Pod, and executor.Writer holds Patch and the eviction
+// subresource and no Delete. A field of type client.Writer here held Create,
+// Update, Patch, Delete and DeleteAllOf, so a Delete was one line away in a
+// file that enumeration does not cover, and would have compiled and passed.
 //
 // The narrowing costs nothing — mgr.GetClient() satisfies this unchanged —
-// and it makes the exception the executor's doc now states an enforced one
-// rather than a promise. TestTheEventWriteIsTheOnlyOtherThingBinpackWrites
+// and it makes the exception the executor's doc states an enforced one rather
+// than a promise. TestTheEventCreateIsBinpacksOnlyWriteOutsideTheExecutor
 // counts the methods.
+//
+// It bounds this path and not the process. The long-running reporter above
+// hands events to client-go's recorder, which creates and patches on its own
+// account, and the manager writes a Lease and core Events for leader
+// election. Nothing in Go can narrow those; docs/reference/rbac.md is where
+// the process-wide surface is enumerated, and no rule there grants delete.
 type eventWriter interface {
 	Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error
 }

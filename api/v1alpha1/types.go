@@ -99,13 +99,20 @@ type Discovery struct {
 	// running" is a claim about the operator's cluster it has not established
 	// — and on a cluster that renamed the object, a false one.
 	//
-	// DefaultAutoscalerStatusName is the one spelling of that default in the
-	// tree, and binpack's tests build their fixtures from it rather than from
-	// a constant of their own. A second copy is self-consistent with whatever
+	// DefaultAutoscalerStatusName is the one spelling of that default in Go,
+	// and binpack's tests build their fixtures from it rather than from a
+	// constant of their own. A second Go copy is self-consistent with whatever
 	// the tests assert and silent about what binpack ships, so changing this
 	// value would leave an unconfigured binpack reading an object that is not
-	// there while the suite stayed green — reporting exactly the false claim
-	// the paragraph above says the configurability exists to avoid.
+	// there while the suite stayed green — exactly the false claim the
+	// paragraph above says the configurability exists to avoid.
+	//
+	// In Go, and no further. The chart hard-codes the literal in
+	// templates/NOTES.txt, where it renders the *namespace* half through the
+	// binpack.autoscalerNamespace helper and the name half not at all — so an
+	// operator who sets this field is told after install that binpack reads an
+	// object it will not read. Nothing in this package can hold that, and the
+	// claim above should not be read as covering it.
 	AutoscalerStatusName string `json:"autoscalerStatusName,omitempty"`
 
 	// NodeGroups states outright which node group a NodeGroupIDLabel value
