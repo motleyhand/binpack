@@ -63,6 +63,109 @@ pools:
 	}
 }
 
+// TestConfigValidateSaysWhichNamesItCouldNotCheck stops two binpack commands
+// giving opposite verdicts on one document.
+//
+// Two fields name something the cluster has to confirm, and neither is
+// confirmable from a document. `pools[].name` is checked for emptiness and
+// duplication at load time and against the cluster only in
+// [engine.ResolvePools]; `discovery.nodeGroups[].group` is checked there too,
+// by checkStatedJoin. This command has no cluster, so both got `configuration
+// is valid` and their entry echoed back fully resolved, while the deployed
+// controller refuses to start on the same file — "configuration overrides
+// pools that do not exist in this cluster", or "states a join to a node group
+// the cluster-autoscaler does not publish" — and evaluates nothing. The
+// command whose whole job is to say what a document resolves to was the one
+// that was wrong, and it was wrong in the reassuring direction.
+//
+// Both fields, because they are separate conditions and either can be
+// forgotten alone. The pools half was written first and the node-group half
+// found in review, which is the argument for the table.
+func TestConfigValidateSaysWhichNamesItCouldNotCheck(t *testing.T) {
+	for _, tc := range []struct {
+		what     string
+		document string
+		names    string
+	}{
+		{
+			what:     "pool override",
+			document: "pools:\n  - name: does-not-exist\n",
+			names:    "pools[].name",
+		},
+		{
+			// Discovered the same way and refused by the same preflight, but
+			// by a different check — so a disclosure conditioned on the pool
+			// overrides alone says nothing about a document that has only
+			// this. That was the state this test found.
+			what: "stated node-group join",
+			document: "discovery:\n  nodeGroups:\n    - labelValue: mng-a\n" +
+				"      group: does-not-exist\n",
+			names: "discovery.nodeGroups",
+		},
+	} {
+		t.Run(tc.what, func(t *testing.T) {
+			out, err := runWithStdin(t, tc.document, "config", "validate")
+			if err != nil {
+				t.Fatalf("config validate: %v", err)
+			}
+			// The field and the admission, not the sentence around them. What
+			// has to survive a rewording is that the report names the thing it
+			// did not check and says it did not check it.
+			for _, want := range []string{tc.names, "not checked"} {
+				if !strings.Contains(out, want) {
+					t.Errorf("the summary resolves a %s without saying the name is "+
+						"unchecked (%q missing):\n%s", tc.what, want, out)
+				}
+			}
+
+			// And not in the JSON, which is deliberate and is the reason this
+			// half is here at all. That report is a configuration document —
+			// `apiVersion`, `kind`, every key a configuration field — and
+			// docs/reference/cli.md promises feeding it back through `-f` is
+			// valid. The loader rejects unknown fields, so a top-level
+			// `notEvaluated` would make the report unloadable for exactly the
+			// documents these disclosures are about.
+			// TestValidateJSONRoundTrips is what fails if it is added.
+			//
+			// Nothing is lost by leaving it out. The JSON rendering never
+			// claims the configuration is valid — that sentence is the text
+			// summary's — it resolves a document, and what it says about an
+			// entry is true whether or not the cluster has what the entry
+			// names.
+			if _, ok := at(validateJSON(t, tc.document), "notEvaluated"); ok {
+				t.Errorf("the JSON report carries a key that is not a configuration " +
+					"field, so it no longer round-trips through -f")
+			}
+
+			// The negative half. A disclosure printed whatever the document
+			// says is noise, and noise is what teaches a reader to skip the
+			// line that matters: a configuration stating neither has nothing
+			// unchecked to disclose.
+			bare, err := runWithStdin(t, "interval: 45s\n", "config", "validate")
+			if err != nil {
+				t.Fatalf("config validate: %v", err)
+			}
+			if strings.Contains(bare, tc.names) {
+				t.Errorf("the summary disclosed a %s nobody configured:\n%s", tc.what, bare)
+			}
+		})
+	}
+}
+
+// validateJSON runs `config validate --output json` and decodes the result.
+func validateJSON(t *testing.T, stdin string) map[string]any {
+	t.Helper()
+	out, err := runWithStdin(t, stdin, "config", "validate", "--output", "json")
+	if err != nil {
+		t.Fatalf("config validate --output json: %v", err)
+	}
+	var got map[string]any
+	if err := json.Unmarshal([]byte(out), &got); err != nil {
+		t.Fatalf("output is not valid JSON: %v\n%s", err, out)
+	}
+	return got
+}
+
 func TestConfigValidateFromFile(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "binpack.yaml")

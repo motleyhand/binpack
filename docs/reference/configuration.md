@@ -690,7 +690,12 @@ Two things to know:
 
   Omitting the field means "inherit"; `[]` means "none". They are different.
 - **Pools are discovered, never declared.** An entry here adjusts a pool that discovery found;
-  it does not create one. Naming a pool that does not exist is a configuration error.
+  it does not create one. Naming a pool that does not exist is a configuration error — one
+  `binpack explain` and `binpack diagnose` detect, and one the controller treats as fatal.
+  `binpack config validate` cannot detect it, having no cluster to check the name against: it
+  resolves and prints such an override like any other, and says underneath that it did not check
+  the name. The same holds for a `discovery.nodeGroups` entry naming a node group the
+  cluster-autoscaler does not publish.
 
 ## Notes on parsing
 

@@ -261,6 +261,22 @@ declared, so there is nothing an operator must supply.
 |---|---|---|
 | `--file`, `-f` | standard input | Configuration file to read |
 
+Two fields name something only a cluster can confirm, and **neither is checked here**: a
+`pools[]` entry has to name a pool the cluster has, and a `discovery.nodeGroups` entry has to name
+a node group the cluster-autoscaler publishes. This command reads a document, not a cluster, so it
+resolves and prints both like any other setting and then says underneath that it did not check
+them. Each line appears only when the document carries that field — there is nothing to disclose
+about a document that states neither.
+
+`binpack explain` and `binpack diagnose` check both against the cluster, and the controller treats
+an unknown name as a fatal configuration error. It resolves pools on every evaluation but holds
+that error until it has resumed any drain already in progress — exiting one tick into a drain
+would leave a node cordoned with nothing left to uncordon it — so `binpack run --once` can advance
+a drain and exit without reporting the error. A drain advances by at most one step per evaluation,
+so it can span many one-shot runs; the error is reported by the first run that finds no drain in
+progress, not by the next one. `binpack explain` reports it immediately either way, and is the
+command to reach for when a `--once` run has said nothing.
+
 `apiVersion` and `kind` are emitted so the report is a document rather than a report *about* a
 document — see below.
 
@@ -285,7 +301,8 @@ the same settings.
 }
 ```
 
-Every key is a configuration field and is documented in
+Every key is a configuration field — including no disclosure line, which would make the report
+unloadable — and is documented in
 [configuration.md](configuration.md) — `policy` is the resolved default, and each `pools[]` entry
 is that pool's policy already resolved against it, inlined exactly as the document inlines it.
 `interval` and every other duration is a string such as `"1m0s"`.

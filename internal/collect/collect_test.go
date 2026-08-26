@@ -13,6 +13,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
+	"github.com/motleyhand/binpack/api/v1alpha1"
 	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
 	"github.com/motleyhand/binpack/internal/mother"
@@ -31,7 +32,7 @@ const statusNamespace = "kube-system"
 // autoscaler uses unless it was told otherwise.
 var statusThere = collect.StatusRef{
 	Namespace: statusNamespace,
-	Name:      collect.StatusConfigMapName,
+	Name:      v1alpha1.DefaultAutoscalerStatusName,
 }
 
 func statusConfigMap(document string) *corev1.ConfigMap {
@@ -40,7 +41,7 @@ func statusConfigMap(document string) *corev1.ConfigMap {
 
 func statusConfigMapIn(namespace, document string) *corev1.ConfigMap {
 	return statusConfigMapAt(
-		collect.StatusRef{Namespace: namespace, Name: collect.StatusConfigMapName}, document)
+		collect.StatusRef{Namespace: namespace, Name: v1alpha1.DefaultAutoscalerStatusName}, document)
 }
 
 func statusConfigMapAt(at collect.StatusRef, document string) *corev1.ConfigMap {
@@ -334,7 +335,7 @@ func TestSnapshotReadsTheStatusFromTheNamespaceItIsGiven(t *testing.T) {
 	r := reader(mother.SmallNode("a"), statusConfigMapIn("autoscaler", observed))
 
 	s, err := collect.Snapshot(context.Background(), r, now,
-		collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName})
+		collect.StatusRef{Namespace: "autoscaler", Name: v1alpha1.DefaultAutoscalerStatusName})
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -363,7 +364,7 @@ func TestSnapshotReadsNoNamespaceButTheOneItIsGiven(t *testing.T) {
 		statusConfigMapIn("autoscaler", observed))
 
 	s, err := collect.Snapshot(context.Background(), r, now,
-		collect.StatusRef{Namespace: "default", Name: collect.StatusConfigMapName})
+		collect.StatusRef{Namespace: "default", Name: v1alpha1.DefaultAutoscalerStatusName})
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
 	}
@@ -385,7 +386,7 @@ func TestSnapshotRefusesToLookNowhereAtAll(t *testing.T) {
 		at   collect.StatusRef
 		want string
 	}{
-		{"no namespace", collect.StatusRef{Name: collect.StatusConfigMapName}, "namespace"},
+		{"no namespace", collect.StatusRef{Name: v1alpha1.DefaultAutoscalerStatusName}, "namespace"},
 		{"no name", collect.StatusRef{Namespace: statusNamespace}, "name"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {

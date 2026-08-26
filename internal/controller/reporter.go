@@ -31,7 +31,7 @@ const reportingController = "binpack"
 //
 // The key is the type, action, reason, reporting controller and instance, and
 // the object the event is about — and not the note
-// (k8s.io/client-go@v0.36.3, tools/events/event_broadcaster.go, getKey). So
+// (k8s.io/client-go@v0.36.4, tools/events/event_broadcaster.go, getKey). So
 // "identical" is a weaker condition than it sounds, and a note is written
 // once per series and never refreshed: every later event of the series is
 // dropped in favour of bumping the count. Both [report] and [refusal] are
@@ -65,10 +65,34 @@ func (r broadcastReporter) emit(
 	return nil
 }
 
+// eventWriter is the one write binpack's own code makes outside
+// internal/executor.
+//
+// One method, and the narrowing is the point. internal/executor's package doc
+// tells a reviewer that reading executor.go enumerates what binpack's code
+// does to a Node or a Pod, and executor.Writer holds Patch and the eviction
+// subresource and no Delete. A field of type client.Writer here held Create,
+// Update, Patch, Delete and DeleteAllOf, so a Delete was one line away in a
+// file that enumeration does not cover, and would have compiled and passed.
+//
+// The narrowing costs nothing — mgr.GetClient() satisfies this unchanged —
+// and it makes the exception the executor's doc states an enforced one rather
+// than a promise. TestTheEventCreateIsBinpacksOnlyWriteOutsideTheExecutor
+// counts the methods.
+//
+// It bounds this path and not the process. The long-running reporter above
+// hands events to client-go's recorder, which creates and patches on its own
+// account, and the manager writes a Lease and core Events for leader
+// election. Nothing in Go can narrow those; docs/reference/rbac.md is where
+// the process-wide surface is enumerated, and no rule there grants delete.
+type eventWriter interface {
+	Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error
+}
+
 // directReporter writes the event itself and waits for the API server to
 // accept it, for a process that will not be alive to retry.
 type directReporter struct {
-	writer   client.Writer
+	writer   eventWriter
 	instance string
 	now      func() time.Time
 }

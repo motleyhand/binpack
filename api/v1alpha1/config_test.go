@@ -40,6 +40,17 @@ func TestEmptyConfigIsValidAndSafe(t *testing.T) {
 		t.Errorf("autoscalerNamespace = %q, want %q",
 			cfg.Discovery.AutoscalerNamespace, DefaultAutoscalerNamespace)
 	}
+	// And the other half of the location, for the same reason and with the
+	// same consequence: binpack reads one object, and a Get for a name
+	// nothing published finds nothing and reports a healthy autoscaler as
+	// absent. This constant is the only spelling of that name in the tree —
+	// the fixtures every autoscaler test builds are constructed from it — so
+	// what it is set to is what binpack reads on a cluster that configured
+	// nothing.
+	if cfg.Discovery.AutoscalerStatusName != DefaultAutoscalerStatusName {
+		t.Errorf("autoscalerStatusName = %q, want %q",
+			cfg.Discovery.AutoscalerStatusName, DefaultAutoscalerStatusName)
+	}
 
 	p := cfg.PolicyFor("any-pool")
 	if !p.Enabled {

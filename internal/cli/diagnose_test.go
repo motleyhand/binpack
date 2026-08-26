@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/motleyhand/binpack/api/v1alpha1"
 	"github.com/motleyhand/binpack/internal/collect"
 	"github.com/motleyhand/binpack/internal/engine"
 )
@@ -35,7 +36,7 @@ const renderedNamespace = "kube-system"
 // status from.
 var renderedStatus = collect.StatusRef{
 	Namespace: renderedNamespace,
-	Name:      collect.StatusConfigMapName,
+	Name:      v1alpha1.DefaultAutoscalerStatusName,
 }
 
 var sample = []engine.Finding{
@@ -526,7 +527,7 @@ func TestTheNoAutoscalerClosingLineNamesWhereBinpackLooked(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	opts := &options{output: outputText, out: &buf, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: collect.StatusConfigMapName}}
+	opts := &options{output: outputText, out: &buf, autoscalerStatus: collect.StatusRef{Namespace: "autoscaler", Name: v1alpha1.DefaultAutoscalerStatusName}}
 	if err := renderDiagnose(opts, []engine.Finding{findingFor(noAutoscaler)}); err != nil {
 		t.Fatalf("rendering: %v", err)
 	}
@@ -548,7 +549,7 @@ func TestTheNoAutoscalerClosingLineNamesWhereBinpackLooked(t *testing.T) {
 	// kube-system whatever binpack was configured with is the original defect
 	// in prose.
 	buf.Reset()
-	opts.autoscalerStatus = collect.StatusRef{Namespace: "somewhere-else", Name: collect.StatusConfigMapName}
+	opts.autoscalerStatus = collect.StatusRef{Namespace: "somewhere-else", Name: v1alpha1.DefaultAutoscalerStatusName}
 	if err := renderDiagnose(opts, []engine.Finding{findingFor(noAutoscaler)}); err != nil {
 		t.Fatalf("rendering: %v", err)
 	}

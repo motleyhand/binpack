@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"reflect"
 	"slices"
 	"sync"
 	"testing"
@@ -72,7 +73,7 @@ func (s *recordingSink) Patch(_ context.Context, event *eventsv1.Event, _ []byte
 // The grant was documented as the thing that lets the recorder aggregate
 // repeats of an identical event into one object with a count. It is not:
 // aggregation is a strategic-merge patch. client-go's only write path is
-// `recordEvent` (v0.36.3, tools/events/event_broadcaster.go), which calls
+// `recordEvent` (v0.36.4, tools/events/event_broadcaster.go), which calls
 // `sink.Patch` when the event has a Series and `sink.Create` otherwise or when
 // the series object has gone; `EventSinkImpl.Update` exists to satisfy the
 // interface and has no call site. Reading that once is not enough to remove a
@@ -136,5 +137,38 @@ func TestTheEventRecorderNeverIssuesAnUpdate(t *testing.T) {
 			t.Errorf("the recorder never issued a %s (%v), so this test is not "+
 				"observing the write path it claims to", want, called)
 		}
+	}
+}
+
+// TestTheEventCreateIsBinpacksOnlyWriteOutsideTheExecutor holds the
+// enumeration internal/executor's package doc tells a reviewer to trust.
+//
+// That doc says every write binpack's own code makes to a Node or a Pod is in
+// executor.go, and R4-017's RBAC argument and R4-003's availability argument
+// both rest on what a reviewer concludes from reading it: binpack removes no
+// object, ever. True of executor.Writer, which has Patch and SubResource and
+// no Delete. It was not true of binpack's code, because this file creates
+// Events and held the whole of client.Writer to do it — Create, Update,
+// Patch, Delete and DeleteAllOf — so a Delete was one line away in a file
+// that enumeration does not cover, and would compile, pass, and be invisible.
+//
+// One method, counted rather than assumed. A verb added here has to be added
+// to the executor package doc's exception too, or this fails.
+//
+// What it does not hold, and what the doc no longer claims: the writes the
+// libraries binpack embeds make on its behalf. client-go's event recorder
+// creates and patches events.k8s.io Events on the long-running path, and the
+// manager writes a Lease and core Events for leader election. No Go interface
+// bounds those, and a test that pretended otherwise would be the same
+// over-claim in a new place. docs/reference/rbac.md enumerates them, and no
+// rule the chart renders grants delete on anything — which is where "binpack
+// removes no object, ever" is actually enforced.
+func TestTheEventCreateIsBinpacksOnlyWriteOutsideTheExecutor(t *testing.T) {
+	const permitted = 1
+	if n := reflect.TypeFor[eventWriter]().NumMethod(); n != permitted {
+		t.Fatalf("eventWriter has %d methods and this test asserts %d: internal/executor's "+
+			"package doc names this Event create as the one write binpack's own code makes "+
+			"outside that file — widen the doc with the new verb, or say here why it "+
+			"needs none", n, permitted)
 	}
 }
