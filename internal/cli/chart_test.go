@@ -1014,6 +1014,18 @@ func renderedServiceAccount(t *testing.T) (name, namespace string) {
 		t.Fatalf("reading the chart's ServiceAccount: %v", err)
 	}
 
+	// What it is, before what it is called. Changed to another valid kind the
+	// metadata still reads the same, so the Deployment and the bindings went
+	// on agreeing with a name nothing creates — and a default install has no
+	// ServiceAccount and a pod Kubernetes will not start.
+	for _, want := range []string{"apiVersion: v1", "kind: ServiceAccount"} {
+		if !strings.Contains(string(manifest), want+"\n") {
+			t.Errorf("the chart's serviceaccount.yaml does not declare %q; whatever it "+
+				"creates, the Deployment and every binding name an account that does not "+
+				"exist", want)
+		}
+	}
+
 	var section string
 	for line := range strings.SplitSeq(string(manifest), "\n") {
 		if !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":") {
@@ -1407,6 +1419,13 @@ func TestTheChartAgreesWithItselfAboutItsOptions(t *testing.T) {
 		t.Errorf("binpack.autoscalerNamespace is %d actions; with more than one, which "+
 			"of them decides the namespace is a question this cannot answer and the two "+
 			"RBAC objects are held to the helper by name alone", len(actions))
+	} else if strings.Contains(actions[0], ":=") {
+		// An assignment emits nothing. `{{- $_ := dig … -}}` has one action,
+		// no literal beside it and the dig inside it, and returns the empty
+		// string — which is the shape the previous version of this check was
+		// written against and still admitted.
+		t.Errorf("binpack.autoscalerNamespace assigns rather than emits (%s), so it "+
+			"returns the empty string whatever it reads", strings.TrimSpace(actions[0]))
 	} else if !strings.Contains(actions[0], `dig "discovery" "autoscalerNamespace"`) {
 		t.Errorf("binpack.autoscalerNamespace does not derive its value from "+
 			"config.discovery.autoscalerNamespace (%s): the Role would be created where "+

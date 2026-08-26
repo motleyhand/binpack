@@ -158,9 +158,14 @@ type Metadata struct {
 // and 403s on every ConfigMap read — with every assertion about what the Roles
 // grant still true, because they do grant it and nothing reaches it.
 type Binding struct {
-	Kind     string   `json:"kind"`
-	Metadata Metadata `json:"metadata"`
-	RoleRef  struct {
+	// APIVersion for the reason [Role] carries one: a binding missing it or
+	// misspelling it decodes to the same kind, name, roleRef and subject, and
+	// Kubernetes refuses the object — leaving the Role it names bound to
+	// nobody while every assertion here agrees.
+	APIVersion string   `json:"apiVersion"`
+	Kind       string   `json:"kind"`
+	Metadata   Metadata `json:"metadata"`
+	RoleRef    struct {
 		// APIGroup is modelled because Kubernetes rejects a binding whose
 		// roleRef names the wrong one, and nothing else here would notice: the
 		// kind and name would still be the pair this package expects. Helm
@@ -204,6 +209,12 @@ func Bindings(template string) ([]Binding, error) {
 		}
 		if b.Kind != "RoleBinding" && b.Kind != "ClusterRoleBinding" {
 			continue
+		}
+		if b.APIVersion != RBACAPIVersion {
+			return nil, fmt.Errorf("the chart declares a %s with apiVersion %q, and "+
+				"Kubernetes serves RBAC under %q; the API server refuses the binding and "+
+				"the Role it names is bound to nobody:\n%s",
+				b.Kind, b.APIVersion, RBACAPIVersion, doc)
 		}
 		if b.Metadata.Name == "" {
 			return nil, fmt.Errorf("the chart declares a %s with no metadata.name; the API "+
