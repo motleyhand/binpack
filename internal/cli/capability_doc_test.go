@@ -192,9 +192,9 @@ func TestTheRBACReferenceIsACompleteRoleSpecification(t *testing.T) {
 	// And a property that is not a comparison at all: a rule can be wrong on
 	// its own terms, and two documents agreeing about it says nothing.
 	for _, grant := range rbacdoc.Unauthorizable(roles) {
-		t.Errorf("%s — a resourceNames restriction cannot authorise a request that carries "+
-			"no object name, so this grant authorises nothing and binpack's cache would "+
-			"never establish its watch", grant)
+		t.Errorf("%s — these verbs carry no object name for a resourceNames restriction "+
+			"to match, and no field selector supplies one, so this grant authorises "+
+			"nothing at all", grant)
 	}
 }
 

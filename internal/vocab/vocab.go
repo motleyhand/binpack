@@ -40,6 +40,8 @@ func StringConstants(dir, prefix string) (map[string]string, error) {
 		return nil, err
 	}
 
+	runeConstants = runes(files)
+
 	declared := declarations(files, stringTypes(files))
 
 	// Every declaration's literal value, whatever its name, so an alias can be
@@ -148,7 +150,53 @@ func convertedString(call *ast.CallExpr, resolved map[string]string) (string, bo
 		runes, err := strconv.Unquote(lit.Value)
 		return runes, err == nil
 	}
+	// A named rune is as legal an operand as a literal one, and those names
+	// are not in `resolved` — that map holds strings, and a `const letter rune
+	// = 'x'` is filtered out before it reaches one. So the runes are collected
+	// separately and consulted here.
+	if ident, ok := call.Args[0].(*ast.Ident); ok {
+		if value, ok := runeConstants[ident.Name]; ok {
+			return value, true
+		}
+	}
 	return evaluate(call.Args[0], resolved)
+}
+
+// runeConstants are the package's rune constants, by name, for the conversions
+// that name one.
+var runeConstants map[string]string
+
+// runes is every constant declared as a character literal, whatever its type.
+//
+// Collected apart from the string declarations because those are filtered by
+// type — a `const letter rune = 'x'` is deliberately not a string — and a
+// `string(letter)` conversion still needs it.
+func runes(files []*ast.File) map[string]string {
+	out := map[string]string{}
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			block, ok := decl.(*ast.GenDecl)
+			if !ok || block.Tok != token.CONST {
+				continue
+			}
+			for _, spec := range block.Specs {
+				spec, ok := spec.(*ast.ValueSpec)
+				if !ok || len(spec.Names) != len(spec.Values) {
+					continue
+				}
+				for i, name := range spec.Names {
+					lit, ok := spec.Values[i].(*ast.BasicLit)
+					if !ok || lit.Kind != token.CHAR {
+						continue
+					}
+					if value, err := strconv.Unquote(lit.Value); err == nil {
+						out[name.Name] = value
+					}
+				}
+			}
+		}
+	}
+	return out
 }
 
 // declaration is one name and the expression it was declared with.

@@ -80,23 +80,28 @@ says, so the two cannot drift apart. **If you manage RBAC yourself, they can**: 
 the controller reports as a failed evaluation and the one-shot commands as a failure to read the
 cluster. Neither says the Role is in the wrong namespace.
 
-### Why that one is not restricted by name
+### Why that one is scoped by namespace rather than by name
 
-The obvious rule — a ClusterRole on `configmaps` with
-`resourceNames: [cluster-autoscaler-status]` — does not work, and fails in a way worth
-understanding before you write it.
+The obvious alternative is a ClusterRole on `configmaps` with
+`resourceNames: [cluster-autoscaler-status]`. It would work, and it is still not what the
+chart renders.
 
-`resourceNames` restricts a request by the name in its path. `list` and `watch` requests carry
-no name, so they cannot be restricted this way and the rule authorises nothing for them. The
-one-shot commands would work, because they issue a `get`; the controller would not start at
-all, because its cache issues a `list` followed by a `watch`.
+It would work because `resourceNames` reaches further than it looks. A request names an object
+in its path, and a `list` or a `watch` has no such path segment — but the API server also takes
+the name from an exact-match `metadata.name` field selector when a collection request carries
+one, and matches `resourceNames` against that. binpack's cache carries exactly that selector,
+and the one-shot commands issue a `get`, so every read binpack makes would be authorised.
 
-Narrowing by namespace is the restriction that does hold. binpack still reads only the one
-object: the cache is configured with a field selector on `metadata.name`, which the API server
-applies, so no other ConfigMap in that namespace is ever transmitted or held in memory. The
-difference is that this is binpack declining to read them rather than Kubernetes refusing —
-so grant the Role in that one namespace alone, and never cluster-wide, where it would cover
-application configuration binpack has no business seeing.
+What that rule grants, though, is conditional on the query binpack sends. Drop the selector and
+the same rule authorises nothing; and a ClusterRole carries the name into every namespace, so
+any `cluster-autoscaler-status` anywhere in the cluster is readable. Neither is visible in the
+rule itself.
+
+Narrowing by namespace holds however binpack asks. It still reads only the one object — the
+cache sends that field selector either way, so no other ConfigMap in that namespace is
+transmitted or held in memory. The difference is that this is binpack declining to read them
+rather than Kubernetes refusing. So grant the Role in that one namespace alone, and never
+cluster-wide, where it would cover application configuration binpack has no business seeing.
 
 ## Report
 

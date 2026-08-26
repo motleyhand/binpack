@@ -751,27 +751,40 @@ func Identity(role Role) string {
 	return ""
 }
 
-// namelessVerbs are the verbs whose requests carry no object name, so a
-// resourceNames restriction on them authorises nothing at all.
+// namelessVerbs are the verbs whose requests carry no object name however the
+// client phrases them, so a resourceNames restriction on them authorises
+// nothing at all.
 //
-// The chart's own RBAC comment establishes these two, and they are the reason
-// it scopes the autoscaler-status Role by namespace rather than naming the
-// object: "list and watch requests carry none — so a ClusterRole naming
-// cluster-autoscaler-status would authorise `binpack explain`, which issues a
-// get, and authorise nothing for the controller, whose cache issues a list
-// followed by a watch". Other verbs may share the property; these are the two
-// this repository has established and the two binpack's cache depends on.
-var namelessVerbs = []string{"list", "watch"}
+// Two, and list and watch are not among them — which is what this repository
+// asserted in three places until a reviewer checked. The API server derives
+// the name from an exact-match metadata.name field selector when a collection
+// request carries one (requestinfo.go in k8s.io/apiserver@v0.36.4 sets
+// requestInfo.Name from opts.FieldSelector.RequiresExactMatch, ungated), and
+// RuleAllows then matches resourceNames against it like any other name. So a
+// name-restricted list is a grant Kubernetes deliberately supports, and
+// refusing it here blocked the tightest rule an operator can write.
+//
+// A create carries no name because the object does not have one yet: the
+// request path ends at the collection, requestInfo.Parts holds one element,
+// and nothing later fills the field in. A deletecollection is the verb the
+// server picks precisely when a delete arrived without a name. Neither has a
+// selector escape hatch, so for these two the restriction is empty.
+var namelessVerbs = []string{"create", "deletecollection"}
 
 // Unauthorizable names grants that cannot authorise the request they appear
 // to, however they are compared with anything else.
 //
 // This is the one property here that is not a comparison. Adding
-// `resourceNames: [cluster-autoscaler-status]` to the ConfigMap rule leaves
-// chart and page agreeing, every count above its floor and every scope check
-// satisfied — and the controller's cache, which lists and then watches, holds
-// no permission at all. A guard that only ever compares two documents cannot
-// see a rule that is wrong on its own terms.
+// `resourceNames` to the eviction rule leaves chart and page agreeing, every
+// count above its floor and every scope check satisfied — and no eviction is
+// authorised, because a create is named by nobody at the moment it is
+// authorised. A guard that only ever compares two documents cannot see a rule
+// that is wrong on its own terms.
+//
+// It reports only what is wrong however the client behaves. Whether a
+// name-restricted list authorises anything depends on the field selector the
+// caller sends, which is not in either document this package reads, so it is
+// not this function's to judge — see [namelessVerbs].
 func Unauthorizable(roles []Role) []string {
 	var out []string
 	for _, role := range roles {

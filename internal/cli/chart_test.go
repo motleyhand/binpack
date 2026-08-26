@@ -1033,28 +1033,18 @@ func renderedServiceAccount(t *testing.T) (name, namespace string) {
 			objects[0].APIVersion, objects[0].Kind)
 	}
 
-	var section string
-	for line := range strings.SplitSeq(string(manifest), "\n") {
-		if !strings.HasPrefix(line, " ") && strings.HasSuffix(line, ":") {
-			section = strings.TrimSuffix(line, ":")
-		}
-		if section != "metadata" {
-			continue
-		}
-		trimmed := strings.TrimSpace(line)
-		switch {
-		case strings.HasPrefix(trimmed, "name:"):
-			name = rbacdoc.Placeholder(strings.TrimPrefix(trimmed, "name:"))
-		case strings.HasPrefix(trimmed, "namespace:"):
-			namespace = rbacdoc.Placeholder(strings.TrimPrefix(trimmed, "namespace:"))
-		}
-	}
-
-	if name == "" {
+	// From the decode, not a second pass over the text. Scanning for
+	// `name:` under `metadata` is indentation-blind, so a nested key — a
+	// `labels.name` carrying the old expression, say — overwrites the object's
+	// own name and the Deployment and bindings go on agreeing with something
+	// Kubernetes does not create.
+	if objects[0].Metadata.Name == "" {
 		t.Fatal("the chart's ServiceAccount manifest names no account, so nothing here can " +
 			"say whether the Deployment and the bindings agree with it")
 	}
-	return name, namespace
+	// Already rendered: Objects runs the same substitution, so these are the
+	// placeholders the other halves of the comparison carry.
+	return objects[0].Metadata.Name, objects[0].Metadata.Namespace
 }
 
 // deploymentServiceAccount is the account expression the pod runs as, rendered

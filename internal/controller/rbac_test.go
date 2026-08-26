@@ -626,6 +626,22 @@ func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 			}
 		}
 
+		// A block's statements are not independent: once a preceding one can
+		// return, everything after it is reached only when that branch was not
+		// taken. `if skip { return nil }` followed by a write made the write
+		// look unconditional while a fixture taking the early return never
+		// reached it.
+		if block, ok := n.(*ast.BlockStmt); ok {
+			mayHaveReturned := conditional
+			for _, statement := range block.List {
+				walk(statement, mayHaveReturned)
+				if !mayHaveReturned && terminates(statement) {
+					mayHaveReturned = true
+				}
+			}
+			return
+		}
+
 		for _, child := range children(n) {
 			walk(child, conditional)
 		}
@@ -636,6 +652,26 @@ func requireEveryWriteIsUnconditional(t *testing.T, source *ast.File) {
 		t.Fatalf("no Writer call found in %s; either the writes moved or this parse has "+
 			"stopped seeing them", executorSource)
 	}
+}
+
+// terminates reports whether a statement can end the function early.
+//
+// Conservatively: anything containing a return or a panic. A branch that can
+// leave makes everything after it conditional, whether or not it does.
+func terminates(statement ast.Stmt) bool {
+	var leaves bool
+	ast.Inspect(statement, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.ReturnStmt:
+			leaves = true
+		case *ast.CallExpr:
+			if fn, ok := n.Fun.(*ast.Ident); ok && fn.Name == "panic" {
+				leaves = true
+			}
+		}
+		return !leaves
+	})
+	return leaves
 }
 
 // children is one node's immediate children, in source order.

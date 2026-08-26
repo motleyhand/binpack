@@ -313,8 +313,15 @@ func eventActions() []string {
 	return []string{ActionConsolidate}
 }
 
-// actionClaim matches the reference's statement of an Event's action.
-var actionClaim = regexp.MustCompile("`action: ([A-Za-z]+)`")
+// actionClaim matches the reference's statement of an Event's action, taking
+// the whole token.
+//
+// Bounded by the closing backtick rather than by an alphabetic run: an Event
+// action may hold anything the field permits, and `Consolidate-Node` is a
+// legal value the declaration audit and the documentation guard both accept
+// while this pattern could not see the sentence documenting it — so a valid
+// rename failed here for being spelled with a dash.
+var actionClaim = regexp.MustCompile("`action: ([^`]+)`")
 
 // TestTheDocumentedActionIsExactlyTheVocabulary is the actions' half of
 // TestTheEventReasonTableIsExactlyTheVocabulary.
