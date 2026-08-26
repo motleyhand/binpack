@@ -141,39 +141,54 @@ func stringTypes(files []*ast.File) map[string]bool {
 func declarations(files []*ast.File, stringy map[string]bool) []declaration {
 	var out []declaration
 	for _, file := range files {
-		var previous []ast.Expr
-		var previousType ast.Expr
-		ast.Inspect(file, func(n ast.Node) bool {
-			spec, ok := n.(*ast.ValueSpec)
-			if !ok {
-				return true
+		// Package-level `const` blocks and nothing else. A ValueSpec is also a
+		// `var`, and a function-local one at that, so walking every node made
+		// an implementation detail part of the published vocabulary: a
+		// `var CodeFormatter = "compact"` in internal/engine would be returned
+		// for the prefix `Code` and fail the declaration guard until it was
+		// renamed or exposed as a decision code. A guard that fires on correct
+		// code is one somebody switches off.
+		for _, decl := range file.Decls {
+			block, ok := decl.(*ast.GenDecl)
+			if !ok || block.Tok != token.CONST {
+				continue
 			}
 
-			// A const spec with no expression repeats the previous one — and
-			// its type — so a name declared alone is an alias carrying that
-			// value, or the next member of an iota run.
-			values, typ := spec.Values, spec.Type
-			if len(values) == 0 {
-				values, typ = previous, previousType
-			} else {
-				previous, previousType = values, spec.Type
-			}
-			if len(spec.Names) != len(values) || !mayBeString(typ, stringy) {
-				return true
-			}
-
-			for i, name := range spec.Names {
-				// An iota run repeats `iota` into every member, and none of
-				// them is a string. Dropped here rather than reported, since
-				// the alternative is to call every enum in the package an
-				// expression this cannot evaluate.
-				if ident, ok := values[i].(*ast.Ident); ok && ident.Name == "iota" {
+			// Reset per block, which is Go's own rule: a spec repeats the
+			// previous one within a const block and never across two.
+			var previous []ast.Expr
+			var previousType ast.Expr
+			for _, spec := range block.Specs {
+				spec, ok := spec.(*ast.ValueSpec)
+				if !ok {
 					continue
 				}
-				out = append(out, declaration{expr: values[i], name: name.Name})
+
+				// A const spec with no expression repeats the previous one —
+				// and its type — so a name declared alone is an alias carrying
+				// that value, or the next member of an iota run.
+				values, typ := spec.Values, spec.Type
+				if len(values) == 0 {
+					values, typ = previous, previousType
+				} else {
+					previous, previousType = values, spec.Type
+				}
+				if len(spec.Names) != len(values) || !mayBeString(typ, stringy) {
+					continue
+				}
+
+				for i, name := range spec.Names {
+					// An iota run repeats `iota` into every member, and none
+					// of them is a string. Dropped here rather than reported,
+					// since the alternative is to call every enum in the
+					// package an expression this cannot evaluate.
+					if ident, ok := values[i].(*ast.Ident); ok && ident.Name == "iota" {
+						continue
+					}
+					out = append(out, declaration{expr: values[i], name: name.Name})
+				}
 			}
-			return true
-		})
+		}
 	}
 	return out
 }

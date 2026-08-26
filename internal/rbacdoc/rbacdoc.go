@@ -804,8 +804,17 @@ func malformed(role Role) string {
 		case len(rule.Verbs) == 0:
 			return fmt.Sprintf("rule %d names no verbs", i+1)
 		case len(rule.NonResourceURLs) > 0:
-			if len(rule.Resources) > 0 || len(rule.APIGroups) > 0 {
-				return fmt.Sprintf("rule %d mixes nonResourceURLs with resources", i+1)
+			// A namespaced Role cannot carry one at all, and a non-resource
+			// rule may name none of the three resource fields — resourceNames
+			// included, which an earlier version of this check overlooked
+			// (k8s.io/kubernetes v1.36.4, pkg/apis/rbac/validation,
+			// ValidatePolicyRule).
+			if role.Kind == "Role" {
+				return fmt.Sprintf("rule %d applies to non-resource URLs in a namespaced "+
+					"Role, which cannot reach them", i+1)
+			}
+			if len(rule.Resources) > 0 || len(rule.APIGroups) > 0 || len(rule.ResourceNames) > 0 {
+				return fmt.Sprintf("rule %d mixes nonResourceURLs with resource fields", i+1)
 			}
 		case len(rule.Resources) == 0:
 			return fmt.Sprintf("rule %d names no resources and no nonResourceURLs", i+1)

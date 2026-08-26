@@ -510,7 +510,7 @@ func TestEveryDocumentedNamespaceIsOneAnInstallCreates(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		for i, line := range strings.Split(string(body), "\n") {
+		for i, line := range joinContinuations(strings.Split(string(body), "\n")) {
 			cmd := strings.Index(line, "kubectl ")
 			if cmd < 0 {
 				continue
@@ -936,6 +936,35 @@ func identity(t *testing.T, seen map[string]bool, kind, namespace, name string) 
 			"dedupes it, and Helm asks the API server to create one object twice", key)
 	}
 	seen[key] = true
+}
+
+// joinContinuations folds a backslash-continued shell command onto the line it
+// starts on, leaving the lines it consumed blank so the numbering still points
+// at the source.
+//
+// The scan below looks at one line at a time and only at lines carrying
+// `kubectl `, so a command written across two — `kubectl get deploy binpack \`
+// and then `--namespace binpack` — had its flags on a line the scan never
+// examined. The other examples kept the "did this check anything" counter
+// above zero, so the wrong namespace stayed green and a reader copying it gets
+// a NotFound.
+func joinContinuations(lines []string) []string {
+	out := make([]string, len(lines))
+	for i := 0; i < len(lines); i++ {
+		start, joined := i, lines[i]
+		for i+1 < len(lines) {
+			trimmed := strings.TrimRight(joined, " \t")
+			if !strings.HasSuffix(trimmed, `\`) {
+				break
+			}
+			joined = strings.TrimSuffix(trimmed, `\`) + " " + strings.TrimSpace(lines[i+1])
+			i++
+		}
+		// The lines a command was folded from stay empty, so a failure still
+		// reports the line the command starts on.
+		out[start] = joined
+	}
+	return out
 }
 
 // renderedServiceAccount is the name and namespace expressions of the account
