@@ -56,33 +56,36 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the chart's rules: %v", err)
 	}
-	granted := rbacdoc.Grants(roles)
 	// A count rather than a non-empty check, in chart_test.go's shape. The
 	// chart renders thirty-six pairs; a reader that found a handful would
-	// satisfy the subset assertion below without checking anything, and that
-	// is the failure this whole commit is about.
-	if len(granted) < 30 {
+	// satisfy the comparisons below without checking anything, and that is the
+	// failure this whole commit is about.
+	if all := rbacdoc.Grants(roles); len(all) < 30 {
 		t.Fatalf("the chart parsed to %d group/resource: verb pairs, which is fewer than "+
 			"it has ever rendered — the reader has stopped seeing rules, and every "+
-			"assertion below would pass on the remainder", len(granted))
+			"assertion below would pass on the remainder", len(all))
 	}
 
-	act, err := rbacdoc.Section(string(chart), ".Values.rbac.allowDraining")
-	if err != nil {
-		t.Fatalf("reading the chart's act rules: %v", err)
-	}
-	gated := rbacdoc.Grants(act)
-	if len(gated) == 0 {
-		t.Fatal("the chart gates no rules on rbac.allowDraining, so this asserts nothing")
-	}
+	// Cluster-scoped, because every write binpack's own code makes is. Nodes
+	// are cluster-scoped objects; eviction is namespaced but binpack evicts
+	// from whichever namespaces the chosen node hosts; and the decision event
+	// is filed under `default`, where `kubectl describe node` looks for it,
+	// which is not the namespace binpack runs in and not the one the
+	// autoscaler-status Role is scoped to.
+	//
+	// The pair alone cannot say that. Flattened across kinds, moving the
+	// events rule out of the ClusterRole and into the namespaced Role beside
+	// the ConfigMap grant left every comparison here green, and reporting
+	// would 403 on a namespace that Role does not cover.
+	clusterWide := rbacdoc.Grants(rbacdoc.OfKind(roles, "ClusterRole"))
 
 	// What an install that has not opted in renders. The union above is the
 	// right reading of "what could this chart ever grant" and the wrong one of
 	// "what does a default install grant" — and dryRun defaults to true, so
 	// the decision event is written by installs that render none of the act
 	// rules. Checked against the union, moving its grant inside the opt-in
-	// guard is invisible: the pair is still in `granted`, and the reverse check
-	// below still finds it exercised.
+	// guard is invisible: the pair is still in `granted`, and the reverse
+	// check below still finds it exercised.
 	off, err := rbacdoc.Without(string(chart), ".Values.rbac.allowDraining")
 	if err != nil {
 		t.Fatalf("reading the chart without its act rules: %v", err)
@@ -91,21 +94,47 @@ func TestTheChartGrantsWhatTheCodeCalls(t *testing.T) {
 	if err != nil {
 		t.Fatalf("reading the chart's ungated rules: %v", err)
 	}
-	ungated := rbacdoc.Grants(ungatedRoles)
+	ungated := rbacdoc.Grants(rbacdoc.OfKind(ungatedRoles, "ClusterRole"))
+
+	// The act grants are the difference between the two renders rather than
+	// the guarded block read on its own. A block lifted out of its document
+	// has no kind to carry, so reading it directly is the one way to obtain
+	// these pairs that cannot tell a ClusterRole rule from a namespaced one.
+	gated := map[string]bool{}
+	for pair := range clusterWide {
+		if !ungated[pair] {
+			gated[pair] = true
+		}
+	}
+	if len(gated) == 0 {
+		t.Fatal("opting in to rbac.allowDraining adds no cluster-scoped rule, so this " +
+			"asserts nothing about what acting takes")
+	}
 
 	always, acting := drivenWrites(t)
 
 	for pair := range always {
 		if !ungated[pair] {
-			t.Errorf("binpack performs %q whatever dryRun is set to, and no rule the chart "+
-				"renders without rbac.allowDraining grants it; a default install would "+
-				"403 on that call while looking healthy", pair)
+			t.Errorf("binpack performs %q whatever dryRun is set to, and no cluster-scoped "+
+				"rule the chart renders without rbac.allowDraining grants it; a default "+
+				"install would 403 on that call while looking healthy", pair)
 		}
 	}
+
+	// An equality, not a subset. `acting ⊆ gated` says a mutating write stays
+	// behind the opt-in — `nodes: patch` moved one line above the guard is
+	// still granted, so a subset against the union accepted it, and a default
+	// install would hold a verb that can cordon a node while the reference
+	// page promises it holds none. `gated ⊆ acting` says the opt-in grants
+	// nothing that has outlived its caller, and stops the first direction
+	// quietly comparing a set this test has stopped driving.
 	for pair := range acting {
-		if !granted[pair] {
-			t.Errorf("binpack's code performs %q and no rule the chart renders grants it; "+
-				"an install would 403 on that call", pair)
+		if !gated[pair] {
+			t.Errorf("binpack performs %q only when it is acting, and the chart grants it "+
+				"without rbac.allowDraining (or not at all). An install that has not "+
+				"opted in must hold no verb that can cordon a node or evict a pod, "+
+				"whatever its configuration says — docs/reference/rbac.md promises "+
+				"exactly that", pair)
 		}
 	}
 	for pair := range gated {

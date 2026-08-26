@@ -88,10 +88,19 @@ func TestTheRBACReferenceMatchesWhatTheExecutorDoes(t *testing.T) {
 	// A count rather than a non-empty check. The act block has held two pairs
 	// since it existed, and a reader that found one would compare that one and
 	// pass — which is the whole failure this guard is here for.
+	//
+	// Two ways to get here and the message names both, because they call for
+	// opposite responses: the reader has stopped seeing a rule, or a rule has
+	// left the guard. The second is the more alarming and the less obvious —
+	// internal/controller's TestTheChartGrantsWhatTheCodeCalls is what says
+	// which, since it holds the act grants to the writes binpack makes only
+	// when acting.
 	if len(granted) < 2 {
 		t.Fatalf("the chart's act rules parsed to %d group/resource: verb pairs, fewer "+
-			"than the two it has always rendered — the reader has stopped seeing a rule, "+
-			"and the comparison below is against the remainder", len(granted))
+			"than the two it has always rendered. Either the reader has stopped seeing "+
+			"a rule and the comparison below is against the remainder, or a rule has "+
+			"moved out of the rbac.allowDraining guard and a default install now holds "+
+			"it", len(granted))
 	}
 
 	documented := documentedGrants(t)

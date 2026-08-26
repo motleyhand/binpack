@@ -967,7 +967,7 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 		}, cappedAt(2), engine.SkipTooManyPods},
 	}
 
-	seen := map[string]bool{}
+	seen, produced := map[string]bool{}, map[string]bool{}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			d := engine.Decide(tc.build(), tc.cfg)
@@ -976,6 +976,7 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 			for _, a := range d.Assessments {
 				if a.Skipped {
 					codes = append(codes, a.SkipCode)
+					produced[a.SkipCode] = true
 					if a.SkipReason == "" {
 						t.Errorf("%s: a skip code with no prose to explain it", a.SkipCode)
 					}
@@ -998,7 +999,10 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 	// binpack_nodes_skipped{code="protected-pod"}, documented in
 	// docs/reference/metrics.md, and asserted by nothing at all. Every test of
 	// that branch pinned the sentence, which is explicitly not the public half.
+	enumerated := map[string]bool{}
 	for _, code := range engine.SkipCodes() {
+		enumerated[code] = true
+
 		why, elsewhere := decidedElsewhere[code]
 		switch {
 		case elsewhere && seen[code]:
@@ -1007,6 +1011,26 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 			t.Errorf("a case reaches %q, but the record says Decide cannot:\n  %s", code, why)
 		case !elsewhere && !seen[code]:
 			t.Errorf("no case reaches %q", code)
+		}
+	}
+
+	// And the other direction, which the loop above cannot give: a code the
+	// engine emits that the enumerator has stopped listing is invisible to
+	// every check keyed on the enumerator, this one included — it simply
+	// stops being visited.
+	//
+	// [TestEverySkipCodeDecideProducesIsEnumerated] asks the same question of
+	// its own smaller table, and the metrics reference guard asks it of the
+	// documentation. Neither reaches every branch this table does: deleting
+	// SkipProtectedPod from [engine.SkipCodes] and from
+	// docs/reference/metrics.md left the whole suite green with the branch
+	// still emitting "protected-pod", so the series was no longer
+	// pre-initialised, no longer documented, and still produced.
+	for code := range produced {
+		if !enumerated[code] {
+			t.Errorf("Decide emits %q and SkipCodes() does not enumerate it, so it is "+
+				"published as binpack_nodes_skipped{code=%q} without being "+
+				"pre-initialised or held to the reference", code, code)
 		}
 	}
 }
