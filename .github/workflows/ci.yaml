@@ -24,6 +24,11 @@ jobs:
           go-version-file: go.mod
           cache: true
 
+      # internal/cli and internal/controller render the chart and read the
+      # manifests back, so the test job needs helm as much as the chart job
+      # does. Absent, those tests fail rather than skipping.
+      - uses: azure/setup-helm@v5
+
       - name: Verify go.mod and go.sum are tidy
         run: |
           go mod tidy

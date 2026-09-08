@@ -41,6 +41,11 @@ jobs:
         with:
           version: v2.12.2
 
+      # And `make test` renders the chart, so helm has to be here too. The
+      # chart job below has it and runs on its own runner, which is no help to
+      # this one.
+      - uses: azure/setup-helm@v5
+
       # Everything CI runs, again. A tag skipping the tests it was cut from is
       # how a release gets published from a commit nobody verified — the branch
       # may have been green hours and several merges ago.

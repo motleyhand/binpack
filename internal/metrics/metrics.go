@@ -18,6 +18,7 @@
 package metrics
 
 import (
+	"slices"
 	"strconv"
 	"sync/atomic"
 	"time"
@@ -215,7 +216,7 @@ func init() {
 	for _, code := range engine.SkipCodes() {
 		drainsAbandoned.WithLabelValues(code)
 	}
-	for _, code := range []string{engine.VerdictInfeasible, engine.VerdictBlocked} {
+	for _, code := range abandonmentVerdicts {
 		drainsAbandoned.WithLabelValues(code)
 	}
 
@@ -223,6 +224,29 @@ func init() {
 		evaluations, evaluationErrors, evaluationDuration,
 		drainsStarted, drainsCompleted, drainsAbandoned, state)
 }
+
+// abandonmentVerdicts are the verdicts that can end a drain, which is two of
+// the four.
+//
+// A revalidation that returns no skip code ends the drain on its verdict, and
+// only infeasible and blocked mean it should stop — skipped carries a code by
+// construction and drainable is the drain continuing. Named rather than
+// written inline because the reference guard has to allow exactly this set:
+// spelled twice, the table could document a series the counter can never
+// create, which is the failure the reverse check exists to catch.
+var abandonmentVerdicts = []string{engine.VerdictInfeasible, engine.VerdictBlocked}
+
+// AbandonmentVerdicts is that set, for the one test that can check it against
+// what the executor actually produces.
+//
+// This list is both the source of the pre-initialised zero series and the
+// reference guard's allowed set, which is one source of truth and also one
+// place to be wrong: a verdict added here and to the table satisfies the
+// zero-series check, the reverse-documentation check and the uniqueness check
+// at once, and nothing here can tell that no failed step ever carries it. The
+// package that decides which verdicts end a drain is internal/executor, and
+// its test drives that decision against this.
+func AbandonmentVerdicts() []string { return slices.Clone(abandonmentVerdicts) }
 
 // DrainStarted records a node being marked and cordoned.
 func DrainStarted() { drainsStarted.Inc() }

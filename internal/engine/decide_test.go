@@ -652,8 +652,18 @@ func TestExcludedNamespaceProtectsItsNode(t *testing.T) {
 	if d.Action == engine.Drain && d.Node.Name == "a" {
 		t.Fatal("a node hosting an excluded namespace must not be drained")
 	}
-	if a := assessmentFor(d, "a"); a == nil || !strings.Contains(a.SkipReason, "payments") {
-		t.Errorf("reason should name the namespace, got %+v", a)
+	a := assessmentFor(d, "a")
+	if a == nil || !strings.Contains(a.SkipReason, "payments") {
+		t.Fatalf("reason should name the namespace, got %+v", a)
+	}
+	// The sentence is for a human and the code is the public thing: it is
+	// published as binpack_nodes_skipped{code="protected-pod"} and documented
+	// in docs/reference/metrics.md. Pinning only the prose leaves this branch
+	// free to reuse a neighbouring code — the sentence still names the
+	// namespace, the series stops existing, and any alert keyed on it never
+	// fires again.
+	if a.SkipCode != engine.SkipProtectedPod {
+		t.Errorf("skip code = %q, want %q", a.SkipCode, engine.SkipProtectedPod)
 	}
 }
 
@@ -846,6 +856,21 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 		c.Default.CooldownAfterDrain = 10 * time.Minute
 		return c
 	}
+	disabledPool := func() engine.Config {
+		c := config()
+		c.ByPool = map[string]engine.Policy{poolName: {Enabled: false}}
+		return c
+	}
+	excluding := func(namespace string) engine.Config {
+		c := config()
+		c.Default.ExcludedNamespaces = []string{namespace}
+		return c
+	}
+	cappedAt := func(pods int) engine.Config {
+		c := config()
+		c.Default.MaxPodsPerDrain = pods
+		return c
+	}
 
 	tests := []struct {
 		name  string
@@ -920,9 +945,29 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 				inPool("b"),
 			}, nil)
 		}, config(), engine.SkipBeingRemoved},
+
+		{"the pool is switched off", func() engine.Snapshot {
+			return cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+		}, disabledPool(), engine.SkipPoolDisabled},
+
+		{"a pod binpack must not evict", func() engine.Snapshot {
+			return cluster([]*corev1.Node{inPool("a"), inPool("b")}, []*corev1.Pod{
+				mother.Pod("payments", "ledger", mother.OnNode("a"),
+					mother.Requests("100m", "128Mi")),
+			})
+		}, excluding("payments"), engine.SkipProtectedPod},
+
+		{"more pods than the blast radius allows", func() engine.Snapshot {
+			var pods []*corev1.Pod
+			for _, name := range []string{"p1", "p2", "p3"} {
+				pods = append(pods, mother.Pod("default", name,
+					mother.OnNode("a"), mother.Requests("50m", "64Mi")))
+			}
+			return cluster([]*corev1.Node{inPool("a"), inPool("b")}, pods)
+		}, cappedAt(2), engine.SkipTooManyPods},
 	}
 
-	seen := map[string]bool{}
+	seen, produced := map[string]bool{}, map[string]bool{}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			d := engine.Decide(tc.build(), tc.cfg)
@@ -931,6 +976,7 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 			for _, a := range d.Assessments {
 				if a.Skipped {
 					codes = append(codes, a.SkipCode)
+					produced[a.SkipCode] = true
 					if a.SkipReason == "" {
 						t.Errorf("%s: a skip code with no prose to explain it", a.SkipCode)
 					}
@@ -945,16 +991,110 @@ func TestEverySkipReasonCarriesItsOwnCode(t *testing.T) {
 
 	// Every code the engine can emit must be reachable, or it is documentation
 	// for a state that cannot happen.
-	for _, code := range []string{
-		engine.SkipNotAutoscaled, engine.SkipScaleUpInProgress,
-		engine.SkipCooldownAfterScaleUp, engine.SkipCooldownAfterDrain,
-		engine.SkipPoolAtMinimum, engine.SkipAnnotated, engine.SkipDrainInProgress,
-		engine.SkipBackoff, engine.SkipCordoned, engine.SkipBeingRemoved,
-	} {
-		if !seen[code] {
+	//
+	// Enumerated from [engine.SkipCodes] rather than listed here, because a
+	// list is a record of what somebody remembered to type rather than of what
+	// the vocabulary holds. The hand-written one this replaced named ten of
+	// sixteen, and the six it omitted included protected-pod — published as
+	// binpack_nodes_skipped{code="protected-pod"}, documented in
+	// docs/reference/metrics.md, and asserted by nothing at all. Every test of
+	// that branch pinned the sentence, which is explicitly not the public half.
+	enumerated := map[string]bool{}
+	for _, code := range engine.SkipCodes() {
+		enumerated[code] = true
+
+		why, elsewhere := decidedElsewhere[code]
+		switch {
+		case elsewhere && seen[code]:
+			// A false record reads as coverage, so it fails as loudly as a
+			// gap does. The fix is to move the code into the table above.
+			t.Errorf("a case reaches %q, but the record says Decide cannot:\n  %s", code, why)
+		case !elsewhere && !seen[code]:
 			t.Errorf("no case reaches %q", code)
 		}
 	}
+
+	// And the record is checked against something that emits, not only against
+	// itself. Every entry claims Revalidate reaches the code instead, and until
+	// now that claim was a sentence: a value added to SkipCodes(), to
+	// docs/reference/metrics.md and to this map satisfied all three at once,
+	// so a misspelling or a branch never written could be documented and
+	// pre-initialised as a public label for ever with nothing producing it.
+	//
+	// The fixtures are vocabulary_test.go's, driven rather than described.
+	// The record and [engine.SelectionSkipCodes] have to name the same three.
+	// The package's set is what metrics and the reference read; this one
+	// carries the reasons and the driven check, and a package that quietly
+	// widened its set would otherwise leave both green.
+	for _, code := range engine.SkipCodes() {
+		_, excused := decidedElsewhere[code]
+		if reachable := slices.Contains(engine.SelectionSkipCodes(), code); reachable == excused {
+			t.Errorf("SelectionSkipCodes() %s %q and this record %s it; the two describe "+
+				"one fact and disagree", map[bool]string{true: "includes", false: "omits"}[reachable],
+				code, map[bool]string{true: "excuses", false: "does not excuse"}[excused])
+		}
+	}
+
+	produces := revalidateProduces(t)
+	for code, why := range decidedElsewhere {
+		if !produces[code] {
+			t.Errorf("the record says Revalidate reaches %q instead, and no fixture there "+
+				"produces it:\n  %s\nA code nothing emits is documentation for a state "+
+				"that cannot happen, which is what this loop exists to refuse", code, why)
+		}
+	}
+
+	// And the other direction, which the loop above cannot give: a code the
+	// engine emits that the enumerator has stopped listing is invisible to
+	// every check keyed on the enumerator, this one included — it simply
+	// stops being visited.
+	//
+	// [TestEverySkipCodeDecideProducesIsEnumerated] asks the same question of
+	// its own smaller table, and the metrics reference guard asks it of the
+	// documentation. Neither reaches every branch this table does: deleting
+	// SkipProtectedPod from [engine.SkipCodes] and from
+	// docs/reference/metrics.md left the whole suite green with the branch
+	// still emitting "protected-pod", so the series was no longer
+	// pre-initialised, no longer documented, and still produced.
+	for code := range produced {
+		if !enumerated[code] {
+			t.Errorf("Decide emits %q and SkipCodes() does not enumerate it, so it is "+
+				"published as binpack_nodes_skipped{code=%q} without being "+
+				"pre-initialised or held to the reference", code, code)
+		}
+	}
+}
+
+// decidedElsewhere is the other half of the reachability guard, and it is the
+// half that has to be written down.
+//
+// A skip code Decide never emits is either a branch that has stopped firing or
+// a value only [engine.Revalidate] can reach, and only one of those is a
+// defect. So each entry says which, and names the test that adjudicates the
+// code instead — deleting it from the enumerator to quiet the loop would take
+// a published label value out of the vocabulary the reference is checked
+// against, which is the failure the enumerator exists to prevent.
+//
+// All three here are Revalidate's because the two entry points ask different
+// questions: Decide chooses among the nodes it can see, while Revalidate
+// re-asks about one named node whose drain is already under way — so "gone",
+// "uncordoned" and "no autoscaler to finish this" are states only the second
+// can be in.
+var decidedElsewhere = map[string]string{
+	engine.SkipGone: "Decide assesses the nodes the snapshot carries, so a node it " +
+		"can see is by construction not gone. Revalidate answers for a node that " +
+		"left between the decision and this evaluation, which is the outcome a " +
+		"drain is working towards. Exercised by TestRevalidateTreatsAMissingNodeAsGone.",
+	engine.SkipUncordoned: "eligibility reaches this branch only when resuming, and " +
+		"Decide passes resuming false — a node it has not marked cannot be a marked " +
+		"node that is not cordoned. Exercised by " +
+		"TestRevalidateRefusesAMarkedNodeThatIsNotCordoned.",
+	engine.SkipAutoscalerNotLive: "Decide refuses above the assessments when " +
+		"Autoscaler.Live says no, and returns a decision code rather than a per-node " +
+		"skip — that emptiness is what stops a dead autoscaler zeroing the node " +
+		"gauges. Only a drain already in flight needs the per-node answer. Exercised " +
+		"by TestRevalidateStopsADrainTheClusterHasOvertaken and " +
+		"TestEverySkipCodeRevalidateProducesIsEnumerated.",
 }
 
 func TestEveryDecisionCarriesACode(t *testing.T) {
@@ -976,6 +1116,18 @@ func TestEveryDecisionCarriesACode(t *testing.T) {
 		mother.Pod("default", "big-b", mother.OnNode("b"), mother.Requests("100m", "3Gi")),
 	})
 
+	// A drain already under way pre-empts a new decision, and an autoscaler
+	// that reports itself unwell stops one being made at all.
+	draining := cluster([]*corev1.Node{
+		inPool("a", mother.NodeAnnotations(map[string]string{
+			engine.AnnotationDrainStarted: now.Format(time.RFC3339)})),
+		inPool("b"),
+	}, nil)
+
+	unhealthy := cluster([]*corev1.Node{inPool("a"), inPool("b")}, nil)
+	unhealthy.Autoscaler.HealthStatus = engine.HealthUnhealthy
+
+	produced := map[string]bool{}
 	for _, tc := range []struct {
 		name string
 		s    engine.Snapshot
@@ -985,13 +1137,36 @@ func TestEveryDecisionCarriesACode(t *testing.T) {
 		{"nothing eligible", allSkipped, engine.CodeNoCandidates},
 		{"nothing fits", tooBig, engine.CodeNoneFeasible},
 		{"a drain", feasible, engine.CodeDrain},
+		{"a drain already under way", draining, engine.CodeDraining},
+		{"the autoscaler says it is unwell", unhealthy, engine.CodeAutoscalerUnhealthy},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			d := engine.Decide(tc.s, config())
 			if d.Code != tc.want {
 				t.Errorf("code = %q, want %q (reason: %s)", d.Code, tc.want, d.Reason)
 			}
+			produced[d.Code] = true
 		})
+	}
+
+	// Every enumerated code has to be one a decision produces, which the loop
+	// above cannot say: it visits the fixtures rather than the vocabulary. The
+	// skip codes have had that direction since this pull request's first
+	// commit and the decision codes had not, so a constant added here and to
+	// the reference satisfied the declaration count, the uniqueness guard and
+	// both directions of the table comparison while no Decision ever carried
+	// it — and binpack_evaluations_total{code=…} advertised a selector that
+	// can never match.
+	//
+	// No exceptions, unlike the skip codes: every decision code is a whole
+	// evaluation's outcome, and there is no second entry point to reach one
+	// from.
+	for _, code := range engine.DecisionCodes() {
+		if !produced[code] {
+			t.Errorf("no case produces %q; it is published as "+
+				"binpack_evaluations_total{code=%q} and documented as an outcome, and "+
+				"nothing here reaches it", code, code)
+		}
 	}
 }
 

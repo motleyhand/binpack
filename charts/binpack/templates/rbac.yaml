@@ -72,12 +72,18 @@ subjects:
 # The cluster-autoscaler's status, scoped to the namespace it publishes into
 # rather than restricted by resourceNames.
 #
-# resourceNames restricts a request by the name in its path, and list and watch
-# requests carry none — so a ClusterRole naming cluster-autoscaler-status would
-# authorise `binpack explain`, which issues a get, and authorise nothing for
-# the controller, whose cache issues a list followed by a watch. Narrowing by
-# namespace is the restriction that actually holds. binpack still reads only
-# the one object: its cache carries a field selector the API server applies.
+# A ClusterRole naming cluster-autoscaler-status would in fact authorise every
+# read binpack makes today, and this comment used to say it would not: the API
+# server takes the name of a list or watch from an exact-match metadata.name
+# field selector, and binpack's cache sends one. What it would authorise is a
+# grant conditional on the client's own query — the same rule stops working
+# the day that selector is dropped, and it carries the name into every
+# namespace in the cluster, not the one the autoscaler publishes into.
+#
+# Narrowing by namespace holds regardless of how binpack asks. binpack still
+# reads only the one object, because the cache sends that selector either way;
+# the difference is that here it is binpack declining to read the rest rather
+# than Kubernetes refusing.
 #
 # The namespace follows config.discovery.autoscalerNamespace, because that is
 # the namespace binpack will read. The autoscaler publishes into the namespace
