@@ -397,6 +397,7 @@ var irrelevantToScheduling = map[string]string{
 	"ReadinessGates":                "readiness after placement",
 	"EnableServiceLinks":            "environment variables injected into containers",
 	"OS":                            "the operating system the pod expects; no default Filter plugin reads it, and the kubernetes.io/os node selector that conventionally accompanies it is evaluated by CanFit",
+	"EvictionResponders":            "which controllers are asked to carry out an eviction of this pod; it shapes how a pod leaves a node, never which node it could go to",
 }
 
 // TestPodSpecFieldsAreAccountedFor states the allowlist over corev1.PodSpec

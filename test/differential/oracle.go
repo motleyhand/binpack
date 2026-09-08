@@ -140,6 +140,15 @@ type Oracle struct {
 // the plugins read is assembled by the code under comparison rather than by
 // this package. The indirection exists only because plugins capture the lister
 // at construction while the cluster changes per question.
+//
+// The delegations are spelled out rather than promoted from an embedded
+// *cache.Snapshot, which would satisfy fwk.SharedLister whatever it grows into.
+// A release that widens that interface widens what the scheduler reads the
+// cluster through, and this harness is worth something only while it reads the
+// cluster the same way — so the compiler naming the new method is the
+// notification, exactly as internal/fit's field tables are for corev1.PodSpec.
+// Embedding would also promote the snapshot's mutating half, AddPod and
+// RemovePod and StartMutations, onto a lister these plugins may only read.
 type clusterLister struct {
 	snapshot *cache.Snapshot
 }
@@ -148,8 +157,26 @@ func (c *clusterLister) NodeInfos() fwk.NodeInfoLister           { return c.snap
 func (c *clusterLister) StorageInfos() fwk.StorageInfoLister     { return c.snapshot.StorageInfos() }
 func (c *clusterLister) PodGroupStates() fwk.PodGroupStateLister { return c.snapshot.PodGroupStates() }
 
+// PodGroups, CompositePodGroupStates and CompositePodGroups joined
+// fwk.SharedLister in 1.37, for the pod-group machinery: GangScheduling,
+// TopologyPlacement, PodGroupPodsCount and preemption. Not one of them is a
+// Filter plugin — they decide at Permit, at placement generation, at scoring
+// and at PostFilter — so nothing the oracle runs can reach a pod group through
+// these listers, whatever the GenericWorkload gate is set to. They delegate
+// anyway, for the same reason as the rest: what a plugin reads here is
+// upstream's own snapshot rather than a stub this package writes.
+func (c *clusterLister) PodGroups() fwk.PodGroupLister { return c.snapshot.PodGroups() }
+
+func (c *clusterLister) CompositePodGroupStates() fwk.CompositePodGroupStateLister {
+	return c.snapshot.CompositePodGroupStates()
+}
+
+func (c *clusterLister) CompositePodGroups() fwk.CompositePodGroupLister {
+	return c.snapshot.CompositePodGroups()
+}
+
 // NewOracle builds the Filter plugins corresponding to the predicates binpack
-// models: NodeUnschedulable, NodeName, TaintToleration, NodeAffinity,
+// models: NodeName, NodeUnschedulable, TaintToleration, NodeAffinity,
 // NodePorts, NodeResourcesFit, PodTopologySpread, InterPodAffinity and
 // NodeDeclaredFeatures, in the order the release's default profile runs them
 // — so the plugin a Verdict names is the one the scheduler would have
@@ -259,16 +286,16 @@ func NewOracle() (*Oracle, error) {
 		return nil
 	}
 
-	p, err := nodeunschedulable.New(ctx, args[nodeunschedulable.Name], handle, features)
-	if err := add(nodeunschedulable.Name, p, err); err != nil {
-		return nil, err
-	}
-
 	// NodeName is inert for anything binpack would relocate — a pod naming a
 	// node bypasses the scheduler, and fit refuses those outright — so it
 	// costs nothing and makes that refusal falsifiable rather than assumed.
-	p, err = nodename.New(ctx, args[nodename.Name], handle, features)
+	p, err := nodename.New(ctx, args[nodename.Name], handle, features)
 	if err := add(nodename.Name, p, err); err != nil {
+		return nil, err
+	}
+
+	p, err = nodeunschedulable.New(ctx, args[nodeunschedulable.Name], handle, features)
+	if err := add(nodeunschedulable.Name, p, err); err != nil {
 		return nil, err
 	}
 
