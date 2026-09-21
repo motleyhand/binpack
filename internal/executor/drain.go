@@ -109,62 +109,27 @@ func Advance(
 			Reason: "the cluster-autoscaler removed the node"}, nil
 
 	case engine.BeingRemoved(a.Node) && engine.AutoscalerCanFinish(a.SkipCode):
-		// The taint asked of the node directly rather than read from the skip
-		// code, because eligibility reports one reason and a node can satisfy
-		// several. The likeliest overlap is the one this must survive: the
-		// autoscaler deleting a node is frequently *what brings the pool to
-		// its minimum*, so pool-at-minimum would be reported instead, this
-		// branch would be skipped, and the drain abandoned — uncordoning a
-		// node mid-deletion, which is the single thing the branch exists to
-		// prevent. A scale-up elsewhere, or an operator annotating the node,
-		// reach it the same way.
+		// The autoscaler owns the node now. Not abandoned: uncordoning a node
+		// another component is deleting leaves two controllers disagreeing
+		// about whether it accepts pods. Not advanced: the autoscaler is
+		// evicting the same pods.
 		//
-		// Conditioned, though, on there still being an autoscaler that could
-		// finish what it started. Only a live one ever clears this taint — on
-		// a failed scale-down, on the batch rollback, or from its start-up
-		// clean-up, which is itself filtered to the node groups it currently
-		// manages, so a pool that left that set keeps its taint across a full
-		// restart. An autoscaler that stopped in between leaves a hand-over
-		// nothing will ever complete, and a branch with no bound waits for it
-		// for ever: the node stays cordoned, and because the controller
-		// short-circuits every evaluation to this function while a drain is
-		// marked, binpack stops consolidating anywhere in the cluster.
+		// The taint is read from the node rather than the skip code, because
+		// eligibility reports one reason and a node can satisfy several — the
+		// deletion itself can bring the pool to its minimum — and following
+		// another code here would uncordon the node mid-deletion.
 		//
-		// [engine.AutoscalerCanFinish] is that question already answered, in
-		// the place that answers it for everything else: revalidation reports
-		// autoscaler-not-live when the status is too stale to vouch for the
-		// process, eligibility not-autoscaled when the node's pool is not one
-		// the autoscaler manages. Both are readings of the autoscaler's own
-		// published status, and the predicate covers both because either
-		// leaves this hand-over with nothing to finish it. Asked through the
-		// predicate rather than by comparing one code, because that is what
-		// this branch was doing when the two conditions shared a spelling —
-		// and splitting them without it would have made the dead-autoscaler
-		// case fall in here and wait for ever, which is the one thing this
-		// condition exists to prevent.
+		// The wait is bounded by [engine.AutoscalerCanFinish], not by the
+		// taint's timestamp: elapsed time cannot tell a dead autoscaler from a
+		// slow deletion. When it cannot finish, this falls through and the
+		// drain ends under the reason revalidation computed. Unbounded, it
+		// would stop consolidation cluster-wide, because the controller sends
+		// every evaluation here while a drain is marked.
 		//
-		// What is deliberately not read is the taint's value, which is the
-		// Unix second it was applied:
-		// elapsed time cannot tell a dead autoscaler from a slow deletion, and
-		// guessing wrong uncordons a node mid-delete. Falling through hands
-		// the node back under the reason revalidation already computed.
-		//
-		// The autoscaler owns the node now. Not abandoned — abandoning
-		// uncordons, and uncordoning a node another component is deleting is
-		// two controllers disagreeing about whether it accepts pods. Not
-		// advanced either: it is evicting the same pods, and doubling that up
-		// gains nothing.
-		//
-		// The markers stay, so the drain is still binpack's to observe. When
-		// the node goes, the next evaluation records the completion it would
-		// otherwise have missed — on the cluster where this was found, binpack
-		// scored two abandonments for an operation that succeeded.
-		//
-		// Progress is recorded because there is progress: the autoscaler is
-		// emptying the node. Without it, an autoscaler that changed its mind
-		// and removed its taint would hand back a drain whose stall clock had
-		// been running the whole time, and the next evaluation would abandon
-		// it on the spot.
+		// The markers stay, so the node's removal is recorded as a completed
+		// drain. Progress is recorded because the autoscaler is emptying the
+		// node; without it, an autoscaler that removed its taint would hand
+		// back a drain whose stall clock had run the whole time.
 		if err := Annotate(ctx, w, a.Node, map[string]string{
 			engine.AnnotationDrainProgress: s.Now.UTC().Format(time.RFC3339),
 		}); err != nil {
@@ -174,20 +139,9 @@ func Advance(
 			Reason: "the cluster-autoscaler is removing this node"}, nil
 	}
 
-	// The bound, computed before any branch that would otherwise return
-	// without one.
-	//
-	// It used to sit fifty lines below, under the repair and under the wait
-	// for a replacement, and both of those returned above it — so on those two
-	// paths stallTimeout, removalTimeout and the stuck detector were not
-	// merely unmet, they were never evaluated. That is the closure property
-	// failing in the one place it is load-bearing: a node nothing will finish
-	// stays cordoned, and because the controller short-circuits every
-	// evaluation to this function while a drain is marked, binpack stops
-	// consolidating anywhere in the cluster.
-	//
-	// Assessing here costs nothing that returning early saved: it reads the
-	// snapshot and writes nothing.
+	// The bound, assessed before any branch below can return, so each of them
+	// is held to stallTimeout, removalTimeout and the stuck detector. It reads
+	// the snapshot and writes nothing.
 	state := drain.StateFor(s, a.Node)
 	assessment := drain.Assess(state, policy)
 
@@ -195,12 +149,9 @@ func Advance(
 	// rather than computed a second time beside it. Everything below that asks
 	// how far the drain has got — what is still in flight, which residents the
 	// simulation should have named, how many came back — has to be asking about
-	// the set the assessment counted, and two filters obliged to agree is the
-	// shape this pair was already wrong in.
-	//
-	// It couples them, and that is the point rather than a cost: a change to
-	// what [drain.PodsToMove] keeps now moves the abandonment below as well as
-	// the count recorded on the node.
+	// the set the assessment counted. The coupling is the point: a change to
+	// what [drain.PodsToMove] keeps moves the abandonment below as well as the
+	// count recorded on the node.
 	mine := drain.PodsToMove(state.Pods)
 
 	// What became of the pod an earlier eviction owes this drain.

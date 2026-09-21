@@ -57,14 +57,13 @@ on.
 is not: that is what forces a cluster into a test and makes behaviour depend on the environment.
 Enforced by the `purity` `depguard` rule, which is an **allowlist** — a list of clients we
 remembered can never be complete — so any import not named in it fails CI. It covers
-`internal/engine`, `internal/fit`, `internal/drain`, `api/v1alpha1` and `internal/mother`: the
-middle two because each had a document claiming the property before anything held them to it,
-and `mother` because the others import it from their test files, which `depguard` also checks.
+`internal/engine`, `internal/fit`, `internal/drain`, `api/v1alpha1`, `internal/mother` and
+`internal/permute` — the last two because the others import them from their test files, which
+`depguard` also checks.
 **The set is closed — a guarded package may import only guarded packages** — because `depguard`
 sees one hop and an unguarded intermediary is otherwise a way round the rule. Rationale:
 [ADR-0008](docs/design/adr-0008-engine-uses-api-types.md), which supersedes the stricter
-no-Kubernetes-imports rule of [ADR-0003](docs/design/adr-0003-pure-decision-engine.md) — that
-rule was a proxy, and the mirror types it required caused most of the defects found in review.
+no-Kubernetes-imports rule of [ADR-0003](docs/design/adr-0003-pure-decision-engine.md).
 
 **Objects handed to the engine are strictly read-only.** One `Snapshot`'s pointers are shared by
 every candidate assessment, by `internal/fit`'s destination checks and by the executor — so
@@ -103,19 +102,13 @@ too — ignoring `nvidia.com/gpu` in the oracle's arguments leaves both aggregat
 only the dimension guard red.
 
 **A dimension the generator cannot reach is a dimension nothing is testing.** Every node mother
-but `mother.CappedNode` advertises 110 pod slots against at most three residents, so before that
-archetype existed the whole differential evidence for `pods` was one hand-written case: deleting
-the synthetic `pods: 1` from `fit.EffectiveRequests` moved none of the three thousand generated
-decisions. It now moves 67 of them.
+but `mother.CappedNode` advertises 110 pod slots against at most three residents, so that
+archetype is the only generated evidence for `pods`. Check a new dimension the same way: delete
+its handling and confirm generated decisions move.
 
 **The differential harness's feature gates come from `NewSchedulerFeaturesFromGates`, never a
-hand-written list.** Its first run reported 171 unsound placements, all one message: sidecar
-containers disabled. That was the oracle modelling a cluster that has not existed since 1.29 —
-`SidecarContainers` has been Beta and on by default since then, and GA only at 1.33 — not a
-defect in `fit`. A hand-maintained gate list is a set of guesses about someone else's defaults,
-and a wrong guess produces confident, wrong disagreement reports rather than an error. Upstream's
-own annotation is no safer to copy: the gate's comment says "remove in 1.36" and at 1.36.3 it is
-still there.
+hand-written list.** A hand-maintained gate list is a set of guesses about someone else's
+defaults, and a wrong guess produces confident, wrong disagreement reports rather than an error.
 
 **Test fixtures use object mothers plus builders.** Mothers name archetypes —
 `mother.SmallNode()`, `mother.DaemonSetPod()` — so a test says what it needs in three words and
@@ -259,6 +252,10 @@ legitimate forty-minute shutdown must not kill a healthy drain because a timesta
 - **The maintainer merges.** Branch, commit, push, open the PR; do not merge.
 - Keep PRs reviewable and self-contained. This project is deliberately built as a sequence of
   small steps.
+
+## Comments, docs and PRs
+
+Follow @docs/writing.md. User-facing docs also follow the rules below.
 
 ## Writing style for user-facing docs
 

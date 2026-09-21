@@ -23,11 +23,8 @@ spec:
       # precedence. Appending podLabels would let one set
       # app.kubernetes.io/name to something else, producing either a duplicate
       # YAML key or a Deployment whose selector no longer matches its own pod
-      # template — which the API server rejects.
-      # merge fills the first argument from the second without overwriting it,
-      # so the selector labels must be the first — piping podLabels in would
-      # make them the source and let a user's value win, which is the whole
-      # thing this guards against.
+      # template — which the API server rejects. merge keeps its first
+      # argument's value for a key both share, so the selector labels go first.
       labels: {{- merge (include "binpack.selectorLabels" . | fromYaml)
                         (deepCopy (.Values.podLabels | default dict))
                   | toYaml | nindent 8 }}

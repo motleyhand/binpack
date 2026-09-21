@@ -144,6 +144,8 @@ Keep them reviewable. A PR that does one thing is easier to reason about than on
 four, and this project is being built as a sequence of small, self-contained steps
 deliberately.
 
+Comments, docs and PR descriptions follow [docs/writing.md](docs/writing.md).
+
 CI must be green before merge.
 
 ## Licence

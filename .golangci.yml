@@ -29,11 +29,11 @@ linters:
         # named here is refused by default, which is the same reasoning
         # ADR-0006 applies to unmodelled scheduler constraints.
         #
-        # Named `purity` rather than `engine-purity` because it no longer
-        # covers only the engine, and the five packages are here for four
-        # different reasons — each stated below, because a files: list nobody
-        # can justify line by line is one the next entry gets added to by
-        # sympathy rather than by argument.
+        # Named `purity` rather than `engine-purity` because it covers more
+        # than the engine, and the six packages are here for four different
+        # reasons — each stated below, because a files: list nobody can
+        # justify line by line is one the next entry gets added to by sympathy
+        # rather than by argument.
         #
         # The set is closed: every package listed here may import only packages
         # that are also listed here. That is what makes the guarantee hold one
@@ -49,8 +49,7 @@ linters:
             - "**/internal/fit/**"
             # The module's only importable package, so its dependency set is
             # public surface: anything it imports, a consumer importing the
-            # configuration types inherits. docs/design/2026-08-15-architecture.md
-            # has claimed this row was enforced since before it was.
+            # configuration types inherits.
             - "**/api/v1alpha1/**"
             # Its package doc says it "answers it as a pure function so the
             # judgement can be stated as a table". Held to what it claims.

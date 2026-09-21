@@ -1,46 +1,25 @@
-// Package executor performs the only changes binpack makes to a cluster —
+// Package executor performs the changes binpack makes to Nodes and Pods —
 // cordoning a node, annotating it, handing it back, and evicting a pod — and
 // sequences them into a drain.
 //
-// Two halves, and the split is the thing to know. executor.go is the writes
-// and nothing else: how each individual change is made, and what each way of
+// executor.go is the writes: how each change is made, and what each way of
 // failing means. Every write binpack's own code makes to a Node or a Pod is
-// here — two verbs, Patch and the eviction subresource, and no Delete.
+// here — Patch and the eviction subresource, and no Delete. The one other
+// write in binpack's code is internal/controller's events.k8s.io Event for a
+// --once run, through an interface holding only Create.
 //
-// One further write is binpack's own and lives outside this package:
-// internal/controller creates an events.k8s.io Event to publish the decision
-// of a --once run, through a one-method interface holding Create and nothing
-// else. That exception is what this doc used to omit while the reporter held
-// a full client.Writer, Delete included — so a reviewer checking "binpack
-// removes no object, ever" concluded correctly about the executor and
-// incorrectly about binpack.
+// The process writes more than binpack's code does: client-go's event
+// recorder creates and patches Events, and leader election writes a Lease and
+// core Events. No interface here bounds those; docs/reference/rbac.md
+// enumerates the process-wide surface, and no rule the chart renders grants
+// delete on anything.
 //
-// The *process* writes more than binpack's code does, and reading this file
-// is not an audit of it. The long-running path publishes decisions through
-// client-go's event recorder, which creates and patches events.k8s.io Events
-// itself; and the manager's leader election writes a coordination.k8s.io
-// Lease and announces itself on the core events API. Those are libraries
-// binpack embeds rather than calls, and no interface here bounds them.
-// docs/reference/rbac.md enumerates the process-wide surface and is the
-// authority for that question — including for what the enumeration exists to
-// support, since no rule the chart renders grants delete on anything. That
-// property is held by the grant, not by this file's word for it.
-//
-// drain.go is the drain protocol, and that is policy. It decides what an
-// evaluation does next to a node already being drained: whether to hand over
-// to the cluster-autoscaler, whether a replacement is still in flight, which
-// pod is evicted next, and what to call a revalidation failure. Whether a node
-// should be drained at all remains [engine.Decide]'s answer, and what should
-// happen next given one node's state remains [drain.Assess]'s — a pure
-// function this package calls. What lives here is the part neither can be:
-// carrying a step out and deciding the next one are a single unit against a
-// node whose state is the annotations these writes set.
-//
-// The doc this replaces said "It holds no policy" and located the ordering in
-// "the drain protocol", as a component living somewhere else. That was true
-// when the package was four writes and the protocol had no home yet; it
-// survived unchanged through all fifteen commits that have touched drain.go
-// since, which is how a package doc ends up denying what the package holds.
+// drain.go is the drain protocol, and that is policy: what an evaluation does
+// next to a node already being drained — hand over to the cluster-autoscaler,
+// wait for a replacement, evict the next pod, or name a revalidation failure.
+// Whether to drain at all is [engine.Decide]'s answer, and what one node's
+// state calls for is [drain.Assess]'s. This package carries a step out and
+// decides the next as one unit, against the annotations its own writes set.
 package executor
 
 import (
@@ -193,9 +172,7 @@ var (
 	// rather than retried here, because one step per evaluation is the shape of
 	// this whole package: the controller ends the evaluation on it and re-reads
 	// the cluster on the next interval, which is the retry — against a fresh
-	// snapshot rather than the stale one that produced the refusal. It used to
-	// end the process instead, which made the pod's restart backoff, rather
-	// than the interval, the clock every drain ran on.
+	// snapshot rather than the stale one that produced the refusal.
 	ErrEvictionBlocked = errors.New("a PodDisruptionBudget currently allows no disruption")
 
 	// ErrEvictionImpossible is the API refusing outright, which it does when a

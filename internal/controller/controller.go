@@ -87,8 +87,7 @@ const DefaultGracefulShutdown = 15 * time.Second
 // is right for a bad minute and wrong for a deployment that will never work
 // again — a narrowed nodes/patch grant, an admission webhook that denies
 // binpack's patches — where a quiet retry every interval leaves a controller
-// reporting healthy while doing nothing at all. That reading is exactly what
-// returning the error used to protect against, and it is worth keeping.
+// reporting healthy while doing nothing at all.
 //
 // Five, which at the default interval is five minutes: long enough to ride out
 // a control-plane upgrade or a disruption budget that is only briefly
@@ -580,19 +579,11 @@ func (e *evaluator) Start(ctx context.Context) error {
 // evaluate runs one pass and decides whether its failure, if it failed, is the
 // process's failure too.
 //
-// Almost never, and it used to be always. Every write binpack makes — a cordon,
-// an annotation, an eviction the API server answered 429 because a disruption
-// budget's allowance had been drawn on since the snapshot — returned its error
-// from here, which returned it from [evaluator.Start], which stops the manager
-// and exits the process. On a managed control plane those failures are ordinary
-// rather than exceptional, and they cluster during a control-plane upgrade,
-// which is when binpack is likeliest to be mid-drain. The 429 in particular is
-// documented in the executor as retryable and was the one nothing retried.
-//
-// Nothing is lost by carrying on. A drain's recovery state is on the node it is
-// draining precisely so that the next evaluation can pick it up (ADR-0007), so
-// re-reading and re-deciding a minute later is both cheaper and safer than a
-// restart — and it is already what a failed report does two functions below.
+// Almost never. An error returned from here ends the process, and a failed
+// write — a cordon, an annotation, an eviction answered 429 because a budget's
+// allowance was drawn on since the snapshot — is ordinary. A drain's recovery
+// state is on its node (ADR-0007), so re-reading and re-deciding on the next
+// interval is cheaper and safer than a restart.
 func (e *evaluator) evaluate(ctx context.Context) error {
 	if err := e.attempt(ctx); err != nil {
 		return e.failed(ctx, err)
