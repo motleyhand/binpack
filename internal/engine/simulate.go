@@ -937,59 +937,20 @@ func ControllerOf(pod *corev1.Pod) (OwnerRef, bool) {
 	}, true
 }
 
-// replacement is the pod that will exist after this one is evicted.
-//
-// This is the whole point of reading owner templates. `fit` is asked whether a
-// *replacement* can be placed and was being handed the *running* pod, which is
-// usually the same thing and sometimes is not:
-//
-//   - A pod resized downward in place carries requests smaller than its
-//     template's, and its replacement will ask for the larger figure. Approving
-//     a node on the running pod's numbers leaves the replacement Pending and
-//     provokes exactly the scale-up binpack exists to prevent. Nothing on the
-//     pod records that a completed resize happened — the kubelet updates
-//     allocatedResources to match — so the template is the only source of truth.
-//   - A template pinning spec.nodeName produces a replacement that bypasses the
-//     scheduler entirely. Every running pod has a nodeName, so the running pod
-//     cannot show this; the template can.
-//
-// Neither spec alone is safe, so the replacement is built from both.
-//
-// The template understates in the other direction whenever admission mutates a
-// pod on creation: a service-mesh sidecar injected by a webhook, or requests
-// filled in by a LimitRange, are on the running pod and absent from the stored
-// template. Sizing on the template alone would then approve a node the real
-// replacement does not fit — the identical failure, from the opposite cause.
-//
-// So requests are the per-resource maximum of the two. Each source understates
-// a different case and neither overstates, which makes the larger of them
-// conservative in both.
-//
-// Labels come from the template, not the running pod and not a union of the
-// two. Selector matching is not monotonic — an extra label makes an `In`
-// selector match and a `DoesNotExist` selector stop matching — so "more labels"
-// is not a safe direction and only the set the replacement will actually carry
-// is right. Identity stays the running pod's, so anything reported names an
-// object an operator can go and look at.
-// replacement is [sizedReplacement] plus the checks that decide whether this
-// pod can be *moved*.
+// replacement is the pod that will exist after this one is evicted:
+// [sizedReplacement] plus the checks that decide whether this pod can be moved.
 //
 // Placement constraints the running pod carries and its template does not are
-// admission's work, and there is no safe merge for most of them: a required
-// affinity term is not something you can take the larger of. Refusing is the
-// allowlist rule, and it is counted.
+// usually admission's work, and there is no safe merge for most of them: a
+// required affinity term is not something you can take the larger of.
+// Refusing is the allowlist rule, and it is counted.
 //
-// Separate from sizing because the reserve asks a different question. It scans
-// every relocatable pod in the cluster to find the largest, and it is not
-// moving any of them — so a webhook-mutated workload on some unrelated node
-// would otherwise make every candidate refuse, which is the third route to the
-// same "one pod blocks all drains" failure this change has now closed.
+// Separate from sizing because the reserve scans every relocatable pod in the
+// cluster and moves none of them, so a webhook-mutated workload on an
+// unrelated node would otherwise make every candidate refuse.
 //
-// Three outcomes, not two. ok reports whether the pod can be moved; when it
-// cannot, diverged names the field admission added, or is empty when there was
-// no template to read in the first place. Both helpers below already compute
-// that name, and discarding it was what let one refusal be reported as the
-// other — see [Blocked.Unmodelled].
+// ok reports whether the pod can be moved; when it cannot, diverged names what
+// differs, or is empty when there was no template to read.
 func replacement(
 	pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec,
 ) (out *corev1.Pod, diverged string, ok bool) {
@@ -1018,9 +979,8 @@ func replacement(
 // is not the only cause. See [FindingTemplateDivergence]'s catalogue entry.
 //
 // One function because the two summaries are the same sentence about different
-// facts, and because keeping them apart is what previously drifted: the
-// divergence case borrowed the other's wording and told operators to report a
-// controller that binpack reads perfectly well.
+// facts, and apart they drift: the divergence case must not tell operators to
+// report a controller that binpack reads perfectly well.
 func unpredictable(pod *corev1.Pod, diverged string) *Blocked {
 	if diverged == "" {
 		return &Blocked{
@@ -1048,6 +1008,17 @@ func unpredictable(pod *corev1.Pod, diverged string) *Blocked {
 // [replacement]. What remains is what the reserve needs: the template's spec,
 // with requests raised to the running pod's and any volume it has but the
 // template does not carried over.
+//
+// Requests are the per-resource maximum: each source understates a case the
+// other catches, and overstating costs only a missed drain. A pod resized
+// downward in place asks for less than the replacement will, and the template
+// lacks what admission adds on creation, such as an injected sidecar or
+// LimitRange defaults.
+//
+// Labels come from the template alone. Selector matching is not monotonic — an
+// extra label makes an `In` selector match and a `DoesNotExist` one stop — so
+// a union is not a safe direction. Identity stays the running pod's, so a
+// refusal names an object an operator can look at.
 func sizedReplacement(pod *corev1.Pod, templates map[OwnerRef]*corev1.PodTemplateSpec) (*corev1.Pod, bool) {
 	ref, owned := ControllerOf(pod)
 	if !owned {
@@ -1171,25 +1142,24 @@ func mutatedVolume(template *corev1.PodTemplateSpec, running *corev1.Pod) string
 // restrictiveDivergence reports a constraint the running pod carries that its
 // template does not, naming the first found.
 //
-// Only fields that *narrow* where a pod may go are checked, and that is the
-// whole design. Measured against a real cluster, the fields split three ways:
+// Only fields that *narrow* where a pod may go are checked. The fields split
+// three ways:
 //
 //   - Additive: containers and volumes. The running pod may have more, from an
 //     injected sidecar or a volumeClaimTemplate. Merged, since more of either
 //     can only narrow placement further.
-//   - Permissive: tolerations. The API server adds two NoExecute tolerations to
-//     every pod, so these always differ. The template's are used as-is: fewer
-//     tolerations means the replacement tolerates less, which costs a missed
-//     destination rather than a wrong one.
+//   - Permissive: tolerations. The DefaultTolerationSeconds admission plugin
+//     adds NoExecute tolerations for not-ready and unreachable nodes to every
+//     pod that lacks them, so these nearly always differ. The template's are
+//     used as-is: fewer tolerations means the replacement tolerates less, which
+//     costs a missed destination rather than a wrong one.
 //   - Restrictive: these. A nodeSelector or required affinity present only after
 //     admission makes the replacement look freer than it is, and binpack would
 //     approve a destination the scheduler refuses — leaving the pod Pending and
 //     provoking the scale-up it exists to prevent.
 //
-// An earlier attempt compared every field and refused 80 of 122 pods, all of it
-// API-server defaulting; the conclusion drawn then was that the check could not
-// work. It was comparing the wrong things. Restricted to these five, the same
-// cluster diverges on none.
+// Comparing every field would refuse nearly every pod over what admission and
+// binding add to all of them.
 func restrictiveDivergence(template *corev1.PodTemplateSpec, running *corev1.Pod) string {
 	switch {
 	case !maps.Equal(template.Spec.NodeSelector, running.Spec.NodeSelector):
@@ -1257,46 +1227,29 @@ func hardSpread(cs []corev1.TopologySpreadConstraint) []corev1.TopologySpreadCon
 // sizeProbe is a pod carrying the resource shape of another, and the
 // permissions it would be placed with, and nothing else.
 //
-// Rebuilt field by field rather than copied and stripped, because the question
-// is which fields *contribute to size* and everything else is a liability. A
-// host port copied along with a container makes fit refuse the probe on every
-// node, so one such workload anywhere in the cluster would block every drain —
-// the same failure this probe was introduced to fix, arriving by a different
-// route.
+// Rebuilt field by field rather than copied and stripped, because anything
+// that is not size is a liability: a host port copied along with a container
+// makes fit refuse the probe on every node, so one such workload anywhere in
+// the cluster would block every drain.
 //
 // What size means here is whatever resource.PodRequests reads: the regular
 // containers, the init-container peak, native sidecars kept running (hence
 // their restart policy), RuntimeClass overhead, and pod-level requests where
 // the cluster has them.
 //
-// Tolerations are kept, and they are the exception the rule needed. A
-// toleration is a *permission*, not a constraint: dropping one cannot make the
-// probe fit where the real replacement would not, only make it refusable by
-// taints the replacement tolerates. So the probe was strictly harder to place
-// than the pod it stood for wherever taints exist at all, and a cluster whose
-// spare capacity sits in a tainted pool — a batch pool, a GPU pool, an ARM
-// pool, a wholly tainted single-pool cluster — failed the reserve for ever and
-// was told "no room" about nodes that were empty.
+// Tolerations are kept: a toleration is a permission, not a constraint, and
+// without them a cluster whose spare capacity sits in a tainted pool would
+// fail the reserve for ever on nodes that are empty.
 //
-// ObjectMeta is rebuilt too, and for the same reason as the spec: labels are
-// not size. Copied wholesale, they let a *resident's* required anti-affinity
-// select the probe as the workload it was taken from, so a workload running
-// one hard-anti-affine replica per node — the ordinary way to get per-node
-// placement without a DaemonSet — refused the margin on every node it ran on.
-// Namespace and name stay because a refusal has to name something an operator
-// can look at.
+// ObjectMeta is rebuilt too, because labels are not size. Copied, they let a
+// resident's required anti-affinity select the probe as the workload it was
+// taken from, so a workload running one hard-anti-affine replica per node would
+// refuse the margin on every node it ran on. Namespace and name stay because a
+// refusal has to name something an operator can look at.
 //
-// That failure is closed twice over, at two different levels, and deliberately:
-// [checkHeadroom] hands fit no residents and no domain index, so it does not
-// ask the identity question, and this drops the labels, so the probe carries no
-// answer to it. Either alone is enough today, which means neither is
-// individually observable and a mutation sweep will report both as surviving —
-// equivalent mutants rather than gaps. They are kept because they fail
-// differently under change: the call site is what a reader weighing "should the
-// reserve see residents?" will find and reason about, and this is what stops a
-// future check that reads labels from quietly reopening the same door. This is
-// the fourth route to "one workload blocks every drain" that the probe was
-// built to close; the pattern has earned two locks.
+// [checkHeadroom] also hands fit neither residents nor a domain index, which
+// closes the same hole on its own today. Keep both: this one is what stops a
+// future check that reads labels from reopening it.
 func sizeProbe(pod *corev1.Pod) *corev1.Pod {
 	shape := func(cs []corev1.Container, keepRestartPolicy bool) []corev1.Container {
 		out := make([]corev1.Container, 0, len(cs))

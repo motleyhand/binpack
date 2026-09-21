@@ -20,34 +20,21 @@ const reportingController = "binpack"
 // reporter puts a decision where a cluster user will find it.
 //
 // Two implementations, because the two execution models want incompatible
-// things from an event and neither can serve both.
+// things from an event.
 //
-// The controller runs for weeks and re-decides every minute, so it wants the
-// event recorder's aggregation: events sharing a key collapse into a single
-// object carrying a count and a first and last timestamp, and a decision that
-// holds for an hour reads as one line saying so. It pays for that with
-// asynchrony — the recorder hands each event to a goroutine and returns, and
+// The controller re-decides every interval, so it wants the event recorder's
+// aggregation: events sharing a key collapse into a single object carrying a
+// count and a first and last timestamp, and a decision that holds for an hour
+// reads as one line saying so. The recorder writes from a goroutine, and
 // nothing waits for the write.
 //
 // The key is the type, action, reason, reporting controller and instance, and
-// the object the event is about — and not the note
-// (k8s.io/client-go@v0.36.4, tools/events/event_broadcaster.go, getKey). So
-// "identical" is a weaker condition than it sounds, and a note is written
-// once per series and never refreshed: every later event of the series is
-// dropped in favour of bumping the count. Both [report] and [refusal] are
-// written to that constraint, which is why neither note carries anything that
-// moves.
+// the object the event is about — not the note (client-go tools/events,
+// getKey). A note is written once per series and never refreshed, which is
+// why neither [report] nor [refusal] puts anything in one that moves.
 //
-// A --once run exits in milliseconds, and there fire-and-forget means
-// forgotten: the process is gone before that goroutine posts anything, so the
-// CronJob reports nothing at all. It writes its event synchronously instead,
-// accepting one object per invocation in exchange for the write having
-// actually happened.
-//
-// Found by running --once against a real cluster and finding no event. A fake
-// recorder cannot show this, because the entire defect is in what happens
-// after the call returns — which is also why the synchronous path is the one
-// that can be tested.
+// A --once run exits before that goroutine posts anything, so it writes its
+// event synchronously instead: one object per invocation, but written.
 type reporter interface {
 	emit(ctx context.Context, node *corev1.Node, reason, action, note string) error
 }
@@ -68,23 +55,9 @@ func (r broadcastReporter) emit(
 // eventWriter is the one write binpack's own code makes outside
 // internal/executor.
 //
-// One method, and the narrowing is the point. internal/executor's package doc
-// tells a reviewer that reading executor.go enumerates what binpack's code
-// does to a Node or a Pod, and executor.Writer holds Patch and the eviction
-// subresource and no Delete. A field of type client.Writer here held Create,
-// Update, Patch, Delete and DeleteAllOf, so a Delete was one line away in a
-// file that enumeration does not cover, and would have compiled and passed.
-//
-// The narrowing costs nothing — mgr.GetClient() satisfies this unchanged —
-// and it makes the exception the executor's doc states an enforced one rather
-// than a promise. TestTheEventCreateIsBinpacksOnlyWriteOutsideTheExecutor
-// counts the methods.
-//
-// It bounds this path and not the process. The long-running reporter above
-// hands events to client-go's recorder, which creates and patches on its own
-// account, and the manager writes a Lease and core Events for leader
-// election. Nothing in Go can narrow those; docs/reference/rbac.md is where
-// the process-wide surface is enumerated, and no rule there grants delete.
+// Create alone, so the account of binpack's writes in internal/executor's
+// package doc is enforced rather than promised: a client.Writer here would put
+// Delete one line away. mgr.GetClient() satisfies it unchanged.
 type eventWriter interface {
 	Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error
 }

@@ -30,23 +30,15 @@ import (
 // Slack is how long past a pod's termination deadline binpack waits before
 // calling it stuck rather than slow.
 //
-// A calibration, not a description of Kubernetes. An earlier version of this
-// comment claimed the latter and used it to close the question of making the
-// value configurable; the claim does not survive reading the kubelet. What
-// upstream bounds is SIGKILL *delivery* — killContainer hands the remaining
-// grace period to the CRI's StopContainer. Nothing bounds the teardown after
-// it: the object survives until SyncTerminatedPod completes, and that waits
-// for volumes to unmount and then polls podVolumesExist in a loop with no
-// timeout at all (pkg/kubelet/kubelet.go). The nearest thing to a bound on
-// that path, podAttachAndMountTimeout, is 2m3s and is a retry yield rather
-// than a deadline, by its own comment.
+// A calibration, not an upstream bound. The kubelet bounds SIGKILL delivery,
+// but the pod object then stays until its volumes are cleaned up, and that
+// wait has no timeout. So a pod that uses its full grace period and needs a
+// second unmount attempt (the kubelet's first gives up after 2m3s) is reported
+// stuck while behaving correctly.
 //
-// So the cost of this number is knowable: a pod using its full grace period
-// whose volumes need a second unmount attempt is already past it, and gets
-// reported stuck while behaving correctly. Fixed rather than configurable
-// because there is no upstream quantity to derive a better one from and a
-// config key cannot be withdrawn once shipped — a trade, not a fact. See
-// ADR-0007, which names the metric that would argue for the knob.
+// Fixed rather than configurable, because no upstream quantity gives a better
+// value and a config key cannot be withdrawn once shipped. ADR-0007 names the
+// metric that would argue for the knob.
 const Slack = 2 * time.Minute
 
 // State is everything the judgement reads.

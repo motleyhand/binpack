@@ -16,11 +16,9 @@ const minInterval = 10 * time.Second
 // namespaceErrors reports why a string is not a namespace name, if it is not.
 //
 // A namespace name is a DNS-1123 label, and this asks the API server's own
-// helper rather than restating the rule. What used to be here was a regexp
-// matching the character rule alone, which is the half of the spec a
-// hand-rolled copy keeps; the 63-character limit is the half it loses, and
-// nothing goes wrong until a namespace binpack cannot read looks exactly like
-// a namespace that is empty.
+// helper rather than restating the rule. A hand-rolled copy keeps the character
+// rule and loses the 63-character limit, and nothing goes wrong until a
+// namespace binpack cannot read looks exactly like a namespace that is empty.
 func namespaceErrors(path, ns string) []error {
 	var errs []error
 	for _, why := range validation.IsDNS1123Label(ns) {
@@ -31,18 +29,10 @@ func namespaceErrors(path, ns string) []error {
 
 // labelKeyErrors reports why a string is not a label key, if it is not.
 //
-// The same borrowing as above, and the one that had gone wrong. What used to
-// be here was a regexp applying the *prefix* rule to a key with no prefix, so
-// it required a bare key to begin lowercase — and Kubernetes does not:
-// upstream splits on '/', validates any prefix as a DNS subdomain and the name
-// part against a rule whose own error message offers "MyName" as its first
-// example (k8s.io/apimachinery pkg/api/validate/content, IsLabelKey, which is
-// what the API server's ValidateLabelName calls).
-//
-// Getting this wrong is not a missed consolidation. Validate runs at load, so
-// a key binpack refuses is binpack refusing to start — on a field every
-// operator whose cluster is not DOKS has to set, since the defaults are
-// DigitalOcean's.
+// The same borrowing as above. Upstream validates any prefix as a DNS
+// subdomain and the name part by a rule that allows uppercase ("MyName"), so a
+// regexp applying the prefix rule to the whole key refuses legal keys.
+// Validate runs at load, so a key refused here is binpack refusing to start.
 func labelKeyErrors(path, key string) []error {
 	var errs []error
 	for _, why := range validation.IsQualifiedName(key) {

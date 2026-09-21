@@ -32,9 +32,7 @@ rules:
   #
   # `patch` is the aggregation: repeats of one decision become a count on the
   # existing event rather than a new object, and client-go applies that count
-  # as a strategic-merge patch. `update` was granted too and never issued —
-  # see internal/controller's TestTheEventRecorderNeverIssuesAnUpdate, which is
-  # what would notice if a client-go release started issuing one.
+  # as a strategic-merge patch. client-go's recorder never issues `update`.
   - apiGroups: ["events.k8s.io"]
     resources: [events]
     verbs: [create, patch]

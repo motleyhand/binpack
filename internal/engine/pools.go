@@ -112,11 +112,9 @@ type Rejection struct {
 // GroupOf is the identifier the cluster-autoscaler publishes for the pool a
 // node belongs to, or "" for a node in no pool binpack can see.
 //
-// Every caller goes through here. The alternative — reading
-// `node.Labels[cfg.NodeGroupIDLabel]` at each site, as the code did while
-// equality was the only join — is nine places that have to be changed
-// together, and the one that is missed reports a node as unmanaged rather
-// than failing.
+// Every caller goes through here. A site reading
+// `node.Labels[cfg.NodeGroupIDLabel]` directly skips the derived join, and
+// reports a node as unmanaged rather than failing.
 func (c Config) GroupOf(node *corev1.Node) string {
 	value := node.Labels[c.mappingKey()]
 	if value == "" {
@@ -285,10 +283,9 @@ func liveGroups(a Autoscaler) []NodeGroup {
 // resolveMapping establishes the join, in precedence order.
 //
 // Configured first, because an operator who has stated the answer has settled
-// it. Then equality, which is ADR-0012's join and the only one until now.
-// Only if neither reaches a single node does binpack derive one — so DOKS and
-// every hand-labelled cluster take exactly the path they took before, and the
-// derivation cannot change what any working cluster does.
+// it. Then equality, which is ADR-0012's join. Only if neither reaches a single
+// node does binpack derive one, so the derivation cannot change what a cluster
+// that joins by configuration or equality does.
 func resolveMapping(s Snapshot, cfg Config) PoolMapping {
 	if live, _, _ := s.Autoscaler.Live(s.Now); !live || len(s.Nodes) == 0 {
 		return PoolMapping{}
@@ -777,12 +774,10 @@ func checkStatedJoin(s Snapshot, cfg Config) error {
 // anything: it establishes how nodes join to pools, and rejects a
 // configuration binpack will not be able to resolve.
 //
-// It returns the Config to use. That is why it is not called CheckPools any
-// more: the join is derived per snapshot rather than configured, so a caller
-// that discarded the result would be deciding against a different cluster
-// from the one it validated. Discarding it costs the derivation and never
-// produces a wrong mapping — [Config.GroupOf] falls back to equality — but it
-// silently narrows scope, which is the failure ADR-0012 exists to prevent.
+// It returns the Config to use, because the join is derived per snapshot
+// rather than configured. Discarding the result never produces a wrong
+// mapping — [Config.GroupOf] falls back to equality — but it silently narrows
+// scope, which is the failure ADR-0012 exists to prevent.
 //
 // Three ways the configuration fails, and the order is load-bearing: the
 // mapping first, because everything else is downstream of there being any
