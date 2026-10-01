@@ -77,7 +77,7 @@ require (
 	k8s.io/client-go v0.37.0
 	k8s.io/component-helpers v0.37.0
 	k8s.io/kube-scheduler v0.0.0
-	k8s.io/kubernetes v1.37.0
+	k8s.io/kubernetes v1.37.1
 )
 
 require (
