@@ -20,7 +20,7 @@
 # arm64 image on an amd64 base, which is a broken release nobody is told about.
 # `docker buildx imagetools inspect gcr.io/distroless/static:nonroot` prints
 # the index digest first, above the per-platform ones.
-FROM gcr.io/distroless/static:nonroot@sha256:1c2c046bc09ed40fad370b599a0b1ae7987f55b01e247cf27a7c27cd97e5bbc7
+FROM gcr.io/distroless/static:nonroot@sha256:e2e927ec666bae08560abb3c55d0659eceabb657f56b6782ab500a9fc7f555e3
 
 # dockers_v2 puts every platform's binary in one build context, under a
 # directory named for the platform, and buildx sets TARGETPLATFORM per build.
